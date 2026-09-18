@@ -51,7 +51,9 @@ use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::rt;
 use crate::stats::ReceiveStats;
-use crate::tile::{DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window};
+use crate::tile::{
+    CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
+};
 use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
     TransportError,
@@ -116,11 +118,21 @@ pub struct StabilityConfig {
 impl Default for StabilityConfig {
     fn default() -> Self {
         Self {
+            // Symmetric: a longer demote than promote latches a tile at the
+            // top of the order well after the speaker stopped, which reads as
+            // a stuck UI rather than a damped one.
             promote: Duration::from_millis(1500),
-            demote: Duration::from_millis(5000),
+            demote: Duration::from_millis(1500),
             coalesce: Duration::from_millis(300),
         }
     }
+}
+
+/// Raw speaking state of one member, with the generation of the hysteresis
+/// timer that would make it effective (R10). A bump makes an older timer stale.
+struct SpeakerState {
+    raw: bool,
+    generation: u64,
 }
 
 pub struct EngineConfig {
@@ -232,6 +244,16 @@ enum ActorMessage {
         kind: MediaStreamKind,
         generation: u64,
     },
+    /// A hysteresis timer elapsed; apply if it is still the current one (R10).
+    SpeakerTimer {
+        member_id: String,
+        generation: u64,
+    },
+    /// The coalesce window closed; publish the new order if it is still the
+    /// current window (R11).
+    FlushReorder {
+        generation: u64,
+    },
     /// Which tiles get full records; see [`CallEngine::set_detail_window`].
     SetDetailWindow(DetailWindow),
     /// Close every pooled connection and stop.
@@ -316,6 +338,11 @@ impl CallEngine {
             local_tx,
             window: DetailWindow::default(),
             speaking: HashSet::new(),
+            speakers: HashMap::new(),
+            last_order: Vec::new(),
+            pending_reorder: None,
+            reorder_generation: 0,
+            stability: config.stability,
             tracks: tracks.clone(),
             messages_tx: messages_tx.clone(),
             roster: Vec::new(),
@@ -617,8 +644,18 @@ struct Actor {
     local_tx: watch::Sender<Option<LocalState>>,
     /// Which tiles get full records. Defaults to everything.
     window: DetailWindow,
-    /// Members currently counted as speaking, as fed to the tile ranking.
+    /// Members currently counted as speaking — the damped set the ranking
+    /// reads (R10). `speakers` holds the raw state driving it.
     speaking: HashSet<String>,
+    /// Raw speaking state per member and its in-flight timer's generation.
+    speakers: HashMap<String, SpeakerState>,
+    /// The tile order consumers were last given (R11). Departed ids leave it
+    /// at once; the new order replaces it when the coalesce window closes.
+    last_order: Vec<TileId>,
+    /// Generation of the open coalesce window, if one is open.
+    pending_reorder: Option<u64>,
+    reorder_generation: u64,
+    stability: StabilityConfig,
     tracks: TrackMap,
     /// Handed to connection forwarders and timers so everything funnels into
     /// the same mailbox.
@@ -1021,6 +1058,31 @@ impl Actor {
                     self.apply_constraints_now(&member_id, kind);
                 }
             }
+            ActorMessage::SpeakerTimer {
+                member_id,
+                generation,
+            } => {
+                // Only the newest timer applies; an older one was superseded.
+                let raw = match self.speakers.get(&member_id) {
+                    Some(state) if state.generation == generation => state.raw,
+                    _ => return,
+                };
+                let changed = if raw {
+                    self.speaking.insert(member_id)
+                } else {
+                    self.speaking.remove(&member_id)
+                };
+                if changed {
+                    self.publish_tiles();
+                }
+            }
+            ActorMessage::FlushReorder { generation } => {
+                if self.pending_reorder != Some(generation) {
+                    return;
+                }
+                self.pending_reorder = None;
+                self.publish_tiles_reordered();
+            }
             ActorMessage::SetDetailWindow(window) => {
                 self.window = window;
                 self.publish_tiles();
@@ -1416,11 +1478,11 @@ impl Actor {
                             })
                     })
                     .collect();
-                // Slice 2a: the raw set is the effective set. Hysteresis (R10)
-                // arrives in 2b and damps this before it reaches the ranking.
-                self.speaking = speakers.iter().map(|s| s.member_id.clone()).collect();
+                // Timers are armed before the event goes out, so a consumer
+                // woken by it finds the hysteresis already running.
+                let raw: HashSet<String> = speakers.iter().map(|s| s.member_id.clone()).collect();
+                self.apply_raw_speakers(raw);
                 self.emit(CallEvent::ActiveSpeakers { speakers });
-                self.publish_tiles();
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
                 match self.identity_map.get(&identity).cloned() {
@@ -1726,6 +1788,7 @@ impl Actor {
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
         self.speaking.remove(member_id);
+        self.speakers.remove(member_id);
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
@@ -1926,14 +1989,109 @@ impl Actor {
         self.publish_tiles();
     }
 
+    /// Feeds the transport's speaking snapshot into the hysteresis (R10).
+    ///
+    /// A member whose raw state moved away from their effective state gets a
+    /// timer — `promote` to start counting as speaking, `demote` to stop — and
+    /// a move back before it fires makes that timer stale. Two people trading
+    /// half-second bursts therefore never trade places.
+    fn apply_raw_speakers(&mut self, raw: HashSet<String>) {
+        let ids: HashSet<String> = self
+            .speakers
+            .keys()
+            .cloned()
+            .chain(raw.iter().cloned())
+            .collect();
+        for member_id in ids {
+            let is_raw = raw.contains(&member_id);
+            let state = self
+                .speakers
+                .entry(member_id.clone())
+                .or_insert(SpeakerState {
+                    raw: false,
+                    generation: 0,
+                });
+            if state.raw == is_raw {
+                continue;
+            }
+            state.raw = is_raw;
+            state.generation += 1;
+            let generation = state.generation;
+            if is_raw == self.speaking.contains(&member_id) {
+                // Back to matching the effective state: the in-flight timer is
+                // stale now, and there is nothing to arm.
+                continue;
+            }
+            let delay = if is_raw {
+                self.stability.promote
+            } else {
+                self.stability.demote
+            };
+            let messages = self.messages_tx.clone();
+            rt::spawn(async move {
+                rt::sleep(delay).await;
+                let _ = messages.send(ActorMessage::SpeakerTimer {
+                    member_id,
+                    generation,
+                });
+            });
+        }
+    }
+
     /// Derives and publishes the tile roster and our local state. Reached from
     /// every roster publish, and from the two changes that do not touch the
-    /// roster: the speaking set and the detail window.
+    /// roster: the effective speaking set and the detail window.
     ///
-    /// Slice 2a: an order change is published immediately. 2b coalesces it
-    /// (R11) while keeping per-tile state undelayed.
+    /// R11: a tile's own state is never delayed, and reordering is coalesced.
+    /// When the order moved, consumers get the fresh state now — in the order
+    /// they already hold, minus anyone who left — and the new order when the
+    /// window closes, so a burst of rank changes lands as one reorder.
     fn publish_tiles(&mut self) {
         let Tiles { remote, own } = derive_tiles(&self.roster, &self.speaking);
+        self.publish_local(own);
+
+        let order: Vec<TileId> = remote.iter().map(CallTile::id).collect();
+        if order == self.last_order {
+            self.send_tiles(window(&remote, &self.window));
+            return;
+        }
+        if self.last_order.is_empty() {
+            // Populating an empty order is not a reorder: nothing a consumer
+            // holds can jump. Publish at once, or every call would open on a
+            // blank window for the length of the coalesce delay.
+            self.last_order = order;
+            self.send_tiles(window(&remote, &self.window));
+            return;
+        }
+
+        if self.pending_reorder.is_none() {
+            self.reorder_generation += 1;
+            let generation = self.reorder_generation;
+            self.pending_reorder = Some(generation);
+            let delay = self.stability.coalesce;
+            let messages = self.messages_tx.clone();
+            rt::spawn(async move {
+                rt::sleep(delay).await;
+                let _ = messages.send(ActorMessage::FlushReorder { generation });
+            });
+        }
+        // Departed tiles leave the held order at once; joiners wait for it.
+        let by_id: HashMap<TileId, &CallTile> =
+            remote.iter().map(|tile| (tile.id(), tile)).collect();
+        self.last_order.retain(|id| by_id.contains_key(id));
+        let held: Vec<CallTile> = self.last_order.iter().map(|id| by_id[id].clone()).collect();
+        self.send_tiles(window(&held, &self.window));
+    }
+
+    /// The coalesce window closed: publish the current order (R11).
+    fn publish_tiles_reordered(&mut self) {
+        let Tiles { remote, own } = derive_tiles(&self.roster, &self.speaking);
+        self.publish_local(own);
+        self.last_order = remote.iter().map(CallTile::id).collect();
+        self.send_tiles(window(&remote, &self.window));
+    }
+
+    fn publish_local(&self, own: Option<CallTile>) {
         let local = own.map(|tile| LocalState {
             // Publication state, not intent: up and unmuted, however it ends.
             is_screen_sharing: self
@@ -1955,7 +2113,9 @@ impl Actor {
             *current = local;
             true
         });
-        let roster = window(&remote, &self.window);
+    }
+
+    fn send_tiles(&self, roster: TileRoster) {
         self.tiles_tx.send_if_modified(|current| {
             if *current == roster {
                 return false;
@@ -2226,6 +2386,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with(StabilityConfig::default())
+    }
+
+    fn fixture_with(stability: StabilityConfig) -> Fixture {
         let state = Arc::new(TransportState::default());
         let (memberships, memberships_rx) = watch::channel(Vec::new());
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
@@ -2248,7 +2412,7 @@ mod tests {
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
                 raised_hands: Some(raised_hands_rx),
                 reactions: Some(reactions_rx),
-                stability: StabilityConfig::default(),
+                stability,
             },
             memberships_rx,
         );
@@ -3991,5 +4155,251 @@ mod tests {
             .await
             .expect("unpublish should succeed");
         wait_until(|| !sharing()).await;
+    }
+
+    // ---- stability (spec 002 R10, R11) ---------------------------------------
+    //
+    // Paused clock. `after(ms)` advances it: the clock only moves once every
+    // task is idle, so the actor has always drained its mailbox — and handled
+    // any timer that fired on the way — by the time it returns.
+
+    async fn after(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    fn speakers(ids: &[&str]) -> ConnectionEvent {
+        ConnectionEvent::ActiveSpeakers {
+            speakers: ids
+                .iter()
+                .map(|id| SpeakingParticipant {
+                    identity: format!("id-{id}"),
+                    level: 0.5,
+                })
+                .collect(),
+        }
+    }
+
+    fn speaking(fx: &Fixture, member_id: &str) -> bool {
+        fx.engine
+            .tiles()
+            .detail
+            .iter()
+            .any(|t| t.member_id == member_id && t.speaking)
+    }
+
+    fn mic_muted(fx: &Fixture, member_id: &str) -> bool {
+        fx.engine
+            .tiles()
+            .detail
+            .iter()
+            .find(|t| t.member_id == member_id)
+            .is_some_and(|t| t.microphone_muted)
+    }
+
+    fn hand(member_id: &str, raised_at_ms: u64) -> RaisedHand {
+        RaisedHand {
+            member_id: member_id.to_owned(),
+            sender: format!("@{member_id}:example.org"),
+            reaction_event_id: format!("${member_id}"),
+            raised_at_ms,
+        }
+    }
+
+    /// Own + bob on the roster, bob's tile published; returns the own
+    /// connection to inject transport events through.
+    async fn with_bob(fx: &Fixture) -> UnboundedSender<ConnectionEvent> {
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| order_ids(fx) == ["bob"]).await;
+        adopt(fx)
+    }
+
+    /// Own + a, b, c on the roster and published, in that order.
+    async fn with_abc(fx: &Fixture) {
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("a", "@a:example.org"),
+                member("b", "@b:example.org"),
+                member("c", "@c:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| order_ids(fx) == ["a", "b", "c"]).await;
+    }
+
+    /// Records every order consumers are given from now on.
+    fn observe_orders(fx: &Fixture) -> Arc<Mutex<Vec<Vec<String>>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut rx = fx.engine.subscribe_tiles();
+        rx.borrow_and_update();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let ids: Vec<String> = rx
+                    .borrow()
+                    .order
+                    .iter()
+                    .map(|r| r.id.member_id.clone())
+                    .collect();
+                sink.lock().unwrap().push(ids);
+            }
+        });
+        seen
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_a_speaker_is_promoted_only_after_sustained_voice() {
+        let fx = fixture();
+        let connection = with_bob(&fx).await;
+        connection.send(speakers(&["bob"])).unwrap();
+        after(1400).await;
+        assert!(!speaking(&fx, "bob"), "1.5 s of voice is required");
+        after(200).await;
+        assert!(speaking(&fx, "bob"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_a_speaker_is_demoted_only_after_the_cooldown() {
+        let fx = fixture();
+        let connection = with_bob(&fx).await;
+        connection.send(speakers(&["bob"])).unwrap();
+        after(1600).await;
+        assert!(speaking(&fx, "bob"));
+        connection.send(speakers(&[])).unwrap();
+        after(1400).await;
+        assert!(speaking(&fx, "bob"), "still speaking inside the cooldown");
+        after(200).await;
+        assert!(!speaking(&fx, "bob"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_a_burst_shorter_than_the_promotion_never_counts() {
+        let fx = fixture();
+        let connection = with_bob(&fx).await;
+        connection.send(speakers(&["bob"])).unwrap();
+        after(500).await;
+        connection.send(speakers(&[])).unwrap();
+        after(2000).await;
+        assert!(
+            !speaking(&fx, "bob"),
+            "the promotion timer went stale when the voice stopped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_the_thresholds_are_configurable() {
+        let fx = fixture_with(StabilityConfig {
+            promote: Duration::from_millis(500),
+            ..StabilityConfig::default()
+        });
+        let connection = with_bob(&fx).await;
+        connection.send(speakers(&["bob"])).unwrap();
+        after(400).await;
+        assert!(!speaking(&fx, "bob"));
+        after(200).await;
+        assert!(speaking(&fx, "bob"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_the_first_order_is_not_coalesced() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        after(50).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["bob"],
+            "populating an empty order is not a reorder"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_rank_changes_inside_the_window_land_as_one_reorder() {
+        let fx = fixture();
+        with_abc(&fx).await;
+        let seen = observe_orders(&fx);
+
+        // Two rank changes 100 ms apart: c raises a hand, then b.
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(100).await;
+        fx.raised_hands
+            .send(vec![hand("c", 1), hand("b", 2)])
+            .unwrap();
+        after(400).await;
+
+        let mut orders = seen.lock().unwrap().clone();
+        orders.dedup();
+        assert_eq!(
+            orders,
+            vec![vec!["a", "b", "c"], vec!["c", "b", "a"]],
+            "the old order held with fresh state, then one reorder — never [c, a, b] in between"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_state_is_never_delayed_by_the_coalesce_window() {
+        let fx = fixture();
+        with_abc(&fx).await;
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-b".to_owned(),
+                kind: MediaStreamKind::Microphone,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
+            })
+            .unwrap();
+        wait_until(|| !mic_muted(&fx, "b")).await;
+
+        // c raises a hand: the order will change, so a window opens.
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(100).await;
+        // b mutes inside it.
+        connection
+            .send(ConnectionEvent::TrackMuted {
+                identity: "id-b".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            })
+            .unwrap();
+        after(50).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["a", "b", "c"],
+            "the order waits for the window"
+        );
+        assert!(mic_muted(&fx, "b"), "the mute does not");
+
+        after(200).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_a_member_leaving_inside_the_window_leaves_the_order_at_once() {
+        let fx = fixture();
+        with_abc(&fx).await;
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(100).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("a", "@a:example.org"),
+                member("c", "@c:example.org"),
+            ])
+            .unwrap();
+        after(50).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["a", "c"],
+            "b is gone now; c has not moved yet"
+        );
+        after(200).await;
+        assert_eq!(order_ids(&fx), ["c", "a"]);
     }
 }
