@@ -53,4 +53,8 @@ pub struct Participant {
     /// server's clock), or `None` while it is down. Sort ascending to queue
     /// speakers in the order they asked; see `matrix_rtc_core::reactions`.
     pub hand_raised_at_ms: Option<u64>,
+    /// When this participation began (ms since the epoch), when the dialect
+    /// states it. `None` for a native MSC4143 membership, which carries no
+    /// join time; see `JoinedMembership::membership_ts`.
+    pub joined_at_ms: Option<u64>,
 }

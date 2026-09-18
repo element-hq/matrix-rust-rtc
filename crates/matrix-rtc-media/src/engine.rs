@@ -1482,6 +1482,7 @@ impl Actor {
             reachable,
             streams: own_streams.clone(),
             hand_raised_at_ms,
+            joined_at_ms: member.membership_ts,
         });
         self.emit(CallEvent::ParticipantJoined {
             member_id: member.member_id.clone(),

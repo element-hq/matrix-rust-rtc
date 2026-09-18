@@ -39,6 +39,7 @@ pub mod local;
 pub mod participant;
 mod rt;
 pub mod stats;
+pub mod tile;
 pub mod transport;
 
 pub use constraints::{
@@ -54,6 +55,7 @@ pub use keys::{
 pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
 pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use stats::ReceiveStats;
+pub use tile::{CallTile, TileId, Tiles, derive_tiles};
 pub use transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,
     SpeakingParticipant, TransportConnection, TransportError,
