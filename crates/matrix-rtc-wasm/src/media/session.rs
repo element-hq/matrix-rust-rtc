@@ -229,6 +229,7 @@ impl WasmRtcSessionManager {
                 own_connection_key: Some(config.livekit_service_url.clone()),
                 raised_hands,
                 reactions,
+                stability: matrix_rtc_media::StabilityConfig::default(),
             },
             memberships,
         );

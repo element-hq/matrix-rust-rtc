@@ -67,6 +67,58 @@ pub struct Tiles {
     pub own: Option<CallTile>,
 }
 
+/// A tile's place in the order: enough to place it — identity and hero —
+/// and nothing about what the member is doing. One per tile, always.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TileRef {
+    pub id: TileId,
+    pub hero: bool,
+}
+
+/// What consumers are given: the complete order, and full records for the
+/// declared window only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TileRoster {
+    /// Every remote tile, in rank order. Never truncated: the complement and
+    /// the total are computed from it.
+    pub order: Vec<TileRef>,
+    /// Full records for the tiles inside the window, in `order`'s order. Join
+    /// to `order` by [`TileId`], never by index — it is shorter.
+    pub detail: Vec<CallTile>,
+}
+
+/// Our own tile and whether we are sharing our screen, beside the roster
+/// rather than in it. Changes when we act, not when the call moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LocalState {
+    pub tile: CallTile,
+    /// A screen-share publication of ours is up **and unmuted**. Publication
+    /// state, not intent: it goes false however the share ended.
+    pub is_screen_sharing: bool,
+}
+
+/// Which tiles get full records: a rank range, plus identities drawn out of
+/// rank order — a tile shown full-screen, a picture-in-picture source.
+///
+/// The default is everything, so a consumer that never declares a window
+/// sees full records for every tile. Windowing is opt-in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetailWindow {
+    pub offset: u32,
+    pub len: u32,
+    pub also: HashSet<TileId>,
+}
+
+impl Default for DetailWindow {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            len: u32::MAX,
+            also: HashSet::new(),
+        }
+    }
+}
+
 /// Derives ranked tiles from the roster.
 ///
 /// `speaking` holds the `member_id`s currently counted as speaking, after
@@ -89,6 +141,32 @@ pub fn derive_tiles(roster: &[Participant], speaking: &HashSet<String>) -> Tiles
     }
     remote.sort_by_cached_key(rank_key);
     Tiles { remote, own }
+}
+
+/// Applies a window to the ranked remote tiles.
+///
+/// `detail` is a subsequence of `order`: a tile is included when its rank
+/// falls in `[offset, offset + len)` or its id is in `also`, and appears once,
+/// at its rank position. Ranks past the end and ids not in the call are
+/// ignored rather than errors — a tile named in `also` may have just left.
+pub fn window(ranked: &[CallTile], w: &DetailWindow) -> TileRoster {
+    let start = w.offset as usize;
+    // Saturating: on a 32-bit target `offset + u32::MAX` overflows `usize`.
+    let end = start.saturating_add(w.len as usize);
+    let mut order = Vec::with_capacity(ranked.len());
+    let mut detail = Vec::new();
+    for (rank, tile) in ranked.iter().enumerate() {
+        let id = tile.id();
+        let windowed = (start..end).contains(&rank) || w.also.contains(&id);
+        order.push(TileRef {
+            id,
+            hero: tile.hero,
+        });
+        if windowed {
+            detail.push(tile.clone());
+        }
+    }
+    TileRoster { order, detail }
 }
 
 fn tile(p: &Participant, kind: MediaStreamKind, speaking: &HashSet<String>) -> CallTile {
@@ -390,5 +468,106 @@ mod tests {
             .map(|t| (t.member_id.as_str(), t.microphone_muted))
             .collect();
         assert_eq!(muted, [("a", false), ("b", true), ("c", true)]);
+    }
+
+    // ---- window ------------------------------------------------------------
+
+    fn ranked(n: usize) -> Vec<CallTile> {
+        let roster: Vec<Participant> = (0..n).map(|i| member(&format!("m{i:03}"))).collect();
+        derive_tiles(&roster, &silent()).remote
+    }
+
+    fn ids(tiles: &[CallTile]) -> Vec<TileId> {
+        tiles.iter().map(CallTile::id).collect()
+    }
+
+    #[test]
+    fn default_window_is_everything() {
+        let tiles = ranked(5);
+        let roster = window(&tiles, &DetailWindow::default());
+        assert_eq!(roster.order.len(), 5);
+        assert_eq!(ids(&roster.detail), ids(&tiles));
+    }
+
+    #[test]
+    fn range_detail_is_a_subsequence_of_a_complete_order() {
+        let tiles = ranked(5);
+        let w = DetailWindow {
+            offset: 1,
+            len: 2,
+            also: HashSet::new(),
+        };
+        let roster = window(&tiles, &w);
+        assert_eq!(roster.order.len(), 5, "order is never truncated");
+        assert_eq!(ids(&roster.detail), ids(&tiles[1..3]));
+    }
+
+    #[test]
+    fn also_appears_at_its_rank_position_not_appended() {
+        let tiles = ranked(5);
+        let w = DetailWindow {
+            offset: 0,
+            len: 1,
+            also: [tiles[3].id()].into(),
+        };
+        let roster = window(&tiles, &w);
+        assert_eq!(ids(&roster.detail), vec![tiles[0].id(), tiles[3].id()]);
+    }
+
+    #[test]
+    fn also_inside_the_range_is_not_duplicated() {
+        let tiles = ranked(5);
+        let w = DetailWindow {
+            offset: 0,
+            len: 3,
+            also: [tiles[1].id()].into(),
+        };
+        assert_eq!(window(&tiles, &w).detail.len(), 3);
+    }
+
+    #[test]
+    fn range_past_the_end_clamps() {
+        let tiles = ranked(3);
+        let tail = DetailWindow {
+            offset: 2,
+            len: 10,
+            also: HashSet::new(),
+        };
+        assert_eq!(ids(&window(&tiles, &tail).detail), vec![tiles[2].id()]);
+        let beyond = DetailWindow {
+            offset: 5,
+            len: 10,
+            also: HashSet::new(),
+        };
+        assert!(window(&tiles, &beyond).detail.is_empty());
+        assert_eq!(window(&tiles, &beyond).order.len(), 3);
+    }
+
+    #[test]
+    fn unknown_also_id_is_ignored() {
+        let tiles = ranked(2);
+        let w = DetailWindow {
+            offset: 0,
+            len: 0,
+            also: [TileId {
+                member_id: "left-already".into(),
+                kind: MediaStreamKind::Camera,
+            }]
+            .into(),
+        };
+        assert!(window(&tiles, &w).detail.is_empty());
+    }
+
+    #[test]
+    fn builds_only_what_is_windowed() {
+        let tiles = ranked(200);
+        let w = DetailWindow {
+            offset: 0,
+            len: 20,
+            also: HashSet::new(),
+        };
+        let roster = window(&tiles, &w);
+        assert_eq!(roster.order.len(), 200);
+        assert_eq!(roster.detail.len(), 20);
     }
 }

@@ -51,6 +51,7 @@ use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::rt;
 use crate::stats::ReceiveStats;
+use crate::tile::{DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window};
 use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
     TransportError,
@@ -100,6 +101,28 @@ type ConnectOutcome = Result<
 >;
 
 /// Static configuration of a [`CallEngine`].
+/// How much the tile order is damped (spec 002 R10, R11). Configurable
+/// because the values are a product decision, not a protocol one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StabilityConfig {
+    /// Sustained voice before a member counts as speaking.
+    pub promote: Duration,
+    /// Silence before a speaking member stops counting.
+    pub demote: Duration,
+    /// Reorders inside this window are delivered as one.
+    pub coalesce: Duration,
+}
+
+impl Default for StabilityConfig {
+    fn default() -> Self {
+        Self {
+            promote: Duration::from_millis(1500),
+            demote: Duration::from_millis(5000),
+            coalesce: Duration::from_millis(300),
+        }
+    }
+}
+
 pub struct EngineConfig {
     /// Transport backends, in descending order of preference.
     pub transports: Vec<Arc<dyn MediaTransport>>,
@@ -121,6 +144,8 @@ pub struct EngineConfig {
     /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
     /// reports no reactions.
     pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,
+    /// Damping of the tile order; see [`StabilityConfig`].
+    pub stability: StabilityConfig,
 }
 
 /// Everything the engine can be told from outside its actor task.
@@ -207,6 +232,8 @@ enum ActorMessage {
         kind: MediaStreamKind,
         generation: u64,
     },
+    /// Which tiles get full records; see [`CallEngine::set_detail_window`].
+    SetDetailWindow(DetailWindow),
     /// Close every pooled connection and stop.
     Shutdown {
         ack: oneshot::Sender<()>,
@@ -244,6 +271,8 @@ pub struct CallEngine {
     messages: mpsc::UnboundedSender<ActorMessage>,
     events_tx: broadcast::Sender<CallEvent>,
     participants_rx: watch::Receiver<Vec<Participant>>,
+    tiles_rx: watch::Receiver<TileRoster>,
+    local_rx: watch::Receiver<Option<LocalState>>,
     tracks: TrackMap,
     task: rt::TaskHandle,
 }
@@ -269,6 +298,8 @@ impl CallEngine {
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
+        let (tiles_tx, tiles_rx) = watch::channel(TileRoster::default());
+        let (local_tx, local_rx) = watch::channel(None);
         // On wasm32 the map is `!Send` (track handles hold JS values), but it
         // is still shared — engine and actor — so `Arc` stays, uncontended.
         #[cfg_attr(target_arch = "wasm32", expect(clippy::arc_with_non_send_sync))]
@@ -281,6 +312,10 @@ impl CallEngine {
             own_connection_key: config.own_connection_key,
             events_tx: events_tx.clone(),
             participants_tx,
+            tiles_tx,
+            local_tx,
+            window: DetailWindow::default(),
+            speaking: HashSet::new(),
             tracks: tracks.clone(),
             messages_tx: messages_tx.clone(),
             roster: Vec::new(),
@@ -310,6 +345,8 @@ impl CallEngine {
             messages: messages_tx,
             events_tx,
             participants_rx,
+            tiles_rx,
+            local_rx,
             tracks,
             task,
         }
@@ -336,6 +373,41 @@ impl CallEngine {
     /// snapshot.
     pub fn subscribe_participants(&self) -> watch::Receiver<Vec<Participant>> {
         self.participants_rx.clone()
+    }
+
+    /// The tile roster: every remote tile in rank order, with full records for
+    /// the declared detail window. See [`TileRoster`].
+    pub fn tiles(&self) -> TileRoster {
+        self.tiles_rx.borrow().clone()
+    }
+
+    /// Watch the tile roster; the receiver always holds the latest snapshot.
+    pub fn subscribe_tiles(&self) -> watch::Receiver<TileRoster> {
+        self.tiles_rx.clone()
+    }
+
+    /// Our own tile and screen-sharing state, beside the roster. `None` until
+    /// our own membership is on the roster.
+    pub fn local_state(&self) -> Option<LocalState> {
+        self.local_rx.borrow().clone()
+    }
+
+    /// Watch our local state.
+    pub fn subscribe_local_state(&self) -> watch::Receiver<Option<LocalState>> {
+        self.local_rx.clone()
+    }
+
+    /// Declare which tiles get full records: ranks `[offset, offset + len)`
+    /// plus `also`, wherever those rank. The default is everything. Declare
+    /// what you compose, not what is visible.
+    pub fn set_detail_window(&self, offset: u32, len: u32, also: impl IntoIterator<Item = TileId>) {
+        let _ = self
+            .messages
+            .send(ActorMessage::SetDetailWindow(DetailWindow {
+                offset,
+                len,
+                also: also.into_iter().collect(),
+            }));
     }
 
     /// Hand the caller-established own-focus connection to the engine, which
@@ -541,6 +613,12 @@ struct Actor {
     own_connection_key: Option<String>,
     events_tx: broadcast::Sender<CallEvent>,
     participants_tx: watch::Sender<Vec<Participant>>,
+    tiles_tx: watch::Sender<TileRoster>,
+    local_tx: watch::Sender<Option<LocalState>>,
+    /// Which tiles get full records. Defaults to everything.
+    window: DetailWindow,
+    /// Members currently counted as speaking, as fed to the tile ranking.
+    speaking: HashSet<String>,
     tracks: TrackMap,
     /// Handed to connection forwarders and timers so everything funnels into
     /// the same mailbox.
@@ -943,6 +1021,10 @@ impl Actor {
                     self.apply_constraints_now(&member_id, kind);
                 }
             }
+            ActorMessage::SetDetailWindow(window) => {
+                self.window = window;
+                self.publish_tiles();
+            }
             // Handled in the run loop (it must break).
             ActorMessage::Shutdown { ack } => {
                 let _ = ack.send(());
@@ -1334,7 +1416,11 @@ impl Actor {
                             })
                     })
                     .collect();
+                // Slice 2a: the raw set is the effective set. Hysteresis (R10)
+                // arrives in 2b and damps this before it reaches the ranking.
+                self.speaking = speakers.iter().map(|s| s.member_id.clone()).collect();
                 self.emit(CallEvent::ActiveSpeakers { speakers });
+                self.publish_tiles();
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
                 match self.identity_map.get(&identity).cloned() {
@@ -1639,6 +1725,7 @@ impl Actor {
         }
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
+        self.speaking.remove(member_id);
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
@@ -1834,8 +1921,48 @@ impl Actor {
         let _ = self.events_tx.send(event);
     }
 
-    fn publish_roster(&self) {
+    fn publish_roster(&mut self) {
         let _ = self.participants_tx.send(self.roster.clone());
+        self.publish_tiles();
+    }
+
+    /// Derives and publishes the tile roster and our local state. Reached from
+    /// every roster publish, and from the two changes that do not touch the
+    /// roster: the speaking set and the detail window.
+    ///
+    /// Slice 2a: an order change is published immediately. 2b coalesces it
+    /// (R11) while keeping per-tile state undelayed.
+    fn publish_tiles(&mut self) {
+        let Tiles { remote, own } = derive_tiles(&self.roster, &self.speaking);
+        let local = own.map(|tile| LocalState {
+            // Publication state, not intent: up and unmuted, however it ends.
+            is_screen_sharing: self
+                .roster
+                .iter()
+                .find(|p| p.is_local)
+                .and_then(|p| {
+                    p.streams
+                        .iter()
+                        .find(|s| s.kind == MediaStreamKind::ScreenShare)
+                })
+                .is_some_and(|s| !s.muted),
+            tile,
+        });
+        self.local_tx.send_if_modified(|current| {
+            if *current == local {
+                return false;
+            }
+            *current = local;
+            true
+        });
+        let roster = window(&remote, &self.window);
+        self.tiles_tx.send_if_modified(|current| {
+            if *current == roster {
+                return false;
+            }
+            *current = roster;
+            true
+        });
     }
 }
 
@@ -2121,6 +2248,7 @@ mod tests {
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
                 raised_hands: Some(raised_hands_rx),
                 reactions: Some(reactions_rx),
+                stability: StabilityConfig::default(),
             },
             memberships_rx,
         );
@@ -3734,5 +3862,134 @@ mod tests {
         // The adopted own connection is left to its owner.
         assert!(!closed(&fx, OWN_FOCUS));
         drop(own);
+    }
+
+    // ---- tiles (spec 002) ---------------------------------------------------
+
+    fn order_ids(fx: &Fixture) -> Vec<String> {
+        fx.engine
+            .tiles()
+            .order
+            .iter()
+            .map(|r| r.id.member_id.clone())
+            .collect()
+    }
+
+    /// Tiles are a projection of the roster: they appear and disappear with
+    /// memberships, through the same publish.
+    #[tokio::test]
+    async fn tiles_ride_on_the_roster() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| order_ids(&fx) == ["bob"]).await;
+
+        fx.memberships
+            .send(vec![member("own", "@alice:example.org")])
+            .unwrap();
+        wait_until(|| order_ids(&fx).is_empty()).await;
+    }
+
+    /// R7, C3: our own tile is published beside the list, never in it, and is
+    /// never a hero. `None` until our membership is on the roster.
+    #[tokio::test]
+    async fn own_tile_is_beside_the_list_not_in_it() {
+        let fx = fixture();
+        assert!(fx.engine.local_state().is_none());
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.local_state().is_some()).await;
+
+        let local = fx.engine.local_state().unwrap();
+        assert_eq!(local.tile.member_id, "own");
+        assert!(!local.tile.hero);
+        assert!(!local.is_screen_sharing);
+        assert!(order_ids(&fx).iter().all(|id| id != "own"));
+    }
+
+    /// C12: the window bounds the full records, never the order. The default
+    /// is everything; an explicitly named tile appears at its rank position.
+    #[tokio::test]
+    async fn detail_window_bounds_the_records_not_the_order() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("a", "@a:example.org"),
+                member("b", "@b:example.org"),
+                member("c", "@c:example.org"),
+                member("d", "@d:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.tiles().order.len() == 4).await;
+        assert_eq!(
+            fx.engine.tiles().detail.len(),
+            4,
+            "default window is everything"
+        );
+
+        let last = fx.engine.tiles().order[3].id.clone();
+        fx.engine.set_detail_window(0, 2, [last.clone()]);
+        wait_until(|| fx.engine.tiles().detail.len() == 3).await;
+
+        let roster = fx.engine.tiles();
+        assert_eq!(roster.order.len(), 4, "order is never truncated");
+        let detail: Vec<TileId> = roster.detail.iter().map(|t| t.id()).collect();
+        assert_eq!(
+            detail,
+            vec![roster.order[0].id.clone(), roster.order[1].id.clone(), last],
+            "range first, then the named tile at its own rank position"
+        );
+    }
+
+    /// R14, C8: the screen-sharing flag follows the publication — up **and
+    /// unmuted** — not our intent, so it goes false however the share ends.
+    #[tokio::test]
+    async fn screen_sharing_follows_the_publication_up_and_unmuted() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        wait_until(|| fx.engine.local_state().is_some()).await;
+        let _connection = adopt(&fx);
+        let sharing = || fx.engine.local_state().unwrap().is_screen_sharing;
+        assert!(!sharing());
+
+        fx.engine
+            .publish(PublishOptions::screen_share(VideoSourceConfig {
+                width: 1920,
+                height: 1080,
+            }))
+            .await
+            .expect("publish should succeed");
+        wait_until(sharing).await;
+
+        // Muted is "not sharing": one consumer publishes muted and unmutes
+        // only once capture is live, and the flag must not lead the picture.
+        fx.engine
+            .set_local_muted(MediaStreamKind::ScreenShare, true)
+            .await
+            .expect("mute should succeed");
+        wait_until(|| !sharing()).await;
+        fx.engine
+            .set_local_muted(MediaStreamKind::ScreenShare, false)
+            .await
+            .expect("unmute should succeed");
+        wait_until(sharing).await;
+
+        fx.engine
+            .unpublish(MediaStreamKind::ScreenShare)
+            .await
+            .expect("unpublish should succeed");
+        wait_until(|| !sharing()).await;
     }
 }
