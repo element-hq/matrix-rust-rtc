@@ -90,6 +90,123 @@ impl From<matrix_rtc_media::Participant> for FfiParticipant {
 }
 
 /// Why the call ended.
+/// Identity of one call tile: the pair `(member_id, kind)`. Stable for as
+/// long as the tile is in the call. Join [`FfiTileRoster::detail`] to
+/// [`FfiTileRoster::order`] by this, never by index. Contract C1.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTileId {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+}
+
+impl From<matrix_rtc_media::TileId> for FfiTileId {
+    fn from(id: matrix_rtc_media::TileId) -> Self {
+        Self {
+            member_id: id.member_id,
+            kind: id.kind.into(),
+        }
+    }
+}
+
+impl From<FfiTileId> for matrix_rtc_media::TileId {
+    fn from(id: FfiTileId) -> Self {
+        Self {
+            member_id: id.member_id,
+            kind: id.kind.into(),
+        }
+    }
+}
+
+/// A tile's place in the order: identity and whether it is a hero, nothing
+/// else. One per tile in the call, always. Contract C2.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTileRef {
+    pub id: FfiTileId,
+    pub hero: bool,
+}
+
+impl From<matrix_rtc_media::TileRef> for FfiTileRef {
+    fn from(r: matrix_rtc_media::TileRef) -> Self {
+        Self {
+            id: r.id.into(),
+            hero: r.hero,
+        }
+    }
+}
+
+/// One renderable stream of one membership, with what a UI needs to place
+/// and decorate it. `microphone_muted` is the member's microphone; this
+/// tile's own stream state is `has_video`. Mirrors
+/// [`matrix_rtc_media::CallTile`], where every field is documented.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiCallTile {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub hero: bool,
+    pub has_video: bool,
+    pub microphone_muted: bool,
+    pub speaking: bool,
+    pub hand_raised_at_ms: Option<u64>,
+    pub reachable: bool,
+}
+
+impl From<matrix_rtc_media::CallTile> for FfiCallTile {
+    // `joined_at_ms` stays on the Rust side: it only ranks, nothing decorates
+    // with it, and it is `None` for every native MSC4143 membership today.
+    fn from(t: matrix_rtc_media::CallTile) -> Self {
+        Self {
+            member_id: t.member_id,
+            kind: t.kind.into(),
+            user_id: t.user_id,
+            device_id: t.device_id,
+            hero: t.hero,
+            has_video: t.has_video,
+            microphone_muted: t.microphone_muted,
+            speaking: t.speaking,
+            hand_raised_at_ms: t.hand_raised_at_ms,
+            reachable: t.reachable,
+        }
+    }
+}
+
+/// The tile roster: every remote tile in rank order (`order`, never
+/// truncated) and full records for the declared detail window (`detail`, a
+/// subsequence of `order` — join by [`FfiTileId`]). Contract C2, C10, C12.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTileRoster {
+    pub order: Vec<FfiTileRef>,
+    pub detail: Vec<FfiCallTile>,
+}
+
+impl From<matrix_rtc_media::TileRoster> for FfiTileRoster {
+    fn from(r: matrix_rtc_media::TileRoster) -> Self {
+        Self {
+            order: r.order.into_iter().map(Into::into).collect(),
+            detail: r.detail.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Our own tile, beside the roster and never in it, and whether we are
+/// sharing our screen — publication state (up and unmuted), not intent, so
+/// it goes false however the share ended. Contract C3, C8.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLocalState {
+    pub tile: FfiCallTile,
+    pub is_screen_sharing: bool,
+}
+
+impl From<matrix_rtc_media::LocalState> for FfiLocalState {
+    fn from(s: matrix_rtc_media::LocalState) -> Self {
+        Self {
+            tile: s.tile.into(),
+            is_screen_sharing: s.is_screen_sharing,
+        }
+    }
+}
+
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiEndedReason {
     /// We left deliberately.

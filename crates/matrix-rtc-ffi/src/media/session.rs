@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 use matrix_rtc_bridge::compat::ElementCallCompat;
 use matrix_rtc_livekit::{
@@ -24,8 +25,9 @@ use matrix_rtc_media::{
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
-    FfiCallEvent, FfiMediaConstraints, FfiParticipant, FfiPublishOptions, FfiReceiveStats,
-    FfiStreamKind, OpenIdTokenProvider, TokenProviderAdapter,
+    FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
+    FfiReceiveStats, FfiStreamKind, FfiTileId, FfiTileRoster, OpenIdTokenProvider,
+    TokenProviderAdapter,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcSessionManagerHandle;
@@ -271,11 +273,15 @@ async fn build_media_session(
 
     log::info!("media: connected as member {member_id}, local identity {own_identity}");
 
+    let tiles = engine.subscribe_tiles();
+    let local = engine.subscribe_local_state();
     Ok(Arc::new(MediaSession {
         engine,
         connection,
         _bridge: bridge,
         events: TokioMutex::new(events),
+        tiles: TokioMutex::new(tiles),
+        local: TokioMutex::new(local),
         own_identity,
     }))
 }
@@ -294,6 +300,8 @@ pub struct MediaSession {
     /// core's encryption manager also holds it.
     _bridge: Arc<MediaKeyBridge>,
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
+    tiles: TokioMutex<watch::Receiver<matrix_rtc_media::TileRoster>>,
+    local: TokioMutex<watch::Receiver<Option<matrix_rtc_media::LocalState>>>,
     own_identity: String,
 }
 
@@ -326,6 +334,49 @@ impl MediaSession {
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// The next tile roster. Suspends until it changes; `None` means the
+    /// session is over. Latest-value-wins: a consumer that falls behind gets
+    /// the current roster, never a backlog. The first call on a session that
+    /// already has tiles returns at once. Contract C7.
+    pub async fn next_roster(&self) -> Option<FfiTileRoster> {
+        let mut tiles = self.tiles.lock().await;
+        tiles.changed().await.ok()?;
+        Some(tiles.borrow_and_update().clone().into())
+    }
+
+    /// The tile roster as it stands now.
+    pub fn roster(&self) -> FfiTileRoster {
+        self.engine.tiles().into()
+    }
+
+    /// The next change to our own tile or screen-sharing flag. Suspends until
+    /// one; skips the state before our membership is on the roster, so the
+    /// first value is our first tile. `None` means the session is over.
+    pub async fn next_local_state(&self) -> Option<FfiLocalState> {
+        let mut local = self.local.lock().await;
+        loop {
+            local.changed().await.ok()?;
+            if let Some(state) = local.borrow_and_update().clone() {
+                return Some(state.into());
+            }
+        }
+    }
+
+    /// Our own tile and screen-sharing flag now; `None` until our membership
+    /// is on the roster.
+    pub fn local_state(&self) -> Option<FfiLocalState> {
+        self.engine.local_state().map(Into::into)
+    }
+
+    /// Declare which tiles get full records in [`FfiTileRoster::detail`]:
+    /// ranks `[offset, offset + len)` plus `also`, wherever those rank — a
+    /// tile shown full-screen, a picture-in-picture source. The default is
+    /// everything. Declare what you compose, not what is visible. Contract C12.
+    pub fn set_detail_window(&self, offset: u32, len: u32, also: Vec<FfiTileId>) {
+        self.engine
+            .set_detail_window(offset, len, also.into_iter().map(Into::into));
     }
 
     /// Our participant identity on the media plane (the JWT `sub`; peers import

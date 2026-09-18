@@ -17,7 +17,10 @@ use crate::commands::{
 use crate::{FfiJoinSessionParams, RtcSessionManagerHandle};
 
 use super::session::{MediaSessionConfig, connect_media_session};
-use super::types::{FfiMediaConstraints, FfiOpenIdToken, FfiVideoDetail, OpenIdTokenProvider};
+use super::types::{
+    FfiLocalState, FfiMediaConstraints, FfiOpenIdToken, FfiTileId, FfiTileRoster, FfiVideoDetail,
+    OpenIdTokenProvider,
+};
 use super::{MediaFfiError, runtime};
 
 /// A host command sender that accepts everything (the signalling side is not
@@ -228,4 +231,71 @@ fn constraint_dtos_fold_like_the_core_model() {
     ));
     let resolved = constraints.resolve(matrix_rtc_media::MediaStreamKind::Camera);
     assert_eq!(resolved.demand, matrix_rtc_media::StreamDemand::Paused);
+}
+
+// ---- tile DTOs (spec 002) ------------------------------------------------------
+
+fn participant(id: &str) -> matrix_rtc_media::Participant {
+    matrix_rtc_media::Participant {
+        member_id: id.to_owned(),
+        user_id: format!("@{id}:example.org"),
+        device_id: None,
+        is_local: false,
+        reachable: true,
+        streams: vec![],
+        hand_raised_at_ms: None,
+        joined_at_ms: None,
+    }
+}
+
+#[test]
+fn tile_id_round_trips_through_the_ffi() {
+    use matrix_rtc_media::MediaStreamKind::{Camera, ScreenShare};
+    for kind in [Camera, ScreenShare] {
+        let id = matrix_rtc_media::TileId {
+            member_id: "m".to_owned(),
+            kind,
+        };
+        let back: matrix_rtc_media::TileId = FfiTileId::from(id.clone()).into();
+        assert_eq!(back, id);
+    }
+}
+
+#[test]
+fn tile_roster_dto_preserves_order_and_detail() {
+    let roster: Vec<_> = (0..5).map(|i| participant(&format!("m{i}"))).collect();
+    let ranked = matrix_rtc_media::derive_tiles(&roster, &Default::default()).remote;
+    let last = ranked[4].id();
+    let w = matrix_rtc_media::DetailWindow {
+        offset: 1,
+        len: 2,
+        also: [last].into(),
+    };
+    let dto: FfiTileRoster = matrix_rtc_media::window(&ranked, &w).into();
+
+    assert_eq!(dto.order.len(), 5, "order is never truncated");
+    assert_eq!(dto.detail.len(), 3);
+    // Detail joins to order by id: ranks 1 and 2, plus the named last tile.
+    let detail_ids: Vec<&str> = dto.detail.iter().map(|t| t.member_id.as_str()).collect();
+    let expected: Vec<&str> = [1usize, 2, 4]
+        .iter()
+        .map(|&i| dto.order[i].id.member_id.as_str())
+        .collect();
+    assert_eq!(detail_ids, expected);
+}
+
+#[test]
+fn local_state_dto_carries_the_share_flag() {
+    let mut me = participant("me");
+    me.is_local = true;
+    let own = matrix_rtc_media::derive_tiles(&[me], &Default::default())
+        .own
+        .expect("own tile");
+    let dto: FfiLocalState = matrix_rtc_media::LocalState {
+        tile: own,
+        is_screen_sharing: true,
+    }
+    .into();
+    assert_eq!(dto.tile.member_id, "me");
+    assert!(dto.is_screen_sharing);
 }
