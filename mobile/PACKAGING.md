@@ -48,7 +48,7 @@ build below is for development). How they are produced is in
 
 ### Android
 
-The AAR is a Maven artifact, `io.github.billcarsonfr.matrixrtc:matrix-rtc-android`.
+The AAR is a Maven artifact, `io.element.android:matrix-rtc-android`.
 It is published to the repository's GitHub Packages Maven repository on every
 release, and to Maven Central once that is configured (then the extra
 repository block below is unnecessary).
@@ -59,7 +59,7 @@ repository block below is unnecessary).
 dependencyResolutionManagement {
     repositories {
         maven {
-            url = uri("https://maven.pkg.github.com/BillCarsonFr/matrix-rust-rtc")
+            url = uri("https://maven.pkg.github.com/element-hq/matrix-rust-rtc")
             credentials {
                 username = providers.gradleProperty("gpr.user").orNull ?: System.getenv("GITHUB_ACTOR")
                 password = providers.gradleProperty("gpr.key").orNull ?: System.getenv("GITHUB_TOKEN")
@@ -70,7 +70,7 @@ dependencyResolutionManagement {
 
 // build.gradle.kts of the app or module
 dependencies {
-    implementation("io.github.billcarsonfr.matrixrtc:matrix-rtc-android:<version>")
+    implementation("io.element.android:matrix-rtc-android:<version>")
 }
 ```
 

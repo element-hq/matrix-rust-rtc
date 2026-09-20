@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Element Call interop test: a Rust MatrixRTC client and a real Element Call in the same call",
-  "license": "AGPL-3.0-only",
+  "license": "AGPL-3.0-only OR LicenseRef-Element-Commercial",
   "scripts": {
     "test": "playwright test",
     "test:headed": "playwright test --headed",

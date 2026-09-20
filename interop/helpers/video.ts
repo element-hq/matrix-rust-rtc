@@ -1,22 +1,16 @@
 /*
-Copyright 2026 Valere Fedronic
+Copyright 2026 Element Creations Ltd.
 
-This file is part of matrix-rust-rtc.
-
-matrix-rust-rtc is free software: you can redistribute it and/or modify it
-under the terms of the GNU Affero General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your option)
-any later version. See <https://www.gnu.org/licenses/>.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 /**
  * Reading the Rust peer's video back out of Element Call.
- *
  * This is the only assertion that proves media flows *towards* Element Call.
  * Everything else on the browser side (a tile, a display name) is satisfied by
  * signalling alone: Element Call renders a tile for any participant in the
  * call, decoding or not.
- *
  * The peer publishes a frame whose left half is bright (Y=235) and right half
  * dark (Y=16) — the same pattern `e2e_call` verifies in Rust. Finding that
  * split in a `<video>` inside the widget means our frames arrived, were

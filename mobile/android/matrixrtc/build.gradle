@@ -1,19 +1,7 @@
-// Copyright 2026 Valere Fedronic
+// Copyright 2026 Element Creations Ltd.
 //
-// This file is part of matrix-rust-rtc.
-//
-// matrix-rust-rtc is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// matrix-rust-rtc is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
 
 plugins {
     id 'com.android.library'
@@ -36,8 +24,8 @@ def cargoWorkspaceVersion() {
 }
 
 // The Maven group is a property so the artifact can move to another namespace
-// (e.g. org.matrix.rustcomponents) without touching the build.
-def publishGroup = project.findProperty('matrixRtcGroup') ?: 'io.github.billcarsonfr.matrixrtc'
+// without touching the build.
+def publishGroup = project.findProperty('matrixRtcGroup') ?: 'io.element.android'
 def publishVersion = project.findProperty('matrixRtcVersion') ?: cargoWorkspaceVersion()
 def publishArtifactId = 'matrix-rtc-android'
 
@@ -135,23 +123,27 @@ afterEvaluate {
                 pom {
                     name = publishArtifactId
                     description = 'Android bindings to matrix-rust-rtc: MatrixRTC signalling and media (MSC4143, MSC4195, MSC4354)'
-                    url = 'https://github.com/BillCarsonFr/matrix-rust-rtc'
+                    url = 'https://github.com/element-hq/matrix-rust-rtc'
                     licenses {
                         license {
                             name = 'GNU Affero General Public License v3.0'
                             url = 'https://www.gnu.org/licenses/agpl-3.0.txt'
                         }
+                        license {
+                            name = 'Element Commercial License'
+                            url = 'https://github.com/element-hq/matrix-rust-rtc/blob/main/LICENSE-COMMERCIAL'
+                        }
                     }
                     developers {
                         developer {
-                            id = 'BillCarsonFr'
-                            name = 'Valere Fedronic'
+                            id = 'element-hq'
+                            name = 'Element'
                         }
                     }
                     scm {
-                        connection = 'scm:git:git://github.com/BillCarsonFr/matrix-rust-rtc.git'
-                        developerConnection = 'scm:git:ssh://git@github.com/BillCarsonFr/matrix-rust-rtc.git'
-                        url = 'https://github.com/BillCarsonFr/matrix-rust-rtc'
+                        connection = 'scm:git:git://github.com/element-hq/matrix-rust-rtc.git'
+                        developerConnection = 'scm:git:ssh://git@github.com/element-hq/matrix-rust-rtc.git'
+                        url = 'https://github.com/element-hq/matrix-rust-rtc'
                     }
                 }
             }
@@ -160,7 +152,7 @@ afterEvaluate {
         repositories {
             maven {
                 name = 'GitHubPackages'
-                def repository = System.getenv('GITHUB_REPOSITORY') ?: 'BillCarsonFr/matrix-rust-rtc'
+                def repository = System.getenv('GITHUB_REPOSITORY') ?: 'element-hq/matrix-rust-rtc'
                 url = uri("https://maven.pkg.github.com/${repository}")
                 credentials {
                     username = System.getenv('GITHUB_ACTOR') ?: project.findProperty('gpr.user')

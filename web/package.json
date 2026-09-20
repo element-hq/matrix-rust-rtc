@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Browser-first JavaScript package generated from the MatrixRTC wasm bindings.",
+  "license": "AGPL-3.0-only OR LicenseRef-Element-Commercial",
   "main": "./pkg/node/matrix_rtc_wasm.js",
   "module": "./pkg/browser/matrix_rtc_wasm.js",
   "browser": "./pkg/browser/matrix_rtc_wasm.js",

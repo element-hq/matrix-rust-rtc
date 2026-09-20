@@ -1,18 +1,13 @@
 /*
-Copyright 2026 Valere Fedronic
+Copyright 2026 Element Creations Ltd.
 
-This file is part of matrix-rust-rtc.
-
-matrix-rust-rtc is free software: you can redistribute it and/or modify it
-under the terms of the GNU Affero General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your option)
-any later version. See <https://www.gnu.org/licenses/>.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 /**
  * The web stack and the Rust stack in the same call, spec-current dialect
  * (`ElementCallCompat::Off`) — no Element Call involved.
- *
  * This is the web bindings' first contact with everything real: a real
  * homeserver (MSC4354 sticky sends, MSC4140 delayed leave, Olm-encrypted key
  * to-device with cross-signing), a real authorisation service, a real SFU —

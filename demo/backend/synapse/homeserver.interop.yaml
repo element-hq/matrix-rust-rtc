@@ -1,20 +1,14 @@
-# Copyright 2026 Valere Fedronic
+# Copyright 2026 Element Creations Ltd.
 #
-# This file is part of matrix-rust-rtc.
-#
-# matrix-rust-rtc is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version. See <https://www.gnu.org/licenses/>.
-#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
 # Synapse for the Element Call interop stack (docker-compose.interop.yml).
 # Same dev homeserver as homeserver.yaml, with two differences and nothing
 # else — keep the rest in sync with that file:
-#
 #   1. `server_name` is a name a browser can reach over TLS, because Element
 #      Web derives user IDs and federation discovery from it.
 #   2. No TLS listener: nginx terminates both 443 and 8448 in front.
-#
 # NOT for production: open registration, disabled rate limits, well-known dev
 # secrets.
 

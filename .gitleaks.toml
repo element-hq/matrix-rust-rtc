@@ -1,0 +1,50 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[extend]
+useDefault = true
+
+# gitleaks' `generic-api-key` rule fires on the word "key" plus entropy, and in
+# a MatrixRTC codebase "key" is everyday vocabulary: MSC4354 sticky keys are
+# event-deduplication identifiers, and MSC4195 media keys appear as fixtures in
+# unit tests. Every entry below is scoped to one of those two meanings, so a
+# real credential in the same file is still reported.
+#
+# Re-check with: gitleaks detect --no-git=false
+
+[[rules]]
+id = "generic-api-key"
+
+  [rules.allowlist]
+  regexTarget = "line"
+  regexes = [
+    # MSC4354 sticky keys: a UUID or literal placeholder identifying an event
+    # for dedup/replacement. Never a credential, and it travels in cleartext.
+    '''(msc4354_)?sticky_key''',
+    # MSC4143/MSC4354 proposal text vendored under skills/ (deleted in the
+    # relicensing commit, still reachable in history).
+    '''"sender_key":''',
+  ]
+
+[[rules]]
+id = "generic-api-key"
+
+  [rules.allowlist]
+  description = "Media-key fixtures in test code and test data"
+  paths = [
+    '''.*_test\.mjs$''',
+    '''.*/test/.*''',
+    '''.*/tests/.*''',
+    # Superseded trees, reachable only in history: an early architecture draft,
+    # the pre-bridge LiveKit compat module, and the agent scaffolding.
+    '''^MatrixSdkArchitectureDraft/.*''',
+    '''^crates/matrix-rtc-livekit/src/compat/.*''',
+    '''^skills/.*''',
+  ]
+  regexTarget = "line"
+  regexes = [
+    '''"key":\s*"[A-Za-z0-9+/=]+"''',
+    '''(msc4354_)?sticky_key''',
+  ]

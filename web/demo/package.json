@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Call page over the wasm bindings + livekit-js: a human demo UI and, with ?test=1, the Playwright-drivable web interop peer.",
+  "license": "AGPL-3.0-only OR LicenseRef-Element-Commercial",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

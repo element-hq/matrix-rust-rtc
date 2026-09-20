@@ -1,20 +1,8 @@
 // swift-tools-version:5.9
-// Copyright 2026 Valere Fedronic
+// Copyright 2026 Element Creations Ltd.
 //
-// This file is part of matrix-rust-rtc.
-//
-// matrix-rust-rtc is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// matrix-rust-rtc is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
 
 import PackageDescription
 
@@ -31,7 +19,7 @@ import PackageDescription
 // For a local build, copy mobile/ios/Debug-Package.swift over this file.
 let version = "0.2.0-rc.1"
 let checksum = "474719b507c0d99eecfa0b7ed92c3b267b266cc854391def8e0ecd2151b627f4"
-let url = "https://github.com/BillCarsonFr/matrix-rust-rtc/releases/download/v\(version)/MatrixRtcFFI.xcframework.zip"
+let url = "https://github.com/element-hq/matrix-rust-rtc/releases/download/v\(version)/MatrixRtcFFI.xcframework.zip"
 
 // What the statically linked libwebrtc inside MatrixRtcFFI.xcframework needs
 // from the system. Declared here so a consumer's link succeeds without knowing

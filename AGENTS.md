@@ -56,15 +56,6 @@ This project is in active development.
 
 ## Repository Layout (Intent-Oriented)
 
-## Core Principles
-
-The `skills/<skill-name>` folder contains reusable skill for agents.
-Level 1: On startup reads only the name and description from every `SKILL.md`.
-Level 2: When a skill is relevant to a task, the agent loads the full markdown and executes according to its instructions.
-Level 3: Some skills folder have a `references/` subfolder for static files (docs, templates, checklists), Agent should only read them when relevant (load on demand).
-
-Always read the karpathy-guidelines skill before coding (`skills/karpathy-guidelines/SKILL.md`).
-
 ## Useful Commands
 
 - `cargo check`

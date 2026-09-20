@@ -1,22 +1,16 @@
 /*
-Copyright 2026 Valere Fedronic
+Copyright 2026 Element Creations Ltd.
 
-This file is part of matrix-rust-rtc.
-
-matrix-rust-rtc is free software: you can redistribute it and/or modify it
-under the terms of the GNU Affero General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your option)
-any later version. See <https://www.gnu.org/licenses/>.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 /**
  * User provisioning for the interop test.
- *
  * Uses plain **open registration**, which the dev homeserver leaves on
  * (`enable_registration_without_verification`) — the same endpoint
  * `crates/matrix-rtc-livekit/tests/e2e_call/provision.rs` calls, so both halves
  * of this test create users the same way.
- *
  * Element Call's own Playwright suite uses the Synapse *admin* HMAC API
  * instead. That would mean porting the nonce/HMAC dance and duplicating
  * `registration_shared_secret` in a second place, to gain nothing we need here.

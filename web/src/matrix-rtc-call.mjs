@@ -1,31 +1,19 @@
-// Copyright 2026 Valere Fedronic
-//
-// This file is part of matrix-rust-rtc.
-//
-// matrix-rust-rtc is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// matrix-rust-rtc is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+/*
+Copyright 2026 Element Creations Ltd.
+
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
+*/
 
 /**
  * The call model for web apps: the wasm session manager's roster and
  * connection lifecycle, joined with livekit-js participants.
- *
  * This is the thin JS half of the web media session. Rust owns the protocol
  * (membership reconciliation, the multi-focus pool, MSC4195 identities, token
  * request shapes, key bookkeeping); this wrapper owns what only JS can:
  * `fetch`, the livekit-js `Room`, and the RoomEvent-to-sink translation. Every
  * roster entry is a plain object from Rust plus `livekitParticipant` — the
  * live livekit-js participant, when the room knows the entry's `rtc_identity`.
- *
  * `livekit-client` is not imported here: the app passes its module (or a
  * compatible mock) to the constructor, keeping it a peer dependency and this
  * file testable without it.

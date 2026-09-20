@@ -1,24 +1,13 @@
-// Copyright 2026 Valere Fedronic
-//
-// This file is part of matrix-rust-rtc.
-//
-// matrix-rust-rtc is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// matrix-rust-rtc is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+/*
+Copyright 2026 Element Creations Ltd.
+
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
+*/
 
 /**
  * The Matrix side of a web call: matrix-js-sdk behind the wasm manager's
  * host contract.
- *
  * Two halves:
  * - the command-sender object the manager dispatches on (`commandSender()`):
  *   sticky sends (MSC4354), delayed events (MSC4140 — restart is the restart
@@ -29,12 +18,10 @@
  *   membership set through the raw funnel (replace, not merge) — plus inbound
  *   media-key to-device messages with their Olm decryption metadata and
  *   MSC4153 cross-signing status.
- *
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
  * the module is injected (`sdk`), keeping it an optional peer dependency and
  * this file testable against a mock. Requires v42+ (`_unstable_` sticky and
  * delayed-event APIs, rust-crypto).
- *
  * Every manager call goes through the shared ManagerOpQueue: the wasm object
  * allows one in-flight call at a time.
  */
