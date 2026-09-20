@@ -1,32 +1,17 @@
 #!/usr/bin/env bash
-# Copyright 2026 Valere Fedronic
+# Copyright 2026 Element Creations Ltd.
 #
-# This file is part of matrix-rust-rtc.
-#
-# matrix-rust-rtc is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# matrix-rust-rtc is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
 
 # Run cargo against the MSC4354-capable matrix-rust-sdk fork.
-#
 #   scripts/cargo-sticky.sh <cargo subcommand and args>
-#
 # The workspace depends on upstream matrix-rust-sdk; this applies the
 # `.cargo/experimental-sticky.toml` overlay that redirects it to the fork. The
 # caller still passes the features (`experimental-sticky` plus the SDK's own
 # `unstable-msc4354` on matrix-sdk and matrix-sdk-ui — see the Makefile's
 # STICKY_FEATURES), because a cargo feature cannot forward to an SDK feature
 # upstream lacks.
-#
 # Two side effects are contained here so the two SDK trees never fight:
 # - the build goes to target/sticky (override with CARGO_TARGET_DIR);
 # - the redirected SDK re-resolves the lockfile, so Cargo.lock is swapped for
