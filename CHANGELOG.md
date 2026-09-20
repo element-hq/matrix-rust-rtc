@@ -15,6 +15,27 @@ Swift package end to end. Everything it contains is described under
 
 ## Unreleased
 
+### Project
+
+- **Moved to `element-hq/matrix-rust-rtc` and relicensed.** The project is now
+  dual licensed by Element Creations Ltd: AGPL-3.0-only **OR** the Element
+  Commercial License (`AGPL-3.0-only OR LicenseRef-Element-Commercial`). Every
+  source file carries an SPDX header, `LICENSE` holds the AGPL text and
+  `LICENSE-COMMERCIAL` the commercial terms. A new
+  `scripts/check-license-headers.sh` enforces the headers in CI and via
+  `make license-headers`.
+- **Consumer coordinates changed.** The Android artifact is now
+  `io.element.android:matrix-rtc-android` (was
+  `io.github.billcarsonfr.matrixrtc:matrix-rtc-android`), the GitHub Packages
+  repository is `element-hq/matrix-rust-rtc`, and `Package.swift` resolves the
+  xcframework from the `element-hq` releases. Update your dependency
+  declarations; see `mobile/PACKAGING.md`.
+- Contributions now require the
+  [Element CLA](https://cla-assistant.io/element-hq/matrix-rust-rtc); see
+  `CONTRIBUTING.md`.
+- Removed the `skills/` directory of agent scaffolding, including the vendored
+  MSC copies. Reference the proposals upstream instead.
+
 ### Breaking
 
 Hosts implementing the FFI/WASM command sender must update. All of these are

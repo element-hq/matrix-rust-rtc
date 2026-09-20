@@ -1,20 +1,8 @@
 #!/bin/bash
-# Copyright 2026 Valere Fedronic
+# Copyright 2026 Element Creations Ltd.
 #
-# This file is part of matrix-rust-rtc.
-#
-# matrix-rust-rtc is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# matrix-rust-rtc is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
 
 # Makefile for common development tasks
 
@@ -30,6 +18,8 @@ help:
 	@echo "  make fmt                Format code"
 	@echo "  make fmt-check          Check code formatting without changes"
 	@echo "  make clippy             Run clippy linter"
+	@echo "  make license-headers    Check every source file carries the license header"
+	@echo "  make license-headers-fix  Insert or rewrite the license headers in place"
 	@echo "  make test               Run all tests"
 	@echo "  make build-check        Check builds for all crates"
 	@echo ""
@@ -74,6 +64,12 @@ fmt:
 
 fmt-check:
 	cargo fmt --all -- --check
+
+license-headers:
+	./scripts/check-license-headers.sh
+
+license-headers-fix:
+	./scripts/check-license-headers.sh --fix
 
 clippy:
 	cargo clippy --all-targets --all-features -- -D warnings
@@ -196,7 +192,7 @@ test-interop: interop-up
 	cd web/demo && { [ -f package-lock.json ] && npm ci || npm install; }
 	cd interop && { [ -f package-lock.json ] && npm ci || npm install; } && npx playwright test
 
-.PHONY: quality-check
-quality-check: fmt-check clippy test build-check
+.PHONY: quality-check license-headers license-headers-fix
+quality-check: fmt-check license-headers clippy test build-check
 	@echo "✅ All quality checks passed!"
 

@@ -53,7 +53,7 @@ Repository secrets read by the workflow:
 | Secret | Needed for | Notes |
 | --- | --- | --- |
 | (none) | GitHub Packages, GitHub Release | Uses the workflow's `GITHUB_TOKEN` |
-| `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD` | Maven Central | A Central Portal user token; the namespace (`matrixRtcGroup`, default `io.github.billcarsonfr.matrixrtc`) must be verified on the Portal. Skipped when unset. |
+| `MAVEN_CENTRAL_USERNAME`, `MAVEN_CENTRAL_PASSWORD` | Maven Central | A Central Portal user token; the namespace (`matrixRtcGroup`, default `io.element.android`) must be verified on the Portal. Skipped when unset. |
 | `SIGNING_KEY_ID`, `SIGNING_KEY`, `SIGNING_PASSWORD` | Maven Central | ASCII-armoured private key (`gpg --armor --export-secret-keys <id>`), its short id and passphrase. Central rejects unsigned artifacts. |
 
 The Maven group is a Gradle property so the artifact can move namespaces

@@ -1,6 +1,6 @@
 # matrix-rust-rtc
 
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL_3.0-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![License: AGPL-3.0 OR Element Commercial](https://img.shields.io/badge/License-AGPL_3.0_OR_Element_Commercial-blue.svg)](LICENSE)
 
 > **Note:** This project is developed with AI assistance.
 
@@ -141,7 +141,7 @@ integration notes.
 
 ```kotlin
 // Android — Gradle (GitHub Packages Maven repository, or Maven Central once enabled)
-implementation("io.github.billcarsonfr.matrixrtc:matrix-rtc-android:<version>")
+implementation("io.element.android:matrix-rtc-android:<version>")
 ```
 
 ```
@@ -271,6 +271,21 @@ Finally, record anything a host integrator would notice in
 especially breaking changes to the command-sender callbacks, which surface as
 compile errors in the host app.
 
-## License
+## Copyright & License
 
-Licensed under the [AGPL-3.0](LICENSE).
+Copyright (c) 2026 Element Creations Ltd.
+
+This software is dual licensed by Element Creations Ltd (Element). It can be used either:
+
+(1) for free under the terms of the GNU Affero General Public License (as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any later version); OR
+
+(2) under the terms of a paid-for Element Commercial License agreement between you and Element (the
+terms of which may vary depending on what you and Element have agreed to).
+
+Unless required by applicable law or agreed to in writing, software distributed under the Licenses is
+distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied. See the Licenses for the specific language governing permissions and limitations under the
+Licenses.
+
+See [LICENSE](LICENSE) and [LICENSE-COMMERCIAL](LICENSE-COMMERCIAL).

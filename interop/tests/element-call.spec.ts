@@ -1,27 +1,20 @@
 /*
-Copyright 2026 Valere Fedronic
+Copyright 2026 Element Creations Ltd.
 
-This file is part of matrix-rust-rtc.
-
-matrix-rust-rtc is free software: you can redistribute it and/or modify it
-under the terms of the GNU Affero General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your option)
-any later version. See <https://www.gnu.org/licenses/>.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 /**
  * A Rust MatrixRTC client and a real Element Call in the same call.
- *
  * Both directions are asserted, because each proves a different half of the
  * compat dialect:
- *
  * - **Rust sees Element Call**: its membership parses into our roster, its
  *   media key installs under the identity the *SFU* assigned it, and its
  *   frames decrypt (audio with real energy in it).
  * - **Element Call sees Rust**: our membership renders as a tile with our
  *   display name, and Element Call is not stuck on "Waiting for media...",
  *   which is what it shows when nothing decodes.
- *
  * `crates/matrix-rtc-livekit/tests/e2e_call` already proves our stack talks to
  * itself in every mode. What it cannot prove is that Element Call agrees with
  * our reading of the wire format — that needs a browser, and this is it.

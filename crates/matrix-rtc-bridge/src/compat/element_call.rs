@@ -1,19 +1,7 @@
-// Copyright 2026 Valere Fedronic
+// Copyright 2026 Element Creations Ltd.
 //
-// This file is part of matrix-rust-rtc.
-//
-// matrix-rust-rtc is free software: you can redistribute it and/or modify
-// it under the terms of the GNU Affero General Public License as published by
-// the Free Software Foundation, either version 3 of the License, or
-// (at your option) any later version.
-//
-// matrix-rust-rtc is distributed in the hope that it will be useful,
-// but WITHOUT ANY WARRANTY; without even the implied warranty of
-// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-// GNU Affero General Public License for more details.
-//
-// You should have received a copy of the GNU Affero General Public License
-// along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
 
 //! The pre-2026 Element Call wire format, translated to and from current
 //! MSC4143.
@@ -919,9 +907,10 @@ mod tests {
     }
 
     /// Stripped of `application` and `m.text`, what the core sends must equal
-    /// what a real Element Call sends — captured verbatim in
-    /// `skills/e2e-testing/references/Alice-Bob-Call-Events.md`, where Bob
-    /// starts the call and Alice, joining second, sends nothing.
+    /// what a real Element Call sends. The fixture below was captured from a
+    /// live call where Bob starts it and Alice, joining second, sends nothing;
+    /// the interop suite (`interop/`) re-checks the same claim against a real
+    /// Element Call build.
     #[test]
     fn a_notification_is_flattened_into_what_element_call_sends() {
         // As `matrix_rtc_core::build_notification_content` writes it: the MSC's

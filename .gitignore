@@ -32,6 +32,14 @@ interop/blob-report/
 
 .idea/
 
+# Per-user agent settings (permission allowlists and the like). Untracked but
+# not previously ignored, so a `git add -A` could have swept it into what is
+# now a public repository.
+.claude/
+
+# Xcode/SwiftPM local state.
+.swiftpm/
+
 mobile/android/.gradle/
 
 # libwebrtc's Java classes for the media AAR. Re-materialized on every

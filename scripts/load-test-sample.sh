@@ -1,38 +1,20 @@
 #!/bin/bash
-# Copyright 2026 Valere Fedronic
+# Copyright 2026 Element Creations Ltd.
 #
-# This file is part of matrix-rust-rtc.
-#
-# matrix-rust-rtc is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# matrix-rust-rtc is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with matrix-rust-rtc.  If not, see <https://www.gnu.org/licenses/>.
-#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
 # Template for running the MatrixRTC load generator
 # (crates/matrix-rtc-livekit/examples/load_test.rs).
-#
 # Copy it, fill in the block below, and run your copy:
-#
 #     cp scripts/load-test-sample.sh scripts/load-test.sh
 #     $EDITOR scripts/load-test.sh
 #     ./scripts/load-test.sh
-#
 # `scripts/load-test.sh` is git-ignored, so the password and recovery key you
 # put in it stay out of the repository. Keep the credentials out of THIS file.
-#
 # Extra flags are passed straight through and win over the block below, so
 # one-off tweaks need no edit:
-#
 #     ./scripts/load-test.sh --devices 10 --no-simulcast
-#
 # Prerequisites: `ffmpeg` on PATH (unless VIDEO is .y4m/.yuv), and an account
 # that has already joined ROOM_ID with a call open in it.
 

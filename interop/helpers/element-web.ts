@@ -1,17 +1,12 @@
 /*
-Copyright 2026 Valere Fedronic
+Copyright 2026 Element Creations Ltd.
 
-This file is part of matrix-rust-rtc.
-
-matrix-rust-rtc is free software: you can redistribute it and/or modify it
-under the terms of the GNU Affero General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your option)
-any later version. See <https://www.gnu.org/licenses/>.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 /**
  * Driving Element Web, and the Element Call widget it bundles.
- *
  * Adapted from Element Call's own `playwright/widget/test-helpers.ts` (AGPL,
  * element-hq/element-call, `livekit` branch). Every selector here is an
  * upstream UI string and is the most brittle part of this suite — they all

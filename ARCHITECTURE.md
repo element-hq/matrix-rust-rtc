@@ -366,8 +366,9 @@ Current implementation only establishes event intake and membership state wiring
 
 ### MSC4143 catch-up status
 
-The vendored reference in `skills/msc/references/msc4143.md` tracks the rewritten
-proposal. The `m.rtc.member` wire format now matches it:
+Tracked against the rewritten proposal
+([MSC4143](https://github.com/matrix-org/matrix-spec-proposals/pull/4143)). The
+`m.rtc.member` wire format now matches it:
 
 - `member.membership` (`join` / `leave`) is the explicit join signal; the old
   inference from content shape is gone.

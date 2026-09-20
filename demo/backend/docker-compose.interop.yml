@@ -1,21 +1,14 @@
-# Copyright 2026 Valere Fedronic
+# Copyright 2026 Element Creations Ltd.
 #
-# This file is part of matrix-rust-rtc.
-#
-# matrix-rust-rtc is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version. See <https://www.gnu.org/licenses/>.
-#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
 # Overlay turning the plain-HTTP backend stack into a TLS one that a browser
 # will accept, and adding Element Web (which ships Element Call embedded). Used
 # by the Element Call interop test. Apply on top of the base file, never alone:
-#
 #   docker compose -f demo/backend/docker-compose.yml \
 #                  -f demo/backend/docker-compose.interop.yml up -d --wait
-#
 # or `make interop-up`. See INTEROP.md.
-#
 # Why any of this is needed: Element Call runs as a widget in an iframe, and
 # WebRTC plus the widget API need a secure context. The base stack is
 # http://localhost only. nginx terminates TLS for a family of *.m.localhost

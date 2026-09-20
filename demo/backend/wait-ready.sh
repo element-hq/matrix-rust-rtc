@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Copyright 2026 Valere Fedronic
+# Copyright 2026 Element Creations Ltd.
 #
-# This file is part of matrix-rust-rtc.
-#
-# matrix-rust-rtc is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version. See <https://www.gnu.org/licenses/>.
-#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
 # Host-side readiness probe for the MatrixRTC backend stack. `docker compose up
 # --wait` already gates on the synapse and livekit healthchecks; this exists
 # mainly for lk-jwt-service, whose FROM-scratch image cannot carry a compose
 # healthcheck (no shell, and 0.4.4 predates the healthcheck binary).
-#
 # With --interop it additionally probes the TLS overlay
 # (docker-compose.interop.yml): the proxied homeserver, the MatrixRTC origin,
 # Element Web, and the Element Call widget Element Web bundles.

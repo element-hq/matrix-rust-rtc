@@ -1,18 +1,13 @@
 /*
-Copyright 2026 Valere Fedronic
+Copyright 2026 Element Creations Ltd.
 
-This file is part of matrix-rust-rtc.
-
-matrix-rust-rtc is free software: you can redistribute it and/or modify it
-under the terms of the GNU Affero General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your option)
-any later version. See <https://www.gnu.org/licenses/>.
+SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+Please see LICENSE in the repository root for full details.
 */
 
 /**
  * The web stack and a real Element Call in the same call — EC's 2025 sticky
  * generation ("Matrix 2.0" in its Developer tab), our `sticky_events` mode.
- *
  * The web sibling of `element-call.spec.ts`'s second scenario, proving the
  * wasm compat seam end-to-end from a browser host: our membership goes out
  * with the legacy mirror fields (or EC shows no tile), EC's membership-less
