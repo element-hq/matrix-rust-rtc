@@ -321,6 +321,11 @@ impl TransportConnection for LiveKitTransportConnection {
     ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
         let kind = options.kind;
         let source_kind = livekit_track_source(kind);
+        // Muted before publishing, not after: livekit puts `track.is_muted()`
+        // into the `AddTrackRequest`, so the track is announced muted in the
+        // same request. Muting once the publish resolved would leave a window
+        // with a live unmuted track at the SFU — a hot mic.
+        let muted = options.muted;
         match kind {
             MediaStreamKind::Microphone | MediaStreamKind::ScreenShareAudio => {
                 let config = options.audio.unwrap_or_default();
@@ -334,6 +339,9 @@ impl TransportConnection for LiveKitTransportConnection {
                     "audio",
                     RtcAudioSource::Native(source.clone()),
                 );
+                if muted {
+                    track.mute();
+                }
                 let published = LocalTrack::Audio(track.clone());
                 self.session
                     .room()
@@ -377,6 +385,9 @@ impl TransportConnection for LiveKitTransportConnection {
                     "video",
                     RtcVideoSource::Native(source.clone()),
                 );
+                if muted {
+                    track.mute();
+                }
                 let published = LocalTrack::Video(track.clone());
                 // Below 480px livekit computes a single simulcast encoding
                 // (rid "q" only) — a degenerate shape the SFU delivered no
