@@ -17,16 +17,16 @@ the root `Cargo.toml`. Tags are `v<version>`. The Gradle module and
 
 ## Procedure
 
-1. **Release PR.** On a branch:
+1. **Release branch.** On `release/<version>`:
    - Bump `[workspace.package].version` in `Cargo.toml` and run `cargo check` so
      `Cargo.lock` follows.
    - In `CHANGELOG.md`, rename `## Unreleased` to `## v<version> - <date>` and
      add a fresh empty `## Unreleased` above it. The release workflow refuses
      to run without a section for the version, and uses it as the release
      notes.
-   - Merge.
+   - Push, and open the PR — but do **not** merge it yet.
 
-2. **Dry run.** Actions → *Release* → *Run workflow* on the merged branch with
+2. **Dry run.** Actions → *Release* → *Run workflow* on `release/<version>` with
    the version and `dry_run` **checked**. Every job builds; nothing is
    published. Download the `release-v<version>` artifact and sanity-check it:
    the AAR lists `jni/{arm64-v8a,armeabi-v7a,x86_64}/libmatrix_rtc_ffi.so`
@@ -37,12 +37,16 @@ the root `Cargo.toml`. Tags are `v<version>`. The Gradle module and
 
 3. **Release.** Run the workflow again with `dry_run` **unchecked**. It
    publishes the AAR, commits `Package.swift` + `Sources/MatrixRtc` as
-   `Release v<version>` on the branch, tags that commit, pushes both, and
-   creates the GitHub Release with the assets. The branch must allow the
-   `github-actions` bot to push (or dispatch from a branch without protection
-   and merge the release commit back).
+   `Release v<version>` on the release branch, tags that commit, pushes both,
+   and creates the GitHub Release with the assets.
 
-4. **Announce** the coordinates (see `mobile/PACKAGING.md`, "Consuming a
+4. **Merge the PR with a merge commit.** Not squash, not rebase: either would
+   rewrite the commit the tag points at, leaving `v<version>` dangling off a
+   commit no longer in `main`'s history and `main`'s `Package.swift`
+   disagreeing with the tag. Pull afterwards — the release commit was made by
+   the bot.
+
+5. **Announce** the coordinates (see `mobile/PACKAGING.md`, "Consuming a
    release") and, for a breaking release, point integrators at the CHANGELOG's
    *Breaking* section.
 
@@ -73,16 +77,20 @@ the hotfix branch; merge it forward afterwards.
 ## Local equivalents
 
 ```bash
+# The version the workflow validates against, from the single source of truth.
+VERSION="$(cargo metadata --no-deps --format-version 1 \
+  | jq -r '.packages[] | select(.name == "matrix-rtc-ffi") | .version')"
+
 # What the android jobs run (one target), then what the publish job runs.
 MEDIA=1 ./scripts/build-android-aar.sh --target aarch64-linux-android --profile mobile-release --split-debug
-MEDIA=1 ./scripts/build-android-aar.sh --skip-build --skip-codegen --version 0.2.0
+MEDIA=1 ./scripts/build-android-aar.sh --skip-build --skip-codegen --version "$VERSION"
 
 # What the ios job runs.
 MEDIA=1 ./scripts/build-ios-xcframework.sh --profile mobile-release --swift-out Sources/MatrixRtc --zip
-./scripts/update-package-swift.sh 0.2.0 "$(cat mobile/ios/build/MatrixRtcFFI.xcframework.zip.sha256)"
+./scripts/update-package-swift.sh "$VERSION" "$(cat mobile/ios/build/MatrixRtcFFI.xcframework.zip.sha256)"
 
 # Release notes as the workflow will post them.
-./scripts/changelog-section.sh 0.2.0
+./scripts/changelog-section.sh "$VERSION"
 ```
 
 `make release-android` and `make release-ios` run the full-ABI variants of the
