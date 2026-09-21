@@ -1,40 +1,19 @@
 # Changelog
 
 Notable changes to matrix-rust-rtc. Format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project has not
-had a tagged release yet, so everything so far lives under Unreleased.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 Entries begin with the Android integration work — earlier history is in the git
 log only.
 
-## v0.2.0-rc.1
-
-Release candidate of 0.2.0, cut to exercise the release pipeline and the
-Swift package end to end. Everything it contains is described under
-[Unreleased](#unreleased); the final 0.2.0 notes will replace this section.
-
 ## Unreleased
+
+## v0.3.0-rc.1 - 2026-09-21
 
 ### Project
 
-- **Moved to `element-hq/matrix-rust-rtc` and relicensed.** The project is now
-  dual licensed by Element Creations Ltd: AGPL-3.0-only **OR** the Element
-  Commercial License (`AGPL-3.0-only OR LicenseRef-Element-Commercial`). Every
-  source file carries an SPDX header, `LICENSE` holds the AGPL text and
-  `LICENSE-COMMERCIAL` the commercial terms. A new
-  `scripts/check-license-headers.sh` enforces the headers in CI and via
-  `make license-headers`.
-- **Consumer coordinates changed.** The Android artifact is now
-  `io.element.android:matrix-rtc-android` (was
-  `io.github.billcarsonfr.matrixrtc:matrix-rtc-android`), the GitHub Packages
-  repository is `element-hq/matrix-rust-rtc`, and `Package.swift` resolves the
-  xcframework from the `element-hq` releases. Update your dependency
-  declarations; see `mobile/PACKAGING.md`.
-- Contributions now require the
-  [Element CLA](https://cla-assistant.io/element-hq/matrix-rust-rtc); see
-  `CONTRIBUTING.md`.
-- Removed the `skills/` directory of agent scaffolding, including the vendored
-  MSC copies. Reference the proposals upstream instead.
+- The project is now dual licensed by Element Creations Ltd: AGPL-3.0-only
+  **OR** the Element Commercial License (`AGPL-3.0-only OR LicenseRef-Element-Commercial`).
 
 ### Breaking
 
@@ -98,7 +77,7 @@ compile errors, not silent behaviour changes.
   event. `JoinedMembership` / `MembershipSnapshot` grow the matching
   `membership_event_id`, which moves on every sticky refresh.
 
-**v0.2.0 sweep** — deliberately batched into one release while there is still a
+**v0.3.0 sweep** — deliberately batched into one release while there is still a
 single integrator, rather than dripped out over several:
 
 - **`CallOptions::legacy_element_call: bool` is now
@@ -246,7 +225,7 @@ single integrator, rather than dripped out over several:
   [RELEASING.md](RELEASING.md)) builds the media variant for both platforms
   with the new `mobile-release` cargo profile, publishes the AAR to GitHub
   Packages (and Maven Central once its secrets are configured) as
-  `io.github.billcarsonfr.matrixrtc:matrix-rtc-android`, rewrites the root
+  `io.element.android:matrix-rtc-android`, rewrites the root
   `Package.swift` with the xcframework zip's checksum, and tags `v<version>`
   with the AAR, the zip, split Android debug symbols and `SHA256SUMS` attached
   to the GitHub Release. The xcframework now ships its header and module map,
