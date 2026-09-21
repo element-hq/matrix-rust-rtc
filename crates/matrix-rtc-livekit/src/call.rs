@@ -66,6 +66,7 @@ use matrix_rtc_core::{
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
     MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
+    StabilityConfig,
 };
 
 use crate::session::LiveKitSession;
@@ -196,6 +197,11 @@ pub struct CallOptions {
     /// roster; send with [`Call::send_reaction`], [`Call::raise_hand`] and
     /// [`Call::lower_hand`].
     pub reactions: Option<ReactionsConfig>,
+    /// How much the tile order is damped: how long sustained voice must last
+    /// to count as speaking, how long silence must last to stop, and the
+    /// window reorders are coalesced into. A product decision rather than a
+    /// protocol one; see [`StabilityConfig`].
+    pub stability: StabilityConfig,
 }
 
 impl Default for CallOptions {
@@ -213,6 +219,7 @@ impl Default for CallOptions {
             element_call_compat: ElementCallCompat::default(),
             notify: None,
             reactions: None,
+            stability: StabilityConfig::default(),
         }
     }
 }
@@ -534,7 +541,7 @@ impl Call {
                 own_connection_key: Some(livekit.livekit_service_url.clone()),
                 raised_hands,
                 reactions,
-                stability: matrix_rtc_media::StabilityConfig::default(),
+                stability: options.stability.clone(),
             },
             memberships,
         );

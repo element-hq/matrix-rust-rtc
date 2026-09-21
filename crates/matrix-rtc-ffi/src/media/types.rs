@@ -6,6 +6,8 @@
 //! FFI DTOs mirroring the transport-agnostic media model, plus the
 //! host-implemented OpenID token provider.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use super::MediaFfiError;
@@ -203,6 +205,34 @@ impl From<matrix_rtc_media::LocalState> for FfiLocalState {
         Self {
             tile: s.tile.into(),
             is_screen_sharing: s.is_screen_sharing,
+        }
+    }
+}
+
+/// How much the tile order is damped (R10, R11). A product decision rather
+/// than a protocol one, so a host can tune it; the defaults are what
+/// `matrix_rtc_media::StabilityConfig` uses.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStabilityConfig {
+    /// Sustained voice before a member counts as speaking.
+    #[uniffi(default = 1500)]
+    pub promote_ms: u64,
+    /// Silence before a speaking member stops counting. Raising this above
+    /// `promote_ms` leaves a tile at the top of the order after the speaker
+    /// stopped, which reads as a stuck UI.
+    #[uniffi(default = 1500)]
+    pub demote_ms: u64,
+    /// Reorders inside this window are delivered as one.
+    #[uniffi(default = 300)]
+    pub coalesce_ms: u64,
+}
+
+impl From<FfiStabilityConfig> for matrix_rtc_media::StabilityConfig {
+    fn from(c: FfiStabilityConfig) -> Self {
+        Self {
+            promote: Duration::from_millis(c.promote_ms),
+            demote: Duration::from_millis(c.demote_ms),
+            coalesce: Duration::from_millis(c.coalesce_ms),
         }
     }
 }

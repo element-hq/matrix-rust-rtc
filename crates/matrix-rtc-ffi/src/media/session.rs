@@ -26,8 +26,8 @@ use matrix_rtc_media::{
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
     FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
-    FfiReceiveStats, FfiStreamKind, FfiTileId, FfiTileRoster, OpenIdTokenProvider,
-    TokenProviderAdapter,
+    FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiTileId, FfiTileRoster,
+    OpenIdTokenProvider, TokenProviderAdapter,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcSessionManagerHandle;
@@ -43,6 +43,9 @@ pub struct MediaSessionConfig {
     /// the same URL announced in our membership's transport. (Peers' foci
     /// are discovered from their memberships automatically.)
     pub livekit_service_url: String,
+    /// How much the tile order is damped. `None` takes the defaults.
+    #[uniffi(default = None)]
+    pub stability: Option<FfiStabilityConfig>,
 }
 
 /// Attach media to a joined slot: wire frame-key signalling into the core,
@@ -201,7 +204,7 @@ async fn build_media_session(
             own_connection_key: Some(config.livekit_service_url.clone()),
             raised_hands,
             reactions,
-            stability: matrix_rtc_media::StabilityConfig::default(),
+            stability: config.stability.clone().map(Into::into).unwrap_or_default(),
         },
         memberships,
     );

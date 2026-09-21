@@ -11,7 +11,8 @@ log only.
 ### Added
 
 - The call tile roster: `MediaSession::next_roster()` / `next_local_state()`
-  publish one ranked, damped `CallTile` per renderable stream.
+  publish one ranked, damped `CallTile` per renderable stream, with thresholds
+  configurable via `stability`.
 
 ### Breaking
 

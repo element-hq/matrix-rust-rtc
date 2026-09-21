@@ -147,6 +147,7 @@ fn config() -> MediaSessionConfig {
         user_id: "@alice:example.org".to_owned(),
         device_id: "DEVICE".to_owned(),
         livekit_service_url: DEAD_SFU_URL.to_owned(),
+        stability: None,
     }
 }
 

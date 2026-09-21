@@ -97,6 +97,22 @@ export interface MediaSessionConfigIn {
     key_ring_size?: number;
     /** Cross-check only: the mode comes from the join. */
     element_call_compat?: ElementCallCompatMode;
+    /** How much the tile order is damped; omitted fields take the defaults. */
+    stability?: StabilityConfigIn;
+}
+
+/**
+ * Tile-order damping. A product decision rather than a protocol one, so a
+ * page can tune it. A `demote_ms` above `promote_ms` leaves a tile at the top
+ * of the order after the speaker stopped, which reads as a stuck UI.
+ */
+export interface StabilityConfigIn {
+    /** Sustained voice before a member counts as speaking. Default 1500. */
+    promote_ms?: number;
+    /** Silence before a speaking member stops counting. Default 1500. */
+    demote_ms?: number;
+    /** Reorders inside this window are delivered as one. Default 300. */
+    coalesce_ms?: number;
 }
 
 /** The object driving livekit-js for `connectMedia`. */
