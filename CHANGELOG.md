@@ -8,6 +8,11 @@ log only.
 
 ## Unreleased
 
+### Fixed
+
+- Our own publications now land on the roster when they are made before our
+  membership does, mute state included (#50).
+
 ## v0.3.0-rc.1 - 2026-09-21
 
 ### Project

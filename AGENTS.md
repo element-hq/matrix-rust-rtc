@@ -96,6 +96,19 @@ Commit only after every checklist step passes; fix failures and re-run the full 
 ## Contribution Guidelines
 - Always pass the full [Pre-Commit Checklist](#pre-commit-checklist-for-agents), including binding build/test tasks for touched binding surfaces, before committing.
 
+## Changelog, Commit Messages and PR Descriptions
+
+Keep them to about one line. A user-visible change gets a `CHANGELOG.md` entry
+under `## Unreleased` in the matching subsection (`Added`, `Fixed`, `Breaking`,
+...): one sentence naming the change, with the issue number.
+
+- Good: `Our own publications now land on the roster when they are made before our membership does, mute state included (#50).`
+- Do not imitate the long bold-lede-plus-paragraphs entries already in
+  `CHANGELOG.md` — that is legacy style, not a target.
+
+Reasoning and detail belong in code comments and the issue, not in the
+changelog, the commit body or the PR description.
+
 ## Comments and Module Documentation
 
 - Add a short module-level rustdoc comment (`//!`) in each new Rust module and in modified modules when missing.
