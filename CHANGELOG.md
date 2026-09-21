@@ -8,6 +8,11 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- The call tile roster: `MediaSession::next_roster()` / `next_local_state()`
+  publish one ranked, damped `CallTile` per renderable stream.
+
 ### Breaking
 
 - MSC4354 sticky events now come from upstream matrix-rust-sdk and are always on with the `matrix-sdk` feature; the `experimental-sticky` feature, `STICKY_EVENTS_SUPPORTED` and `CallError::StickyEventsUnsupported` are gone.
