@@ -563,8 +563,9 @@ struct Actor {
     /// produce the same line, and only the previous state separates them.
     encryption_states: HashMap<String, FrameEncryptionState>,
     /// Our own live publications, so a mute can reach the transport and the
-    /// roster can be corrected in one place.
-    local_tracks: HashMap<MediaStreamKind, Arc<dyn LocalTrackHandle>>,
+    /// roster can be corrected in one place, and so a membership landing after
+    /// them can be seeded from them.
+    local_tracks: HashMap<MediaStreamKind, LocalPublication>,
     /// Key indices installed per member, in the order they were imported.
     ///
     /// Kept so a frame-encryption failure can say whether *any* key reached this
@@ -590,6 +591,16 @@ struct Actor {
     /// media is reported degraded while this is non-empty.
     degraded_keys: HashSet<String>,
     ended: bool,
+}
+
+/// One of our own live publications.
+///
+/// The mute state is kept here rather than read back from the handle:
+/// [`LocalTrackHandle`] cannot be asked, and it is needed to seed our roster
+/// entry when our membership lands after the publish.
+struct LocalPublication {
+    track: Arc<dyn LocalTrackHandle>,
+    muted: bool,
 }
 
 /// Waits for the raised-hands watch to change; never resolves when there is
@@ -829,7 +840,13 @@ impl Actor {
                 }
             }
             ActorMessage::LocalPublished { kind, track } => {
-                self.local_tracks.insert(kind, track);
+                self.local_tracks.insert(
+                    kind,
+                    LocalPublication {
+                        track,
+                        muted: false,
+                    },
+                );
                 let own_member_id = self.own_member_id.clone();
                 self.add_local_stream(&own_member_id, kind);
             }
@@ -839,19 +856,26 @@ impl Actor {
                 respond,
             } => {
                 let outcome = match self.local_tracks.get(&kind) {
-                    Some(track) => track.set_muted(muted),
+                    Some(publication) => publication.track.set_muted(muted),
                     None => Err(TransportError::Unsupported(format!(
                         "nothing of kind {kind:?} is published locally"
                     ))),
                 };
                 if outcome.is_ok() {
+                    // Remembered, not just pushed at the roster: peers have
+                    // been told, and our roster entry may not exist yet (or may
+                    // be rebuilt later), in which case this is the only record
+                    // `add_member` can seed it from.
+                    if let Some(publication) = self.local_tracks.get_mut(&kind) {
+                        publication.muted = muted;
+                    }
                     let own_member_id = self.own_member_id.clone();
                     self.set_member_muted(&own_member_id, kind, muted);
                 }
                 let _ = respond.send(outcome);
             }
             ActorMessage::Unpublish { kind, respond } => {
-                let Some(track) = self.local_tracks.get(&kind) else {
+                let Some(publication) = self.local_tracks.get(&kind) else {
                     let _ = respond.send(Err(TransportError::Unsupported(format!(
                         "nothing of kind {kind:?} is published locally"
                     ))));
@@ -863,7 +887,7 @@ impl Actor {
                 // back as success from the transport), and clearing local
                 // state on a failed attempt would leave a still-live
                 // publication that nothing can mute or retract anymore.
-                let track = Arc::clone(track);
+                let track = Arc::clone(&publication.track);
                 let messages = self.messages_tx.clone();
                 rt::spawn(async move {
                     let outcome = track.unpublish().await;
@@ -877,7 +901,7 @@ impl Actor {
                 if self
                     .local_tracks
                     .get(&kind)
-                    .is_some_and(|current| Arc::ptr_eq(current, &track))
+                    .is_some_and(|current| Arc::ptr_eq(&current.track, &track))
                 {
                     self.local_tracks.remove(&kind);
                     let own_member_id = self.own_member_id.clone();
@@ -1398,6 +1422,28 @@ impl Actor {
         );
     }
 
+    /// The streams `member_id` should start out with: for our own membership,
+    /// our live publications and the mute state we last applied to them;
+    /// nothing for anyone else, whose media attaches through `add_stream`.
+    ///
+    /// Sorted, because `local_tracks` is a `HashMap` and the events derived
+    /// from this must come out in a stable order.
+    fn own_published_streams(&self, member_id: &str) -> Vec<StreamState> {
+        if member_id != self.own_member_id {
+            return Vec::new();
+        }
+        let mut streams: Vec<StreamState> = self
+            .local_tracks
+            .iter()
+            .map(|(kind, publication)| StreamState {
+                kind: *kind,
+                muted: publication.muted,
+            })
+            .collect();
+        streams.sort_by_key(|stream| stream.kind);
+        streams
+    }
+
     fn add_member(&mut self, member: &JoinedMembership) {
         let reachable = select_transport(&self.transports, member).is_some();
         let identity = self
@@ -1421,13 +1467,21 @@ impl Actor {
         }
 
         let hand_raised_at_ms = self.raised_hands.get(&member.member_id).copied();
+        // Our own publications outlive any single membership: they can go up
+        // before the first one lands (the SFU connection is adopted
+        // independently of the snapshot) and they survive one being re-created.
+        // This entry is built from scratch, so it has to be re-seeded from
+        // them — nothing publishes again later to correct it, and a host would
+        // render itself as camera-off while the track is live at the SFU.
+        let own_streams = self.own_published_streams(&member.member_id);
+
         self.roster.push(Participant {
             member_id: member.member_id.clone(),
             user_id: member.sender.clone(),
             device_id: member.origin.sender_device_id().map(str::to_owned),
             is_local: member.member_id == self.own_member_id,
             reachable,
-            streams: Vec::new(),
+            streams: own_streams.clone(),
             hand_raised_at_ms,
         });
         self.emit(CallEvent::ParticipantJoined {
@@ -1439,6 +1493,20 @@ impl Actor {
                 member_id: member.member_id.clone(),
                 raised_at_ms,
             });
+        }
+        // After `ParticipantJoined`, so a host sees the same order either way
+        // round: the membership-first case emits the join, then the stream.
+        for stream in own_streams {
+            self.emit(CallEvent::StreamStarted {
+                member_id: member.member_id.clone(),
+                kind: stream.kind,
+            });
+            if stream.muted {
+                self.emit(CallEvent::StreamMuted {
+                    member_id: member.member_id.clone(),
+                    kind: stream.kind,
+                });
+            }
         }
 
         if let Some(identity) = identity {
@@ -1595,8 +1663,9 @@ impl Actor {
     fn add_local_stream(&mut self, member_id: &str, kind: MediaStreamKind) {
         let Some(participant) = self.roster.iter_mut().find(|p| p.member_id == member_id) else {
             // Our own membership has not come back through the sticky map yet.
-            // The publication is live at the transport regardless; the roster
-            // catches up when `add_member` runs.
+            // The publication is live at the transport regardless, and it is
+            // already in `local_tracks`, which `add_member` seeds our roster
+            // entry from once the membership lands.
             log::debug!("published {kind:?} before our own membership is known");
             return;
         };
@@ -2143,6 +2212,21 @@ mod tests {
         })
         .await
         .expect("condition not reached in time");
+    }
+
+    /// Let the actor apply everything queued so far.
+    ///
+    /// `publish` resolves as soon as the transport answered, while the
+    /// `LocalPublished` that puts the stream on the roster is still queued —
+    /// and the membership watch is a different `select!` branch, so a test that
+    /// publishes and then feeds a snapshot would race the two. Muting a kind
+    /// that was never published is answered without touching any state, so its
+    /// reply proves every message queued before it has been applied.
+    async fn settle(engine: &CallEngine) {
+        engine
+            .set_local_muted(MediaStreamKind::Data, true)
+            .await
+            .expect_err("nothing of that kind is published");
     }
 
     /// Adopt an own-focus connection into the engine, returning its sender.
@@ -2959,6 +3043,172 @@ mod tests {
         assert_eq!(own.streams.len(), 1);
         assert_eq!(own.streams[0].kind, MediaStreamKind::Microphone);
         assert!(!own.streams[0].muted);
+    }
+
+    /// The reverse order of the test above, and the normal one: the SFU
+    /// connection is adopted and published on before our own membership has
+    /// round-tripped through the homeserver. The publication is live either
+    /// way, so our roster entry has to show it once the membership lands —
+    /// nothing publishes again later to correct it.
+    #[tokio::test]
+    async fn publishing_before_our_membership_lands_still_rosters_the_stream() {
+        let mut fx = fixture();
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        settle(&fx.engine).await;
+
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "own".to_owned(),
+                user_id: "@own:example.org".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .expect("we are on our own roster");
+        assert_eq!(
+            own.streams,
+            vec![StreamState {
+                kind: MediaStreamKind::Microphone,
+                muted: false,
+            }],
+        );
+    }
+
+    /// A mute applied while our membership is still in flight reaches the
+    /// transport, and a mute is signalling rather than media — peers see it
+    /// whether or not they can decrypt our frames yet. Seeding the roster entry
+    /// as unmuted when the membership lands would therefore contradict what the
+    /// SFU is already telling everyone.
+    #[tokio::test]
+    async fn muting_before_our_membership_lands_is_reflected_when_it_does() {
+        let mut fx = fixture();
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        fx.engine
+            .set_local_muted(MediaStreamKind::Microphone, true)
+            .await
+            .expect("muting a live publication should succeed");
+
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "own".to_owned(),
+                user_id: "@own:example.org".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamMuted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .expect("we are on our own roster");
+        assert_eq!(
+            own.streams,
+            vec![StreamState {
+                kind: MediaStreamKind::Microphone,
+                muted: true,
+            }],
+        );
+    }
+
+    /// Our membership can leave the roster and come back mid-call — a sticky
+    /// entry that expired a moment before its refresh landed. The publication
+    /// never went anywhere, so the rebuilt entry must carry it again.
+    #[tokio::test]
+    async fn our_streams_survive_our_membership_being_re_created() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        let _connection = adopt(&fx);
+
+        fx.engine
+            .publish(PublishOptions::microphone())
+            .await
+            .expect("publish should succeed");
+        let _ = next_event(&mut fx.events).await; // StreamStarted
+
+        fx.memberships.send(Vec::new()).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantLeft {
+                member_id: "own".to_owned(),
+            }
+        );
+
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "own".to_owned(),
+                user_id: "@own:example.org".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "own".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        let own = fx
+            .engine
+            .participants()
+            .into_iter()
+            .find(|p| p.is_local)
+            .expect("we are back on our own roster");
+        assert_eq!(
+            own.streams,
+            vec![StreamState {
+                kind: MediaStreamKind::Microphone,
+                muted: false,
+            }],
+        );
     }
 
     /// Muting must reach the transport (so peers are told, rather than seeing a

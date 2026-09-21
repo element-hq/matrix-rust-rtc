@@ -12,7 +12,10 @@
 //! that already exist.
 
 /// The kind of media stream a participant publishes.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+///
+/// Ordered so a set of streams can be reported in a stable order; the
+/// declaration order below is what that ordering is.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MediaStreamKind {
     Microphone,
     Camera,
