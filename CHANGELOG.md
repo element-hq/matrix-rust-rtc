@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.3.0-rc.2 - 2026-09-22
+
 ### Added
 
 - `PublishOptions::muted` publishes a track already muted, for a lobby that
