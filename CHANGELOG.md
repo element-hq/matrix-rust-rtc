@@ -8,6 +8,11 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- `PublishOptions::muted` publishes a track already muted, for a lobby that
+  joins muted; also on `FfiPublishOptions`.
+
 ### Fixed
 
 - Our own publications now land on the roster when they are made before our

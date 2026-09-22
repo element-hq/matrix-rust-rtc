@@ -571,6 +571,8 @@ pub struct FfiPublishOptions {
     pub video: Option<FfiVideoSourceConfig>,
     /// Publish multiple quality layers (video only).
     pub simulcast: bool,
+    /// Publish already muted, for a lobby that joins muted.
+    pub muted: bool,
 }
 
 impl From<FfiPublishOptions> for matrix_rtc_media::PublishOptions {
@@ -590,6 +592,7 @@ impl From<FfiPublishOptions> for matrix_rtc_media::PublishOptions {
                     height: video.height,
                 }),
             simulcast: options.simulcast,
+            muted: options.muted,
         }
     }
 }

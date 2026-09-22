@@ -56,6 +56,14 @@ pub struct PublishOptions {
     /// [`MediaConstraints`](crate::constraints::MediaConstraints). Video only;
     /// transports without layered publishing ignore it.
     pub simulcast: bool,
+    /// Publish already muted, so peers see a deliberate off from the first
+    /// frame on.
+    ///
+    /// For a lobby that joins muted. Muting after the publish resolves cannot
+    /// express that: it leaves a window in which the track is live and unmuted
+    /// at the SFU, which for a microphone is a hot mic. The mute travels in the
+    /// same request that announces the track, so there is no such window.
+    pub muted: bool,
 }
 
 impl PublishOptions {
@@ -66,6 +74,7 @@ impl PublishOptions {
             audio: Some(AudioSourceConfig::default()),
             video: None,
             simulcast: false,
+            muted: false,
         }
     }
 
@@ -76,6 +85,7 @@ impl PublishOptions {
             audio: None,
             video: Some(video),
             simulcast: true,
+            muted: false,
         }
     }
 
@@ -86,7 +96,14 @@ impl PublishOptions {
             audio: None,
             video: Some(video),
             simulcast: true,
+            muted: false,
         }
+    }
+
+    /// Publish already muted; see [`PublishOptions::muted`].
+    pub fn muted(mut self) -> Self {
+        self.muted = true;
+        self
     }
 }
 
