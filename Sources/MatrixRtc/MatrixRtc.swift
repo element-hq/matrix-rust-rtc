@@ -6053,6 +6053,10 @@ public struct FfiPublishOptions {
      * Publish multiple quality layers (video only).
      */
     public var simulcast: Bool
+    /**
+     * Publish already muted, for a lobby that joins muted.
+     */
+    public var muted: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -6065,11 +6069,15 @@ public struct FfiPublishOptions {
          */video: FfiVideoSourceConfig?, 
         /**
          * Publish multiple quality layers (video only).
-         */simulcast: Bool) {
+         */simulcast: Bool, 
+        /**
+         * Publish already muted, for a lobby that joins muted.
+         */muted: Bool) {
         self.kind = kind
         self.audio = audio
         self.video = video
         self.simulcast = simulcast
+        self.muted = muted
     }
 }
 
@@ -6092,6 +6100,9 @@ extension FfiPublishOptions: Equatable, Hashable {
         if lhs.simulcast != rhs.simulcast {
             return false
         }
+        if lhs.muted != rhs.muted {
+            return false
+        }
         return true
     }
 
@@ -6100,6 +6111,7 @@ extension FfiPublishOptions: Equatable, Hashable {
         hasher.combine(audio)
         hasher.combine(video)
         hasher.combine(simulcast)
+        hasher.combine(muted)
     }
 }
 
@@ -6115,7 +6127,8 @@ public struct FfiConverterTypeFfiPublishOptions: FfiConverterRustBuffer {
                 kind: FfiConverterTypeFfiStreamKind.read(from: &buf), 
                 audio: FfiConverterOptionTypeFfiAudioSourceConfig.read(from: &buf), 
                 video: FfiConverterOptionTypeFfiVideoSourceConfig.read(from: &buf), 
-                simulcast: FfiConverterBool.read(from: &buf)
+                simulcast: FfiConverterBool.read(from: &buf), 
+                muted: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -6124,6 +6137,7 @@ public struct FfiConverterTypeFfiPublishOptions: FfiConverterRustBuffer {
         FfiConverterOptionTypeFfiAudioSourceConfig.write(value.audio, into: &buf)
         FfiConverterOptionTypeFfiVideoSourceConfig.write(value.video, into: &buf)
         FfiConverterBool.write(value.simulcast, into: &buf)
+        FfiConverterBool.write(value.muted, into: &buf)
     }
 }
 
