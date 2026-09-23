@@ -66,10 +66,10 @@ struct WasmMediaSessionConfig {
 /// `matrix_rtc_media::StabilityConfig` uses.
 #[derive(Debug, Deserialize)]
 struct WasmStabilityConfig {
-    /// Sustained voice before a member counts as speaking.
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
     #[serde(default = "default_promote_ms")]
     promote_ms: u64,
-    /// Silence before a speaking member stops counting. Raising this above
+    /// Silence before a speaking member stops ranking as one. Raising this above
     /// `promote_ms` leaves a tile at the top of the order after the speaker
     /// stopped, which reads as a stuck UI.
     #[serde(default = "default_demote_ms")]

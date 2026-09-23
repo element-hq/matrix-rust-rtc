@@ -149,6 +149,8 @@ pub struct FfiCallTile {
     pub hero: bool,
     pub has_video: bool,
     pub microphone_muted: bool,
+    /// Speaking now, undamped: what a speaking ring means. Only the order is
+    /// damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
     pub speaking: bool,
     pub hand_raised_at_ms: Option<u64>,
     pub reachable: bool,
@@ -214,10 +216,10 @@ impl From<matrix_rtc_media::LocalState> for FfiLocalState {
 /// `matrix_rtc_media::StabilityConfig` uses.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiStabilityConfig {
-    /// Sustained voice before a member counts as speaking.
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
     #[uniffi(default = 1500)]
     pub promote_ms: u64,
-    /// Silence before a speaking member stops counting. Raising this above
+    /// Silence before a speaking member stops ranking as one. Raising this above
     /// `promote_ms` leaves a tile at the top of the order after the speaker
     /// stopped, which reads as a stuck UI.
     #[uniffi(default = 1500)]

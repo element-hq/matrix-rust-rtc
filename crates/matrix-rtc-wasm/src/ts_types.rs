@@ -107,9 +107,9 @@ export interface MediaSessionConfigIn {
  * of the order after the speaker stopped, which reads as a stuck UI.
  */
 export interface StabilityConfigIn {
-    /** Sustained voice before a member counts as speaking. Default 1500. */
+    /** Sustained voice before a member ranks as speaking; the tile flag is not delayed. Default 1500. */
     promote_ms?: number;
-    /** Silence before a speaking member stops counting. Default 1500. */
+    /** Silence before a speaking member stops ranking as one. Default 1500. */
     demote_ms?: number;
     /** Reorders inside this window are delivered as one. Default 300. */
     coalesce_ms?: number;

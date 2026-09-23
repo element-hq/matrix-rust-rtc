@@ -107,9 +107,9 @@ type ConnectOutcome = Result<
 /// because the values are a product decision, not a protocol one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StabilityConfig {
-    /// Sustained voice before a member counts as speaking.
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
     pub promote: Duration,
-    /// Silence before a speaking member stops counting.
+    /// Silence before a speaking member stops ranking as one.
     pub demote: Duration,
     /// Reorders inside this window are delivered as one.
     pub coalesce: Duration,
@@ -644,8 +644,9 @@ struct Actor {
     local_tx: watch::Sender<Option<LocalState>>,
     /// Which tiles get full records. Defaults to everything.
     window: DetailWindow,
-    /// Members currently counted as speaking — the damped set the ranking
-    /// reads (R10). `speakers` holds the raw state driving it.
+    /// Members currently counted as speaking for the order — the damped set
+    /// the ranking reads (R10). `speakers` holds the raw state driving it,
+    /// which is what a tile's own `speaking` flag reports (R11).
     speaking: HashSet<String>,
     /// Raw speaking state per member and its in-flight timer's generation.
     speakers: HashMap<String, SpeakerState>,
@@ -1989,13 +1990,26 @@ impl Actor {
         self.publish_tiles();
     }
 
+    /// Members speaking now, undamped: what a tile's flag reports.
+    fn raw_speaking(&self) -> HashSet<String> {
+        self.speakers
+            .iter()
+            .filter(|(_, state)| state.raw)
+            .map(|(member_id, _)| member_id.clone())
+            .collect()
+    }
+
     /// Feeds the transport's speaking snapshot into the hysteresis (R10).
     ///
     /// A member whose raw state moved away from their effective state gets a
     /// timer — `promote` to start counting as speaking, `demote` to stop — and
     /// a move back before it fires makes that timer stale. Two people trading
     /// half-second bursts therefore never trade places.
+    ///
+    /// The raw state itself is published at once: the flag on a tile is not
+    /// damped (R11), only where the tile ranks.
     fn apply_raw_speakers(&mut self, raw: HashSet<String>) {
+        let mut raw_changed = false;
         let ids: HashSet<String> = self
             .speakers
             .keys()
@@ -2016,6 +2030,7 @@ impl Actor {
             }
             state.raw = is_raw;
             state.generation += 1;
+            raw_changed = true;
             let generation = state.generation;
             if is_raw == self.speaking.contains(&member_id) {
                 // Back to matching the effective state: the in-flight timer is
@@ -2036,18 +2051,22 @@ impl Actor {
                 });
             });
         }
+        if raw_changed {
+            self.publish_tiles();
+        }
     }
 
     /// Derives and publishes the tile roster and our local state. Reached from
-    /// every roster publish, and from the two changes that do not touch the
-    /// roster: the effective speaking set and the detail window.
+    /// every roster publish, and from the changes that do not touch the
+    /// roster: the raw and the effective speaking sets, and the detail window.
     ///
     /// R11: a tile's own state is never delayed, and reordering is coalesced.
     /// When the order moved, consumers get the fresh state now — in the order
     /// they already hold, minus anyone who left — and the new order when the
     /// window closes, so a burst of rank changes lands as one reorder.
     fn publish_tiles(&mut self) {
-        let Tiles { remote, own } = derive_tiles(&self.roster, &self.speaking);
+        let Tiles { remote, own } =
+            derive_tiles(&self.roster, &self.raw_speaking(), &self.speaking);
         self.publish_local(own);
 
         let order: Vec<TileId> = remote.iter().map(CallTile::id).collect();
@@ -2085,7 +2104,8 @@ impl Actor {
 
     /// The coalesce window closed: publish the current order (R11).
     fn publish_tiles_reordered(&mut self) {
-        let Tiles { remote, own } = derive_tiles(&self.roster, &self.speaking);
+        let Tiles { remote, own } =
+            derive_tiles(&self.roster, &self.raw_speaking(), &self.speaking);
         self.publish_local(own);
         self.last_order = remote.iter().map(CallTile::id).collect();
         self.send_tiles(window(&remote, &self.window));
@@ -4205,19 +4225,6 @@ mod tests {
         }
     }
 
-    /// Own + bob on the roster, bob's tile published; returns the own
-    /// connection to inject transport events through.
-    async fn with_bob(fx: &Fixture) -> UnboundedSender<ConnectionEvent> {
-        fx.memberships
-            .send(vec![
-                member("own", "@alice:example.org"),
-                member("bob", "@bob:example.org"),
-            ])
-            .unwrap();
-        wait_until(|| order_ids(fx) == ["bob"]).await;
-        adopt(fx)
-    }
-
     /// Own + a, b, c on the roster and published, in that order.
     async fn with_abc(fx: &Fixture) {
         fx.memberships
@@ -4251,41 +4258,71 @@ mod tests {
         seen
     }
 
+    /// Own + a, b, c published, with the own connection adopted so transport
+    /// speaker events reach the engine.
+    async fn with_abc_connected(fx: &Fixture) -> UnboundedSender<ConnectionEvent> {
+        with_abc(fx).await;
+        adopt(fx)
+    }
+
+    // The flag is raw (R11) and only the rank is damped (R10). A promotion
+    // lands after `promote` plus the coalesce window, since it is a reorder.
+
     #[tokio::test(start_paused = true)]
-    async fn r10_a_speaker_is_promoted_only_after_sustained_voice() {
+    async fn r10_speaking_is_reported_at_once_and_ranked_only_after_sustained_voice() {
         let fx = fixture();
-        let connection = with_bob(&fx).await;
-        connection.send(speakers(&["bob"])).unwrap();
+        let connection = with_abc_connected(&fx).await;
+        connection.send(speakers(&["c"])).unwrap();
+        after(50).await;
+        assert!(speaking(&fx, "c"), "the flag is not damped");
+        assert_eq!(order_ids(&fx), ["a", "b", "c"], "the rank is");
         after(1400).await;
-        assert!(!speaking(&fx, "bob"), "1.5 s of voice is required");
-        after(200).await;
-        assert!(speaking(&fx, "bob"));
+        assert_eq!(
+            order_ids(&fx),
+            ["a", "b", "c"],
+            "1.5 s of voice is required"
+        );
+        after(400).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn r10_a_speaker_is_demoted_only_after_the_cooldown() {
+    async fn r10_a_speaker_stops_at_once_and_keeps_their_rank_through_the_cooldown() {
         let fx = fixture();
-        let connection = with_bob(&fx).await;
-        connection.send(speakers(&["bob"])).unwrap();
-        after(1600).await;
-        assert!(speaking(&fx, "bob"));
-        connection.send(speakers(&[])).unwrap();
-        after(1400).await;
-        assert!(speaking(&fx, "bob"), "still speaking inside the cooldown");
-        after(200).await;
-        assert!(!speaking(&fx, "bob"));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn r10_a_burst_shorter_than_the_promotion_never_counts() {
-        let fx = fixture();
-        let connection = with_bob(&fx).await;
-        connection.send(speakers(&["bob"])).unwrap();
-        after(500).await;
-        connection.send(speakers(&[])).unwrap();
+        let connection = with_abc_connected(&fx).await;
+        connection.send(speakers(&["c"])).unwrap();
         after(2000).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
+        connection.send(speakers(&[])).unwrap();
+        after(50).await;
+        assert!(!speaking(&fx, "c"), "the flag is not damped");
+        assert_eq!(order_ids(&fx), ["c", "a", "b"], "the rank is");
+        after(1400).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["c", "a", "b"],
+            "still ranked inside the cooldown"
+        );
+        after(400).await;
+        assert_eq!(order_ids(&fx), ["a", "b", "c"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_a_burst_shorter_than_the_promotion_never_moves_the_tile() {
+        let fx = fixture();
+        let connection = with_abc_connected(&fx).await;
+        let seen = observe_orders(&fx);
+        connection.send(speakers(&["c"])).unwrap();
+        after(500).await;
+        assert!(speaking(&fx, "c"));
+        connection.send(speakers(&[])).unwrap();
+        after(2500).await;
+        assert!(!speaking(&fx, "c"));
         assert!(
-            !speaking(&fx, "bob"),
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|order| order.first().map(String::as_str) == Some("a")),
             "the promotion timer went stale when the voice stopped"
         );
     }
@@ -4296,12 +4333,12 @@ mod tests {
             promote: Duration::from_millis(500),
             ..StabilityConfig::default()
         });
-        let connection = with_bob(&fx).await;
-        connection.send(speakers(&["bob"])).unwrap();
+        let connection = with_abc_connected(&fx).await;
+        connection.send(speakers(&["c"])).unwrap();
         after(400).await;
-        assert!(!speaking(&fx, "bob"));
-        after(200).await;
-        assert!(speaking(&fx, "bob"));
+        assert_eq!(order_ids(&fx), ["a", "b", "c"]);
+        after(500).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
     }
 
     #[tokio::test(start_paused = true)]

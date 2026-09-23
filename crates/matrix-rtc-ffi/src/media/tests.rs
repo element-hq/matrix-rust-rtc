@@ -265,7 +265,8 @@ fn tile_id_round_trips_through_the_ffi() {
 #[test]
 fn tile_roster_dto_preserves_order_and_detail() {
     let roster: Vec<_> = (0..5).map(|i| participant(&format!("m{i}"))).collect();
-    let ranked = matrix_rtc_media::derive_tiles(&roster, &Default::default()).remote;
+    let ranked =
+        matrix_rtc_media::derive_tiles(&roster, &Default::default(), &Default::default()).remote;
     let last = ranked[4].id();
     let w = matrix_rtc_media::DetailWindow {
         offset: 1,
@@ -289,7 +290,7 @@ fn tile_roster_dto_preserves_order_and_detail() {
 fn local_state_dto_carries_the_share_flag() {
     let mut me = participant("me");
     me.is_local = true;
-    let own = matrix_rtc_media::derive_tiles(&[me], &Default::default())
+    let own = matrix_rtc_media::derive_tiles(&[me], &Default::default(), &Default::default())
         .own
         .expect("own tile");
     let dto: FfiLocalState = matrix_rtc_media::LocalState {
