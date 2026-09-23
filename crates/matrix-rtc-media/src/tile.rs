@@ -72,10 +72,13 @@ pub struct Tiles {
 }
 
 /// A tile's place in the order: enough to place it — identity and hero —
-/// and nothing about what the member is doing. One per tile, always.
+/// and to draw it as an avatar with a name — `user_id` — and nothing about
+/// what the member is doing. One per tile, always, so a tile outside the
+/// detail window is still drawable (contract C1, C2, C12).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TileRef {
     pub id: TileId,
+    pub user_id: String,
     pub hero: bool,
 }
 
@@ -170,6 +173,7 @@ pub fn window(ranked: &[CallTile], w: &DetailWindow) -> TileRoster {
         let windowed = (start..end).contains(&rank) || w.also.contains(&id);
         order.push(TileRef {
             id,
+            user_id: tile.user_id.clone(),
             hero: tile.hero,
         });
         if windowed {
@@ -539,6 +543,23 @@ mod tests {
         let roster = window(&tiles, &w);
         assert_eq!(roster.order.len(), 5, "order is never truncated");
         assert_eq!(ids(&roster.detail), ids(&tiles[1..3]));
+    }
+
+    /// A tile outside the window has no record, but its reference must still
+    /// draw as an avatar with a name — so it carries the user id (C12).
+    #[test]
+    fn a_reference_outside_the_window_still_names_its_user() {
+        let tiles = ranked(5);
+        let w = DetailWindow {
+            offset: 0,
+            len: 1,
+            also: HashSet::new(),
+        };
+        let roster = window(&tiles, &w);
+        assert_eq!(roster.detail.len(), 1);
+        let outside = &roster.order[4];
+        assert_eq!(outside.id, tiles[4].id());
+        assert_eq!(outside.user_id, tiles[4].user_id);
     }
 
     #[test]

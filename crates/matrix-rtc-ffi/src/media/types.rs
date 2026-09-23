@@ -119,11 +119,14 @@ impl From<FfiTileId> for matrix_rtc_media::TileId {
     }
 }
 
-/// A tile's place in the order: identity and whether it is a hero, nothing
-/// else. One per tile in the call, always. Contract C2.
+/// A tile's place in the order: identity, whose tile it is, and whether it
+/// is a hero — enough to place it and to draw it as an avatar with a name,
+/// nothing about what the member is doing. One per tile in the call, always.
+/// Contract C2.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiTileRef {
     pub id: FfiTileId,
+    pub user_id: String,
     pub hero: bool,
 }
 
@@ -131,6 +134,7 @@ impl From<matrix_rtc_media::TileRef> for FfiTileRef {
     fn from(r: matrix_rtc_media::TileRef) -> Self {
         Self {
             id: r.id.into(),
+            user_id: r.user_id,
             hero: r.hero,
         }
     }
