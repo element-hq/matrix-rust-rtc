@@ -16,6 +16,28 @@ use std::collections::HashSet;
 
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 
+/// What a tile is: a person, or a screen they are sharing.
+///
+/// Not a [`MediaStreamKind`]. A person tile draws the member's camera and
+/// carries their microphone state; a share tile draws the screen. Which
+/// stream a tile draws is [`TileKind::video_stream`], so a consumer never has
+/// to guess it — and a microphone can never be mistaken for a tile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TileKind {
+    Person,
+    ScreenShare,
+}
+
+impl TileKind {
+    /// The stream this kind of tile draws.
+    pub fn video_stream(self) -> MediaStreamKind {
+        match self {
+            TileKind::Person => MediaStreamKind::Camera,
+            TileKind::ScreenShare => MediaStreamKind::ScreenShare,
+        }
+    }
+}
+
 /// Identity of one tile: the pair `(member_id, kind)`.
 ///
 /// Stable for as long as the tile is in the call — neither component changes
@@ -23,8 +45,7 @@ use crate::participant::{MediaStreamKind, Participant, StreamState};
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileId {
     pub member_id: String,
-    /// `Camera` or `ScreenShare`.
-    pub kind: MediaStreamKind,
+    pub kind: TileKind,
 }
 
 /// One renderable stream of one membership, with what a UI needs to place and
@@ -32,7 +53,7 @@ pub struct TileId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallTile {
     pub member_id: String,
-    pub kind: MediaStreamKind,
+    pub kind: TileKind,
     pub user_id: String,
     pub device_id: Option<String>,
     /// Sorts above everything else. A screen share; a pin, once pinning exists.
@@ -140,7 +161,7 @@ pub fn derive_tiles(
     let mut remote = Vec::with_capacity(roster.len());
     let mut own = None;
     for participant in roster {
-        let camera = tile(participant, MediaStreamKind::Camera, speaking);
+        let camera = tile(participant, TileKind::Person, speaking);
         if participant.is_local {
             // R7: beside the list, not in it. R13: our own share is never a
             // tile — we do not subscribe to our own outgoing stream.
@@ -149,7 +170,7 @@ pub fn derive_tiles(
         }
         remote.push(camera);
         if stream(participant, MediaStreamKind::ScreenShare).is_some() {
-            remote.push(tile(participant, MediaStreamKind::ScreenShare, speaking));
+            remote.push(tile(participant, TileKind::ScreenShare, speaking));
         }
     }
     remote.sort_by_cached_key(|t| rank_key(t, ranked_speaking.contains(&t.member_id)));
@@ -183,7 +204,7 @@ pub fn window(ranked: &[CallTile], w: &DetailWindow) -> TileRoster {
     TileRoster { order, detail }
 }
 
-fn tile(p: &Participant, kind: MediaStreamKind, speaking: &HashSet<String>) -> CallTile {
+fn tile(p: &Participant, kind: TileKind, speaking: &HashSet<String>) -> CallTile {
     CallTile {
         member_id: p.member_id.clone(),
         kind,
@@ -191,8 +212,8 @@ fn tile(p: &Participant, kind: MediaStreamKind, speaking: &HashSet<String>) -> C
         device_id: p.device_id.clone(),
         // R3: a share is a hero. R12 falls out of derivation: the own tile is
         // only ever built for `Camera`.
-        hero: kind == MediaStreamKind::ScreenShare,
-        has_video: stream(p, kind).is_some_and(|s| !s.muted),
+        hero: kind == TileKind::ScreenShare,
+        has_video: stream(p, kind.video_stream()).is_some_and(|s| !s.muted),
         microphone_muted: stream(p, MediaStreamKind::Microphone).is_none_or(|s| s.muted),
         speaking: speaking.contains(&p.member_id),
         hand_raised_at_ms: p.hand_raised_at_ms,
@@ -236,7 +257,7 @@ fn rank_key(
         none_last(t.joined_at_ms),
         t.member_id.clone(),
         match t.kind {
-            MediaStreamKind::ScreenShare => 1,
+            TileKind::ScreenShare => 1,
             _ => 0,
         },
     )
@@ -269,7 +290,7 @@ mod tests {
         p
     }
 
-    fn order(tiles: &[CallTile]) -> Vec<(&str, MediaStreamKind)> {
+    fn order(tiles: &[CallTile]) -> Vec<(&str, TileKind)> {
         tiles
             .iter()
             .map(|t| (t.member_id.as_str(), t.kind))
@@ -290,9 +311,9 @@ mod tests {
         assert_eq!(
             order(&tiles.remote),
             [
-                ("a", MediaStreamKind::ScreenShare),
-                ("a", MediaStreamKind::Camera),
-                ("b", MediaStreamKind::Camera),
+                ("a", TileKind::ScreenShare),
+                ("a", TileKind::Person),
+                ("b", TileKind::Person),
             ]
         );
     }
@@ -303,10 +324,7 @@ mod tests {
         me.is_local = true;
         let tiles = derive_tiles(&[me], &silent(), &silent());
         assert!(tiles.remote.is_empty());
-        assert_eq!(
-            tiles.own.as_ref().map(|t| t.kind),
-            Some(MediaStreamKind::Camera)
-        );
+        assert_eq!(tiles.own.as_ref().map(|t| t.kind), Some(TileKind::Person));
     }
 
     #[test]
@@ -314,7 +332,7 @@ mod tests {
         let mut me = member("me");
         me.is_local = true;
         let tiles = derive_tiles(&[member("a"), me], &silent(), &silent());
-        assert_eq!(order(&tiles.remote), [("a", MediaStreamKind::Camera)]);
+        assert_eq!(order(&tiles.remote), [("a", TileKind::Person)]);
         let own = tiles.own.expect("own tile");
         assert_eq!(own.member_id, "me");
         assert!(!own.hero);
@@ -330,7 +348,7 @@ mod tests {
             tiles.remote[0].id(),
             TileId {
                 member_id: "share".into(),
-                kind: MediaStreamKind::ScreenShare
+                kind: TileKind::ScreenShare
             }
         );
         assert!(tiles.remote[0].hero);
@@ -345,10 +363,7 @@ mod tests {
         let tiles = derive_tiles(&[late, early], &silent(), &silent());
         assert_eq!(
             order(&tiles.remote),
-            [
-                ("early", MediaStreamKind::Camera),
-                ("late", MediaStreamKind::Camera)
-            ]
+            [("early", TileKind::Person), ("late", TileKind::Person)]
         );
     }
 
@@ -361,10 +376,7 @@ mod tests {
         let tiles = derive_tiles(&[member("a"), member("b")], &raw, &silent());
         assert_eq!(
             order(&tiles.remote),
-            [
-                ("a", MediaStreamKind::Camera),
-                ("b", MediaStreamKind::Camera)
-            ],
+            [("a", TileKind::Person), ("b", TileKind::Person)],
             "not yet ranked for it"
         );
         assert!(tiles.remote[1].speaking, "but already reported speaking");
@@ -381,10 +393,7 @@ mod tests {
         let tiles = derive_tiles(&[member("a"), member("b")], &speaking, &speaking);
         assert_eq!(
             order(&tiles.remote),
-            [
-                ("b", MediaStreamKind::Camera),
-                ("a", MediaStreamKind::Camera)
-            ]
+            [("b", TileKind::Person), ("a", TileKind::Person)]
         );
         assert!(tiles.remote[0].speaking);
     }
@@ -398,10 +407,7 @@ mod tests {
         let tiles = derive_tiles(&roster, &silent(), &silent());
         assert_eq!(
             order(&tiles.remote),
-            [
-                ("b", MediaStreamKind::Camera),
-                ("a", MediaStreamKind::Camera)
-            ]
+            [("b", TileKind::Person), ("a", TileKind::Person)]
         );
         assert!(tiles.remote[0].has_video);
         assert!(!tiles.remote[1].has_video);
@@ -435,18 +441,18 @@ mod tests {
         assert_eq!(
             order(&tiles.remote),
             [
-                ("share", MediaStreamKind::ScreenShare),
-                ("hand", MediaStreamKind::Camera),
-                ("talk", MediaStreamKind::Camera),
-                ("video", MediaStreamKind::Camera),
-                ("z-early", MediaStreamKind::Camera),
-                ("z-late", MediaStreamKind::Camera),
+                ("share", TileKind::ScreenShare),
+                ("hand", TileKind::Person),
+                ("talk", TileKind::Person),
+                ("video", TileKind::Person),
+                ("z-early", TileKind::Person),
+                ("z-late", TileKind::Person),
                 // Plain tiles with no join time, by member_id — including the
                 // sharer's camera tile, which is not a hero (C4) and publishes
                 // no camera here.
-                ("a", MediaStreamKind::Camera),
-                ("b", MediaStreamKind::Camera),
-                ("share", MediaStreamKind::Camera),
+                ("a", TileKind::Person),
+                ("b", TileKind::Person),
+                ("share", TileKind::Person),
             ]
         );
     }
@@ -460,9 +466,9 @@ mod tests {
         assert_eq!(
             order(&first.remote),
             [
-                ("a", MediaStreamKind::Camera),
-                ("b", MediaStreamKind::Camera),
-                ("c", MediaStreamKind::Camera)
+                ("a", TileKind::Person),
+                ("b", TileKind::Person),
+                ("c", TileKind::Person)
             ]
         );
     }
@@ -479,7 +485,7 @@ mod tests {
         let camera = |t: &Tiles| {
             t.remote
                 .iter()
-                .find(|x| x.kind == MediaStreamKind::Camera)
+                .find(|x| x.kind == TileKind::Person)
                 .map(CallTile::id)
         };
         assert_eq!(camera(&before), camera(&during));
@@ -494,7 +500,7 @@ mod tests {
             &silent(),
         );
         let share = &tiles.remote[0];
-        assert_eq!(share.kind, MediaStreamKind::ScreenShare);
+        assert_eq!(share.kind, TileKind::ScreenShare);
         assert!(share.hero);
         assert!(!share.has_video);
     }
@@ -611,7 +617,7 @@ mod tests {
             len: 0,
             also: [TileId {
                 member_id: "left-already".into(),
-                kind: MediaStreamKind::Camera,
+                kind: TileKind::Person,
             }]
             .into(),
         };

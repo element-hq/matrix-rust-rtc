@@ -56,7 +56,8 @@ pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSource
 pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use stats::ReceiveStats;
 pub use tile::{
-    CallTile, DetailWindow, LocalState, TileId, TileRef, TileRoster, Tiles, derive_tiles, window,
+    CallTile, DetailWindow, LocalState, TileId, TileKind, TileRef, TileRoster, Tiles, derive_tiles,
+    window,
 };
 pub use transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,

@@ -98,7 +98,35 @@ impl From<matrix_rtc_media::Participant> for FfiParticipant {
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FfiTileId {
     pub member_id: String,
-    pub kind: FfiStreamKind,
+    pub kind: FfiTileKind,
+}
+
+/// What a tile is: a person — their camera, their microphone state — or a
+/// screen they are sharing. Not an [`FfiStreamKind`]: which stream a tile
+/// draws follows from this (person → camera, share → screen share), and a
+/// microphone is never a tile. Contract C1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTileKind {
+    Person,
+    ScreenShare,
+}
+
+impl From<matrix_rtc_media::TileKind> for FfiTileKind {
+    fn from(kind: matrix_rtc_media::TileKind) -> Self {
+        match kind {
+            matrix_rtc_media::TileKind::Person => Self::Person,
+            matrix_rtc_media::TileKind::ScreenShare => Self::ScreenShare,
+        }
+    }
+}
+
+impl From<FfiTileKind> for matrix_rtc_media::TileKind {
+    fn from(kind: FfiTileKind) -> Self {
+        match kind {
+            FfiTileKind::Person => Self::Person,
+            FfiTileKind::ScreenShare => Self::ScreenShare,
+        }
+    }
 }
 
 impl From<matrix_rtc_media::TileId> for FfiTileId {
@@ -147,7 +175,7 @@ impl From<matrix_rtc_media::TileRef> for FfiTileRef {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiCallTile {
     pub member_id: String,
-    pub kind: FfiStreamKind,
+    pub kind: FfiTileKind,
     pub user_id: String,
     pub device_id: Option<String>,
     pub hero: bool,

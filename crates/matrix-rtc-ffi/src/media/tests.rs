@@ -251,8 +251,8 @@ fn participant(id: &str) -> matrix_rtc_media::Participant {
 
 #[test]
 fn tile_id_round_trips_through_the_ffi() {
-    use matrix_rtc_media::MediaStreamKind::{Camera, ScreenShare};
-    for kind in [Camera, ScreenShare] {
+    use matrix_rtc_media::TileKind::{Person, ScreenShare};
+    for kind in [Person, ScreenShare] {
         let id = matrix_rtc_media::TileId {
             member_id: "m".to_owned(),
             kind,
