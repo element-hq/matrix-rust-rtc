@@ -13,6 +13,10 @@ log only.
 - The call tile roster: `MediaSession::next_roster()` / `next_local_state()`
   publish one ranked, damped `CallTile` per renderable stream, with thresholds
   configurable via `stability`.
+- `MediaSession::receive_stats_for(streams)` (and `CallEngine::receive_stats_for`)
+  reads receive counters for a set of `(member_id, kind)` in one call, awaiting
+  the transports concurrently: one round trip per sample for a host that polls
+  the tiles it draws, instead of one per stream.
 
 ### Breaking
 

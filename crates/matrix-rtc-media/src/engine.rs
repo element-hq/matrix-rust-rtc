@@ -589,6 +589,37 @@ impl CallEngine {
         track.receive_stats().await
     }
 
+    /// [`CallEngine::receive_stats`] for many streams at once.
+    ///
+    /// One entry per element of `streams`, in the same order — `None` under
+    /// the same conditions as the single call. The track map is locked once,
+    /// for the lookups only; the transports' stats round trips then run
+    /// concurrently, so a batch costs about one collection rather than one
+    /// per stream. Bound the request to what is drawn (contract C12) and call
+    /// this once per sample.
+    pub async fn receive_stats_for(
+        &self,
+        streams: &[(String, MediaStreamKind)],
+    ) -> Vec<Option<ReceiveStats>> {
+        if streams.is_empty() {
+            return Vec::new();
+        }
+        let tracks: Vec<Option<Arc<dyn RemoteTrackHandle>>> = {
+            let map = self.tracks.lock().expect("track map mutex poisoned");
+            streams.iter().map(|key| map.get(key).cloned()).collect()
+        };
+        // Unbounded on purpose: libwebrtc serialises stats collection on its
+        // own thread. `futures_util::stream::iter(..).buffered(n)` is the
+        // drop-in if a call size ever makes that a problem.
+        futures_util::future::join_all(tracks.into_iter().map(|track| async move {
+            match track {
+                Some(track) => track.receive_stats().await,
+                None => None,
+            }
+        }))
+        .await
+    }
+
     /// Emit [`CallEvent::Ended`] and close every pooled peer-focus connection.
     /// The adopted own-focus connection is not closed here — its owner (the
     /// caller of [`CallEngine::adopt_own_connection`]) closes it and gets the
@@ -2345,11 +2376,26 @@ mod tests {
         /// What `receive_stats` reports; `None` models a transport with no
         /// counters (the trait default).
         stats: Option<ReceiveStats>,
+        /// A barrier every `receive_stats` waits at before answering, so a
+        /// test can prove several were in flight together.
+        gate: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl FakeTrack {
         fn new(kind: MediaStreamKind) -> Self {
-            Self { kind, stats: None }
+            Self {
+                kind,
+                stats: None,
+                gate: None,
+            }
+        }
+
+        fn with_stats(kind: MediaStreamKind, stats: ReceiveStats) -> Self {
+            Self {
+                kind,
+                stats: Some(stats),
+                gate: None,
+            }
         }
     }
 
@@ -2370,6 +2416,9 @@ mod tests {
         }
 
         async fn receive_stats(&self) -> Option<ReceiveStats> {
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
             self.stats.clone()
         }
     }
@@ -3051,10 +3100,10 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Microphone,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Microphone,
-                    stats: Some(reported.clone()),
-                }),
+                track: Arc::new(FakeTrack::with_stats(
+                    MediaStreamKind::Microphone,
+                    reported.clone(),
+                )),
             })
             .unwrap();
         let _ = next_event(&mut fx.events).await; // StreamStarted
@@ -3075,6 +3124,147 @@ mod tests {
         fn assert_send<T: Send>(_: T) {}
         let fx = fixture();
         assert_send(fx.engine.receive_stats("bob", MediaStreamKind::Microphone));
+    }
+
+    fn stats_with(packets_received: u64) -> ReceiveStats {
+        ReceiveStats {
+            packets_received,
+            ..ReceiveStats::default()
+        }
+    }
+
+    /// Own connection adopted and one fake track per `(member, kind)` added,
+    /// each answering `receive_stats` with the given counters.
+    async fn with_tracks(fx: &Fixture, tracks: Vec<(&str, MediaStreamKind, FakeTrack)>) {
+        let connection = adopt(fx);
+        for (member_id, kind, track) in tracks {
+            connection
+                .send(ConnectionEvent::TrackAdded {
+                    identity: format!("id-{member_id}"),
+                    kind,
+                    track: Arc::new(track),
+                })
+                .unwrap();
+            wait_until(|| fx.engine.remote_track(member_id, kind).is_some()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_receive_stats_follow_request_order_with_none_for_unknown() {
+        use MediaStreamKind::{Camera, Microphone, ScreenShare};
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 2).await;
+        with_tracks(
+            &fx,
+            vec![
+                (
+                    "bob",
+                    Microphone,
+                    FakeTrack::with_stats(Microphone, stats_with(1)),
+                ),
+                ("bob", Camera, FakeTrack::with_stats(Camera, stats_with(2))),
+                (
+                    "carol",
+                    Microphone,
+                    FakeTrack::with_stats(Microphone, stats_with(3)),
+                ),
+            ],
+        )
+        .await;
+
+        let request = [
+            ("carol".to_owned(), Microphone),
+            ("bob".to_owned(), Camera),
+            ("dave".to_owned(), Microphone), // unknown member
+            ("bob".to_owned(), Microphone),
+            ("bob".to_owned(), ScreenShare),  // unsubscribed kind
+            ("carol".to_owned(), Microphone), // duplicate: answered twice
+        ];
+        let results = fx.engine.receive_stats_for(&request).await;
+
+        assert_eq!(
+            results,
+            vec![
+                Some(stats_with(3)),
+                Some(stats_with(2)),
+                None,
+                Some(stats_with(1)),
+                None,
+                Some(stats_with(3)),
+            ]
+        );
+    }
+
+    /// Three tracks share a barrier of three: only if all three
+    /// `receive_stats` are in flight together does any of them return. A
+    /// sequential loop deadlocks on the first, and the timeout says so.
+    #[tokio::test]
+    async fn batched_receive_stats_are_awaited_concurrently() {
+        use MediaStreamKind::Microphone;
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("a", "@a:example.org"),
+                member("b", "@b:example.org"),
+                member("c", "@c:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 3).await;
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let gated = |n: u64| FakeTrack {
+            kind: Microphone,
+            stats: Some(stats_with(n)),
+            gate: Some(gate.clone()),
+        };
+        with_tracks(
+            &fx,
+            vec![
+                ("a", Microphone, gated(1)),
+                ("b", Microphone, gated(2)),
+                ("c", Microphone, gated(3)),
+            ],
+        )
+        .await;
+
+        let request: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|m| (m.to_owned(), Microphone))
+            .collect();
+        let results = tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.engine.receive_stats_for(&request),
+        )
+        .await
+        .expect("stats were awaited one at a time: a barrier of three never released");
+
+        assert_eq!(
+            results,
+            vec![
+                Some(stats_with(1)),
+                Some(stats_with(2)),
+                Some(stats_with(3))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_receive_stats_for_an_empty_request_are_empty() {
+        let fx = fixture();
+        assert!(fx.engine.receive_stats_for(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_batched_receive_stats_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let fx = fixture();
+        let request = [("bob".to_owned(), MediaStreamKind::Microphone)];
+        assert_send(fx.engine.receive_stats_for(&request));
     }
 
     #[tokio::test]

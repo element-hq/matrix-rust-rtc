@@ -18,8 +18,8 @@ use crate::{FfiJoinSessionParams, RtcSessionManagerHandle};
 
 use super::session::{MediaSessionConfig, connect_media_session};
 use super::types::{
-    FfiLocalState, FfiMediaConstraints, FfiOpenIdToken, FfiTileId, FfiTileRoster, FfiVideoDetail,
-    OpenIdTokenProvider,
+    FfiLocalState, FfiMediaConstraints, FfiOpenIdToken, FfiStreamKind, FfiStreamRef, FfiTileId,
+    FfiTileRoster, FfiVideoDetail, OpenIdTokenProvider, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 
@@ -260,6 +260,47 @@ fn tile_id_round_trips_through_the_ffi() {
         let back: matrix_rtc_media::TileId = FfiTileId::from(id.clone()).into();
         assert_eq!(back, id);
     }
+}
+
+#[test]
+fn stream_ref_converts_every_kind() {
+    use FfiStreamKind::{Camera, Data, Microphone, ScreenShare, ScreenShareAudio};
+    for kind in [Microphone, Camera, ScreenShare, ScreenShareAudio, Data] {
+        let (member_id, back): (String, matrix_rtc_media::MediaStreamKind) = FfiStreamRef {
+            member_id: "m".to_owned(),
+            kind,
+        }
+        .into();
+        assert_eq!(member_id, "m");
+        assert_eq!(FfiStreamKind::from(back), kind);
+    }
+}
+
+#[test]
+fn stream_stats_dto_zips_request_with_results() {
+    let request = vec![
+        FfiStreamRef {
+            member_id: "bob".to_owned(),
+            kind: FfiStreamKind::Microphone,
+        },
+        FfiStreamRef {
+            member_id: "bob".to_owned(),
+            kind: FfiStreamKind::Camera,
+        },
+    ];
+    let answered = matrix_rtc_media::ReceiveStats {
+        packets_received: 7,
+        ..Default::default()
+    };
+    let dto = zip_stream_stats(request, vec![Some(answered), None]);
+
+    assert_eq!(dto.len(), 2);
+    assert_eq!(dto[0].member_id, "bob");
+    assert_eq!(dto[0].kind, FfiStreamKind::Microphone);
+    assert_eq!(dto[0].stats.as_ref().map(|s| s.packets_received), Some(7));
+    assert_eq!(dto[1].kind, FfiStreamKind::Camera);
+    // Asked about and answered with nothing, rather than left out.
+    assert!(dto[1].stats.is_none());
 }
 
 #[test]

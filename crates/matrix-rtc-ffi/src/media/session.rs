@@ -19,15 +19,15 @@ use matrix_rtc_livekit::{
     identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 use matrix_rtc_media::{
-    CallEngine, CallEvent, ConnectionContext, EngineConfig, OwnMemberClaims,
+    CallEngine, CallEvent, ConnectionContext, EngineConfig, MediaStreamKind, OwnMemberClaims,
     TransportConnection as _,
 };
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
     FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
-    FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiTileId, FfiTileRoster,
-    OpenIdTokenProvider, TokenProviderAdapter,
+    FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef, FfiStreamStats, FfiTileId,
+    FfiTileRoster, OpenIdTokenProvider, TokenProviderAdapter, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcSessionManagerHandle;
@@ -443,6 +443,21 @@ impl MediaSession {
             .receive_stats(&member_id, kind.into())
             .await
             .map(Into::into)
+    }
+
+    /// [`MediaSession::receive_stats`] for many streams in one round trip.
+    ///
+    /// One entry per requested stream, in request order; nothing is omitted
+    /// and a duplicate is answered twice. Bound the request to the tiles you
+    /// compose — the detail window of contract C12 is the right set, plus the
+    /// microphone of each member in it — and call this once per sample rather
+    /// than once per stream. The counters are the same cumulative totals as
+    /// the single call; see [`FfiReceiveStats`].
+    pub async fn receive_stats_for(&self, streams: Vec<FfiStreamRef>) -> Vec<FfiStreamStats> {
+        let keys: Vec<(String, MediaStreamKind)> =
+            streams.iter().cloned().map(Into::into).collect();
+        let results = self.engine.receive_stats_for(&keys).await;
+        zip_stream_stats(streams, results)
     }
 
     /// Publish a local track on our focus; push captured frames into the

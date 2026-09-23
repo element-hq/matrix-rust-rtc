@@ -166,6 +166,14 @@ is a running total, so sample twice and compare:
 | `concealedSamples` up in step with `totalSamplesReceived` | The "audio" is entirely fabricated |
 | both up, `packetsLost`/`jitter` rising | Arriving and decoding, but lossy |
 
+For a per-tile health readout, ask for the whole window at once rather than one stream
+at a time. **`MediaSession.receiveStatsFor(streams)`** takes a list of
+`FfiStreamRef(memberId, kind)` and answers every entry in one round trip, in request
+order, with `stats == null` exactly where `receiveStats` would return `null`. Bound the
+list to the tiles you compose — the detail window you gave `setDetailWindow`, plus each
+member's microphone — and call it once per second; at two hundred participants that is
+one call per sample instead of hundreds.
+
 **`FfiCallEvent.FrameEncryptionState`** on the event stream names the cause when it is
 a key problem. `MissingKey` means frames carry a key index we hold nothing for (their
 key never reached us, or arrived under a different identity); `DecryptionFailed` means

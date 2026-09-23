@@ -443,6 +443,54 @@ impl From<matrix_rtc_media::ReceiveStats> for FfiReceiveStats {
     }
 }
 
+/// One of a participant's streams, named for a request: the pair
+/// `(member_id, kind)`, of any kind.
+///
+/// Not [`FfiTileId`], on purpose: a tile is a *renderable* stream, camera or
+/// screen share (contract C1), and statistics are also wanted for the
+/// microphone. Build one from a tile with its `member_id` and `kind`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiStreamRef {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+}
+
+impl From<FfiStreamRef> for (String, matrix_rtc_media::MediaStreamKind) {
+    fn from(r: FfiStreamRef) -> Self {
+        (r.member_id, r.kind.into())
+    }
+}
+
+/// One entry of [`MediaSession::receive_stats_for`](super::MediaSession::receive_stats_for)'s
+/// answer: the stream asked about and its counters. `stats` is `null`
+/// exactly when [`MediaSession::receive_stats`](super::MediaSession::receive_stats)
+/// would be — not subscribed, or no RTCP report yet — so a host can tell
+/// "asked, and nothing there" from a stream it never asked about.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStreamStats {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+    pub stats: Option<FfiReceiveStats>,
+}
+
+/// Zip a request with the engine's positional answer into self-describing
+/// records. Same length is the engine's guarantee.
+pub(super) fn zip_stream_stats(
+    streams: Vec<FfiStreamRef>,
+    results: Vec<Option<matrix_rtc_media::ReceiveStats>>,
+) -> Vec<FfiStreamStats> {
+    debug_assert_eq!(streams.len(), results.len());
+    streams
+        .into_iter()
+        .zip(results)
+        .map(|(stream, stats)| FfiStreamStats {
+            member_id: stream.member_id,
+            kind: stream.kind,
+            stats: stats.map(Into::into),
+        })
+        .collect()
+}
+
 /// An event on the unified call stream (mirrors
 /// `matrix_rtc_media::CallEvent`). Consume via
 /// [`MediaSession::next_event`](super::MediaSession::next_event).
