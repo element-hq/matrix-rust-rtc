@@ -1510,6 +1510,11 @@ impl Actor {
                             })
                     })
                     .collect();
+                // Not sampled here: the SFU decides who is speaking and sends one
+                // update for the whole call per `update_interval` (LiveKit default
+                // 500 ms), smoothed over two intervals. That bounds how often the
+                // raw set — and with it the tile flag and the roster — can change.
+                //
                 // Timers are armed before the event goes out, so a consumer
                 // woken by it finds the hysteresis already running.
                 let raw: HashSet<String> = speakers.iter().map(|s| s.member_id.clone()).collect();
@@ -2021,7 +2026,9 @@ impl Actor {
         self.publish_tiles();
     }
 
-    /// Members speaking now, undamped: what a tile's flag reports.
+    /// Members speaking now as the SFU reports them: what a tile's flag
+    /// reports. Undamped here, but already smoothed and rate-limited by the
+    /// server (see the `ActiveSpeakers` handler).
     fn raw_speaking(&self) -> HashSet<String> {
         self.speakers
             .iter()
