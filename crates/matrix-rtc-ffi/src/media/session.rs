@@ -278,7 +278,6 @@ async fn build_media_session(
 
     let tiles = engine.subscribe_tiles();
     let local = engine.subscribe_local_state();
-    let participants = engine.subscribe_participants();
     Ok(Arc::new(MediaSession {
         engine,
         connection,
@@ -286,7 +285,6 @@ async fn build_media_session(
         events: TokioMutex::new(events),
         tiles: TokioMutex::new(tiles),
         local: TokioMutex::new(local),
-        participants: TokioMutex::new(participants),
         own_identity,
     }))
 }
@@ -307,7 +305,6 @@ pub struct MediaSession {
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
     tiles: TokioMutex<watch::Receiver<matrix_rtc_media::TileRoster>>,
     local: TokioMutex<watch::Receiver<Option<matrix_rtc_media::LocalState>>>,
-    participants: TokioMutex<watch::Receiver<Vec<matrix_rtc_media::Participant>>>,
     own_identity: String,
 }
 
@@ -319,12 +316,12 @@ impl MediaSession {
     ///
     /// Events are one-shots and diagnostics: joins and leaves, streams
     /// starting and stopping, key and encryption reports, the connection
-    /// degrading, the call ending. **State lives elsewhere**: who is in the
-    /// call and what they publish is [`Self::next_participants`], what to
-    /// draw is [`Self::next_roster`], and both are latest-value pushes. So a
-    /// consumer that falls very far behind (the buffer holds 256) can lose a
-    /// sound cue or a badge update, never the roster. Who is speaking is not
-    /// an event at all: it is [`FfiCallTile::speaking`].
+    /// degrading, the call ending. **State lives elsewhere**: what to draw,
+    /// and whose audio to play, is [`Self::next_roster`] — a latest-value push
+    /// whose order is every tile in the call. So a consumer that falls very
+    /// far behind (the buffer holds 256) can lose a sound cue or a badge
+    /// update, never the roster. Who is speaking is not an event at all: it
+    /// is [`FfiCallTile::speaking`].
     pub async fn next_event(&self) -> Option<FfiCallEvent> {
         let mut events = self.events.lock().await;
         loop {
@@ -343,25 +340,12 @@ impl MediaSession {
         }
     }
 
-    /// The next participant roster. Suspends until it changes; `None` means
-    /// the session is over. Latest-value-wins, like [`Self::next_roster`]:
-    /// a consumer that falls behind gets the current roster, never a backlog,
-    /// so there is nothing to re-read after an event. Seed from
-    /// [`Self::participants`]. Contract C7, C11.
-    pub async fn next_participants(&self) -> Option<Vec<FfiParticipant>> {
-        let mut participants = self.participants.lock().await;
-        participants.changed().await.ok()?;
-        Some(
-            participants
-                .borrow_and_update()
-                .iter()
-                .cloned()
-                .map(Into::into)
-                .collect(),
-        )
-    }
-
-    /// The current participant roster (including ourselves).
+    /// The current participant roster, including ourselves: the transport's
+    /// un-joined view, one row per membership. A **diagnostics pull**, not a
+    /// live surface — it is the whole call every time, which is the cost the
+    /// tile roster's detail window exists to avoid. Read it once to seed what
+    /// the tiles do not carry yet (your own row before local state arrives),
+    /// and on demand for a readout. Contract C11.
     pub fn participants(&self) -> Vec<FfiParticipant> {
         self.engine
             .participants()

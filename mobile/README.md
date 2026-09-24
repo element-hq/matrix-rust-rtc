@@ -174,13 +174,16 @@ list to the tiles you compose — the detail window you gave `setDetailWindow`, 
 member's microphone — and call it once per second; at two hundred participants that is
 one call per sample instead of hundreds.
 
-Who is in the call and what they publish is **`nextParticipants()`**, a latest-value push
-like `nextRoster()`: pump it from one coroutine, seeded from `participants()`, and drive
-audio playback from it — a member with a microphone stream gets a player, a member
-without one loses it. Do not rebuild that from `StreamStarted`/`StreamStopped`: the
-event stream is for one-shots (joins and leaves, key reports, the call ending), and a
-consumer that lags more than 256 events loses some, which must never cost anyone their
-voice. Who is speaking is `FfiCallTile.speaking`; there is no event for it.
+Whose audio to play follows the tile roster too: every remote person tile in
+`nextRoster().order` is a candidate, so on each roster open `audioStream(memberId,
+MICROPHONE)` for candidates you have no player for — it returns `null` at once for a
+member with no microphone track, so the retries cost nothing — and stop the player of
+anyone who left the order. Do not rebuild that from `StreamStarted`/`StreamStopped`:
+the event stream is for one-shots (joins and leaves, key reports, the call ending), and
+a consumer that lags more than 256 events loses some, which must never cost anyone
+their voice. `participants()` is a diagnostics pull, the whole call every time; read it
+once for your own row and on demand, never per event. Who is speaking is
+`FfiCallTile.speaking`; there is no event for it.
 
 **`FfiCallEvent.FrameEncryptionState`** on the event stream names the cause when it is
 a key problem. `MissingKey` means frames carry a key index we hold nothing for (their
