@@ -91,7 +91,6 @@ impl From<matrix_rtc_media::Participant> for FfiParticipant {
     }
 }
 
-/// Why the call ended.
 /// Identity of one call tile: the pair `(member_id, kind)`. Stable for as
 /// long as the tile is in the call. Join [`FfiTileRoster::detail`] to
 /// [`FfiTileRoster::order`] by this, never by index. Contract C1.
@@ -271,6 +270,7 @@ impl From<FfiStabilityConfig> for matrix_rtc_media::StabilityConfig {
     }
 }
 
+/// Why the call ended.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiEndedReason {
     /// We left deliberately.
