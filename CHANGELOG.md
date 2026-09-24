@@ -16,6 +16,9 @@ log only.
 - A tile's kind is a `TileKind` — `Person` or `ScreenShare` — rather than a stream
   kind: `TileId.kind`, `CallTile.kind` and their `FfiTileKind` mirrors. The stream a
   tile draws is `TileKind::video_stream()`; a microphone is never a tile.
+- `MediaSession::next_participants()`: the participant roster as a latest-value
+  push, like `next_roster()`, so a host no longer re-reads `participants()` after
+  every event.
 - `MediaSession::receive_stats_for(streams)` (and `CallEngine::receive_stats_for`)
   reads receive counters for a set of `(member_id, kind)` in one call, awaiting
   the transports concurrently: one round trip per sample for a host that polls
@@ -24,6 +27,13 @@ log only.
 ### Breaking
 
 - MSC4354 sticky events now come from upstream matrix-rust-sdk and are always on with the `matrix-sdk` feature; the `experimental-sticky` feature, `STICKY_EVENTS_SUPPORTED` and `CallError::StickyEventsUnsupported` are gone.
+
+### Removed
+
+- `FfiCallEvent::ActiveSpeakers`. Who is speaking is `FfiCallTile::speaking`, damped
+  into the roster's order; the event was the noisiest thing on the stream and no
+  host drew from it. The event stream now carries one-shots and diagnostics only —
+  see `MediaSession::next_event`'s docs. wasm keeps its own `active_speakers`.
 
 ## v0.3.0-rc.2 - 2026-09-22
 

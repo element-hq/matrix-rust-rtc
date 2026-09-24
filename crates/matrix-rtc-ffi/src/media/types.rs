@@ -339,14 +339,6 @@ impl From<matrix_rtc_media::FrameEncryptionDiagnostic> for FfiFrameEncryptionDia
     }
 }
 
-/// One speaking member and how loud they are.
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct FfiSpeakingMember {
-    pub member_id: String,
-    /// `0.0` (silent) to `1.0` (loudest); `0.0` from transports reporting none.
-    pub level: f32,
-}
-
 /// Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
 ///
 /// Typed rather than a message so a host can act on it: `NotCrossSigned` is a
@@ -549,12 +541,6 @@ pub enum FfiCallEvent {
         member_id: String,
         kind: FfiStreamKind,
     },
-    ActiveSpeakers {
-        /// Who is speaking, each with their current audio level. The level rides
-        /// along because it comes from the same transport event — without it a
-        /// host has to meter the PCM itself to answer "how loud".
-        speakers: Vec<FfiSpeakingMember>,
-    },
     /// This participant's media is decryptable from here on.
     KeyImported {
         member_id: String,
@@ -647,15 +633,10 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                 member_id,
                 kind: kind.into(),
             },
-            Event::ActiveSpeakers { speakers } => Self::ActiveSpeakers {
-                speakers: speakers
-                    .into_iter()
-                    .map(|speaker| FfiSpeakingMember {
-                        member_id: speaker.member_id,
-                        level: speaker.level,
-                    })
-                    .collect(),
-            },
+            // Filtered out before it reaches a host, see `MediaSession::next_event`.
+            Event::ActiveSpeakers { .. } => {
+                unreachable!("ActiveSpeakers is ranked into the roster, never relayed")
+            }
             Event::KeyImported {
                 member_id,
                 key_index,
