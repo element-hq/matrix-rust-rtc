@@ -609,10 +609,14 @@ pub enum FfiCallEvent {
     },
 }
 
-impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
-    fn from(event: matrix_rtc_media::CallEvent) -> Self {
+impl FfiCallEvent {
+    /// The event as a host sees it, or `None` for one the FFI does not relay:
+    /// who is speaking is ranked into the roster (`FfiCallTile::speaking`) rather
+    /// than sent as an event — it was the noisiest thing on the stream and
+    /// nothing drew from it.
+    pub(super) fn relayed(event: matrix_rtc_media::CallEvent) -> Option<Self> {
         use matrix_rtc_media::CallEvent as Event;
-        match event {
+        Some(match event {
             Event::ParticipantJoined { member_id, user_id } => {
                 Self::ParticipantJoined { member_id, user_id }
             }
@@ -633,10 +637,7 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                 member_id,
                 kind: kind.into(),
             },
-            // Filtered out before it reaches a host, see `MediaSession::next_event`.
-            Event::ActiveSpeakers { .. } => {
-                unreachable!("ActiveSpeakers is ranked into the roster, never relayed")
-            }
+            Event::ActiveSpeakers { .. } => return None,
             Event::KeyImported {
                 member_id,
                 key_index,
@@ -695,7 +696,7 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                     }
                 },
             },
-        }
+        })
     }
 }
 

@@ -329,10 +329,11 @@ impl MediaSession {
         let mut events = self.events.lock().await;
         loop {
             match events.recv().await {
-                // Ranked into the roster, not relayed: at the SFU's cadence this
-                // was the noisiest event on the stream and nothing drew from it.
-                Ok(CallEvent::ActiveSpeakers { .. }) => continue,
-                Ok(event) => return Some(event.into()),
+                Ok(event) => {
+                    if let Some(event) = FfiCallEvent::relayed(event) {
+                        return Some(event);
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     log::warn!("call event consumer lagged; {missed} events dropped");
                     continue;
