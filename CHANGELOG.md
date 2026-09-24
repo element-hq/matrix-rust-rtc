@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- MSC4354 sticky events now come from upstream matrix-rust-sdk and are always on with the `matrix-sdk` feature; the `experimental-sticky` feature, `STICKY_EVENTS_SUPPORTED` and `CallError::StickyEventsUnsupported` are gone.
+
 ## v0.3.0-rc.2 - 2026-09-22
 
 ### Added

@@ -125,7 +125,8 @@ Two `CommandSenderCallback` methods are load-bearing here, and both are easy to
 implement in a way that looks right and silently breaks the call:
 
 - **`sendStickyEvent(..., durationMs)`** — pass `durationMs` through verbatim;
-  with matrix-rust-sdk that is `.with_sticky_duration_ms(durationMs)`.
+  with matrix-sdk-ffi that is
+  `Room.sendStickyRaw(eventType, content, durationMs)`.
   Substituting a value of your own breaks the refresh: shorter and the
   membership disappears mid-call, longer and a ghost membership outlives a
   crash.

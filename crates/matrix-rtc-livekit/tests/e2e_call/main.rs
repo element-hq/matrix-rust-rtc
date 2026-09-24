@@ -114,11 +114,6 @@ impl Config {
 }
 
 /// Which media topology a run exercises.
-///
-/// Without `experimental-sticky` only `LegacyStateEvents` has a test, so the
-/// other variants are constructed nowhere; that is the feature's doing, not
-/// dead code to remove.
-#[cfg_attr(not(feature = "experimental-sticky"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq)]
 enum RunMode {
     /// Both participants publish on the same focus (one SFU, one connection
@@ -191,10 +186,9 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
     Ok((alice, bob))
 }
 
-/// Log in and start the sync service. With `experimental-sticky` (which brings
-/// the SDK's `unstable-msc4354`), sliding sync auto-enables the sticky-events
-/// extension, so `m.rtc.member` stickies flow into the base room's sticky store
-/// (see `matrix_rtc_bridge::sdk`). Without it the sync still delivers the
+/// Log in and start the sync service. Sliding sync enables the sticky-events
+/// extension, so `m.rtc.member` stickies flow into the base room's sticky map
+/// (see `matrix_rtc_bridge::sdk`); it also delivers the
 /// `org.matrix.msc3401.call.member` room state the pre-sticky scenario reads.
 ///
 /// Cross-signing is bootstrapped at login: each user is freshly registered
@@ -394,25 +388,19 @@ async fn wait_for_key(call: &Call, peer_identity: &str, label: &str) -> bool {
     false
 }
 
-// The three spec-current scenarios carry membership as MSC4354 sticky events,
-// which only a build with `experimental-sticky` (and the fork SDK behind it) can
-// send or read; `Call::join` would refuse them anywhere else. See
-// `make test-e2e-sticky`.
-#[cfg(feature = "experimental-sticky")]
+// The three spec-current scenarios carry membership as MSC4354 sticky events.
 #[test]
 #[ignore = "requires the demo/backend docker stack (make backend-up)"]
 fn e2e_call_two_clients_audio() {
     harness(RunMode::SingleFocus);
 }
 
-#[cfg(feature = "experimental-sticky")]
 #[test]
 #[ignore = "requires the demo/backend docker stack (make backend-up)"]
 fn e2e_call_two_clients_two_foci() {
     harness(RunMode::TwoFoci);
 }
 
-#[cfg(feature = "experimental-sticky")]
 #[test]
 #[ignore = "requires the demo/backend docker stack (make backend-up)"]
 fn e2e_call_rejoin_in_the_same_process() {

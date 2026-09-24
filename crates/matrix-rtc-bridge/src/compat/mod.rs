@@ -73,8 +73,7 @@
 //! 2. `sdk::SdkCommandSender` — routes and rewrites outbound events.
 //! 3. `sdk::element_call_state_snapshot` — reads inbound state membership.
 //! 4. `sdk::run_membership_bridge` — the room-state wake source a state-carried
-//!    membership needs, and the only membership source in a build without
-//!    `experimental-sticky`.
+//!    membership needs.
 //!
 //! In `matrix-rtc-livekit`:
 //!

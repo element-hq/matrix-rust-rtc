@@ -22,7 +22,7 @@ registration).
 | Layer | What's exercised |
 | --- | --- |
 | **Room setup** | `alice` creates an **encrypted** room (`m.room.encryption`) with `shared` history visibility and invites `bob`; `bob` joins; both wait for the 2-member membership before any RTC signalling. |
-| **Signalling** | Each client publishes its own `m.rtc.member` membership as a sticky event (+ a dead-man's-switch delayed leave) and discovers the peer via `subscribe_to_sticky_events` → `RtcSessionManager`. Both peers join the room before RTC signalling. Success = each side sees 2 members. |
+| **Signalling** | Each client publishes its own `m.rtc.member` membership as a sticky event (+ a dead-man's-switch delayed leave) and discovers the peer via `sticky_events().subscribe()` → `RtcSessionManager`. Both peers join the room before RTC signalling. Success = each side sees 2 members. |
 | **Transport** | MSC4195 OpenID→JWT token exchange and SFU connect for both clients. |
 | **Encryption** | The core `EncryptionManager` generates a per-participant media key and distributes it to the peer as an Olm-encrypted `m.rtc.encryption_key` to-device message (`SdkCommandSender::send_to_device_message`). Each side imports received keys into its LiveKit `KeyProvider` (`MediaKeyBridge`), addressed by the MSC4195 pseudonymous identity. Success = `bob` imported `alice`'s key. |
 | **Media** | 440 Hz tone published by `alice`, **GCM frame-encrypted** at the SFU, decrypted and recorded by `bob`, verified with a Goertzel filter (`media::detect_tone > 0.5`). A WAV is written to `target/e2e/received-<label>.wav` — inside the repo, not the system temp dir — and uploaded as a CI artifact on failure. A scenario that records twice (the redial) keeps both files. The tone only decodes because the keys were exchanged and mapped correctly. |
@@ -36,10 +36,10 @@ join/leave facade, so the test exercises exactly what a consumer would use.
 Inside `Call::join`:
 
 ```
-matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext auto-on with experimental-sticky)
+matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext auto-on)
         │                              │
         │                              ▼
-        │            room.subscribe_to_sticky_events()   [experimental-sticky only]
+        │            room.sticky_events().subscribe()
         │            room.subscribe_to_updates() + 30s poll  [pre-sticky state mode]
         │                              │  run_membership_bridge (bridge: src/sdk.rs)
         ▼                              ▼
@@ -72,17 +72,8 @@ make backend-up
 ## Dependency caveat (important)
 
 The workspace depends on **upstream `matrix-org/matrix-rust-sdk`** (rev in the
-root `Cargo.toml`), which has no MSC4354 sticky events. Against it only the
-pre-sticky scenario (`e2e_call_two_clients_pre_sticky_element_call`, membership
-as room state) exists; the three sticky scenarios are compiled out.
-
-The sticky scenarios need the `experimental-sticky` feature and the SDK fork
-that implements MSC4354 (`BillCarsonFr/matrix-rust-sdk`), selected by the
-`.cargo/experimental-sticky.toml` overlay — `scripts/cargo-sticky.sh` applies
-it, builds in `target/sticky`, and keeps the fork's lockfile in
-`Cargo.sticky.lock` so the committed `Cargo.lock` stays the upstream one. The
-SDK's own `unstable-msc4354` feature is passed on the command line, because a
-cargo feature cannot forward to a feature the upstream dependency lacks.
+root `Cargo.toml`) with its `unstable-msc4354` feature, which our `matrix-sdk`
+feature turns on.
 
 Member events go through `matrix_rtc_core::RawStickyEventContent` and
 `m.rtc.encryption_key` to-device messages through a raw handler in `call.rs`,
@@ -97,12 +88,8 @@ propagate a git dep's patches to the consumer).
 First build is long (it compiles `matrix-sdk` + native `libwebrtc`).
 
 ```sh
-# upstream SDK: the pre-sticky scenario
-cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
-
-# fork SDK: the whole suite (or `make test-e2e-sticky`)
-./scripts/cargo-sticky.sh test -p matrix-rtc-livekit \
-  --features matrix-sdk,testing,experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354 \
+# the whole suite (or `make test-e2e`)
+cargo test -p matrix-rtc-livekit --features matrix-sdk,testing \
   --test e2e_call -- --ignored --nocapture --test-threads=1
 ```
 

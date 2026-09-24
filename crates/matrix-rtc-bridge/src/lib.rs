@@ -34,14 +34,6 @@
 //! was split out of the LiveKit transport, where every one of them was trapped
 //! behind a `libwebrtc` build.
 //!
-//! # Why sticky events are a second feature
-//!
-//! `matrix-sdk` alone builds against upstream matrix-rust-sdk, which has no
-//! MSC4354 support, so that build carries membership as room state only
-//! ([`ElementCallCompat::StateEvents`]). `experimental-sticky` adds the
-//! spec-current sticky carrier and needs the fork SDK that implements it; see
-//! [`STICKY_EVENTS_SUPPORTED`] and the crate manifest.
-//!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
 use async_trait::async_trait;
@@ -55,8 +47,8 @@ pub mod sdk;
 
 #[cfg(feature = "matrix-sdk")]
 pub use sdk::{
-    STICKY_EVENTS_SUPPORTED, SdkCommandSender, TimelineIngest, register_timeline_receiver,
-    run_membership_bridge, run_timeline_bridge, timeline_ingest_from_raw,
+    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_membership_bridge,
+    run_timeline_bridge, timeline_ingest_from_raw,
 };
 
 pub use compat::{
