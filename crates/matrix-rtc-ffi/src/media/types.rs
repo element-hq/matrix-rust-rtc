@@ -613,7 +613,9 @@ impl FfiCallEvent {
     /// The event as a host sees it, or `None` for one the FFI does not relay:
     /// who is speaking is ranked into the roster (`FfiCallTile::speaking`) rather
     /// than sent as an event — it was the noisiest thing on the stream and
-    /// nothing drew from it.
+    /// nothing drew from it. `CallEvent::ActiveSpeakers` itself survives in the
+    /// core only because the wasm binding still relays it to a web client that
+    /// has no tile roster; once the roster is exposed to wasm, delete the event.
     pub(super) fn relayed(event: matrix_rtc_media::CallEvent) -> Option<Self> {
         use matrix_rtc_media::CallEvent as Event;
         Some(match event {
