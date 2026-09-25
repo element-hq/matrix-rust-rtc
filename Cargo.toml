@@ -21,7 +21,7 @@ resolver = "2"
 # livekit and bridge crates could not be published anyway — they pin matrix-sdk
 # by git rev, which the registry rejects.
 [workspace.package]
-version = "0.3.0-rc.2"
+version = "0.4.0-rc.1"
 edition = "2024"
 license = "AGPL-3.0-only OR LicenseRef-Element-Commercial"
 

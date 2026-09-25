@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.4.0-rc.1 - 2026-09-25
+
 ### Added
 
 - The call tile roster: `MediaSession::next_roster()` / `next_local_state()`
