@@ -161,8 +161,8 @@ deliberate: it is what users actually get, and it removes any Element
 Web/Element Call version skew from the test.
 
 `docker-compose.interop.yml` pins an Element Web release, and the Element Call
-under test is the one that release bundles — `v1.12.25` ships
-`@element-hq/element-call-embedded` 0.22.0. Which version a release bundles is
+under test is the one that release bundles — `v1.12.30-rc.1` ships
+`@element-hq/element-call-embedded` 0.26.0. Which version a release bundles is
 in `apps/web/package.json` of the [element-web
 repo](https://github.com/element-hq/element-web) at that tag.
 
