@@ -23,12 +23,17 @@
 //! 6. `alice` publishes a 440 Hz tone and `bob` records what the SFU forwards
 //!    and verifies the frequency.
 //!
-//! Three scenarios share this flow: `e2e_call_two_clients_audio` (both on one
-//! SFU, verified over the raw LiveKit event stream), `e2e_call_two_clients_two_foci`
-//! (each participant on their own SFU — MSC4195 multi-SFU — with tones in both
-//! directions verified through the transport-agnostic media API), and
-//! `e2e_call_rejoin_in_the_same_process` (one peer hangs up and calls again
-//! while the other stays, so the incumbent has to re-key the new participation).
+//! Two independent axes, every combination a test named
+//! `e2e_call_<scenario>_<compat>`:
+//!
+//! - [`Scenario`] — the media topology: both on one SFU (`single_focus`),
+//!   each on their own (`two_foci`, MSC4195 multi-SFU), or one peer redialling
+//!   while the other stays (`rejoin`).
+//! - [`ElementCallCompat`] — the wire dialect both peers speak: spec-current
+//!   (`off`), the 2025 sticky dialect (`sticky_events`), or pre-sticky room
+//!   state (`state_events`). In `state_events` step 4 is skipped (that
+//!   generation has no slot concept) and membership is
+//!   `org.matrix.msc3401.call.member` room state rather than a sticky event.
 //!
 //! Runs against the `demo/backend` stack (see its README) with no further
 //! configuration — every endpoint defaults to the stack's localhost ports and
@@ -80,7 +85,7 @@ struct SyncedClient {
 }
 
 /// A participant on a live call. The sync service is kept alive alongside the
-/// call (dropping it stops the sticky/key traffic the call depends on).
+/// call (dropping it stops the membership/key traffic the call depends on).
 struct Participant {
     call: Call,
     _sync: SyncService,
@@ -115,7 +120,7 @@ impl Config {
 
 /// Which media topology a run exercises.
 #[derive(Clone, Copy, PartialEq)]
-enum RunMode {
+enum Scenario {
     /// Both participants publish on the same focus (one SFU, one connection
     /// each). Media is verified through the raw LiveKit event stream.
     SingleFocus,
@@ -145,20 +150,6 @@ enum RunMode {
     /// (matrix-rtc-core) and `a_rejoin_distributes_keys_without_new_sticky_events`
     /// (matrix-rtc-ffi).
     RejoinSameProcess,
-    /// Single focus, but both participants speak the **pre-sticky Element Call**
-    /// dialect: membership as `org.matrix.msc3401.call.member` room state, plain
-    /// `{user}:{device}` SFU identities, and the `/sfu/get` token endpoint.
-    ///
-    /// The highest-value check of that path available without an actual Element
-    /// Call, because in this mode both halves of the protocol are ours: it
-    /// exercises the state-event write, the delayed *state* event and its
-    /// cancellation, the `{}` leave, the unhashed identity end to end through
-    /// frame decryption, and the legacy key exchange.
-    ///
-    /// Note no slot is opened: that generation has no slot concept, so the bridge
-    /// leaves the condition unenforced rather than reporting an empty (all-closed)
-    /// room. See `matrix_rtc_livekit::compat`.
-    LegacyStateEvents,
 }
 
 /// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
@@ -189,7 +180,8 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
 /// Log in and start the sync service. Sliding sync enables the sticky-events
 /// extension, so `m.rtc.member` stickies flow into the base room's sticky map
 /// (see `matrix_rtc_bridge::sdk`); it also delivers the
-/// `org.matrix.msc3401.call.member` room state the pre-sticky scenario reads.
+/// `org.matrix.msc3401.call.member` room state the `state_events` compat mode
+/// reads.
 ///
 /// Cross-signing is bootstrapped at login: each user is freshly registered
 /// with a single device, so that device self-signs and the MSC4153
@@ -358,14 +350,14 @@ async fn wait_for_members(call: &Call, target: usize, label: &str) -> bool {
     for _ in 0..60 {
         last_count = call.member_count().await;
         if last_count >= target {
-            println!("[{label}] sees {last_count} members (sticky round-trip OK)");
+            println!("[{label}] sees {last_count} members (membership round-trip OK)");
             return true;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     // The count separates failure modes: 0 = the slot/room-state projection
     // dropped everyone (even ourselves); 1 = own membership round-tripped but
-    // the peer's sticky never arrived.
+    // the peer's never arrived.
     println!("[{label}] WARNING: observed {last_count} of {target} members within 30s");
     false
 }
@@ -388,30 +380,27 @@ async fn wait_for_key(call: &Call, peer_identity: &str, label: &str) -> bool {
     false
 }
 
-// The three spec-current scenarios carry membership as MSC4354 sticky events.
-#[test]
-#[ignore = "requires the demo/backend docker stack (make backend-up)"]
-fn e2e_call_two_clients_audio() {
-    harness(RunMode::SingleFocus);
+/// One `#[test]` per (scenario, compat) pair.
+macro_rules! e2e_tests {
+    ($($name:ident => ($scenario:ident, $compat:ident),)*) => {$(
+        #[test]
+        #[ignore = "requires the demo/backend docker stack (make backend-up)"]
+        fn $name() {
+            harness(Scenario::$scenario, ElementCallCompat::$compat);
+        }
+    )*};
 }
 
-#[test]
-#[ignore = "requires the demo/backend docker stack (make backend-up)"]
-fn e2e_call_two_clients_two_foci() {
-    harness(RunMode::TwoFoci);
-}
-
-#[test]
-#[ignore = "requires the demo/backend docker stack (make backend-up)"]
-fn e2e_call_rejoin_in_the_same_process() {
-    harness(RunMode::RejoinSameProcess);
-}
-
-// The one scenario the upstream SDK can run: membership as room state.
-#[test]
-#[ignore = "requires the demo/backend docker stack (make backend-up)"]
-fn e2e_call_two_clients_pre_sticky_element_call() {
-    harness(RunMode::LegacyStateEvents);
+e2e_tests! {
+    e2e_call_single_focus_off => (SingleFocus, Off),
+    e2e_call_single_focus_sticky_events => (SingleFocus, StickyEvents),
+    e2e_call_single_focus_state_events => (SingleFocus, StateEvents),
+    e2e_call_two_foci_off => (TwoFoci, Off),
+    e2e_call_two_foci_sticky_events => (TwoFoci, StickyEvents),
+    e2e_call_two_foci_state_events => (TwoFoci, StateEvents),
+    e2e_call_rejoin_off => (RejoinSameProcess, Off),
+    e2e_call_rejoin_sticky_events => (RejoinSameProcess, StickyEvents),
+    e2e_call_rejoin_state_events => (RejoinSameProcess, StateEvents),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -429,7 +418,7 @@ fn init_test_process() {
         .try_init();
 }
 
-fn harness(mode: RunMode) {
+fn harness(scenario: Scenario, compat: ElementCallCompat) {
     init_test_process();
     let cfg = Config::from_env();
 
@@ -439,10 +428,9 @@ fn harness(mode: RunMode) {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    let outcome = runtime.block_on(
-        tokio::task::LocalSet::new()
-            .run_until(async { tokio::time::timeout(OVERALL_DEADLINE, run(cfg, mode)).await }),
-    );
+    let outcome = runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+        tokio::time::timeout(OVERALL_DEADLINE, run(cfg, scenario, compat)).await
+    }));
 
     match outcome {
         Err(_) => panic!("e2e call did not finish within {OVERALL_DEADLINE:?}"),
@@ -451,7 +439,11 @@ fn harness(mode: RunMode) {
     }
 }
 
-async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
+async fn run(
+    cfg: Config,
+    scenario: Scenario,
+    compat: ElementCallCompat,
+) -> Result<(), Box<dyn Error>> {
     let (alice_creds, bob_creds) = credentials(&cfg).await?;
 
     // 1. Both clients log in and sync.
@@ -471,11 +463,6 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     println!("[bob] joined room {room_id}");
     wait_for_joined_members(&alice_room, 2, "alice").await?;
     wait_for_joined_members(&bob_room, 2, "bob").await?;
-
-    let compat = match mode {
-        RunMode::LegacyStateEvents => ElementCallCompat::StateEvents,
-        _ => ElementCallCompat::Off,
-    };
 
     // 4. Alice (the room creator, so the only one with the power level for it)
     //    opens the slot. Without an open `m.rtc.slot` in room state, MSC4143
@@ -500,15 +487,13 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
         println!("[alice] opened slot {}", cfg.slot_id);
     }
 
-    // 5. Now both join the call (membership stickies + key exchange + SFU
+    // 5. Now both join the call (membership + key exchange + SFU
     //    connect, all through the facade). In two-foci mode each participant
     //    publishes on their own SFU; the engines then cross-connect to the
     //    peer's focus for subscribing (MSC4195 multi-SFU).
-    let bob_url = match mode {
-        RunMode::SingleFocus | RunMode::RejoinSameProcess | RunMode::LegacyStateEvents => {
-            cfg.livekit_service_url.clone()
-        }
-        RunMode::TwoFoci => cfg.livekit_service_url_2.clone(),
+    let bob_url = match scenario {
+        Scenario::SingleFocus | Scenario::RejoinSameProcess => cfg.livekit_service_url.clone(),
+        Scenario::TwoFoci => cfg.livekit_service_url_2.clone(),
     };
     let alice_url = cfg.livekit_service_url.clone();
     // Kept so bob can redial on the same room handle after hanging up.
@@ -524,8 +509,8 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     .await?;
     let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_url, compat).await?;
 
-    // Signalling proof: each side discovers the other's membership
-    // via stickies (own + peer == 2).
+    // Signalling proof: each side discovers the other's membership, over
+    // whichever carrier the compat mode uses (own + peer == 2).
     let alice_sees = wait_for_members(&alice.call, 2, "alice").await;
     let bob_sees = wait_for_members(&bob.call, 2, "bob").await;
 
@@ -542,14 +527,14 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     // scenario's tone.
     let mut _bob_tone = None;
     let mut _alice_video = None;
-    let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match mode {
-        RunMode::SingleFocus | RunMode::RejoinSameProcess | RunMode::LegacyStateEvents => (
+    let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match scenario {
+        Scenario::SingleFocus | Scenario::RejoinSameProcess => (
             record_and_verify_tone(&mut bob.call, "first-call").await?,
             true,
             true,
             true,
         ),
-        RunMode::TwoFoci => {
+        Scenario::TwoFoci => {
             println!("[bob] publishing 660 Hz tone");
             _bob_tone = Some(media::publish_tone(bob.call.session(), 660.0).await?);
             let bob_hears = record_peer_tone(&bob.call, "bob", 440.0).await?;
@@ -588,7 +573,7 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     // core is the long-lived one across this transition: it retires the key bob's
     // first participation held and must hand his new one a key it can decrypt the
     // next frame with, on a frame cryptor that starts empty.
-    let (rejoin_tone_ok, rejoin_key_ok) = if mode == RunMode::RejoinSameProcess {
+    let (rejoin_tone_ok, rejoin_key_ok) = if scenario == Scenario::RejoinSameProcess {
         let Participant {
             call: first_call,
             _sync,
@@ -646,17 +631,18 @@ async fn run(cfg: Config, mode: RunMode) -> Result<(), Box<dyn Error>> {
     }
 
     println!("\n=== RESULT ===");
-    println!("sticky membership discovered by alice: {alice_sees}");
-    println!("sticky membership discovered by bob:   {bob_sees}");
+    println!("compat mode:                            {compat:?}");
+    println!("membership discovered by alice:         {alice_sees}");
+    println!("membership discovered by bob:           {bob_sees}");
     println!("alice's media key received by bob:      {alice_key_seen_by_bob}");
     println!("tone alice->bob received + verified:    {tone_ok}");
     println!("raised hand + reaction alice->bob:      {reactions_ok}");
-    if mode == RunMode::TwoFoci {
+    if scenario == Scenario::TwoFoci {
         println!("tone bob->alice received + verified:    {reverse_tone_ok}");
         println!("video pattern alice->bob verified:      {video_ok}");
         println!("constraints pause/resume verified:      {constraints_ok}");
     }
-    if mode == RunMode::RejoinSameProcess {
+    if scenario == Scenario::RejoinSameProcess {
         println!("alice's key received on bob's redial:   {rejoin_key_ok}");
         println!("tone alice->bob on bob's redial:        {rejoin_tone_ok}");
     }
