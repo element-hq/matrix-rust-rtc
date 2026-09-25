@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Fixed
+
+- A closed slot is noticed as soon as its `m.rtc.slot` event syncs, not at the next membership refresh up to 30 minutes later.
+
 ### Breaking
 
 - MSC4354 sticky events now come from upstream matrix-rust-sdk and are always on with the `matrix-sdk` feature; the `experimental-sticky` feature, `STICKY_EVENTS_SUPPORTED` and `CallError::StickyEventsUnsupported` are gone.

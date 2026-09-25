@@ -598,12 +598,9 @@ What the core does model is the *intent*, via `TransportIntent`:
 
 Still outstanding:
 
-1. **Prompt reaction to slot changes** — the Matrix bridge re-reads room state
-   on sticky-event ticks, so a slot closing in an otherwise idle room is noticed
-   late. A room-state subscription would fix it.
-2. **Mid-session renegotiation** — a slot that changes its encryption mechanism
+1. **Mid-session renegotiation** — a slot that changes its encryption mechanism
    while a session is live keeps the mechanism negotiated at join.
-3. **Slot state comes from a server fetch, not the store** — sliding sync only
+2. **Slot state comes from a server fetch, not the store** — sliding sync only
    delivers state types listed in `required_state`, and the SDK's room-list
    defaults do not include the MSC4143 slot type, so the local store reports
    every room as slotless (which the core reads as "slot closed, everyone
@@ -611,12 +608,12 @@ Still outstanding:
    and skips the update when the fetch fails. The real fix is adding the slot
    type to the SDK's sliding sync `required_state`, then reverting
    `slot_snapshot` to the state store.
-4. **A unified `CallEvent` stream on the `Call` facade** — landed as
+3. **A unified `CallEvent` stream on the `Call` facade** — landed as
    `matrix-rtc-media::CallEvent` via `Call::subscribe_call_events` (peer
    joined/left, stream started/stopped, key imported, connection health,
    ended-with-reason). Remaining: migrate the e2e test and examples off the
    raw `Call::events`/`Call::session` accessors and delete them, and surface
-   slot-close (item 1) as `CallEvent::Ended`.
+   slot-close as `CallEvent::Ended`.
 
 ## Logging
 
