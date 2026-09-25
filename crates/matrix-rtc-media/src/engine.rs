@@ -40,7 +40,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::{DiscardedKey, JoinedMembership, RaisedHand, ReceivedReaction};
+use matrix_rtc_core::{
+    DiscardedKey, JoinedMembership, LeaveCode, LeaveReason, RaisedHand, ReceivedReaction,
+};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::constraints::MediaConstraints;
@@ -209,6 +211,7 @@ enum ActorMessage {
     },
     /// Close every pooled connection and stop.
     Shutdown {
+        reason: EndedReason,
         ack: oneshot::Sender<()>,
     },
 }
@@ -221,6 +224,46 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    /// Ends the call when the core session leaves on its own, until then idle.
+    pub async fn end_on_auto_leave(
+        self,
+        mut auto_leaves: broadcast::Receiver<LeaveReason>,
+        own_connection: Box<dyn TransportConnection>,
+    ) {
+        use tokio::sync::broadcast::error::RecvError;
+        let reason = loop {
+            match auto_leaves.recv().await {
+                Ok(reason) => break reason,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return,
+            }
+        };
+        let ended = match reason.code {
+            LeaveCode::SlotClosed => EndedReason::SlotClosed,
+            _ => EndedReason::Left,
+        };
+        log::info!(
+            "call: the session left on its own ({:?}); ending media",
+            reason.code
+        );
+        self.shutdown(ended).await;
+        if let Err(error) = own_connection.close().await {
+            log::warn!("call: own focus did not close cleanly after the session left: {error}");
+        }
+    }
+
+    /// [`CallEngine::shutdown`] with the given reason.
+    pub async fn shutdown(&self, reason: EndedReason) {
+        let (ack, done) = oneshot::channel();
+        if self
+            .messages
+            .send(ActorMessage::Shutdown { reason, ack })
+            .is_ok()
+        {
+            let _ = done.await;
+        }
+    }
+
     /// See [`CallEngine::notify_key_imported`]. No-op once the engine is gone.
     pub fn notify_key_imported(&self, identity: impl Into<String>, key_index: u8) {
         let _ = self.messages.send(ActorMessage::KeyImported {
@@ -495,10 +538,7 @@ impl CallEngine {
     /// caller of [`CallEngine::adopt_own_connection`]) closes it and gets the
     /// result. Resolves once the engine has processed the shutdown.
     pub async fn shutdown(&self) {
-        let (ack, done) = oneshot::channel();
-        if self.messages.send(ActorMessage::Shutdown { ack }).is_ok() {
-            let _ = done.await;
-        }
+        self.handle().shutdown(EndedReason::Left).await;
     }
 }
 
@@ -680,8 +720,8 @@ impl Actor {
                     None => reactions = None,
                 },
                 message = messages.recv() => match message {
-                    Some(ActorMessage::Shutdown { ack }) => {
-                        self.end(EndedReason::Left);
+                    Some(ActorMessage::Shutdown { reason, ack }) => {
+                        self.end(reason);
                         let _ = ack.send(());
                         break;
                     }
@@ -944,7 +984,7 @@ impl Actor {
                 }
             }
             // Handled in the run loop (it must break).
-            ActorMessage::Shutdown { ack } => {
+            ActorMessage::Shutdown { ack, .. } => {
                 let _ = ack.send(());
             }
         }
@@ -3710,6 +3750,30 @@ mod tests {
             .send(ConnectionEvent::Reconnected)
             .unwrap();
         wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
+    }
+
+    /// The core leaving on its own (its slot closed) ends the call with the
+    /// matching reason and closes the own-focus connection too, which a plain
+    /// shutdown leaves to its owner.
+    #[tokio::test(start_paused = true)]
+    async fn an_auto_leave_ends_the_call_and_closes_the_own_connection() {
+        let mut fx = fixture();
+        let (own, _own_events) = fake_connection(&fx.state, OWN_FOCUS);
+        let (auto_leaves_tx, auto_leaves) = broadcast::channel(1);
+        let ending = tokio::spawn(fx.engine.handle().end_on_auto_leave(auto_leaves, own));
+
+        auto_leaves_tx
+            .send(LeaveReason::new(LeaveCode::SlotClosed))
+            .unwrap();
+        ending.await.unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::Ended {
+                reason: EndedReason::SlotClosed,
+            }
+        );
+        assert!(closed(&fx, OWN_FOCUS));
     }
 
     #[tokio::test(start_paused = true)]

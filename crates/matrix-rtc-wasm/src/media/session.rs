@@ -685,6 +685,7 @@ impl From<CallEvent> for WasmCallEvent {
             CallEvent::Ended { reason } => Self::Ended {
                 reason: match reason {
                     EndedReason::Left => "left".to_owned(),
+                    EndedReason::SlotClosed => "slot_closed".to_owned(),
                     EndedReason::ConnectionClosed { message } => message,
                 },
             },

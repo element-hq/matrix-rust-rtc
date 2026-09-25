@@ -94,6 +94,8 @@ impl From<matrix_rtc_media::Participant> for FfiParticipant {
 pub enum FfiEndedReason {
     /// We left deliberately.
     Left,
+    /// The slot was closed.
+    SlotClosed,
     /// The connection to our own focus closed and will not be
     /// re-established.
     ConnectionClosed { message: String },
@@ -480,6 +482,7 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
             Event::Ended { reason } => Self::Ended {
                 reason: match reason {
                     matrix_rtc_media::EndedReason::Left => FfiEndedReason::Left,
+                    matrix_rtc_media::EndedReason::SlotClosed => FfiEndedReason::SlotClosed,
                     matrix_rtc_media::EndedReason::ConnectionClosed { message } => {
                         FfiEndedReason::ConnectionClosed { message }
                     }

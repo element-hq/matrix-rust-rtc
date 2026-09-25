@@ -90,6 +90,8 @@ pub struct SpeakingMember {
 pub enum EndedReason {
     /// We left the call deliberately.
     Left,
+    /// The slot was closed.
+    SlotClosed,
     /// The connection to our own focus (the one we publish on) closed and
     /// will not be re-established. Peer-focus connections closing do not end
     /// the call — they reconnect.
