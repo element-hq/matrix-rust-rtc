@@ -486,22 +486,6 @@ fileprivate struct FfiConverterInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterFloat: FfiConverterPrimitive {
-    typealias FfiType = Float
-    typealias SwiftType = Float
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Float {
-        return try lift(readFloat(&buf))
-    }
-
-    public static func write(_ value: Float, into buf: inout [UInt8]) {
-        writeFloat(&buf, lower(value))
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
     typealias FfiType = Double
     typealias SwiftType = Double
@@ -801,19 +785,11 @@ public protocol CommandSenderCallback: AnyObject, Sendable {
      * send it verbatim, it is already translated for you
      * * `content_json` - The event content as a JSON string
      * * `duration_ms` - How long the homeserver should keep this entry in the
-     * sticky map. Pass it through verbatim (matrix-rust-sdk:
-     * `.with_sticky_duration_ms(durationMs)`); do NOT substitute a value of
-     * your own. The SDK re-sends the membership before this elapses to stay
-     * in the call, so a shorter lifetime here silently drops the membership
-     * mid-call and a longer one leaves a ghost behind.
-     *
-     * It is a `u64` here and a `u32` in matrix-rust-sdk's
-     * `withStickyDurationMs`, so the value narrows on the way down. Clamp
-     * rather than truncate: a bare cast turns an over-large duration into a
-     * near-instant expiry, which reads as the membership vanishing for no
-     * reason. The SDK clamps its own resolved value to one hour
-     * (`MAX_STICKY_DURATION_MS`) before it ever reaches you, so in practice
-     * the value always fits — the clamp is for hosts that pass their own.
+     * sticky map. Pass it through verbatim (matrix-sdk-ffi:
+     * `Room.sendStickyRaw(eventType, content, durationMs)`); do NOT
+     * substitute a value of your own. The SDK re-sends the membership before
+     * this elapses to stay in the call, so a shorter lifetime here silently
+     * drops the membership mid-call and a longer one leaves a ghost behind.
      *
      * # Returns
      * The event id the homeserver assigned — matrix-rust-sdk: the `eventId` on
@@ -1092,19 +1068,11 @@ open class CommandSenderCallbackImpl: CommandSenderCallback, @unchecked Sendable
      * send it verbatim, it is already translated for you
      * * `content_json` - The event content as a JSON string
      * * `duration_ms` - How long the homeserver should keep this entry in the
-     * sticky map. Pass it through verbatim (matrix-rust-sdk:
-     * `.with_sticky_duration_ms(durationMs)`); do NOT substitute a value of
-     * your own. The SDK re-sends the membership before this elapses to stay
-     * in the call, so a shorter lifetime here silently drops the membership
-     * mid-call and a longer one leaves a ghost behind.
-     *
-     * It is a `u64` here and a `u32` in matrix-rust-sdk's
-     * `withStickyDurationMs`, so the value narrows on the way down. Clamp
-     * rather than truncate: a bare cast turns an over-large duration into a
-     * near-instant expiry, which reads as the membership vanishing for no
-     * reason. The SDK clamps its own resolved value to one hour
-     * (`MAX_STICKY_DURATION_MS`) before it ever reaches you, so in practice
-     * the value always fits — the clamp is for hosts that pass their own.
+     * sticky map. Pass it through verbatim (matrix-sdk-ffi:
+     * `Room.sendStickyRaw(eventType, content, durationMs)`); do NOT
+     * substitute a value of your own. The SDK re-sends the membership before
+     * this elapses to stay in the call, so a shorter lifetime here silently
+     * drops the membership mid-call and a longer one leaves a ghost behind.
      *
      * # Returns
      * The event id the homeserver assigned — matrix-rust-sdk: the `eventId` on
@@ -2172,17 +2140,49 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
     func localIdentity()  -> String
     
     /**
+     * Our own tile and screen-sharing flag now; `None` until our membership
+     * is on the roster.
+     */
+    func localState()  -> FfiLocalState?
+    
+    /**
      * The next event on the unified call stream. Suspends until one
      * arrives; `None` means the session is over. Bridge to a Kotlin `Flow`
      * or Swift `AsyncStream` by looping.
      *
-     * A consumer that falls very far behind may miss events (the internal
-     * buffer holds 256); resynchronise from [`Self::participants`].
+     * Events are one-shots and diagnostics: joins and leaves, streams
+     * starting and stopping, key and encryption reports, the connection
+     * degrading, the call ending. **State lives elsewhere**: what to draw,
+     * and whose audio to play, is [`Self::next_roster`] — a latest-value push
+     * whose order is every tile in the call. So a consumer that falls very
+     * far behind (the buffer holds 256) can lose a sound cue or a badge
+     * update, never the roster. Who is speaking is not an event at all: it
+     * is [`FfiCallTile::speaking`].
      */
     func nextEvent() async  -> FfiCallEvent?
     
     /**
-     * The current participant roster (including ourselves).
+     * The next change to our own tile or screen-sharing flag. Suspends until
+     * one; skips the state before our membership is on the roster, so the
+     * first value is our first tile. `None` means the session is over.
+     */
+    func nextLocalState() async  -> FfiLocalState?
+    
+    /**
+     * The next tile roster. Suspends until it changes; `None` means the
+     * session is over. Latest-value-wins: a consumer that falls behind gets
+     * the current roster, never a backlog. The first call on a session that
+     * already has tiles returns at once. Contract C7.
+     */
+    func nextRoster() async  -> FfiTileRoster?
+    
+    /**
+     * The current participant roster, including ourselves: the transport's
+     * un-joined view, one row per membership. A **diagnostics pull**, not a
+     * live surface — it is the whole call every time, which is the cost the
+     * tile roster's detail window exists to avoid. Read it once to seed what
+     * the tiles do not carry yet (your own row before local state arrives),
+     * and on demand for a readout. Contract C11.
      */
     func participants()  -> [FfiParticipant]
     
@@ -2205,10 +2205,35 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
     func receiveStats(memberId: String, kind: FfiStreamKind) async  -> FfiReceiveStats?
     
     /**
+     * [`MediaSession::receive_stats`] for many streams in one round trip.
+     *
+     * One entry per requested stream, in request order; nothing is omitted
+     * and a duplicate is answered twice. Bound the request to the tiles you
+     * compose — the detail window of contract C12 is the right set, plus the
+     * microphone of each member in it — and call this once per sample rather
+     * than once per stream. The counters are the same cumulative totals as
+     * the single call; see [`FfiReceiveStats`].
+     */
+    func receiveStatsFor(streams: [FfiStreamRef]) async  -> [FfiStreamStats]
+    
+    /**
+     * The tile roster as it stands now.
+     */
+    func roster()  -> FfiTileRoster
+    
+    /**
      * Set the subscription constraints for one stream of one participant.
      * Debounced and re-applied automatically when the stream (re)appears.
      */
     func setConstraints(memberId: String, kind: FfiStreamKind, constraints: FfiMediaConstraints) 
+    
+    /**
+     * Declare which tiles get full records in [`FfiTileRoster::detail`]:
+     * ranks `[offset, offset + len)` plus `also`, wherever those rank — a
+     * tile shown full-screen, a picture-in-picture source. The default is
+     * everything. Declare what you compose, not what is visible. Contract C12.
+     */
+    func setDetailWindow(offset: UInt32, len: UInt32, also: [FfiTileId]) 
     
     /**
      * Mute or unmute one of our own publications.
@@ -2367,12 +2392,29 @@ open func localIdentity() -> String  {
 }
     
     /**
+     * Our own tile and screen-sharing flag now; `None` until our membership
+     * is on the roster.
+     */
+open func localState() -> FfiLocalState?  {
+    return try!  FfiConverterOptionTypeFfiLocalState.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_mediasession_local_state(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * The next event on the unified call stream. Suspends until one
      * arrives; `None` means the session is over. Bridge to a Kotlin `Flow`
      * or Swift `AsyncStream` by looping.
      *
-     * A consumer that falls very far behind may miss events (the internal
-     * buffer holds 256); resynchronise from [`Self::participants`].
+     * Events are one-shots and diagnostics: joins and leaves, streams
+     * starting and stopping, key and encryption reports, the connection
+     * degrading, the call ending. **State lives elsewhere**: what to draw,
+     * and whose audio to play, is [`Self::next_roster`] — a latest-value push
+     * whose order is every tile in the call. So a consumer that falls very
+     * far behind (the buffer holds 256) can lose a sound cue or a badge
+     * update, never the roster. Who is speaking is not an event at all: it
+     * is [`FfiCallTile::speaking`].
      */
 open func nextEvent()async  -> FfiCallEvent?  {
     return
@@ -2393,7 +2435,59 @@ open func nextEvent()async  -> FfiCallEvent?  {
 }
     
     /**
-     * The current participant roster (including ourselves).
+     * The next change to our own tile or screen-sharing flag. Suspends until
+     * one; skips the state before our membership is on the roster, so the
+     * first value is our first tile. `None` means the session is over.
+     */
+open func nextLocalState()async  -> FfiLocalState?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_mediasession_next_local_state(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeFfiLocalState.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * The next tile roster. Suspends until it changes; `None` means the
+     * session is over. Latest-value-wins: a consumer that falls behind gets
+     * the current roster, never a backlog. The first call on a session that
+     * already has tiles returns at once. Contract C7.
+     */
+open func nextRoster()async  -> FfiTileRoster?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_mediasession_next_roster(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeFfiTileRoster.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * The current participant roster, including ourselves: the transport's
+     * un-joined view, one row per membership. A **diagnostics pull**, not a
+     * live surface — it is the whole call every time, which is the cost the
+     * tile roster's detail window exists to avoid. Read it once to seed what
+     * the tiles do not carry yet (your own row before local state arrives),
+     * and on demand for a readout. Contract C11.
      */
 open func participants() -> [FfiParticipant]  {
     return try!  FfiConverterSequenceTypeFfiParticipant.lift(try! rustCall() {
@@ -2452,6 +2546,44 @@ open func receiveStats(memberId: String, kind: FfiStreamKind)async  -> FfiReceiv
 }
     
     /**
+     * [`MediaSession::receive_stats`] for many streams in one round trip.
+     *
+     * One entry per requested stream, in request order; nothing is omitted
+     * and a duplicate is answered twice. Bound the request to the tiles you
+     * compose — the detail window of contract C12 is the right set, plus the
+     * microphone of each member in it — and call this once per sample rather
+     * than once per stream. The counters are the same cumulative totals as
+     * the single call; see [`FfiReceiveStats`].
+     */
+open func receiveStatsFor(streams: [FfiStreamRef])async  -> [FfiStreamStats]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_mediasession_receive_stats_for(
+                    self.uniffiClonePointer(),
+                    FfiConverterSequenceTypeFfiStreamRef.lower(streams)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFfiStreamStats.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * The tile roster as it stands now.
+     */
+open func roster() -> FfiTileRoster  {
+    return try!  FfiConverterTypeFfiTileRoster_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_mediasession_roster(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Set the subscription constraints for one stream of one participant.
      * Debounced and re-applied automatically when the stream (re)appears.
      */
@@ -2460,6 +2592,21 @@ open func setConstraints(memberId: String, kind: FfiStreamKind, constraints: Ffi
         FfiConverterString.lower(memberId),
         FfiConverterTypeFfiStreamKind_lower(kind),
         FfiConverterTypeFfiMediaConstraints_lower(constraints),$0
+    )
+}
+}
+    
+    /**
+     * Declare which tiles get full records in [`FfiTileRoster::detail`]:
+     * ranks `[offset, offset + len)` plus `also`, wherever those rank — a
+     * tile shown full-screen, a picture-in-picture source. The default is
+     * everything. Declare what you compose, not what is visible. Contract C12.
+     */
+open func setDetailWindow(offset: UInt32, len: UInt32, also: [FfiTileId])  {try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_mediasession_set_detail_window(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(offset),
+        FfiConverterUInt32.lower(len),
+        FfiConverterSequenceTypeFfiTileId.lower(also),$0
     )
 }
 }
@@ -4966,6 +5113,154 @@ public func FfiConverterTypeFfiAudioSourceConfig_lower(_ value: FfiAudioSourceCo
 
 
 /**
+ * One renderable stream of one membership, with what a UI needs to place
+ * and decorate it. `microphone_muted` is the member's microphone; this
+ * tile's own stream state is `has_video`. Mirrors
+ * [`matrix_rtc_media::CallTile`], where every field is documented.
+ */
+public struct FfiCallTile {
+    public var memberId: String
+    public var kind: FfiTileKind
+    public var userId: String
+    public var deviceId: String?
+    public var hero: Bool
+    public var hasVideo: Bool
+    public var microphoneMuted: Bool
+    /**
+     * Speaking now, undamped: what a speaking ring means. Only the order is
+     * damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
+     */
+    public var speaking: Bool
+    public var handRaisedAtMs: UInt64?
+    public var reachable: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(memberId: String, kind: FfiTileKind, userId: String, deviceId: String?, hero: Bool, hasVideo: Bool, microphoneMuted: Bool, 
+        /**
+         * Speaking now, undamped: what a speaking ring means. Only the order is
+         * damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
+         */speaking: Bool, handRaisedAtMs: UInt64?, reachable: Bool) {
+        self.memberId = memberId
+        self.kind = kind
+        self.userId = userId
+        self.deviceId = deviceId
+        self.hero = hero
+        self.hasVideo = hasVideo
+        self.microphoneMuted = microphoneMuted
+        self.speaking = speaking
+        self.handRaisedAtMs = handRaisedAtMs
+        self.reachable = reachable
+    }
+}
+
+#if compiler(>=6)
+extension FfiCallTile: Sendable {}
+#endif
+
+
+extension FfiCallTile: Equatable, Hashable {
+    public static func ==(lhs: FfiCallTile, rhs: FfiCallTile) -> Bool {
+        if lhs.memberId != rhs.memberId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.deviceId != rhs.deviceId {
+            return false
+        }
+        if lhs.hero != rhs.hero {
+            return false
+        }
+        if lhs.hasVideo != rhs.hasVideo {
+            return false
+        }
+        if lhs.microphoneMuted != rhs.microphoneMuted {
+            return false
+        }
+        if lhs.speaking != rhs.speaking {
+            return false
+        }
+        if lhs.handRaisedAtMs != rhs.handRaisedAtMs {
+            return false
+        }
+        if lhs.reachable != rhs.reachable {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(memberId)
+        hasher.combine(kind)
+        hasher.combine(userId)
+        hasher.combine(deviceId)
+        hasher.combine(hero)
+        hasher.combine(hasVideo)
+        hasher.combine(microphoneMuted)
+        hasher.combine(speaking)
+        hasher.combine(handRaisedAtMs)
+        hasher.combine(reachable)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCallTile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCallTile {
+        return
+            try FfiCallTile(
+                memberId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeFfiTileKind.read(from: &buf), 
+                userId: FfiConverterString.read(from: &buf), 
+                deviceId: FfiConverterOptionString.read(from: &buf), 
+                hero: FfiConverterBool.read(from: &buf), 
+                hasVideo: FfiConverterBool.read(from: &buf), 
+                microphoneMuted: FfiConverterBool.read(from: &buf), 
+                speaking: FfiConverterBool.read(from: &buf), 
+                handRaisedAtMs: FfiConverterOptionUInt64.read(from: &buf), 
+                reachable: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiCallTile, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.memberId, into: &buf)
+        FfiConverterTypeFfiTileKind.write(value.kind, into: &buf)
+        FfiConverterString.write(value.userId, into: &buf)
+        FfiConverterOptionString.write(value.deviceId, into: &buf)
+        FfiConverterBool.write(value.hero, into: &buf)
+        FfiConverterBool.write(value.hasVideo, into: &buf)
+        FfiConverterBool.write(value.microphoneMuted, into: &buf)
+        FfiConverterBool.write(value.speaking, into: &buf)
+        FfiConverterOptionUInt64.write(value.handRaisedAtMs, into: &buf)
+        FfiConverterBool.write(value.reachable, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallTile_lift(_ buf: RustBuffer) throws -> FfiCallTile {
+    return try FfiConverterTypeFfiCallTile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallTile_lower(_ value: FfiCallTile) -> RustBuffer {
+    return FfiConverterTypeFfiCallTile.lower(value)
+}
+
+
+/**
  * FFI-friendly encryption configuration.
  */
 public struct FfiEncryptionConfig {
@@ -5569,6 +5864,81 @@ public func FfiConverterTypeFfiLeaveSessionParams_lift(_ buf: RustBuffer) throws
 #endif
 public func FfiConverterTypeFfiLeaveSessionParams_lower(_ value: FfiLeaveSessionParams) -> RustBuffer {
     return FfiConverterTypeFfiLeaveSessionParams.lower(value)
+}
+
+
+/**
+ * Our own tile, beside the roster and never in it, and whether we are
+ * sharing our screen — publication state (up and unmuted), not intent, so
+ * it goes false however the share ended. Contract C3, C8.
+ */
+public struct FfiLocalState {
+    public var tile: FfiCallTile
+    public var isScreenSharing: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(tile: FfiCallTile, isScreenSharing: Bool) {
+        self.tile = tile
+        self.isScreenSharing = isScreenSharing
+    }
+}
+
+#if compiler(>=6)
+extension FfiLocalState: Sendable {}
+#endif
+
+
+extension FfiLocalState: Equatable, Hashable {
+    public static func ==(lhs: FfiLocalState, rhs: FfiLocalState) -> Bool {
+        if lhs.tile != rhs.tile {
+            return false
+        }
+        if lhs.isScreenSharing != rhs.isScreenSharing {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(tile)
+        hasher.combine(isScreenSharing)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiLocalState: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiLocalState {
+        return
+            try FfiLocalState(
+                tile: FfiConverterTypeFfiCallTile.read(from: &buf), 
+                isScreenSharing: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiLocalState, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiCallTile.write(value.tile, into: &buf)
+        FfiConverterBool.write(value.isScreenSharing, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiLocalState_lift(_ buf: RustBuffer) throws -> FfiLocalState {
+    return try FfiConverterTypeFfiLocalState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiLocalState_lower(_ value: FfiLocalState) -> RustBuffer {
+    return FfiConverterTypeFfiLocalState.lower(value)
 }
 
 
@@ -6961,37 +7331,141 @@ public func FfiConverterTypeFfiRelationLookup_lower(_ value: FfiRelationLookup) 
 
 
 /**
- * One speaking member and how loud they are.
+ * How much the tile order is damped (R10, R11). A product decision rather
+ * than a protocol one, so a host can tune it; the defaults are what
+ * `matrix_rtc_media::StabilityConfig` uses.
  */
-public struct FfiSpeakingMember {
-    public var memberId: String
+public struct FfiStabilityConfig {
     /**
-     * `0.0` (silent) to `1.0` (loudest); `0.0` from transports reporting none.
+     * Sustained voice before a member ranks as speaking; the tile flag is not delayed.
      */
-    public var level: Float
+    public var promoteMs: UInt64
+    /**
+     * Silence before a speaking member stops ranking as one. Raising this above
+     * `promote_ms` leaves a tile at the top of the order after the speaker
+     * stopped, which reads as a stuck UI.
+     */
+    public var demoteMs: UInt64
+    /**
+     * Reorders inside this window are delivered as one.
+     */
+    public var coalesceMs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(memberId: String, 
+    public init(
         /**
-         * `0.0` (silent) to `1.0` (loudest); `0.0` from transports reporting none.
-         */level: Float) {
-        self.memberId = memberId
-        self.level = level
+         * Sustained voice before a member ranks as speaking; the tile flag is not delayed.
+         */promoteMs: UInt64 = UInt64(1500), 
+        /**
+         * Silence before a speaking member stops ranking as one. Raising this above
+         * `promote_ms` leaves a tile at the top of the order after the speaker
+         * stopped, which reads as a stuck UI.
+         */demoteMs: UInt64 = UInt64(1500), 
+        /**
+         * Reorders inside this window are delivered as one.
+         */coalesceMs: UInt64 = UInt64(300)) {
+        self.promoteMs = promoteMs
+        self.demoteMs = demoteMs
+        self.coalesceMs = coalesceMs
     }
 }
 
 #if compiler(>=6)
-extension FfiSpeakingMember: Sendable {}
+extension FfiStabilityConfig: Sendable {}
 #endif
 
 
-extension FfiSpeakingMember: Equatable, Hashable {
-    public static func ==(lhs: FfiSpeakingMember, rhs: FfiSpeakingMember) -> Bool {
+extension FfiStabilityConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiStabilityConfig, rhs: FfiStabilityConfig) -> Bool {
+        if lhs.promoteMs != rhs.promoteMs {
+            return false
+        }
+        if lhs.demoteMs != rhs.demoteMs {
+            return false
+        }
+        if lhs.coalesceMs != rhs.coalesceMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(promoteMs)
+        hasher.combine(demoteMs)
+        hasher.combine(coalesceMs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiStabilityConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStabilityConfig {
+        return
+            try FfiStabilityConfig(
+                promoteMs: FfiConverterUInt64.read(from: &buf), 
+                demoteMs: FfiConverterUInt64.read(from: &buf), 
+                coalesceMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiStabilityConfig, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.promoteMs, into: &buf)
+        FfiConverterUInt64.write(value.demoteMs, into: &buf)
+        FfiConverterUInt64.write(value.coalesceMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStabilityConfig_lift(_ buf: RustBuffer) throws -> FfiStabilityConfig {
+    return try FfiConverterTypeFfiStabilityConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStabilityConfig_lower(_ value: FfiStabilityConfig) -> RustBuffer {
+    return FfiConverterTypeFfiStabilityConfig.lower(value)
+}
+
+
+/**
+ * One of a participant's streams, named for a request: the pair
+ * `(member_id, kind)`, of any kind.
+ *
+ * Not [`FfiTileId`], on purpose: a tile is a *renderable* stream, camera or
+ * screen share (contract C1), and statistics are also wanted for the
+ * microphone. Build one from a tile with its `member_id` and `kind`.
+ */
+public struct FfiStreamRef {
+    public var memberId: String
+    public var kind: FfiStreamKind
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(memberId: String, kind: FfiStreamKind) {
+        self.memberId = memberId
+        self.kind = kind
+    }
+}
+
+#if compiler(>=6)
+extension FfiStreamRef: Sendable {}
+#endif
+
+
+extension FfiStreamRef: Equatable, Hashable {
+    public static func ==(lhs: FfiStreamRef, rhs: FfiStreamRef) -> Bool {
         if lhs.memberId != rhs.memberId {
             return false
         }
-        if lhs.level != rhs.level {
+        if lhs.kind != rhs.kind {
             return false
         }
         return true
@@ -6999,7 +7473,7 @@ extension FfiSpeakingMember: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(memberId)
-        hasher.combine(level)
+        hasher.combine(kind)
     }
 }
 
@@ -7008,18 +7482,18 @@ extension FfiSpeakingMember: Equatable, Hashable {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeFfiSpeakingMember: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSpeakingMember {
+public struct FfiConverterTypeFfiStreamRef: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStreamRef {
         return
-            try FfiSpeakingMember(
+            try FfiStreamRef(
                 memberId: FfiConverterString.read(from: &buf), 
-                level: FfiConverterFloat.read(from: &buf)
+                kind: FfiConverterTypeFfiStreamKind.read(from: &buf)
         )
     }
 
-    public static func write(_ value: FfiSpeakingMember, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiStreamRef, into buf: inout [UInt8]) {
         FfiConverterString.write(value.memberId, into: &buf)
-        FfiConverterFloat.write(value.level, into: &buf)
+        FfiConverterTypeFfiStreamKind.write(value.kind, into: &buf)
     }
 }
 
@@ -7027,15 +7501,15 @@ public struct FfiConverterTypeFfiSpeakingMember: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFfiSpeakingMember_lift(_ buf: RustBuffer) throws -> FfiSpeakingMember {
-    return try FfiConverterTypeFfiSpeakingMember.lift(buf)
+public func FfiConverterTypeFfiStreamRef_lift(_ buf: RustBuffer) throws -> FfiStreamRef {
+    return try FfiConverterTypeFfiStreamRef.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFfiSpeakingMember_lower(_ value: FfiSpeakingMember) -> RustBuffer {
-    return FfiConverterTypeFfiSpeakingMember.lower(value)
+public func FfiConverterTypeFfiStreamRef_lower(_ value: FfiStreamRef) -> RustBuffer {
+    return FfiConverterTypeFfiStreamRef.lower(value)
 }
 
 
@@ -7109,6 +7583,325 @@ public func FfiConverterTypeFfiStreamState_lift(_ buf: RustBuffer) throws -> Ffi
 #endif
 public func FfiConverterTypeFfiStreamState_lower(_ value: FfiStreamState) -> RustBuffer {
     return FfiConverterTypeFfiStreamState.lower(value)
+}
+
+
+/**
+ * One entry of [`MediaSession::receive_stats_for`](super::MediaSession::receive_stats_for)'s
+ * answer: the stream asked about and its counters. `stats` is `null`
+ * exactly when [`MediaSession::receive_stats`](super::MediaSession::receive_stats)
+ * would be — not subscribed, or no RTCP report yet — so a host can tell
+ * "asked, and nothing there" from a stream it never asked about.
+ */
+public struct FfiStreamStats {
+    public var memberId: String
+    public var kind: FfiStreamKind
+    public var stats: FfiReceiveStats?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(memberId: String, kind: FfiStreamKind, stats: FfiReceiveStats?) {
+        self.memberId = memberId
+        self.kind = kind
+        self.stats = stats
+    }
+}
+
+#if compiler(>=6)
+extension FfiStreamStats: Sendable {}
+#endif
+
+
+extension FfiStreamStats: Equatable, Hashable {
+    public static func ==(lhs: FfiStreamStats, rhs: FfiStreamStats) -> Bool {
+        if lhs.memberId != rhs.memberId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        if lhs.stats != rhs.stats {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(memberId)
+        hasher.combine(kind)
+        hasher.combine(stats)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiStreamStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiStreamStats {
+        return
+            try FfiStreamStats(
+                memberId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeFfiStreamKind.read(from: &buf), 
+                stats: FfiConverterOptionTypeFfiReceiveStats.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiStreamStats, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.memberId, into: &buf)
+        FfiConverterTypeFfiStreamKind.write(value.kind, into: &buf)
+        FfiConverterOptionTypeFfiReceiveStats.write(value.stats, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStreamStats_lift(_ buf: RustBuffer) throws -> FfiStreamStats {
+    return try FfiConverterTypeFfiStreamStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiStreamStats_lower(_ value: FfiStreamStats) -> RustBuffer {
+    return FfiConverterTypeFfiStreamStats.lower(value)
+}
+
+
+/**
+ * Identity of one call tile: the pair `(member_id, kind)`. Stable for as
+ * long as the tile is in the call. Join [`FfiTileRoster::detail`] to
+ * [`FfiTileRoster::order`] by this, never by index. Contract C1.
+ */
+public struct FfiTileId {
+    public var memberId: String
+    public var kind: FfiTileKind
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(memberId: String, kind: FfiTileKind) {
+        self.memberId = memberId
+        self.kind = kind
+    }
+}
+
+#if compiler(>=6)
+extension FfiTileId: Sendable {}
+#endif
+
+
+extension FfiTileId: Equatable, Hashable {
+    public static func ==(lhs: FfiTileId, rhs: FfiTileId) -> Bool {
+        if lhs.memberId != rhs.memberId {
+            return false
+        }
+        if lhs.kind != rhs.kind {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(memberId)
+        hasher.combine(kind)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTileId: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTileId {
+        return
+            try FfiTileId(
+                memberId: FfiConverterString.read(from: &buf), 
+                kind: FfiConverterTypeFfiTileKind.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTileId, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.memberId, into: &buf)
+        FfiConverterTypeFfiTileKind.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileId_lift(_ buf: RustBuffer) throws -> FfiTileId {
+    return try FfiConverterTypeFfiTileId.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileId_lower(_ value: FfiTileId) -> RustBuffer {
+    return FfiConverterTypeFfiTileId.lower(value)
+}
+
+
+/**
+ * A tile's place in the order: identity, whose tile it is, and whether it
+ * is a hero — enough to place it and to draw it as an avatar with a name,
+ * nothing about what the member is doing. One per tile in the call, always.
+ * Contract C2.
+ */
+public struct FfiTileRef {
+    public var id: FfiTileId
+    public var userId: String
+    public var hero: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(id: FfiTileId, userId: String, hero: Bool) {
+        self.id = id
+        self.userId = userId
+        self.hero = hero
+    }
+}
+
+#if compiler(>=6)
+extension FfiTileRef: Sendable {}
+#endif
+
+
+extension FfiTileRef: Equatable, Hashable {
+    public static func ==(lhs: FfiTileRef, rhs: FfiTileRef) -> Bool {
+        if lhs.id != rhs.id {
+            return false
+        }
+        if lhs.userId != rhs.userId {
+            return false
+        }
+        if lhs.hero != rhs.hero {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(userId)
+        hasher.combine(hero)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTileRef: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTileRef {
+        return
+            try FfiTileRef(
+                id: FfiConverterTypeFfiTileId.read(from: &buf), 
+                userId: FfiConverterString.read(from: &buf), 
+                hero: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTileRef, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiTileId.write(value.id, into: &buf)
+        FfiConverterString.write(value.userId, into: &buf)
+        FfiConverterBool.write(value.hero, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileRef_lift(_ buf: RustBuffer) throws -> FfiTileRef {
+    return try FfiConverterTypeFfiTileRef.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileRef_lower(_ value: FfiTileRef) -> RustBuffer {
+    return FfiConverterTypeFfiTileRef.lower(value)
+}
+
+
+/**
+ * The tile roster: every remote tile in rank order (`order`, never
+ * truncated) and full records for the declared detail window (`detail`, a
+ * subsequence of `order` — join by [`FfiTileId`]). Contract C2, C10, C12.
+ */
+public struct FfiTileRoster {
+    public var order: [FfiTileRef]
+    public var detail: [FfiCallTile]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(order: [FfiTileRef], detail: [FfiCallTile]) {
+        self.order = order
+        self.detail = detail
+    }
+}
+
+#if compiler(>=6)
+extension FfiTileRoster: Sendable {}
+#endif
+
+
+extension FfiTileRoster: Equatable, Hashable {
+    public static func ==(lhs: FfiTileRoster, rhs: FfiTileRoster) -> Bool {
+        if lhs.order != rhs.order {
+            return false
+        }
+        if lhs.detail != rhs.detail {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(order)
+        hasher.combine(detail)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTileRoster: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTileRoster {
+        return
+            try FfiTileRoster(
+                order: FfiConverterSequenceTypeFfiTileRef.read(from: &buf), 
+                detail: FfiConverterSequenceTypeFfiCallTile.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiTileRoster, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFfiTileRef.write(value.order, into: &buf)
+        FfiConverterSequenceTypeFfiCallTile.write(value.detail, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileRoster_lift(_ buf: RustBuffer) throws -> FfiTileRoster {
+    return try FfiConverterTypeFfiTileRoster.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileRoster_lower(_ value: FfiTileRoster) -> RustBuffer {
+    return FfiConverterTypeFfiTileRoster.lower(value)
 }
 
 
@@ -8044,6 +8837,10 @@ public struct MediaSessionConfig {
      * are discovered from their memberships automatically.)
      */
     public var livekitServiceUrl: String
+    /**
+     * How much the tile order is damped. `None` takes the defaults.
+     */
+    public var stability: FfiStabilityConfig?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8052,12 +8849,16 @@ public struct MediaSessionConfig {
          * The MSC4195 authorisation-service URL of the focus we publish on —
          * the same URL announced in our membership's transport. (Peers' foci
          * are discovered from their memberships automatically.)
-         */livekitServiceUrl: String) {
+         */livekitServiceUrl: String, 
+        /**
+         * How much the tile order is damped. `None` takes the defaults.
+         */stability: FfiStabilityConfig? = nil) {
         self.roomId = roomId
         self.slotId = slotId
         self.userId = userId
         self.deviceId = deviceId
         self.livekitServiceUrl = livekitServiceUrl
+        self.stability = stability
     }
 }
 
@@ -8083,6 +8884,9 @@ extension MediaSessionConfig: Equatable, Hashable {
         if lhs.livekitServiceUrl != rhs.livekitServiceUrl {
             return false
         }
+        if lhs.stability != rhs.stability {
+            return false
+        }
         return true
     }
 
@@ -8092,6 +8896,7 @@ extension MediaSessionConfig: Equatable, Hashable {
         hasher.combine(userId)
         hasher.combine(deviceId)
         hasher.combine(livekitServiceUrl)
+        hasher.combine(stability)
     }
 }
 
@@ -8108,7 +8913,8 @@ public struct FfiConverterTypeMediaSessionConfig: FfiConverterRustBuffer {
                 slotId: FfiConverterString.read(from: &buf), 
                 userId: FfiConverterString.read(from: &buf), 
                 deviceId: FfiConverterString.read(from: &buf), 
-                livekitServiceUrl: FfiConverterString.read(from: &buf)
+                livekitServiceUrl: FfiConverterString.read(from: &buf), 
+                stability: FfiConverterOptionTypeFfiStabilityConfig.read(from: &buf)
         )
     }
 
@@ -8118,6 +8924,7 @@ public struct FfiConverterTypeMediaSessionConfig: FfiConverterRustBuffer {
         FfiConverterString.write(value.userId, into: &buf)
         FfiConverterString.write(value.deviceId, into: &buf)
         FfiConverterString.write(value.livekitServiceUrl, into: &buf)
+        FfiConverterOptionTypeFfiStabilityConfig.write(value.stability, into: &buf)
     }
 }
 
@@ -8980,13 +9787,6 @@ public enum FfiCallEvent {
     )
     case streamUnmuted(memberId: String, kind: FfiStreamKind
     )
-    case activeSpeakers(
-        /**
-         * Who is speaking, each with their current audio level. The level rides
-         * along because it comes from the same transport event — without it a
-         * host has to meter the PCM itself to answer "how loud".
-         */speakers: [FfiSpeakingMember]
-    )
     /**
      * This participant's media is decryptable from here on.
      */
@@ -9088,34 +9888,31 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
         case 6: return .streamUnmuted(memberId: try FfiConverterString.read(from: &buf), kind: try FfiConverterTypeFfiStreamKind.read(from: &buf)
         )
         
-        case 7: return .activeSpeakers(speakers: try FfiConverterSequenceTypeFfiSpeakingMember.read(from: &buf)
+        case 7: return .keyImported(memberId: try FfiConverterString.read(from: &buf), keyIndex: try FfiConverterUInt8.read(from: &buf)
         )
         
-        case 8: return .keyImported(memberId: try FfiConverterString.read(from: &buf), keyIndex: try FfiConverterUInt8.read(from: &buf)
+        case 8: return .frameEncryptionState(memberId: try FfiConverterString.read(from: &buf), state: try FfiConverterTypeFfiFrameEncryptionState.read(from: &buf), diagnostic: try FfiConverterTypeFfiFrameEncryptionDiagnostic.read(from: &buf)
         )
         
-        case 9: return .frameEncryptionState(memberId: try FfiConverterString.read(from: &buf), state: try FfiConverterTypeFfiFrameEncryptionState.read(from: &buf), diagnostic: try FfiConverterTypeFfiFrameEncryptionDiagnostic.read(from: &buf)
+        case 9: return .keyDiscarded(memberId: try FfiConverterString.read(from: &buf), keyIndex: try FfiConverterOptionUInt8.read(from: &buf), senderUserId: try FfiConverterOptionString.read(from: &buf), senderDeviceId: try FfiConverterOptionString.read(from: &buf), reason: try FfiConverterTypeFfiKeyRejection.read(from: &buf)
         )
         
-        case 10: return .keyDiscarded(memberId: try FfiConverterString.read(from: &buf), keyIndex: try FfiConverterOptionUInt8.read(from: &buf), senderUserId: try FfiConverterOptionString.read(from: &buf), senderDeviceId: try FfiConverterOptionString.read(from: &buf), reason: try FfiConverterTypeFfiKeyRejection.read(from: &buf)
+        case 10: return .handRaised(memberId: try FfiConverterString.read(from: &buf), raisedAtMs: try FfiConverterUInt64.read(from: &buf)
         )
         
-        case 11: return .handRaised(memberId: try FfiConverterString.read(from: &buf), raisedAtMs: try FfiConverterUInt64.read(from: &buf)
+        case 11: return .handLowered(memberId: try FfiConverterString.read(from: &buf)
         )
         
-        case 12: return .handLowered(memberId: try FfiConverterString.read(from: &buf)
+        case 12: return .reaction(memberId: try FfiConverterString.read(from: &buf), emoji: try FfiConverterString.read(from: &buf), name: try FfiConverterString.read(from: &buf), sound: try FfiConverterOptionString.read(from: &buf)
         )
         
-        case 13: return .reaction(memberId: try FfiConverterString.read(from: &buf), emoji: try FfiConverterString.read(from: &buf), name: try FfiConverterString.read(from: &buf), sound: try FfiConverterOptionString.read(from: &buf)
+        case 13: return .unknownParticipant(identity: try FfiConverterString.read(from: &buf)
         )
         
-        case 14: return .unknownParticipant(identity: try FfiConverterString.read(from: &buf)
+        case 14: return .mediaConnectionState(degraded: try FfiConverterBool.read(from: &buf)
         )
         
-        case 15: return .mediaConnectionState(degraded: try FfiConverterBool.read(from: &buf)
-        )
-        
-        case 16: return .ended(reason: try FfiConverterTypeFfiEndedReason.read(from: &buf)
+        case 15: return .ended(reason: try FfiConverterTypeFfiEndedReason.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9161,26 +9958,21 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
             FfiConverterTypeFfiStreamKind.write(kind, into: &buf)
             
         
-        case let .activeSpeakers(speakers):
-            writeInt(&buf, Int32(7))
-            FfiConverterSequenceTypeFfiSpeakingMember.write(speakers, into: &buf)
-            
-        
         case let .keyImported(memberId,keyIndex):
-            writeInt(&buf, Int32(8))
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterUInt8.write(keyIndex, into: &buf)
             
         
         case let .frameEncryptionState(memberId,state,diagnostic):
-            writeInt(&buf, Int32(9))
+            writeInt(&buf, Int32(8))
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterTypeFfiFrameEncryptionState.write(state, into: &buf)
             FfiConverterTypeFfiFrameEncryptionDiagnostic.write(diagnostic, into: &buf)
             
         
         case let .keyDiscarded(memberId,keyIndex,senderUserId,senderDeviceId,reason):
-            writeInt(&buf, Int32(10))
+            writeInt(&buf, Int32(9))
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterOptionUInt8.write(keyIndex, into: &buf)
             FfiConverterOptionString.write(senderUserId, into: &buf)
@@ -9189,18 +9981,18 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
             
         
         case let .handRaised(memberId,raisedAtMs):
-            writeInt(&buf, Int32(11))
+            writeInt(&buf, Int32(10))
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterUInt64.write(raisedAtMs, into: &buf)
             
         
         case let .handLowered(memberId):
-            writeInt(&buf, Int32(12))
+            writeInt(&buf, Int32(11))
             FfiConverterString.write(memberId, into: &buf)
             
         
         case let .reaction(memberId,emoji,name,sound):
-            writeInt(&buf, Int32(13))
+            writeInt(&buf, Int32(12))
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterString.write(emoji, into: &buf)
             FfiConverterString.write(name, into: &buf)
@@ -9208,17 +10000,17 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
             
         
         case let .unknownParticipant(identity):
-            writeInt(&buf, Int32(14))
+            writeInt(&buf, Int32(13))
             FfiConverterString.write(identity, into: &buf)
             
         
         case let .mediaConnectionState(degraded):
-            writeInt(&buf, Int32(15))
+            writeInt(&buf, Int32(14))
             FfiConverterBool.write(degraded, into: &buf)
             
         
         case let .ended(reason):
-            writeInt(&buf, Int32(16))
+            writeInt(&buf, Int32(15))
             FfiConverterTypeFfiEndedReason.write(reason, into: &buf)
             
         }
@@ -10231,6 +11023,82 @@ extension FfiStreamKind: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * What a tile is: a person — their camera, their microphone state — or a
+ * screen they are sharing. Not an [`FfiStreamKind`]: which stream a tile
+ * draws follows from this (person → camera, share → screen share), and a
+ * microphone is never a tile. Contract C1.
+ */
+
+public enum FfiTileKind {
+    
+    case person
+    case screenShare
+}
+
+
+#if compiler(>=6)
+extension FfiTileKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiTileKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTileKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTileKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .person
+        
+        case 2: return .screenShare
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiTileKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .person:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .screenShare:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileKind_lift(_ buf: RustBuffer) throws -> FfiTileKind {
+    return try FfiConverterTypeFfiTileKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiTileKind_lower(_ value: FfiTileKind) -> RustBuffer {
+    return FfiConverterTypeFfiTileKind.lower(value)
+}
+
+
+extension FfiTileKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * How much detail to receive for a video stream; the variants are mutually
  * exclusive. Prefer `Dimensions` — the renderer knows its surface size, the
  * server knows the publisher's layer ladder.
@@ -11139,6 +12007,30 @@ fileprivate struct FfiConverterOptionTypeFfiLeaveReason: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiLocalState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiLocalState?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiLocalState.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiLocalState.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiNotifyConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiNotifyConfig?
 
@@ -11203,6 +12095,54 @@ fileprivate struct FfiConverterOptionTypeFfiReceiveStats: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiReceiveStats.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiStabilityConfig: FfiConverterRustBuffer {
+    typealias SwiftType = FfiStabilityConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiStabilityConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiStabilityConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiTileRoster: FfiConverterRustBuffer {
+    typealias SwiftType = FfiTileRoster?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiTileRoster.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiTileRoster.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11405,6 +12345,31 @@ fileprivate struct FfiConverterSequenceString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiCallTile: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiCallTile]
+
+    public static func write(_ value: [FfiCallTile], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiCallTile.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiCallTile] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiCallTile]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiCallTile.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiParticipant: FfiConverterRustBuffer {
     typealias SwiftType = [FfiParticipant]
 
@@ -11505,23 +12470,23 @@ fileprivate struct FfiConverterSequenceTypeFfiRelationLookup: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterSequenceTypeFfiSpeakingMember: FfiConverterRustBuffer {
-    typealias SwiftType = [FfiSpeakingMember]
+fileprivate struct FfiConverterSequenceTypeFfiStreamRef: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiStreamRef]
 
-    public static func write(_ value: [FfiSpeakingMember], into buf: inout [UInt8]) {
+    public static func write(_ value: [FfiStreamRef], into buf: inout [UInt8]) {
         let len = Int32(value.count)
         writeInt(&buf, len)
         for item in value {
-            FfiConverterTypeFfiSpeakingMember.write(item, into: &buf)
+            FfiConverterTypeFfiStreamRef.write(item, into: &buf)
         }
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiSpeakingMember] {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiStreamRef] {
         let len: Int32 = try readInt(&buf)
-        var seq = [FfiSpeakingMember]()
+        var seq = [FfiStreamRef]()
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
-            seq.append(try FfiConverterTypeFfiSpeakingMember.read(from: &buf))
+            seq.append(try FfiConverterTypeFfiStreamRef.read(from: &buf))
         }
         return seq
     }
@@ -11547,6 +12512,81 @@ fileprivate struct FfiConverterSequenceTypeFfiStreamState: FfiConverterRustBuffe
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiStreamState.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiStreamStats: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiStreamStats]
+
+    public static func write(_ value: [FfiStreamStats], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiStreamStats.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiStreamStats] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiStreamStats]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiStreamStats.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiTileId: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTileId]
+
+    public static func write(_ value: [FfiTileId], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiTileId.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTileId] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTileId]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiTileId.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiTileRef: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiTileRef]
+
+    public static func write(_ value: [FfiTileRef], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiTileRef.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiTileRef] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiTileRef]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiTileRef.read(from: &buf))
         }
         return seq
     }
@@ -12031,7 +13071,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_audioframestream_next() != 33587) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_commandsendercallback_send_sticky_event() != 14085) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_commandsendercallback_send_sticky_event() != 35942) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_commandsendercallback_send_delayed_event() != 11101) {
@@ -12076,10 +13116,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_local_identity() != 58204) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_event() != 29332) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_local_state() != 56186) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_participants() != 55733) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_event() != 33443) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_local_state() != 46506) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_roster() != 42201) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_participants() != 4062) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_publish() != 14122) {
@@ -12088,7 +13137,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_receive_stats() != 26857) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_receive_stats_for() != 63838) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_roster() != 45494) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_set_constraints() != 49984) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_set_detail_window() != 26972) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_set_local_muted() != 9215) {
