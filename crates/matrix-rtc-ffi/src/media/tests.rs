@@ -17,7 +17,10 @@ use crate::commands::{
 use crate::{FfiJoinSessionParams, RtcSessionManagerHandle};
 
 use super::session::{MediaSessionConfig, connect_media_session};
-use super::types::{FfiMediaConstraints, FfiOpenIdToken, FfiVideoDetail, OpenIdTokenProvider};
+use super::types::{
+    FfiLocalState, FfiMediaConstraints, FfiOpenIdToken, FfiStreamKind, FfiStreamRef, FfiTileId,
+    FfiTileRoster, FfiVideoDetail, OpenIdTokenProvider, zip_stream_stats,
+};
 use super::{MediaFfiError, runtime};
 
 /// A host command sender that accepts everything (the signalling side is not
@@ -144,6 +147,7 @@ fn config() -> MediaSessionConfig {
         user_id: "@alice:example.org".to_owned(),
         device_id: "DEVICE".to_owned(),
         livekit_service_url: DEAD_SFU_URL.to_owned(),
+        stability: None,
     }
 }
 
@@ -228,4 +232,113 @@ fn constraint_dtos_fold_like_the_core_model() {
     ));
     let resolved = constraints.resolve(matrix_rtc_media::MediaStreamKind::Camera);
     assert_eq!(resolved.demand, matrix_rtc_media::StreamDemand::Paused);
+}
+
+// ---- tile DTOs (spec 002) ------------------------------------------------------
+
+fn participant(id: &str) -> matrix_rtc_media::Participant {
+    matrix_rtc_media::Participant {
+        member_id: id.to_owned(),
+        user_id: format!("@{id}:example.org"),
+        device_id: None,
+        is_local: false,
+        reachable: true,
+        streams: vec![],
+        hand_raised_at_ms: None,
+        joined_at_ms: None,
+    }
+}
+
+#[test]
+fn tile_id_round_trips_through_the_ffi() {
+    use matrix_rtc_media::TileKind::{Person, ScreenShare};
+    for kind in [Person, ScreenShare] {
+        let id = matrix_rtc_media::TileId {
+            member_id: "m".to_owned(),
+            kind,
+        };
+        let back: matrix_rtc_media::TileId = FfiTileId::from(id.clone()).into();
+        assert_eq!(back, id);
+    }
+}
+
+#[test]
+fn stream_ref_converts_every_kind() {
+    use FfiStreamKind::{Camera, Data, Microphone, ScreenShare, ScreenShareAudio};
+    for kind in [Microphone, Camera, ScreenShare, ScreenShareAudio, Data] {
+        let (member_id, back): (String, matrix_rtc_media::MediaStreamKind) = FfiStreamRef {
+            member_id: "m".to_owned(),
+            kind,
+        }
+        .into();
+        assert_eq!(member_id, "m");
+        assert_eq!(FfiStreamKind::from(back), kind);
+    }
+}
+
+#[test]
+fn stream_stats_dto_zips_request_with_results() {
+    let request = vec![
+        FfiStreamRef {
+            member_id: "bob".to_owned(),
+            kind: FfiStreamKind::Microphone,
+        },
+        FfiStreamRef {
+            member_id: "bob".to_owned(),
+            kind: FfiStreamKind::Camera,
+        },
+    ];
+    let answered = matrix_rtc_media::ReceiveStats {
+        packets_received: 7,
+        ..Default::default()
+    };
+    let dto = zip_stream_stats(request, vec![Some(answered), None]);
+
+    assert_eq!(dto.len(), 2);
+    assert_eq!(dto[0].member_id, "bob");
+    assert_eq!(dto[0].kind, FfiStreamKind::Microphone);
+    assert_eq!(dto[0].stats.as_ref().map(|s| s.packets_received), Some(7));
+    assert_eq!(dto[1].kind, FfiStreamKind::Camera);
+    // Asked about and answered with nothing, rather than left out.
+    assert!(dto[1].stats.is_none());
+}
+
+#[test]
+fn tile_roster_dto_preserves_order_and_detail() {
+    let roster: Vec<_> = (0..5).map(|i| participant(&format!("m{i}"))).collect();
+    let ranked =
+        matrix_rtc_media::derive_tiles(&roster, &Default::default(), &Default::default()).remote;
+    let last = ranked[4].id();
+    let w = matrix_rtc_media::DetailWindow {
+        offset: 1,
+        len: 2,
+        also: [last].into(),
+    };
+    let dto: FfiTileRoster = matrix_rtc_media::window(&ranked, &w).into();
+
+    assert_eq!(dto.order.len(), 5, "order is never truncated");
+    assert_eq!(dto.detail.len(), 3);
+    // Detail joins to order by id: ranks 1 and 2, plus the named last tile.
+    let detail_ids: Vec<&str> = dto.detail.iter().map(|t| t.member_id.as_str()).collect();
+    let expected: Vec<&str> = [1usize, 2, 4]
+        .iter()
+        .map(|&i| dto.order[i].id.member_id.as_str())
+        .collect();
+    assert_eq!(detail_ids, expected);
+}
+
+#[test]
+fn local_state_dto_carries_the_share_flag() {
+    let mut me = participant("me");
+    me.is_local = true;
+    let own = matrix_rtc_media::derive_tiles(&[me], &Default::default(), &Default::default())
+        .own
+        .expect("own tile");
+    let dto: FfiLocalState = matrix_rtc_media::LocalState {
+        tile: own,
+        is_screen_sharing: true,
+    }
+    .into();
+    assert_eq!(dto.tile.member_id, "me");
+    assert!(dto.is_screen_sharing);
 }

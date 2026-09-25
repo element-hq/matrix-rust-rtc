@@ -51,6 +51,9 @@ use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
 use crate::rt;
 use crate::stats::ReceiveStats;
+use crate::tile::{
+    CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
+};
 use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
     TransportError,
@@ -100,6 +103,38 @@ type ConnectOutcome = Result<
 >;
 
 /// Static configuration of a [`CallEngine`].
+/// How much the tile order is damped (spec 002 R10, R11). Configurable
+/// because the values are a product decision, not a protocol one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StabilityConfig {
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
+    pub promote: Duration,
+    /// Silence before a speaking member stops ranking as one.
+    pub demote: Duration,
+    /// Reorders inside this window are delivered as one.
+    pub coalesce: Duration,
+}
+
+impl Default for StabilityConfig {
+    fn default() -> Self {
+        Self {
+            // Symmetric: a longer demote than promote latches a tile at the
+            // top of the order well after the speaker stopped, which reads as
+            // a stuck UI rather than a damped one.
+            promote: Duration::from_millis(1500),
+            demote: Duration::from_millis(1500),
+            coalesce: Duration::from_millis(300),
+        }
+    }
+}
+
+/// Raw speaking state of one member, with the generation of the hysteresis
+/// timer that would make it effective (R10). A bump makes an older timer stale.
+struct SpeakerState {
+    raw: bool,
+    generation: u64,
+}
+
 pub struct EngineConfig {
     /// Transport backends, in descending order of preference.
     pub transports: Vec<Arc<dyn MediaTransport>>,
@@ -121,6 +156,8 @@ pub struct EngineConfig {
     /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
     /// reports no reactions.
     pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,
+    /// Damping of the tile order; see [`StabilityConfig`].
+    pub stability: StabilityConfig,
 }
 
 /// Everything the engine can be told from outside its actor task.
@@ -207,6 +244,18 @@ enum ActorMessage {
         kind: MediaStreamKind,
         generation: u64,
     },
+    /// A hysteresis timer elapsed; apply if it is still the current one (R10).
+    SpeakerTimer {
+        member_id: String,
+        generation: u64,
+    },
+    /// The coalesce window closed; publish the new order if it is still the
+    /// current window (R11).
+    FlushReorder {
+        generation: u64,
+    },
+    /// Which tiles get full records; see [`CallEngine::set_detail_window`].
+    SetDetailWindow(DetailWindow),
     /// Close every pooled connection and stop.
     Shutdown {
         ack: oneshot::Sender<()>,
@@ -244,6 +293,8 @@ pub struct CallEngine {
     messages: mpsc::UnboundedSender<ActorMessage>,
     events_tx: broadcast::Sender<CallEvent>,
     participants_rx: watch::Receiver<Vec<Participant>>,
+    tiles_rx: watch::Receiver<TileRoster>,
+    local_rx: watch::Receiver<Option<LocalState>>,
     tracks: TrackMap,
     task: rt::TaskHandle,
 }
@@ -269,6 +320,8 @@ impl CallEngine {
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
         let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
+        let (tiles_tx, tiles_rx) = watch::channel(TileRoster::default());
+        let (local_tx, local_rx) = watch::channel(None);
         // On wasm32 the map is `!Send` (track handles hold JS values), but it
         // is still shared — engine and actor — so `Arc` stays, uncontended.
         #[cfg_attr(target_arch = "wasm32", expect(clippy::arc_with_non_send_sync))]
@@ -281,6 +334,15 @@ impl CallEngine {
             own_connection_key: config.own_connection_key,
             events_tx: events_tx.clone(),
             participants_tx,
+            tiles_tx,
+            local_tx,
+            window: DetailWindow::default(),
+            speaking: HashSet::new(),
+            speakers: HashMap::new(),
+            last_order: Vec::new(),
+            pending_reorder: None,
+            reorder_generation: 0,
+            stability: config.stability,
             tracks: tracks.clone(),
             messages_tx: messages_tx.clone(),
             roster: Vec::new(),
@@ -310,6 +372,8 @@ impl CallEngine {
             messages: messages_tx,
             events_tx,
             participants_rx,
+            tiles_rx,
+            local_rx,
             tracks,
             task,
         }
@@ -336,6 +400,41 @@ impl CallEngine {
     /// snapshot.
     pub fn subscribe_participants(&self) -> watch::Receiver<Vec<Participant>> {
         self.participants_rx.clone()
+    }
+
+    /// The tile roster: every remote tile in rank order, with full records for
+    /// the declared detail window. See [`TileRoster`].
+    pub fn tiles(&self) -> TileRoster {
+        self.tiles_rx.borrow().clone()
+    }
+
+    /// Watch the tile roster; the receiver always holds the latest snapshot.
+    pub fn subscribe_tiles(&self) -> watch::Receiver<TileRoster> {
+        self.tiles_rx.clone()
+    }
+
+    /// Our own tile and screen-sharing state, beside the roster. `None` until
+    /// our own membership is on the roster.
+    pub fn local_state(&self) -> Option<LocalState> {
+        self.local_rx.borrow().clone()
+    }
+
+    /// Watch our local state.
+    pub fn subscribe_local_state(&self) -> watch::Receiver<Option<LocalState>> {
+        self.local_rx.clone()
+    }
+
+    /// Declare which tiles get full records: ranks `[offset, offset + len)`
+    /// plus `also`, wherever those rank. The default is everything. Declare
+    /// what you compose, not what is visible.
+    pub fn set_detail_window(&self, offset: u32, len: u32, also: impl IntoIterator<Item = TileId>) {
+        let _ = self
+            .messages
+            .send(ActorMessage::SetDetailWindow(DetailWindow {
+                offset,
+                len,
+                also: also.into_iter().collect(),
+            }));
     }
 
     /// Hand the caller-established own-focus connection to the engine, which
@@ -490,6 +589,37 @@ impl CallEngine {
         track.receive_stats().await
     }
 
+    /// [`CallEngine::receive_stats`] for many streams at once.
+    ///
+    /// One entry per element of `streams`, in the same order — `None` under
+    /// the same conditions as the single call. The track map is locked once,
+    /// for the lookups only; the transports' stats round trips then run
+    /// concurrently, so a batch costs about one collection rather than one
+    /// per stream. Bound the request to what is drawn (contract C12) and call
+    /// this once per sample.
+    pub async fn receive_stats_for(
+        &self,
+        streams: &[(String, MediaStreamKind)],
+    ) -> Vec<Option<ReceiveStats>> {
+        if streams.is_empty() {
+            return Vec::new();
+        }
+        let tracks: Vec<Option<Arc<dyn RemoteTrackHandle>>> = {
+            let map = self.tracks.lock().expect("track map mutex poisoned");
+            streams.iter().map(|key| map.get(key).cloned()).collect()
+        };
+        // Unbounded on purpose: libwebrtc serialises stats collection on its
+        // own thread. `futures_util::stream::iter(..).buffered(n)` is the
+        // drop-in if a call size ever makes that a problem.
+        futures_util::future::join_all(tracks.into_iter().map(|track| async move {
+            match track {
+                Some(track) => track.receive_stats().await,
+                None => None,
+            }
+        }))
+        .await
+    }
+
     /// Emit [`CallEvent::Ended`] and close every pooled peer-focus connection.
     /// The adopted own-focus connection is not closed here — its owner (the
     /// caller of [`CallEngine::adopt_own_connection`]) closes it and gets the
@@ -541,6 +671,23 @@ struct Actor {
     own_connection_key: Option<String>,
     events_tx: broadcast::Sender<CallEvent>,
     participants_tx: watch::Sender<Vec<Participant>>,
+    tiles_tx: watch::Sender<TileRoster>,
+    local_tx: watch::Sender<Option<LocalState>>,
+    /// Which tiles get full records. Defaults to everything.
+    window: DetailWindow,
+    /// Members currently counted as speaking for the order — the damped set
+    /// the ranking reads (R10). `speakers` holds the raw state driving it,
+    /// which is what a tile's own `speaking` flag reports (R11).
+    speaking: HashSet<String>,
+    /// Raw speaking state per member and its in-flight timer's generation.
+    speakers: HashMap<String, SpeakerState>,
+    /// The tile order consumers were last given (R11). Departed ids leave it
+    /// at once; the new order replaces it when the coalesce window closes.
+    last_order: Vec<TileId>,
+    /// Generation of the open coalesce window, if one is open.
+    pending_reorder: Option<u64>,
+    reorder_generation: u64,
+    stability: StabilityConfig,
     tracks: TrackMap,
     /// Handed to connection forwarders and timers so everything funnels into
     /// the same mailbox.
@@ -943,6 +1090,35 @@ impl Actor {
                     self.apply_constraints_now(&member_id, kind);
                 }
             }
+            ActorMessage::SpeakerTimer {
+                member_id,
+                generation,
+            } => {
+                // Only the newest timer applies; an older one was superseded.
+                let raw = match self.speakers.get(&member_id) {
+                    Some(state) if state.generation == generation => state.raw,
+                    _ => return,
+                };
+                let changed = if raw {
+                    self.speaking.insert(member_id)
+                } else {
+                    self.speaking.remove(&member_id)
+                };
+                if changed {
+                    self.publish_tiles();
+                }
+            }
+            ActorMessage::FlushReorder { generation } => {
+                if self.pending_reorder != Some(generation) {
+                    return;
+                }
+                self.pending_reorder = None;
+                self.publish_tiles_reordered();
+            }
+            ActorMessage::SetDetailWindow(window) => {
+                self.window = window;
+                self.publish_tiles();
+            }
             // Handled in the run loop (it must break).
             ActorMessage::Shutdown { ack } => {
                 let _ = ack.send(());
@@ -1334,6 +1510,15 @@ impl Actor {
                             })
                     })
                     .collect();
+                // Not sampled here: the SFU decides who is speaking and sends one
+                // update for the whole call per `update_interval` (LiveKit default
+                // 500 ms), smoothed over two intervals. That bounds how often the
+                // raw set — and with it the tile flag and the roster — can change.
+                //
+                // Timers are armed before the event goes out, so a consumer
+                // woken by it finds the hysteresis already running.
+                let raw: HashSet<String> = speakers.iter().map(|s| s.member_id.clone()).collect();
+                self.apply_raw_speakers(raw);
                 self.emit(CallEvent::ActiveSpeakers { speakers });
             }
             ConnectionEvent::EncryptionStateChanged { identity, state } => {
@@ -1482,6 +1667,7 @@ impl Actor {
             reachable,
             streams: own_streams.clone(),
             hand_raised_at_ms,
+            joined_at_ms: member.membership_ts,
         });
         self.emit(CallEvent::ParticipantJoined {
             member_id: member.member_id.clone(),
@@ -1638,6 +1824,8 @@ impl Actor {
         }
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
+        self.speaking.remove(member_id);
+        self.speakers.remove(member_id);
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
@@ -1833,8 +2021,166 @@ impl Actor {
         let _ = self.events_tx.send(event);
     }
 
-    fn publish_roster(&self) {
+    fn publish_roster(&mut self) {
         let _ = self.participants_tx.send(self.roster.clone());
+        self.publish_tiles();
+    }
+
+    /// Members speaking now as the SFU reports them: what a tile's flag
+    /// reports. Undamped here, but already smoothed and rate-limited by the
+    /// server (see the `ActiveSpeakers` handler).
+    fn raw_speaking(&self) -> HashSet<String> {
+        self.speakers
+            .iter()
+            .filter(|(_, state)| state.raw)
+            .map(|(member_id, _)| member_id.clone())
+            .collect()
+    }
+
+    /// Feeds the transport's speaking snapshot into the hysteresis (R10).
+    ///
+    /// A member whose raw state moved away from their effective state gets a
+    /// timer — `promote` to start counting as speaking, `demote` to stop — and
+    /// a move back before it fires makes that timer stale. Two people trading
+    /// half-second bursts therefore never trade places.
+    ///
+    /// The raw state itself is published at once: the flag on a tile is not
+    /// damped (R11), only where the tile ranks.
+    fn apply_raw_speakers(&mut self, raw: HashSet<String>) {
+        let mut raw_changed = false;
+        let ids: HashSet<String> = self
+            .speakers
+            .keys()
+            .cloned()
+            .chain(raw.iter().cloned())
+            .collect();
+        for member_id in ids {
+            let is_raw = raw.contains(&member_id);
+            let state = self
+                .speakers
+                .entry(member_id.clone())
+                .or_insert(SpeakerState {
+                    raw: false,
+                    generation: 0,
+                });
+            if state.raw == is_raw {
+                continue;
+            }
+            state.raw = is_raw;
+            state.generation += 1;
+            raw_changed = true;
+            let generation = state.generation;
+            if is_raw == self.speaking.contains(&member_id) {
+                // Back to matching the effective state: the in-flight timer is
+                // stale now, and there is nothing to arm.
+                continue;
+            }
+            let delay = if is_raw {
+                self.stability.promote
+            } else {
+                self.stability.demote
+            };
+            let messages = self.messages_tx.clone();
+            rt::spawn(async move {
+                rt::sleep(delay).await;
+                let _ = messages.send(ActorMessage::SpeakerTimer {
+                    member_id,
+                    generation,
+                });
+            });
+        }
+        if raw_changed {
+            self.publish_tiles();
+        }
+    }
+
+    /// Derives and publishes the tile roster and our local state. Reached from
+    /// every roster publish, and from the changes that do not touch the
+    /// roster: the raw and the effective speaking sets, and the detail window.
+    ///
+    /// R11: a tile's own state is never delayed, and reordering is coalesced.
+    /// When the order moved, consumers get the fresh state now — in the order
+    /// they already hold, minus anyone who left — and the new order when the
+    /// window closes, so a burst of rank changes lands as one reorder.
+    fn publish_tiles(&mut self) {
+        let Tiles { remote, own } =
+            derive_tiles(&self.roster, &self.raw_speaking(), &self.speaking);
+        self.publish_local(own);
+
+        let order: Vec<TileId> = remote.iter().map(CallTile::id).collect();
+        if order == self.last_order {
+            self.send_tiles(window(&remote, &self.window));
+            return;
+        }
+        if self.last_order.is_empty() {
+            // Populating an empty order is not a reorder: nothing a consumer
+            // holds can jump. Publish at once, or every call would open on a
+            // blank window for the length of the coalesce delay.
+            self.last_order = order;
+            self.send_tiles(window(&remote, &self.window));
+            return;
+        }
+
+        if self.pending_reorder.is_none() {
+            self.reorder_generation += 1;
+            let generation = self.reorder_generation;
+            self.pending_reorder = Some(generation);
+            let delay = self.stability.coalesce;
+            let messages = self.messages_tx.clone();
+            rt::spawn(async move {
+                rt::sleep(delay).await;
+                let _ = messages.send(ActorMessage::FlushReorder { generation });
+            });
+        }
+        // Departed tiles leave the held order at once; joiners wait for it.
+        let by_id: HashMap<TileId, &CallTile> =
+            remote.iter().map(|tile| (tile.id(), tile)).collect();
+        self.last_order.retain(|id| by_id.contains_key(id));
+        let held: Vec<CallTile> = self.last_order.iter().map(|id| by_id[id].clone()).collect();
+        self.send_tiles(window(&held, &self.window));
+    }
+
+    /// The coalesce window closed: publish the current order (R11).
+    fn publish_tiles_reordered(&mut self) {
+        let Tiles { remote, own } =
+            derive_tiles(&self.roster, &self.raw_speaking(), &self.speaking);
+        self.publish_local(own);
+        self.last_order = remote.iter().map(CallTile::id).collect();
+        self.send_tiles(window(&remote, &self.window));
+    }
+
+    fn publish_local(&self, own: Option<CallTile>) {
+        let local = own.map(|tile| LocalState {
+            // Publication state, not intent: up and unmuted, however it ends.
+            is_screen_sharing: self
+                .roster
+                .iter()
+                .find(|p| p.is_local)
+                .and_then(|p| {
+                    p.streams
+                        .iter()
+                        .find(|s| s.kind == MediaStreamKind::ScreenShare)
+                })
+                .is_some_and(|s| !s.muted),
+            tile,
+        });
+        self.local_tx.send_if_modified(|current| {
+            if *current == local {
+                return false;
+            }
+            *current = local;
+            true
+        });
+    }
+
+    fn send_tiles(&self, roster: TileRoster) {
+        self.tiles_tx.send_if_modified(|current| {
+            if *current == roster {
+                return false;
+            }
+            *current = roster;
+            true
+        });
     }
 }
 
@@ -2037,11 +2383,26 @@ mod tests {
         /// What `receive_stats` reports; `None` models a transport with no
         /// counters (the trait default).
         stats: Option<ReceiveStats>,
+        /// A barrier every `receive_stats` waits at before answering, so a
+        /// test can prove several were in flight together.
+        gate: Option<Arc<tokio::sync::Barrier>>,
     }
 
     impl FakeTrack {
         fn new(kind: MediaStreamKind) -> Self {
-            Self { kind, stats: None }
+            Self {
+                kind,
+                stats: None,
+                gate: None,
+            }
+        }
+
+        fn with_stats(kind: MediaStreamKind, stats: ReceiveStats) -> Self {
+            Self {
+                kind,
+                stats: Some(stats),
+                gate: None,
+            }
         }
     }
 
@@ -2062,6 +2423,9 @@ mod tests {
         }
 
         async fn receive_stats(&self) -> Option<ReceiveStats> {
+            if let Some(gate) = &self.gate {
+                gate.wait().await;
+            }
             self.stats.clone()
         }
     }
@@ -2098,6 +2462,10 @@ mod tests {
     }
 
     fn fixture() -> Fixture {
+        fixture_with(StabilityConfig::default())
+    }
+
+    fn fixture_with(stability: StabilityConfig) -> Fixture {
         let state = Arc::new(TransportState::default());
         let (memberships, memberships_rx) = watch::channel(Vec::new());
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
@@ -2120,6 +2488,7 @@ mod tests {
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
                 raised_hands: Some(raised_hands_rx),
                 reactions: Some(reactions_rx),
+                stability,
             },
             memberships_rx,
         );
@@ -2738,10 +3107,10 @@ mod tests {
             .send(ConnectionEvent::TrackAdded {
                 identity: "id-bob".to_owned(),
                 kind: MediaStreamKind::Microphone,
-                track: Arc::new(FakeTrack {
-                    kind: MediaStreamKind::Microphone,
-                    stats: Some(reported.clone()),
-                }),
+                track: Arc::new(FakeTrack::with_stats(
+                    MediaStreamKind::Microphone,
+                    reported.clone(),
+                )),
             })
             .unwrap();
         let _ = next_event(&mut fx.events).await; // StreamStarted
@@ -2762,6 +3131,147 @@ mod tests {
         fn assert_send<T: Send>(_: T) {}
         let fx = fixture();
         assert_send(fx.engine.receive_stats("bob", MediaStreamKind::Microphone));
+    }
+
+    fn stats_with(packets_received: u64) -> ReceiveStats {
+        ReceiveStats {
+            packets_received,
+            ..ReceiveStats::default()
+        }
+    }
+
+    /// Own connection adopted and one fake track per `(member, kind)` added,
+    /// each answering `receive_stats` with the given counters.
+    async fn with_tracks(fx: &Fixture, tracks: Vec<(&str, MediaStreamKind, FakeTrack)>) {
+        let connection = adopt(fx);
+        for (member_id, kind, track) in tracks {
+            connection
+                .send(ConnectionEvent::TrackAdded {
+                    identity: format!("id-{member_id}"),
+                    kind,
+                    track: Arc::new(track),
+                })
+                .unwrap();
+            wait_until(|| fx.engine.remote_track(member_id, kind).is_some()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn batched_receive_stats_follow_request_order_with_none_for_unknown() {
+        use MediaStreamKind::{Camera, Microphone, ScreenShare};
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 2).await;
+        with_tracks(
+            &fx,
+            vec![
+                (
+                    "bob",
+                    Microphone,
+                    FakeTrack::with_stats(Microphone, stats_with(1)),
+                ),
+                ("bob", Camera, FakeTrack::with_stats(Camera, stats_with(2))),
+                (
+                    "carol",
+                    Microphone,
+                    FakeTrack::with_stats(Microphone, stats_with(3)),
+                ),
+            ],
+        )
+        .await;
+
+        let request = [
+            ("carol".to_owned(), Microphone),
+            ("bob".to_owned(), Camera),
+            ("dave".to_owned(), Microphone), // unknown member
+            ("bob".to_owned(), Microphone),
+            ("bob".to_owned(), ScreenShare),  // unsubscribed kind
+            ("carol".to_owned(), Microphone), // duplicate: answered twice
+        ];
+        let results = fx.engine.receive_stats_for(&request).await;
+
+        assert_eq!(
+            results,
+            vec![
+                Some(stats_with(3)),
+                Some(stats_with(2)),
+                None,
+                Some(stats_with(1)),
+                None,
+                Some(stats_with(3)),
+            ]
+        );
+    }
+
+    /// Three tracks share a barrier of three: only if all three
+    /// `receive_stats` are in flight together does any of them return. A
+    /// sequential loop deadlocks on the first, and the timeout says so.
+    #[tokio::test]
+    async fn batched_receive_stats_are_awaited_concurrently() {
+        use MediaStreamKind::Microphone;
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("a", "@a:example.org"),
+                member("b", "@b:example.org"),
+                member("c", "@c:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 3).await;
+        let gate = Arc::new(tokio::sync::Barrier::new(3));
+        let gated = |n: u64| FakeTrack {
+            kind: Microphone,
+            stats: Some(stats_with(n)),
+            gate: Some(gate.clone()),
+        };
+        with_tracks(
+            &fx,
+            vec![
+                ("a", Microphone, gated(1)),
+                ("b", Microphone, gated(2)),
+                ("c", Microphone, gated(3)),
+            ],
+        )
+        .await;
+
+        let request: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|m| (m.to_owned(), Microphone))
+            .collect();
+        let results = tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.engine.receive_stats_for(&request),
+        )
+        .await
+        .expect("stats were awaited one at a time: a barrier of three never released");
+
+        assert_eq!(
+            results,
+            vec![
+                Some(stats_with(1)),
+                Some(stats_with(2)),
+                Some(stats_with(3))
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_receive_stats_for_an_empty_request_are_empty() {
+        let fx = fixture();
+        assert!(fx.engine.receive_stats_for(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_batched_receive_stats_future_is_send() {
+        fn assert_send<T: Send>(_: T) {}
+        let fx = fixture();
+        let request = [("bob".to_owned(), MediaStreamKind::Microphone)];
+        assert_send(fx.engine.receive_stats_for(&request));
     }
 
     #[tokio::test]
@@ -3733,5 +4243,397 @@ mod tests {
         // The adopted own connection is left to its owner.
         assert!(!closed(&fx, OWN_FOCUS));
         drop(own);
+    }
+
+    // ---- tiles (spec 002) ---------------------------------------------------
+
+    fn order_ids(fx: &Fixture) -> Vec<String> {
+        fx.engine
+            .tiles()
+            .order
+            .iter()
+            .map(|r| r.id.member_id.clone())
+            .collect()
+    }
+
+    /// Tiles are a projection of the roster: they appear and disappear with
+    /// memberships, through the same publish.
+    #[tokio::test]
+    async fn tiles_ride_on_the_roster() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| order_ids(&fx) == ["bob"]).await;
+
+        fx.memberships
+            .send(vec![member("own", "@alice:example.org")])
+            .unwrap();
+        wait_until(|| order_ids(&fx).is_empty()).await;
+    }
+
+    /// R7, C3: our own tile is published beside the list, never in it, and is
+    /// never a hero. `None` until our membership is on the roster.
+    #[tokio::test]
+    async fn own_tile_is_beside_the_list_not_in_it() {
+        let fx = fixture();
+        assert!(fx.engine.local_state().is_none());
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.local_state().is_some()).await;
+
+        let local = fx.engine.local_state().unwrap();
+        assert_eq!(local.tile.member_id, "own");
+        assert!(!local.tile.hero);
+        assert!(!local.is_screen_sharing);
+        assert!(order_ids(&fx).iter().all(|id| id != "own"));
+    }
+
+    /// C12: the window bounds the full records, never the order. The default
+    /// is everything; an explicitly named tile appears at its rank position.
+    #[tokio::test]
+    async fn detail_window_bounds_the_records_not_the_order() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("a", "@a:example.org"),
+                member("b", "@b:example.org"),
+                member("c", "@c:example.org"),
+                member("d", "@d:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| fx.engine.tiles().order.len() == 4).await;
+        assert_eq!(
+            fx.engine.tiles().detail.len(),
+            4,
+            "default window is everything"
+        );
+
+        let last = fx.engine.tiles().order[3].id.clone();
+        fx.engine.set_detail_window(0, 2, [last.clone()]);
+        wait_until(|| fx.engine.tiles().detail.len() == 3).await;
+
+        let roster = fx.engine.tiles();
+        assert_eq!(roster.order.len(), 4, "order is never truncated");
+        let detail: Vec<TileId> = roster.detail.iter().map(|t| t.id()).collect();
+        assert_eq!(
+            detail,
+            vec![roster.order[0].id.clone(), roster.order[1].id.clone(), last],
+            "range first, then the named tile at its own rank position"
+        );
+    }
+
+    /// R14, C8: the screen-sharing flag follows the publication — up **and
+    /// unmuted** — not our intent, so it goes false however the share ends.
+    #[tokio::test]
+    async fn screen_sharing_follows_the_publication_up_and_unmuted() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![member("own", "@own:example.org")])
+            .unwrap();
+        wait_until(|| fx.engine.local_state().is_some()).await;
+        let _connection = adopt(&fx);
+        let sharing = || fx.engine.local_state().unwrap().is_screen_sharing;
+        assert!(!sharing());
+
+        fx.engine
+            .publish(PublishOptions::screen_share(VideoSourceConfig {
+                width: 1920,
+                height: 1080,
+            }))
+            .await
+            .expect("publish should succeed");
+        wait_until(sharing).await;
+
+        // Muted is "not sharing": one consumer publishes muted and unmutes
+        // only once capture is live, and the flag must not lead the picture.
+        fx.engine
+            .set_local_muted(MediaStreamKind::ScreenShare, true)
+            .await
+            .expect("mute should succeed");
+        wait_until(|| !sharing()).await;
+        fx.engine
+            .set_local_muted(MediaStreamKind::ScreenShare, false)
+            .await
+            .expect("unmute should succeed");
+        wait_until(sharing).await;
+
+        fx.engine
+            .unpublish(MediaStreamKind::ScreenShare)
+            .await
+            .expect("unpublish should succeed");
+        wait_until(|| !sharing()).await;
+    }
+
+    // ---- stability (spec 002 R10, R11) ---------------------------------------
+    //
+    // Paused clock. `after(ms)` advances it: the clock only moves once every
+    // task is idle, so the actor has always drained its mailbox — and handled
+    // any timer that fired on the way — by the time it returns.
+
+    async fn after(ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+
+    fn speakers(ids: &[&str]) -> ConnectionEvent {
+        ConnectionEvent::ActiveSpeakers {
+            speakers: ids
+                .iter()
+                .map(|id| SpeakingParticipant {
+                    identity: format!("id-{id}"),
+                    level: 0.5,
+                })
+                .collect(),
+        }
+    }
+
+    fn speaking(fx: &Fixture, member_id: &str) -> bool {
+        fx.engine
+            .tiles()
+            .detail
+            .iter()
+            .any(|t| t.member_id == member_id && t.speaking)
+    }
+
+    fn mic_muted(fx: &Fixture, member_id: &str) -> bool {
+        fx.engine
+            .tiles()
+            .detail
+            .iter()
+            .find(|t| t.member_id == member_id)
+            .is_some_and(|t| t.microphone_muted)
+    }
+
+    fn hand(member_id: &str, raised_at_ms: u64) -> RaisedHand {
+        RaisedHand {
+            member_id: member_id.to_owned(),
+            sender: format!("@{member_id}:example.org"),
+            reaction_event_id: format!("${member_id}"),
+            raised_at_ms,
+        }
+    }
+
+    /// Own + a, b, c on the roster and published, in that order.
+    async fn with_abc(fx: &Fixture) {
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("a", "@a:example.org"),
+                member("b", "@b:example.org"),
+                member("c", "@c:example.org"),
+            ])
+            .unwrap();
+        wait_until(|| order_ids(fx) == ["a", "b", "c"]).await;
+    }
+
+    /// Records every order consumers are given from now on.
+    fn observe_orders(fx: &Fixture) -> Arc<Mutex<Vec<Vec<String>>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut rx = fx.engine.subscribe_tiles();
+        rx.borrow_and_update();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let ids: Vec<String> = rx
+                    .borrow()
+                    .order
+                    .iter()
+                    .map(|r| r.id.member_id.clone())
+                    .collect();
+                sink.lock().unwrap().push(ids);
+            }
+        });
+        seen
+    }
+
+    /// Own + a, b, c published, with the own connection adopted so transport
+    /// speaker events reach the engine.
+    async fn with_abc_connected(fx: &Fixture) -> UnboundedSender<ConnectionEvent> {
+        with_abc(fx).await;
+        adopt(fx)
+    }
+
+    // The flag is raw (R11) and only the rank is damped (R10). A promotion
+    // lands after `promote` plus the coalesce window, since it is a reorder.
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_speaking_is_reported_at_once_and_ranked_only_after_sustained_voice() {
+        let fx = fixture();
+        let connection = with_abc_connected(&fx).await;
+        connection.send(speakers(&["c"])).unwrap();
+        after(50).await;
+        assert!(speaking(&fx, "c"), "the flag is not damped");
+        assert_eq!(order_ids(&fx), ["a", "b", "c"], "the rank is");
+        after(1400).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["a", "b", "c"],
+            "1.5 s of voice is required"
+        );
+        after(400).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_a_speaker_stops_at_once_and_keeps_their_rank_through_the_cooldown() {
+        let fx = fixture();
+        let connection = with_abc_connected(&fx).await;
+        connection.send(speakers(&["c"])).unwrap();
+        after(2000).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
+        connection.send(speakers(&[])).unwrap();
+        after(50).await;
+        assert!(!speaking(&fx, "c"), "the flag is not damped");
+        assert_eq!(order_ids(&fx), ["c", "a", "b"], "the rank is");
+        after(1400).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["c", "a", "b"],
+            "still ranked inside the cooldown"
+        );
+        after(400).await;
+        assert_eq!(order_ids(&fx), ["a", "b", "c"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_a_burst_shorter_than_the_promotion_never_moves_the_tile() {
+        let fx = fixture();
+        let connection = with_abc_connected(&fx).await;
+        let seen = observe_orders(&fx);
+        connection.send(speakers(&["c"])).unwrap();
+        after(500).await;
+        assert!(speaking(&fx, "c"));
+        connection.send(speakers(&[])).unwrap();
+        after(2500).await;
+        assert!(!speaking(&fx, "c"));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|order| order.first().map(String::as_str) == Some("a")),
+            "the promotion timer went stale when the voice stopped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r10_the_thresholds_are_configurable() {
+        let fx = fixture_with(StabilityConfig {
+            promote: Duration::from_millis(500),
+            ..StabilityConfig::default()
+        });
+        let connection = with_abc_connected(&fx).await;
+        connection.send(speakers(&["c"])).unwrap();
+        after(400).await;
+        assert_eq!(order_ids(&fx), ["a", "b", "c"]);
+        after(500).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_the_first_order_is_not_coalesced() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        after(50).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["bob"],
+            "populating an empty order is not a reorder"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_rank_changes_inside_the_window_land_as_one_reorder() {
+        let fx = fixture();
+        with_abc(&fx).await;
+        let seen = observe_orders(&fx);
+
+        // Two rank changes 100 ms apart: c raises a hand, then b.
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(100).await;
+        fx.raised_hands
+            .send(vec![hand("c", 1), hand("b", 2)])
+            .unwrap();
+        after(400).await;
+
+        let mut orders = seen.lock().unwrap().clone();
+        orders.dedup();
+        assert_eq!(
+            orders,
+            vec![vec!["a", "b", "c"], vec!["c", "b", "a"]],
+            "the old order held with fresh state, then one reorder — never [c, a, b] in between"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_state_is_never_delayed_by_the_coalesce_window() {
+        let fx = fixture();
+        with_abc(&fx).await;
+        let connection = adopt(&fx);
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-b".to_owned(),
+                kind: MediaStreamKind::Microphone,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
+            })
+            .unwrap();
+        wait_until(|| !mic_muted(&fx, "b")).await;
+
+        // c raises a hand: the order will change, so a window opens.
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(100).await;
+        // b mutes inside it.
+        connection
+            .send(ConnectionEvent::TrackMuted {
+                identity: "id-b".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            })
+            .unwrap();
+        after(50).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["a", "b", "c"],
+            "the order waits for the window"
+        );
+        assert!(mic_muted(&fx, "b"), "the mute does not");
+
+        after(200).await;
+        assert_eq!(order_ids(&fx), ["c", "a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn r11_a_member_leaving_inside_the_window_leaves_the_order_at_once() {
+        let fx = fixture();
+        with_abc(&fx).await;
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(100).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("a", "@a:example.org"),
+                member("c", "@c:example.org"),
+            ])
+            .unwrap();
+        after(50).await;
+        assert_eq!(
+            order_ids(&fx),
+            ["a", "c"],
+            "b is gone now; c has not moved yet"
+        );
+        after(200).await;
+        assert_eq!(order_ids(&fx), ["c", "a"]);
     }
 }

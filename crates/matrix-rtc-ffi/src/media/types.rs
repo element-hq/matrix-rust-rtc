@@ -6,6 +6,8 @@
 //! FFI DTOs mirroring the transport-agnostic media model, plus the
 //! host-implemented OpenID token provider.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 
 use super::MediaFfiError;
@@ -89,6 +91,185 @@ impl From<matrix_rtc_media::Participant> for FfiParticipant {
     }
 }
 
+/// Identity of one call tile: the pair `(member_id, kind)`. Stable for as
+/// long as the tile is in the call. Join [`FfiTileRoster::detail`] to
+/// [`FfiTileRoster::order`] by this, never by index. Contract C1.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiTileId {
+    pub member_id: String,
+    pub kind: FfiTileKind,
+}
+
+/// What a tile is: a person — their camera, their microphone state — or a
+/// screen they are sharing. Not an [`FfiStreamKind`]: which stream a tile
+/// draws follows from this (person → camera, share → screen share), and a
+/// microphone is never a tile. Contract C1.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiTileKind {
+    Person,
+    ScreenShare,
+}
+
+impl From<matrix_rtc_media::TileKind> for FfiTileKind {
+    fn from(kind: matrix_rtc_media::TileKind) -> Self {
+        match kind {
+            matrix_rtc_media::TileKind::Person => Self::Person,
+            matrix_rtc_media::TileKind::ScreenShare => Self::ScreenShare,
+        }
+    }
+}
+
+impl From<FfiTileKind> for matrix_rtc_media::TileKind {
+    fn from(kind: FfiTileKind) -> Self {
+        match kind {
+            FfiTileKind::Person => Self::Person,
+            FfiTileKind::ScreenShare => Self::ScreenShare,
+        }
+    }
+}
+
+impl From<matrix_rtc_media::TileId> for FfiTileId {
+    fn from(id: matrix_rtc_media::TileId) -> Self {
+        Self {
+            member_id: id.member_id,
+            kind: id.kind.into(),
+        }
+    }
+}
+
+impl From<FfiTileId> for matrix_rtc_media::TileId {
+    fn from(id: FfiTileId) -> Self {
+        Self {
+            member_id: id.member_id,
+            kind: id.kind.into(),
+        }
+    }
+}
+
+/// A tile's place in the order: identity, whose tile it is, and whether it
+/// is a hero — enough to place it and to draw it as an avatar with a name,
+/// nothing about what the member is doing. One per tile in the call, always.
+/// Contract C2.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTileRef {
+    pub id: FfiTileId,
+    pub user_id: String,
+    pub hero: bool,
+}
+
+impl From<matrix_rtc_media::TileRef> for FfiTileRef {
+    fn from(r: matrix_rtc_media::TileRef) -> Self {
+        Self {
+            id: r.id.into(),
+            user_id: r.user_id,
+            hero: r.hero,
+        }
+    }
+}
+
+/// One renderable stream of one membership, with what a UI needs to place
+/// and decorate it. `microphone_muted` is the member's microphone; this
+/// tile's own stream state is `has_video`. Mirrors
+/// [`matrix_rtc_media::CallTile`], where every field is documented.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiCallTile {
+    pub member_id: String,
+    pub kind: FfiTileKind,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub hero: bool,
+    pub has_video: bool,
+    pub microphone_muted: bool,
+    /// Speaking now, undamped: what a speaking ring means. Only the order is
+    /// damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
+    pub speaking: bool,
+    pub hand_raised_at_ms: Option<u64>,
+    pub reachable: bool,
+}
+
+impl From<matrix_rtc_media::CallTile> for FfiCallTile {
+    // `joined_at_ms` stays on the Rust side: it only ranks, nothing decorates
+    // with it, and it is `None` for every native MSC4143 membership today.
+    fn from(t: matrix_rtc_media::CallTile) -> Self {
+        Self {
+            member_id: t.member_id,
+            kind: t.kind.into(),
+            user_id: t.user_id,
+            device_id: t.device_id,
+            hero: t.hero,
+            has_video: t.has_video,
+            microphone_muted: t.microphone_muted,
+            speaking: t.speaking,
+            hand_raised_at_ms: t.hand_raised_at_ms,
+            reachable: t.reachable,
+        }
+    }
+}
+
+/// The tile roster: every remote tile in rank order (`order`, never
+/// truncated) and full records for the declared detail window (`detail`, a
+/// subsequence of `order` — join by [`FfiTileId`]). Contract C2, C10, C12.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiTileRoster {
+    pub order: Vec<FfiTileRef>,
+    pub detail: Vec<FfiCallTile>,
+}
+
+impl From<matrix_rtc_media::TileRoster> for FfiTileRoster {
+    fn from(r: matrix_rtc_media::TileRoster) -> Self {
+        Self {
+            order: r.order.into_iter().map(Into::into).collect(),
+            detail: r.detail.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Our own tile, beside the roster and never in it, and whether we are
+/// sharing our screen — publication state (up and unmuted), not intent, so
+/// it goes false however the share ended. Contract C3, C8.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLocalState {
+    pub tile: FfiCallTile,
+    pub is_screen_sharing: bool,
+}
+
+impl From<matrix_rtc_media::LocalState> for FfiLocalState {
+    fn from(s: matrix_rtc_media::LocalState) -> Self {
+        Self {
+            tile: s.tile.into(),
+            is_screen_sharing: s.is_screen_sharing,
+        }
+    }
+}
+
+/// How much the tile order is damped (R10, R11). A product decision rather
+/// than a protocol one, so a host can tune it; the defaults are what
+/// `matrix_rtc_media::StabilityConfig` uses.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStabilityConfig {
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
+    #[uniffi(default = 1500)]
+    pub promote_ms: u64,
+    /// Silence before a speaking member stops ranking as one. Raising this above
+    /// `promote_ms` leaves a tile at the top of the order after the speaker
+    /// stopped, which reads as a stuck UI.
+    #[uniffi(default = 1500)]
+    pub demote_ms: u64,
+    /// Reorders inside this window are delivered as one.
+    #[uniffi(default = 300)]
+    pub coalesce_ms: u64,
+}
+
+impl From<FfiStabilityConfig> for matrix_rtc_media::StabilityConfig {
+    fn from(c: FfiStabilityConfig) -> Self {
+        Self {
+            promote: Duration::from_millis(c.promote_ms),
+            demote: Duration::from_millis(c.demote_ms),
+            coalesce: Duration::from_millis(c.coalesce_ms),
+        }
+    }
+}
+
 /// Why the call ended.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiEndedReason {
@@ -156,14 +337,6 @@ impl From<matrix_rtc_media::FrameEncryptionDiagnostic> for FfiFrameEncryptionDia
             },
         }
     }
-}
-
-/// One speaking member and how loud they are.
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct FfiSpeakingMember {
-    pub member_id: String,
-    /// `0.0` (silent) to `1.0` (loudest); `0.0` from transports reporting none.
-    pub level: f32,
 }
 
 /// Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
@@ -290,6 +463,54 @@ impl From<matrix_rtc_media::ReceiveStats> for FfiReceiveStats {
     }
 }
 
+/// One of a participant's streams, named for a request: the pair
+/// `(member_id, kind)`, of any kind.
+///
+/// Not [`FfiTileId`], on purpose: a tile is a *renderable* stream, camera or
+/// screen share (contract C1), and statistics are also wanted for the
+/// microphone. Build one from a tile with its `member_id` and `kind`.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiStreamRef {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+}
+
+impl From<FfiStreamRef> for (String, matrix_rtc_media::MediaStreamKind) {
+    fn from(r: FfiStreamRef) -> Self {
+        (r.member_id, r.kind.into())
+    }
+}
+
+/// One entry of [`MediaSession::receive_stats_for`](super::MediaSession::receive_stats_for)'s
+/// answer: the stream asked about and its counters. `stats` is `null`
+/// exactly when [`MediaSession::receive_stats`](super::MediaSession::receive_stats)
+/// would be — not subscribed, or no RTCP report yet — so a host can tell
+/// "asked, and nothing there" from a stream it never asked about.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiStreamStats {
+    pub member_id: String,
+    pub kind: FfiStreamKind,
+    pub stats: Option<FfiReceiveStats>,
+}
+
+/// Zip a request with the engine's positional answer into self-describing
+/// records. Same length is the engine's guarantee.
+pub(super) fn zip_stream_stats(
+    streams: Vec<FfiStreamRef>,
+    results: Vec<Option<matrix_rtc_media::ReceiveStats>>,
+) -> Vec<FfiStreamStats> {
+    debug_assert_eq!(streams.len(), results.len());
+    streams
+        .into_iter()
+        .zip(results)
+        .map(|(stream, stats)| FfiStreamStats {
+            member_id: stream.member_id,
+            kind: stream.kind,
+            stats: stats.map(Into::into),
+        })
+        .collect()
+}
+
 /// An event on the unified call stream (mirrors
 /// `matrix_rtc_media::CallEvent`). Consume via
 /// [`MediaSession::next_event`](super::MediaSession::next_event).
@@ -319,12 +540,6 @@ pub enum FfiCallEvent {
     StreamUnmuted {
         member_id: String,
         kind: FfiStreamKind,
-    },
-    ActiveSpeakers {
-        /// Who is speaking, each with their current audio level. The level rides
-        /// along because it comes from the same transport event — without it a
-        /// host has to meter the PCM itself to answer "how loud".
-        speakers: Vec<FfiSpeakingMember>,
     },
     /// This participant's media is decryptable from here on.
     KeyImported {
@@ -394,10 +609,16 @@ pub enum FfiCallEvent {
     },
 }
 
-impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
-    fn from(event: matrix_rtc_media::CallEvent) -> Self {
+impl FfiCallEvent {
+    /// The event as a host sees it, or `None` for one the FFI does not relay:
+    /// who is speaking is ranked into the roster (`FfiCallTile::speaking`) rather
+    /// than sent as an event — it was the noisiest thing on the stream and
+    /// nothing drew from it. `CallEvent::ActiveSpeakers` itself survives in the
+    /// core only because the wasm binding still relays it to a web client that
+    /// has no tile roster; once the roster is exposed to wasm, delete the event.
+    pub(super) fn relayed(event: matrix_rtc_media::CallEvent) -> Option<Self> {
         use matrix_rtc_media::CallEvent as Event;
-        match event {
+        Some(match event {
             Event::ParticipantJoined { member_id, user_id } => {
                 Self::ParticipantJoined { member_id, user_id }
             }
@@ -418,15 +639,7 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                 member_id,
                 kind: kind.into(),
             },
-            Event::ActiveSpeakers { speakers } => Self::ActiveSpeakers {
-                speakers: speakers
-                    .into_iter()
-                    .map(|speaker| FfiSpeakingMember {
-                        member_id: speaker.member_id,
-                        level: speaker.level,
-                    })
-                    .collect(),
-            },
+            Event::ActiveSpeakers { .. } => return None,
             Event::KeyImported {
                 member_id,
                 key_index,
@@ -485,7 +698,7 @@ impl From<matrix_rtc_media::CallEvent> for FfiCallEvent {
                     }
                 },
             },
-        }
+        })
     }
 }
 

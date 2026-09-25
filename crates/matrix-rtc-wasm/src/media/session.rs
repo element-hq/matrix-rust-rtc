@@ -14,6 +14,7 @@
 //! multi-focus connection pool; its actor runs on the JS microtask queue.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_bridge::compat::ElementCallCompat;
@@ -21,7 +22,7 @@ use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EndedReason, EngineConfig, FrameEncryptionDiagnostic,
-    FrameEncryptionState, OwnMemberClaims, Participant, TransportConnection as _,
+    FrameEncryptionState, OwnMemberClaims, Participant, StabilityConfig, TransportConnection as _,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, watch};
@@ -54,6 +55,50 @@ struct WasmMediaSessionConfig {
     /// match the membership the page published.
     #[serde(default)]
     element_call_compat: Option<String>,
+    /// How much the tile order is damped. Omitted takes the defaults; so does
+    /// any field left out of the object.
+    #[serde(default)]
+    stability: Option<WasmStabilityConfig>,
+}
+
+/// The tile-order damping a page can set (R10, R11). A product decision
+/// rather than a protocol one; each field defaults to what
+/// `matrix_rtc_media::StabilityConfig` uses.
+#[derive(Debug, Deserialize)]
+struct WasmStabilityConfig {
+    /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
+    #[serde(default = "default_promote_ms")]
+    promote_ms: u64,
+    /// Silence before a speaking member stops ranking as one. Raising this above
+    /// `promote_ms` leaves a tile at the top of the order after the speaker
+    /// stopped, which reads as a stuck UI.
+    #[serde(default = "default_demote_ms")]
+    demote_ms: u64,
+    /// Reorders inside this window are delivered as one.
+    #[serde(default = "default_coalesce_ms")]
+    coalesce_ms: u64,
+}
+
+fn default_promote_ms() -> u64 {
+    StabilityConfig::default().promote.as_millis() as u64
+}
+
+fn default_demote_ms() -> u64 {
+    StabilityConfig::default().demote.as_millis() as u64
+}
+
+fn default_coalesce_ms() -> u64 {
+    StabilityConfig::default().coalesce.as_millis() as u64
+}
+
+impl From<&WasmStabilityConfig> for StabilityConfig {
+    fn from(c: &WasmStabilityConfig) -> Self {
+        Self {
+            promote: Duration::from_millis(c.promote_ms),
+            demote: Duration::from_millis(c.demote_ms),
+            coalesce: Duration::from_millis(c.coalesce_ms),
+        }
+    }
 }
 
 /// Calls the delegate's `setLocalKeyIndex(index)`; the local-sender hook.
@@ -85,7 +130,7 @@ impl WasmRtcSessionManager {
     /// it.
     ///
     /// `config` is `{ room_id, slot_id, user_id, device_id,
-    /// livekit_service_url, key_ring_size?, element_call_compat? }`;
+    /// livekit_service_url, key_ring_size?, element_call_compat?, stability? }`;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
     /// implement `onParticipants(roster)`, `onEvent(event)`, and
@@ -229,6 +274,11 @@ impl WasmRtcSessionManager {
                 own_connection_key: Some(config.livekit_service_url.clone()),
                 raised_hands,
                 reactions,
+                stability: config
+                    .stability
+                    .as_ref()
+                    .map(Into::into)
+                    .unwrap_or_default(),
             },
             memberships,
         );

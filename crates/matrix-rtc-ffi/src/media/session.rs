@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 use matrix_rtc_bridge::compat::ElementCallCompat;
 use matrix_rtc_livekit::{
@@ -18,14 +19,15 @@ use matrix_rtc_livekit::{
     identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 use matrix_rtc_media::{
-    CallEngine, CallEvent, ConnectionContext, EngineConfig, OwnMemberClaims,
+    CallEngine, CallEvent, ConnectionContext, EngineConfig, MediaStreamKind, OwnMemberClaims,
     TransportConnection as _,
 };
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
-    FfiCallEvent, FfiMediaConstraints, FfiParticipant, FfiPublishOptions, FfiReceiveStats,
-    FfiStreamKind, OpenIdTokenProvider, TokenProviderAdapter,
+    FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
+    FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef, FfiStreamStats, FfiTileId,
+    FfiTileRoster, OpenIdTokenProvider, TokenProviderAdapter, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcSessionManagerHandle;
@@ -41,6 +43,9 @@ pub struct MediaSessionConfig {
     /// the same URL announced in our membership's transport. (Peers' foci
     /// are discovered from their memberships automatically.)
     pub livekit_service_url: String,
+    /// How much the tile order is damped. `None` takes the defaults.
+    #[uniffi(default = None)]
+    pub stability: Option<FfiStabilityConfig>,
 }
 
 /// Attach media to a joined slot: wire frame-key signalling into the core,
@@ -199,6 +204,7 @@ async fn build_media_session(
             own_connection_key: Some(config.livekit_service_url.clone()),
             raised_hands,
             reactions,
+            stability: config.stability.clone().map(Into::into).unwrap_or_default(),
         },
         memberships,
     );
@@ -270,11 +276,15 @@ async fn build_media_session(
 
     log::info!("media: connected as member {member_id}, local identity {own_identity}");
 
+    let tiles = engine.subscribe_tiles();
+    let local = engine.subscribe_local_state();
     Ok(Arc::new(MediaSession {
         engine,
         connection,
         _bridge: bridge,
         events: TokioMutex::new(events),
+        tiles: TokioMutex::new(tiles),
+        local: TokioMutex::new(local),
         own_identity,
     }))
 }
@@ -293,6 +303,8 @@ pub struct MediaSession {
     /// core's encryption manager also holds it.
     _bridge: Arc<MediaKeyBridge>,
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
+    tiles: TokioMutex<watch::Receiver<matrix_rtc_media::TileRoster>>,
+    local: TokioMutex<watch::Receiver<Option<matrix_rtc_media::LocalState>>>,
     own_identity: String,
 }
 
@@ -302,13 +314,23 @@ impl MediaSession {
     /// arrives; `None` means the session is over. Bridge to a Kotlin `Flow`
     /// or Swift `AsyncStream` by looping.
     ///
-    /// A consumer that falls very far behind may miss events (the internal
-    /// buffer holds 256); resynchronise from [`Self::participants`].
+    /// Events are one-shots and diagnostics: joins and leaves, streams
+    /// starting and stopping, key and encryption reports, the connection
+    /// degrading, the call ending. **State lives elsewhere**: what to draw,
+    /// and whose audio to play, is [`Self::next_roster`] — a latest-value push
+    /// whose order is every tile in the call. So a consumer that falls very
+    /// far behind (the buffer holds 256) can lose a sound cue or a badge
+    /// update, never the roster. Who is speaking is not an event at all: it
+    /// is [`FfiCallTile::speaking`].
     pub async fn next_event(&self) -> Option<FfiCallEvent> {
         let mut events = self.events.lock().await;
         loop {
             match events.recv().await {
-                Ok(event) => return Some(event.into()),
+                Ok(event) => {
+                    if let Some(event) = FfiCallEvent::relayed(event) {
+                        return Some(event);
+                    }
+                }
                 Err(broadcast::error::RecvError::Lagged(missed)) => {
                     log::warn!("call event consumer lagged; {missed} events dropped");
                     continue;
@@ -318,13 +340,61 @@ impl MediaSession {
         }
     }
 
-    /// The current participant roster (including ourselves).
+    /// The current participant roster, including ourselves: the transport's
+    /// un-joined view, one row per membership. A **diagnostics pull**, not a
+    /// live surface — it is the whole call every time, which is the cost the
+    /// tile roster's detail window exists to avoid. Read it once to seed what
+    /// the tiles do not carry yet (your own row before local state arrives),
+    /// and on demand for a readout. Contract C11.
     pub fn participants(&self) -> Vec<FfiParticipant> {
         self.engine
             .participants()
             .into_iter()
             .map(Into::into)
             .collect()
+    }
+
+    /// The next tile roster. Suspends until it changes; `None` means the
+    /// session is over. Latest-value-wins: a consumer that falls behind gets
+    /// the current roster, never a backlog. The first call on a session that
+    /// already has tiles returns at once. Contract C7.
+    pub async fn next_roster(&self) -> Option<FfiTileRoster> {
+        let mut tiles = self.tiles.lock().await;
+        tiles.changed().await.ok()?;
+        Some(tiles.borrow_and_update().clone().into())
+    }
+
+    /// The tile roster as it stands now.
+    pub fn roster(&self) -> FfiTileRoster {
+        self.engine.tiles().into()
+    }
+
+    /// The next change to our own tile or screen-sharing flag. Suspends until
+    /// one; skips the state before our membership is on the roster, so the
+    /// first value is our first tile. `None` means the session is over.
+    pub async fn next_local_state(&self) -> Option<FfiLocalState> {
+        let mut local = self.local.lock().await;
+        loop {
+            local.changed().await.ok()?;
+            if let Some(state) = local.borrow_and_update().clone() {
+                return Some(state.into());
+            }
+        }
+    }
+
+    /// Our own tile and screen-sharing flag now; `None` until our membership
+    /// is on the roster.
+    pub fn local_state(&self) -> Option<FfiLocalState> {
+        self.engine.local_state().map(Into::into)
+    }
+
+    /// Declare which tiles get full records in [`FfiTileRoster::detail`]:
+    /// ranks `[offset, offset + len)` plus `also`, wherever those rank — a
+    /// tile shown full-screen, a picture-in-picture source. The default is
+    /// everything. Declare what you compose, not what is visible. Contract C12.
+    pub fn set_detail_window(&self, offset: u32, len: u32, also: Vec<FfiTileId>) {
+        self.engine
+            .set_detail_window(offset, len, also.into_iter().map(Into::into));
     }
 
     /// Our participant identity on the media plane (the JWT `sub`; peers import
@@ -388,6 +458,21 @@ impl MediaSession {
             .receive_stats(&member_id, kind.into())
             .await
             .map(Into::into)
+    }
+
+    /// [`MediaSession::receive_stats`] for many streams in one round trip.
+    ///
+    /// One entry per requested stream, in request order; nothing is omitted
+    /// and a duplicate is answered twice. Bound the request to the tiles you
+    /// compose — the detail window of contract C12 is the right set, plus the
+    /// microphone of each member in it — and call this once per sample rather
+    /// than once per stream. The counters are the same cumulative totals as
+    /// the single call; see [`FfiReceiveStats`].
+    pub async fn receive_stats_for(&self, streams: Vec<FfiStreamRef>) -> Vec<FfiStreamStats> {
+        let keys: Vec<(String, MediaStreamKind)> =
+            streams.iter().cloned().map(Into::into).collect();
+        let results = self.engine.receive_stats_for(&keys).await;
+        zip_stream_stats(streams, results)
     }
 
     /// Publish a local track on our focus; push captured frames into the

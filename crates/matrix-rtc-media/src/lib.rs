@@ -39,12 +39,13 @@ pub mod local;
 pub mod participant;
 mod rt;
 pub mod stats;
+pub mod tile;
 pub mod transport;
 
 pub use constraints::{
     Dimensions, MediaConstraints, QualityLimit, ResolvedConstraints, StreamDemand, VideoDetail,
 };
-pub use engine::{CallEngine, EngineConfig, EngineHandle};
+pub use engine::{CallEngine, EngineConfig, EngineHandle, StabilityConfig};
 pub use event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState};
 pub use frame::{AudioFrame, I420Buffer, VideoFrame, VideoRotation};
 pub use keys::{
@@ -54,6 +55,10 @@ pub use keys::{
 pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
 pub use participant::{MediaStreamKind, Participant, StreamState};
 pub use stats::ReceiveStats;
+pub use tile::{
+    CallTile, DetailWindow, LocalState, TileId, TileKind, TileRef, TileRoster, Tiles, derive_tiles,
+    window,
+};
 pub use transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,
     SpeakingParticipant, TransportConnection, TransportError,
