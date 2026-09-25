@@ -1745,6 +1745,64 @@ mod tests {
         );
     }
 
+    /// A slot closing under our join makes the manager leave on its own, with
+    /// `slot_closed`, and tell a host that runs its own media.
+    #[tokio::test]
+    async fn closing_the_slot_leaves_and_reports_an_auto_leave() {
+        let mock = Arc::new(MockCommandSenderCallback::default());
+        let manager = crate::RtcSessionManagerHandle::new();
+        manager
+            .set_command_sender(Arc::new(mock.clone()))
+            .await
+            .expect("the mock sender should be accepted");
+        let (room_id, slot_id) = ("!room:example.org".to_owned(), "m.call#ROOM".to_owned());
+        let slot = |content: &str| crate::SlotEvent {
+            slot_id: slot_id.clone(),
+            content_json: content.to_owned(),
+        };
+        manager
+            .on_room_slots_received(
+                room_id.clone(),
+                vec![slot(
+                    r#"{ "status": "open", "application": { "type": "m.call" } }"#,
+                )],
+            )
+            .await
+            .expect("room slots");
+        manager.join(join_params()).await.expect("join");
+        let auto_leaves = manager
+            .subscribe_auto_leaves(room_id.clone(), slot_id.clone())
+            .await
+            .expect("subscribe")
+            .expect("a joined session");
+
+        manager
+            .on_room_slots_received(room_id.clone(), vec![slot(r#"{ "status": "closed" }"#)])
+            .await
+            .expect("closed slot");
+
+        let reason = auto_leaves.next_auto_leave().await.expect("an auto-leave");
+        assert_eq!(reason.code, "slot_closed");
+        let leave = mock
+            .sends()
+            .into_iter()
+            .rev()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("a leave was sent");
+        assert_eq!(
+            leave.content["leave_reason"]["code"], "slot_closed",
+            "{:?}",
+            leave.content
+        );
+        assert_eq!(
+            manager
+                .own_member_id(room_id.clone(), slot_id.clone())
+                .await
+                .expect("own member id"),
+            None,
+        );
+    }
+
     /// A host can open the slot its own call needs — the reason this is exported
     /// at all is that no generation of Element Call publishes one, so in an
     /// interop room nobody else will.

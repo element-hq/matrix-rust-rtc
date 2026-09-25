@@ -126,6 +126,10 @@ struct OwnParticipation {
     member_id: String,
 }
 
+/// Buffer of [`RtcSession::subscribe_auto_leaves`]. One auto-leave ends a join,
+/// so a subscriber only ever falls behind across several rejoins.
+const AUTO_LEAVES_CAPACITY: usize = 4;
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct RtcSession<T: RtcCommandSender> {
     /// Member events that are join-shaped and still sticky. These are
@@ -144,6 +148,9 @@ pub struct RtcSession<T: RtcCommandSender> {
     /// required to be encrypted.
     room_encryption: RoomEncryption,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
+    /// Announces every leave this session makes on its own, i.e. not asked for
+    /// by the host. See [`RtcSession::subscribe_auto_leaves`].
+    auto_leaves_tx: broadcast::Sender<LeaveReason>,
     /// Command sender for sending events to the Matrix room.
     command_sender: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
@@ -172,6 +179,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             room_members: self.room_members.clone(),
             room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
+            auto_leaves_tx: self.auto_leaves_tx.clone(),
             command_sender: self.command_sender.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             encryption_manager: None,     // Don't clone the encryption manager
@@ -194,6 +202,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             room_members: None,
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
+            auto_leaves_tx: broadcast::channel(AUTO_LEAVES_CAPACITY).0,
             command_sender: None,
             own_membership_machine: None,
             encryption_manager: None,
@@ -214,6 +223,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             room_members: None,
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
+            auto_leaves_tx: broadcast::channel(AUTO_LEAVES_CAPACITY).0,
             command_sender: Some(command_sender),
             own_membership_machine: None,
             encryption_manager: None,
@@ -1317,8 +1327,35 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             self.slot,
             if state.is_open() { "Open" } else { "Closed" },
         );
+        let closed = !state.is_open();
         self.slot = SlotKnowledge::Known(state);
-        self.refresh().await;
+
+        if closed && self.own_membership_machine.is_some() {
+            // A slot closing while we are joined also ends our own participation.
+            self.auto_leave(LeaveReason::new(LeaveCode::SlotClosed))
+                .await;
+        } else {
+            self.refresh().await;
+        }
+    }
+
+    /// Leaves without the host asking, and tells it so.
+    async fn auto_leave(&mut self, reason: LeaveReason) {
+        log::info!("[{}] leaving on our own ({:?})", self.log_tag, reason.code);
+        let params = LeaveSessionParams {
+            leave_reason: Some(reason.clone()),
+        };
+        if let Err(error) = self.leave(params).await {
+            log::info!("[{}] failed leaving on our own: {error}", self.log_tag);
+            self.refresh().await;
+            return;
+        }
+        let _ = self.auto_leaves_tx.send(reason);
+    }
+
+    /// Subscribes to the leaves this session makes on its own.
+    pub fn subscribe_auto_leaves(&self) -> broadcast::Receiver<LeaveReason> {
+        self.auto_leaves_tx.subscribe()
     }
 
     /// Returns this session's slot to [`SlotKnowledge::Unsupplied`], so the

@@ -39,7 +39,7 @@ use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
 use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::{
-    AnyMessageLikeEventContent, AnyStateEventContent, AnySyncMessageLikeEvent,
+    AnyMessageLikeEventContent, AnyStateEventContent, AnySyncMessageLikeEvent, AnySyncStateEvent,
     AnyToDeviceEventContent, MessageLikeEventType, StateEventType, TimelineEventType,
 };
 use matrix_sdk::ruma::serde::Raw;
@@ -1215,6 +1215,22 @@ pub fn register_timeline_receiver(
     )
 }
 
+/// Signal `tx` whenever an `m.rtc.slot` state event arrives in `room` through sync.
+fn register_slot_receiver(room: &Room, tx: mpsc::UnboundedSender<()>) -> EventHandlerHandle {
+    room.add_event_handler(move |event: Raw<AnySyncStateEvent>| {
+        let tx = tx.clone();
+        async move {
+            let event_type = event.get_field::<String>("type").ok().flatten();
+            if matches!(
+                event_type.as_deref(),
+                Some(SLOT_EVENT_TYPE | "org.matrix.msc4143.rtc.slot")
+            ) {
+                let _ = tx.send(());
+            }
+        }
+    })
+}
+
 /// Drives the core's reactions intake from what
 /// [`register_timeline_receiver`] forwards, until the channel closes.
 ///
@@ -1298,23 +1314,31 @@ pub async fn run_membership_bridge(
     // an HTTP round trip on every sync of every call.
     let mut room_updates = state_membership.then(|| room.subscribe_to_updates());
 
+    // Third wake source, outside state mode: the slot's own state event. Closing
+    // a slot produces no sticky traffic either. Without this the close would only
+    // be noticed at the next membership refresh. A room event handler fires when
+    // slot events arrive through sync.
+    let (slot_tx, mut slot_rx) = mpsc::unbounded_channel::<()>();
+    let _slot_handler = (!state_membership).then(|| {
+        room.client()
+            .event_handler_drop_guard(register_slot_receiver(&room, slot_tx))
+    });
+
     // Seed before waiting on anything. `tick` feeds the gating room state before
     // the members, so a member is never briefly considered joined to a slot that
     // room state says is closed.
     tick(&room, &manager, state_membership).await;
 
     loop {
-        // NOTE: without `state_membership` this still only re-checks when sticky
-        // traffic arrives, so a slot closing in an otherwise idle room is noticed
-        // late. Fixing that for the spec path means subscribing to room updates
-        // there too — and paying the state fetch per sync, or throttling it
-        // first. Still a follow-up.
         let woken = match &mut room_updates {
             Some(room_updates) => tokio::select! {
                 result = sticky.recv() => keep_bridging(result),
                 woken = state_wake(room_updates) => woken,
             },
-            None => keep_bridging(sticky.recv().await),
+            None => tokio::select! {
+                result = sticky.recv() => keep_bridging(result),
+                slot = slot_rx.recv() => slot.is_some(),
+            },
         };
         if !woken {
             break;

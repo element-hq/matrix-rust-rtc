@@ -107,7 +107,7 @@ async fn build_media_session(
     // Wire the core's encryption manager to the bridge and to the MSC4195
     // identity derivation, and take the membership snapshot channel the engine
     // consumes.
-    let (memberships, raised_hands, reactions, member_id) = {
+    let (memberships, raised_hands, reactions, auto_leaves, member_id) = {
         let mut mgr = manager.inner.lock().await;
         // Read the `member.id` from the join rather than taking one from the
         // host: it is what our MSC4195 participant identity is derived from, so
@@ -162,7 +162,16 @@ async fn build_media_session(
             ));
         }
 
-        (memberships, raised_hands, reactions, member_id)
+        let auto_leaves = mgr
+            .subscribe_auto_leaves(&config.room_id, &config.slot_id)
+            .ok_or_else(|| {
+                MediaFfiError::NotJoined(format!(
+                    "no session for {}/{} — join the slot first",
+                    config.room_id, config.slot_id
+                ))
+            })?;
+
+        (memberships, raised_hands, reactions, auto_leaves, member_id)
     };
 
     let transport = Arc::new(
@@ -249,6 +258,14 @@ async fn build_media_session(
         })?;
     engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
+    // The core leaves on its own when the slot closes; the media is ours to end.
+    // The host sees it as `Ended { SlotClosed }` on the event stream.
+    let auto_leave_watcher = AbortOnDrop(tokio::spawn(
+        engine
+            .handle()
+            .end_on_auto_leave(auto_leaves, Box::new(connection.clone())),
+    ));
+
     let events = engine.subscribe_events();
     let own_identity = identity_mapper(&config.user_id, &config.device_id, &member_id);
 
@@ -273,10 +290,20 @@ async fn build_media_session(
     Ok(Arc::new(MediaSession {
         engine,
         connection,
+        _auto_leave_watcher: auto_leave_watcher,
         _bridge: bridge,
         events: TokioMutex::new(events),
         own_identity,
     }))
+}
+
+/// Aborts the wrapped task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// A live media session on a joined slot: the participant roster, the
@@ -284,11 +311,15 @@ async fn build_media_session(
 /// publications — with no transport types on the surface.
 ///
 /// End it with [`MediaSession::disconnect`]; leaving the slot itself stays a
-/// manager concern (`RtcSessionManagerHandle::leave`).
+/// manager concern (`RtcSessionManagerHandle::leave`). The one exception is a
+/// slot closing mid-call: the manager leaves on its own and this session ends
+/// itself, reported as `Ended { SlotClosed }`.
 #[derive(uniffi::Object)]
 pub struct MediaSession {
     engine: CallEngine,
     connection: LiveKitTransportConnection,
+    /// Ends the media when the core leaves on its own; stopped with the session.
+    _auto_leave_watcher: AbortOnDrop,
     /// Keeps the key bridge alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _bridge: Arc<MediaKeyBridge>,

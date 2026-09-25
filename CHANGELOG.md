@@ -8,6 +8,14 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- A session leaves on its own when its slot closes, with `leave_reason` `slot_closed`; `Call` and the FFI and web media sessions then end with `EndedReason::SlotClosed`, and hosts running their own media get `subscribe_auto_leaves`.
+
+### Fixed
+
+- A closed slot is noticed as soon as its `m.rtc.slot` event syncs, not at the next membership refresh up to 30 minutes later.
+
 ### Breaking
 
 - MSC4354 sticky events now come from upstream matrix-rust-sdk and are always on with the `matrix-sdk` feature; the `experimental-sticky` feature, `STICKY_EVENTS_SUPPORTED` and `CallError::StickyEventsUnsupported` are gone.

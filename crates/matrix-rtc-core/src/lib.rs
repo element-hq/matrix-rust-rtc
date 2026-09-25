@@ -812,6 +812,66 @@ mod tests {
         assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(1));
     }
 
+    /// A slot closing under our own join ends it: we leave with `slot_closed`,
+    /// cancel the dead man's switch, and announce the leave so the host can tear
+    /// its media down.
+    #[tokio::test]
+    async fn closing_the_slot_leaves_our_own_join() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+        join_as(&mut manager, "alice-a").await;
+        let mut auto_leaves = manager
+            .subscribe_auto_leaves(ROOM_ID, "m.call#ROOM")
+            .expect("joined session");
+
+        manager
+            .on_room_slots_received(
+                ROOM_ID,
+                vec![slot_event("m.call#ROOM", r#"{ "status": "closed" }"#)],
+            )
+            .await;
+
+        assert_eq!(
+            auto_leaves.try_recv().expect("an auto-leave").code,
+            LeaveCode::SlotClosed
+        );
+        assert_eq!(manager.own_member_id(ROOM_ID, "m.call#ROOM"), None);
+        let (_, _, leave, _) = sender.last_sticky_event().expect("a leave was sent");
+        assert_eq!(leave["leave_reason"]["code"], "slot_closed", "{leave}");
+        assert_eq!(sender.cancelled_events.lock().unwrap().len(), 1);
+        assert!(!manager.heartbeat(ROOM_ID, "m.call#ROOM").await);
+    }
+
+    /// Only the leaves the session makes on its own are announced; a host that
+    /// hung up knows it did.
+    #[tokio::test]
+    async fn a_host_leave_is_not_announced_as_an_auto_leave() {
+        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+        join_as(&mut manager, "alice-a").await;
+        let mut auto_leaves = manager
+            .subscribe_auto_leaves(ROOM_ID, "m.call#ROOM")
+            .expect("joined session");
+
+        manager
+            .leave(
+                ROOM_ID.to_owned(),
+                "m.call#ROOM".to_owned(),
+                LeaveSessionParams::default(),
+            )
+            .await
+            .unwrap();
+        // Closing the slot now finds nobody of ours to leave.
+        manager
+            .on_room_slots_received(
+                ROOM_ID,
+                vec![slot_event("m.call#ROOM", r#"{ "status": "closed" }"#)],
+            )
+            .await;
+
+        assert!(auto_leaves.try_recv().is_err());
+    }
+
     /// Slot state that arrives before the session exists still governs it.
     #[tokio::test]
     async fn slot_state_applies_to_sessions_created_later() {

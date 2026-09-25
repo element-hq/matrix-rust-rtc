@@ -173,6 +173,12 @@ impl WasmRtcSessionManager {
             .ok_or_else(|| {
                 JsError::new("no session for the slot — join it before connecting media")
             })?;
+        let auto_leaves = self
+            .inner
+            .subscribe_auto_leaves(&config.room_id, &config.slot_id)
+            .ok_or_else(|| {
+                JsError::new("no session for the slot — join it before connecting media")
+            })?;
         let raised_hands = self
             .inner
             .subscribe_raised_hands(&config.room_id, &config.slot_id);
@@ -281,6 +287,16 @@ impl WasmRtcSessionManager {
             })?;
         engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
+        // The core leaves on its own when the slot closes; the media is ours to
+        // end.
+        let (auto_leave_watcher, registration) = futures::future::AbortHandle::new_pair();
+        let ending = engine
+            .handle()
+            .end_on_auto_leave(auto_leaves, Box::new(connection.clone()));
+        wasm_bindgen_futures::spawn_local(async move {
+            let _ = futures::future::Abortable::new(ending, registration).await;
+        });
+
         let own_identity = mapper(&config.user_id, &config.device_id, &member_id);
 
         // Roster, event, and switch-complete delivery run as spawned pumps
@@ -363,10 +379,17 @@ impl WasmRtcSessionManager {
         Ok(WasmMediaSession {
             engine,
             own_connection: connection,
+            auto_leave_watcher,
             _handler: handler,
             identity_mapper: mapper,
             own_identity,
         })
+    }
+}
+
+impl Drop for WasmMediaSession {
+    fn drop(&mut self) {
+        self.auto_leave_watcher.abort();
     }
 }
 
@@ -393,6 +416,8 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 pub struct WasmMediaSession {
     engine: CallEngine,
     own_connection: JsTransportConnection,
+    /// Ends the media when the core leaves on its own; stopped with the session.
+    auto_leave_watcher: futures::future::AbortHandle,
     /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _handler: Arc<MediaKeyHandler>,
@@ -424,8 +449,11 @@ impl WasmMediaSession {
 
     /// Shut the media session down: stop the engine (closing peer-focus
     /// connections) and close the own-focus room through the delegate.
-    /// Leaving the slot is separate ([`WasmRtcSessionManager::leave`]).
+    /// Leaving the slot is separate ([`WasmRtcSessionManager::leave`]), except
+    /// when the slot closes mid-call: the manager leaves on its own and the
+    /// session ends itself, reported as `ended` with reason `slot_closed`.
     pub async fn disconnect(&mut self) -> Result<(), JsError> {
+        self.auto_leave_watcher.abort();
         self.engine.shutdown().await;
         self.own_connection
             .close()
@@ -685,6 +713,7 @@ impl From<CallEvent> for WasmCallEvent {
             CallEvent::Ended { reason } => Self::Ended {
                 reason: match reason {
                     EndedReason::Left => "left".to_owned(),
+                    EndedReason::SlotClosed => "slot_closed".to_owned(),
                     EndedReason::ConnectionClosed { message } => message,
                 },
             },

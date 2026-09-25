@@ -22,7 +22,7 @@ use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::reactions::{
     RaisedHand, RawTimelineEvent, ReactionError, ReceivedReaction, RelationLookup,
 };
-use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
+use crate::session::{CallMembershipEvent, JoinedMembership, LeaveReason, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
@@ -292,6 +292,20 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         self.sessions
             .get(&key)
             .map(RtcSession::subscribe_membership_snapshots)
+    }
+
+    /// Subscribes to the leaves one `(room_id, slot_id)` session makes on its
+    /// own (see [`RtcSession::subscribe_auto_leaves`]), or `None` if the session
+    /// does not exist.
+    pub fn subscribe_auto_leaves(
+        &self,
+        room_id: &str,
+        slot_id: &str,
+    ) -> Option<broadcast::Receiver<LeaveReason>> {
+        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
+        self.sessions
+            .get(&key)
+            .map(RtcSession::subscribe_auto_leaves)
     }
 
     /// Registers a media key signal handler for one `(room_id, slot_id)`
