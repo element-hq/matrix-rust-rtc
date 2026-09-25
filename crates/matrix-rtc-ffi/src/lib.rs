@@ -109,6 +109,19 @@ impl From<FfiLeaveReason> for matrix_rtc_core::LeaveReason {
     }
 }
 
+impl From<matrix_rtc_core::LeaveReason> for FfiLeaveReason {
+    fn from(value: matrix_rtc_core::LeaveReason) -> Self {
+        let code = serde_json::to_value(&value.code)
+            .ok()
+            .and_then(|code| code.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        FfiLeaveReason {
+            code,
+            reason: value.reason,
+        }
+    }
+}
+
 /// An `m.rtc.slot` state event, with its content as a JSON string.
 ///
 /// The content is passed as JSON rather than a typed record so that
@@ -485,6 +498,30 @@ struct SubscriptionState {
     initial_pending: bool,
 }
 
+/// The leaves one session makes on its own; see
+/// [`RtcSessionManagerHandle::subscribe_auto_leaves`].
+#[derive(uniffi::Object)]
+pub struct AutoLeaveSubscription {
+    receiver: TokioMutex<tokio::sync::broadcast::Receiver<matrix_rtc_core::LeaveReason>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl AutoLeaveSubscription {
+    /// Waits for the next leave the session makes on its own, and returns its
+    /// reason. `None` once the session is gone.
+    pub async fn next_auto_leave(&self) -> Option<FfiLeaveReason> {
+        use tokio::sync::broadcast::error::RecvError;
+        let mut receiver = self.receiver.lock().await;
+        loop {
+            match receiver.recv().await {
+                Ok(reason) => return Some(reason.into()),
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct MembershipSnapshotSubscription {
     state: Mutex<SubscriptionState>,
@@ -805,6 +842,23 @@ impl RtcSessionManagerHandle {
                         receiver,
                         initial_pending: true,
                     }),
+                })
+            }))
+    }
+
+    /// Subscribes to the leaves a session makes on its own, or `None` if no
+    /// session exists for `(room_id, slot_id)`.
+    pub async fn subscribe_auto_leaves(
+        &self,
+        room_id: String,
+        slot_id: String,
+    ) -> Result<Option<Arc<AutoLeaveSubscription>>, MatrixRtcFfiError> {
+        let manager = self.inner.lock().await;
+        Ok(manager
+            .subscribe_auto_leaves(&room_id, &slot_id)
+            .map(|receiver| {
+                Arc::new(AutoLeaveSubscription {
+                    receiver: TokioMutex::new(receiver),
                 })
             }))
     }

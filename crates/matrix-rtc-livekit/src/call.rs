@@ -59,7 +59,7 @@ use matrix_rtc_bridge::{
     run_timeline_bridge,
 };
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin, LiveKitTransport,
+    EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin, LeaveError, LiveKitTransport,
     NotifyConfig, RaisedHand, ReactionError, ReactionsConfig, ReceivedEncryptionKey,
     RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
 };
@@ -219,11 +219,26 @@ impl Default for CallOptions {
 
 /// Aborts the wrapped task when dropped, so a [`Call`] going out of scope
 /// never leaks its background loops.
-struct AbortOnDrop(JoinHandle<()>);
+struct AbortOnDrop(Option<JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self(Some(handle))
+    }
+
+    /// Let the task run to completion instead of aborting it.
+    async fn join(mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.await;
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
     }
 }
 
@@ -258,6 +273,8 @@ pub struct Call {
     heartbeat: AbortOnDrop,
     key_pump: AbortOnDrop,
     rotation_pump: AbortOnDrop,
+    /// Ends the media when the core leaves on its own.
+    auto_leave_watcher: AbortOnDrop,
     _sticky_bridge: AbortOnDrop,
     _timeline_bridge: AbortOnDrop,
     _key_handler: EventHandlerDropGuard,
@@ -324,7 +341,7 @@ impl Call {
         let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(
             Arc::new(SdkCommandSender::with_compat(client.clone(), dialect)),
         )));
-        let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_membership_bridge(
+        let sticky_bridge = AbortOnDrop::new(tokio::task::spawn_local(run_membership_bridge(
             room.clone(),
             manager.clone(),
             options.element_call_compat.reads_state_membership(),
@@ -337,7 +354,7 @@ impl Call {
         let (timeline_tx, timeline_rx) = unbounded_channel::<TimelineIngest>();
         let timeline_handler =
             client.event_handler_drop_guard(register_timeline_receiver(room, timeline_tx));
-        let timeline_bridge = AbortOnDrop(tokio::task::spawn_local(run_timeline_bridge(
+        let timeline_bridge = AbortOnDrop::new(tokio::task::spawn_local(run_timeline_bridge(
             room_id.clone(),
             manager.clone(),
             timeline_rx,
@@ -427,7 +444,7 @@ impl Call {
         params.degraded_lifetime_ms = options.degraded_lifetime_ms;
         params.notify = options.notify.clone();
         params.reactions = options.reactions.clone();
-        let (memberships, raised_hands, reactions) = {
+        let (memberships, raised_hands, reactions, auto_leaves) = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;
             // The same `Arc` that produced `own_identity` above and that the
@@ -460,10 +477,15 @@ impl Call {
                 .ok_or_else(|| {
                     CallError::Signalling("joined session is not tracked by the manager".into())
                 })?;
-            (memberships, raised_hands, reactions)
+            let auto_leaves = mgr
+                .subscribe_auto_leaves(&room_id, &options.slot_id)
+                .ok_or_else(|| {
+                    CallError::Signalling("joined session is not tracked by the manager".into())
+                })?;
+            (memberships, raised_hands, reactions, auto_leaves)
         };
 
-        let key_pump = AbortOnDrop(spawn_key_pump(manager.clone(), key_rx));
+        let key_pump = AbortOnDrop::new(spawn_key_pump(manager.clone(), key_rx));
 
         // Rotations the core coalesced into a key's `delayBeforeUse` window fall
         // due the moment that window closes, and the bridge's scheduled
@@ -479,14 +501,14 @@ impl Call {
         bridge.set_switch_complete_listener(Box::new(move || {
             let _ = switch_tx.send(());
         }));
-        let rotation_pump = AbortOnDrop(spawn_rotation_pump(
+        let rotation_pump = AbortOnDrop::new(spawn_rotation_pump(
             manager.clone(),
             room_id.clone(),
             options.slot_id.clone(),
             switch_rx,
         ));
 
-        let heartbeat = AbortOnDrop(spawn_heartbeat(
+        let heartbeat = AbortOnDrop::new(spawn_heartbeat(
             manager.clone(),
             room_id.clone(),
             options.slot_id.clone(),
@@ -631,6 +653,14 @@ impl Call {
             connection.set_local_key_index(own_key.key_index);
         }
 
+        // A slot closing mid-call makes the core leave on its own; the media is
+        // ours to end.
+        let auto_leave_watcher = AbortOnDrop::new(tokio::task::spawn_local(
+            engine
+                .handle()
+                .end_on_auto_leave(auto_leaves, Box::new(connection.clone())),
+        ));
+
         log::info!("[{room_id}/{}] join: complete", options.slot_id);
 
         // Transition-period raw stream; subscribed immediately after connect,
@@ -650,6 +680,7 @@ impl Call {
             heartbeat,
             key_pump,
             rotation_pump,
+            auto_leave_watcher,
             _sticky_bridge: sticky_bridge,
             _timeline_bridge: timeline_bridge,
             _key_handler: key_handler,
@@ -839,6 +870,10 @@ impl Call {
     /// The heartbeat stops first so it cannot re-arm a delayed leave after
     /// `leave` cancels the current one. The SFU connection is closed even if
     /// the Matrix-side leave fails; the first error wins.
+    ///
+    /// A call whose slot was closed has already left on its own (see
+    /// [`CallEvent::Ended`] with `EndedReason::SlotClosed`); leaving it then
+    /// waits for that teardown to finish and succeeds.
     pub async fn leave(self) -> Result<(), CallError> {
         let Call {
             manager,
@@ -847,6 +882,7 @@ impl Call {
             heartbeat,
             key_pump,
             rotation_pump,
+            auto_leave_watcher,
             room_id,
             slot_id,
             ..
@@ -863,8 +899,18 @@ impl Call {
             .lock()
             .await
             .leave(room_id.clone(), slot_id, Default::default())
-            .await
-            .map_err(signalling_error);
+            .await;
+        // A `Call` only exists joined, so "not joined" means the core already
+        // left on its own (the slot closed) and the watcher owns the teardown.
+        // Otherwise our leave won, and the core cannot auto-leave any more, so
+        // the watcher can go.
+        if let Err(LeaveError::NotJoined) = leave_result {
+            log::debug!("[{room_id}] leave: the core already left; waiting for the media teardown");
+            auto_leave_watcher.join().await;
+            return Ok(());
+        }
+        drop(auto_leave_watcher);
+        let leave_result = leave_result.map_err(signalling_error);
         log::debug!(
             "[{room_id}] leave: matrix leave {}; shutting down the media engine",
             if leave_result.is_ok() {

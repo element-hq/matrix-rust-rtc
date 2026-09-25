@@ -611,9 +611,9 @@ Still outstanding:
 3. **A unified `CallEvent` stream on the `Call` facade** — landed as
    `matrix-rtc-media::CallEvent` via `Call::subscribe_call_events` (peer
    joined/left, stream started/stopped, key imported, connection health,
-   ended-with-reason). Remaining: migrate the e2e test and examples off the
-   raw `Call::events`/`Call::session` accessors and delete them, and surface
-   slot-close as `CallEvent::Ended`.
+   ended-with-reason, including `EndedReason::SlotClosed`). Remaining: migrate
+   the e2e test and examples off the raw `Call::events`/`Call::session`
+   accessors and delete them.
 
 ## Logging
 

@@ -105,6 +105,14 @@ plus third-party `livekit` and `webrtc_sys`.
 See the "Logging" section of [../ARCHITECTURE.md](../ARCHITECTURE.md) for the level
 conventions the SDK follows.
 
+## When the slot closes
+
+A slot closing mid-call ends the call for everyone. The manager sends your leave
+(`leave_reason.code = "slot_closed"`) and stops the keep-alive on its own. A
+`MediaSession` then ends itself with `Ended(SlotClosed)`; a host running its own
+media waits on `manager.subscribeAutoLeaves(roomId, slotId)?.nextAutoLeave()`
+and tears it down there.
+
 ## Staying in the call (keep-alive)
 
 Two independent clocks expire your membership, and the SDK tends both for you.
