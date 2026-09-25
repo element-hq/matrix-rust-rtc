@@ -78,9 +78,9 @@ futures-util = "0.3"
 # two crates cannot drift onto two copies of matrix-sdk.
 matrix-sdk = { workspace = true, optional = true, features = ["experimental-send-custom-to-device"] }
 # Drives sliding sync plus the encryption sync in the examples and the e2e test.
-# Under `experimental-sticky` it also enables the sticky-events extension, so
-# sticky events actually flow; encryption support rides along via matrix-sdk's
-# default features.
+# Its `unstable-msc4354` (enabled by our `matrix-sdk` feature) turns on the
+# sliding-sync sticky-events extension, so sticky events actually flow;
+# encryption support rides along via matrix-sdk's default features.
 matrix-sdk-ui = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
@@ -93,19 +93,14 @@ jni = "0.21"
 # and its default `OpenIdTokenSource` for `matrix_sdk::Client`, the `call::Call`
 # facade that composes them with this transport, and the examples / `e2e_call`.
 # Off by default to keep the base crate light and buildable without the git SDK.
-#
-# Against the stock SDK this only joins in `ElementCallCompat::StateEvents`;
-# `Call::join` rejects the other modes with `CallError::StickyEventsUnsupported`.
-matrix-sdk = ["matrix-rtc-bridge/matrix-sdk", "dep:matrix-sdk", "dep:matrix-sdk-ui"]
-# MSC4354 sticky events, for `ElementCallCompat::Off` and `StickyEvents`. Needs
-# the fork SDK, selected with `.cargo/experimental-sticky.toml`, AND its
-# `unstable-msc4354` feature on both `matrix-sdk` and `matrix-sdk-ui` (the latter
-# is what makes `SyncService` enable the sliding-sync sticky extension). This
-# feature cannot forward those itself — see the bridge's feature of the same name
-# for why — so pass them on the command line, as the Makefile's `*-sticky`
-# targets do:
-#   --features experimental-sticky,matrix-sdk/unstable-msc4354,matrix-sdk-ui/unstable-msc4354
-experimental-sticky = ["matrix-sdk", "matrix-rtc-bridge/experimental-sticky"]
+# `matrix-sdk-ui/unstable-msc4354` is what makes `SyncService` request sticky
+# events over sliding sync.
+matrix-sdk = [
+    "matrix-rtc-bridge/matrix-sdk",
+    "dep:matrix-sdk",
+    "dep:matrix-sdk-ui",
+    "matrix-sdk-ui/unstable-msc4354",
+]
 # Exposes the test-only parts of the `media` module (tone generator, Goertzel
 # frequency detector) for examples and integration tests; recording/WAV
 # helpers in that module are shipped API and need no feature. Otherwise the

@@ -409,19 +409,11 @@ pub trait CommandSenderCallback: Send + Sync {
     ///   send it verbatim, it is already translated for you
     /// * `content_json` - The event content as a JSON string
     /// * `duration_ms` - How long the homeserver should keep this entry in the
-    ///   sticky map. Pass it through verbatim (matrix-rust-sdk:
-    ///   `.with_sticky_duration_ms(durationMs)`); do NOT substitute a value of
-    ///   your own. The SDK re-sends the membership before this elapses to stay
-    ///   in the call, so a shorter lifetime here silently drops the membership
-    ///   mid-call and a longer one leaves a ghost behind.
-    ///
-    ///   It is a `u64` here and a `u32` in matrix-rust-sdk's
-    ///   `withStickyDurationMs`, so the value narrows on the way down. Clamp
-    ///   rather than truncate: a bare cast turns an over-large duration into a
-    ///   near-instant expiry, which reads as the membership vanishing for no
-    ///   reason. The SDK clamps its own resolved value to one hour
-    ///   (`MAX_STICKY_DURATION_MS`) before it ever reaches you, so in practice
-    ///   the value always fits — the clamp is for hosts that pass their own.
+    ///   sticky map. Pass it through verbatim (matrix-sdk-ffi:
+    ///   `Room.sendStickyRaw(eventType, content, durationMs)`); do NOT
+    ///   substitute a value of your own. The SDK re-sends the membership before
+    ///   this elapses to stay in the call, so a shorter lifetime here silently
+    ///   drops the membership mid-call and a longer one leaves a ghost behind.
     ///
     /// # Returns
     /// The event id the homeserver assigned — matrix-rust-sdk: the `eventId` on

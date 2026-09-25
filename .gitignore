@@ -3,6 +3,7 @@
 # Build artifacts
 /build
 /pkg
+/.build
 
 # Static and shared libraries
 *.a

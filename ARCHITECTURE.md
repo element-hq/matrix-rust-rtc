@@ -172,13 +172,10 @@ At this stage there is no persistence, network transport, or encryption key dist
   core's `RtcCommandSender`, turning outbound commands (join/leave sticky events,
   the dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key`
   to-device messages) into Client-Server requests; `run_membership_bridge` feeds
-  the room's live membership back into an `RtcSessionManager`. Which carrier it
-  reads is a build-time fact: MSC4354 sticky events need the
-  **`experimental-sticky` feature** and the SDK fork that implements them (see
-  `.cargo/experimental-sticky.toml`); the default build, against upstream
-  matrix-rust-sdk, reads only `org.matrix.msc3401.call.member` room state, so
-  it serves the pre-sticky `ElementCallCompat::StateEvents` mode and nothing
-  else. `STICKY_EVENTS_SUPPORTED` exposes which build this is.
+  the room's live membership back into an `RtcSessionManager`. It reads MSC4354
+  sticky events (the SDK's `unstable-msc4354`) and, in the pre-sticky
+  `ElementCallCompat::StateEvents` mode, `org.matrix.msc3401.call.member` room
+  state as well.
 - `OpenIdTokenSource` (always available): the host's route to a Matrix OpenID
   token, which a transport exchanges for its own credentials. The trait is
   unconditional so a transport can name it; the `matrix_sdk::Client` impl sits
@@ -384,9 +381,7 @@ Tracked against the rewritten proposal
 - `member.claimed_user_id`, `member.claimed_device_id`, `versions`,
   `m.relates_to` and `created_ts` are gone. The sending device now comes from the
   event's decryption metadata and rides on `RawStickyEvent::origin`, which the
-  Matrix bridge fills from `EncryptionInfo` — for sticky events that is the fork
-  SDK's "keep encryption info for sticky events" change, one of the reasons the
-  sticky carrier needs `experimental-sticky`.
+  Matrix bridge fills from the sticky event's `EncryptionInfo`.
 - `member.id` is generated fresh per join (`generate_member_id`), as the spec
   requires; it is no longer derived from the user and device IDs.
 
@@ -614,7 +609,7 @@ Still outstanding:
    every room as slotless (which the core reads as "slot closed, everyone
    left"). The bridge therefore fetches `GET /rooms/{id}/state` on each tick
    and skips the update when the fetch fails. The real fix is adding the slot
-   type to the fork SDK's sliding sync `required_state`, then reverting
+   type to the SDK's sliding sync `required_state`, then reverting
    `slot_snapshot` to the state store.
 4. **A unified `CallEvent` stream on the `Call` facade** — landed as
    `matrix-rtc-media::CallEvent` via `Call::subscribe_call_events` (peer

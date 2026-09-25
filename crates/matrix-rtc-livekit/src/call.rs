@@ -29,12 +29,8 @@
 //! # Preconditions
 //!
 //! - the client is logged in and syncing (e.g. `matrix_sdk_ui::sync_service::SyncService`
-//!   is running — with the `experimental-sticky` feature it auto-enables the
-//!   sticky-events extension the membership bridge relies on);
-//! - the build matches the mode: without `experimental-sticky` only
-//!   [`ElementCallCompat::StateEvents`] can join, and [`Call::join`] returns
-//!   [`CallError::StickyEventsUnsupported`] for the others (see
-//!   [`STICKY_EVENTS_SUPPORTED`]);
+//!   is running — it enables the sticky-events extension the membership
+//!   bridge relies on);
 //! - the user has joined `room`;
 //! - the slot is open (an `m.rtc.slot` state event; see [`open_slot`]) —
 //!   MSC4143 counts nobody as joined against a closed slot.
@@ -59,8 +55,8 @@ use matrix_rtc_bridge::compat::{
     self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
 };
 use matrix_rtc_bridge::{
-    STICKY_EVENTS_SUPPORTED, SdkCommandSender, TimelineIngest, register_timeline_receiver,
-    run_membership_bridge, run_timeline_bridge,
+    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_membership_bridge,
+    run_timeline_bridge,
 };
 use matrix_rtc_core::{
     EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin, LiveKitTransport,
@@ -103,16 +99,6 @@ pub enum CallError {
     /// [`matrix_rtc_core::reactions`]).
     #[error(transparent)]
     Reaction(#[from] ReactionError),
-
-    /// The requested [`ElementCallCompat`] mode carries membership as MSC4354
-    /// sticky events, and this build of the crate cannot send or read those:
-    /// it was made without the `experimental-sticky` feature, against the stock
-    /// matrix-rust-sdk. Only [`ElementCallCompat::StateEvents`] joins here.
-    #[error(
-        "{0:?} needs MSC4354 sticky events; this build of matrix-rtc-livekit lacks the \
-         `experimental-sticky` feature, so only ElementCallCompat::StateEvents can join"
-    )]
-    StickyEventsUnsupported(ElementCallCompat),
 }
 
 fn signalling_error(error: impl std::fmt::Display) -> CallError {
@@ -301,15 +287,6 @@ impl Call {
             .ok_or_else(|| CallError::Signalling("client has no device id (not logged in)".into()))?
             .to_string();
         let room_id = room.room_id().to_string();
-
-        // Refuse up front rather than join a call nobody can see: without sticky
-        // support our membership would be rejected by the command sender and no
-        // peer's would ever be read.
-        if !STICKY_EVENTS_SUPPORTED && !options.element_call_compat.reads_state_membership() {
-            return Err(CallError::StickyEventsUnsupported(
-                options.element_call_compat,
-            ));
-        }
 
         // The manager plus the bridge feeding it peer memberships.
         let dialect = match options.element_call_compat {

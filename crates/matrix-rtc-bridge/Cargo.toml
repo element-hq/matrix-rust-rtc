@@ -69,28 +69,12 @@ web-time = "1"
 # `matrix_sdk::Client`. Off by default so `compat` — pure JSON translation with
 # no git dependencies — stays cheap to build and test on its own.
 #
-# On its own this speaks only the pre-sticky `ElementCallCompat::StateEvents`
-# dialect: membership as `org.matrix.msc3401.call.member` room state, which the
-# stock SDK reads and writes fine.
-matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:tokio"]
-# MSC4354 sticky events — the spec-current membership carrier, and what
-# `ElementCallCompat::Off` and `StickyEvents` need. Requires an SDK built with
-# `unstable-msc4354`, which upstream matrix-rust-sdk does not have; the fork that
-# carries it is selected with `cargo --config .cargo/experimental-sticky.toml`
-# (workspace root).
-#
-# This feature gates only our code. It deliberately does NOT forward to
-# `matrix-sdk/unstable-msc4354`: cargo resolves the lockfile with every feature
-# enabled, so a feature table that names an SDK feature upstream lacks fails to
-# resolve *always*, not just when this feature is on. The caller enables
-# `matrix-sdk/unstable-msc4354` alongside (the Makefile's `*-sticky` targets do);
-# forgetting it is a compile error on `with_sticky_duration_ms`, which is loud
-# enough.
-#
-# The fork also gives `StickyLiveEvent::encryption_info().sender_device`, the
-# only source for a member event's sending device now that MSC4143 has dropped
+# Turns on the SDK's `unstable-msc4354` for MSC4354 sticky events, the
+# spec-current membership carrier that `ElementCallCompat::Off` and
+# `StickyEvents` need. Their `encryption_info().sender_device` is the only
+# source for a member event's sending device now that MSC4143 has dropped
 # `member.claimed_device_id`. See `sdk::snapshot`.
-experimental-sticky = ["matrix-sdk"]
+matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:tokio", "matrix-sdk/unstable-msc4354"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

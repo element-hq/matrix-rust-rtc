@@ -73,9 +73,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
-      # Same key as the E2E Call workflow's upstream leg: identical tree, and
-      # the matrix-sdk build dominates the job either way. The interop peer runs
-      # in the pre-sticky mode, which the upstream SDK serves.
+      # Same key as the E2E Call workflow: identical tree, and the matrix-sdk
+      # build dominates the job either way.
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
