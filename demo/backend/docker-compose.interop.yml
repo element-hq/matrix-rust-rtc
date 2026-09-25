@@ -86,7 +86,7 @@ services:
   # users actually get, and it removes an EW/EC version skew.
   element-web:
     # The Element Call under test is the one this release bundles.
-    image: ghcr.io/element-hq/element-web:v1.12.30-rc.1
+    image: ghcr.io/element-hq/element-web:v1.12.25
     environment:
       ELEMENT_WEB_PORT: 8081
     volumes:
