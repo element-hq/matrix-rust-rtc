@@ -261,24 +261,6 @@ impl RtcCommandSender for PeerSender {
         Ok("delay-id".to_owned())
     }
 
-    async fn send_room_event(
-        &self,
-        _room_id: String,
-        _event_type: String,
-        _content: Value,
-    ) -> Result<String, CommandError> {
-        Ok("$room".to_owned())
-    }
-
-    async fn redact_event(
-        &self,
-        _room_id: String,
-        _event_id: String,
-        _reason: Option<String>,
-    ) -> Result<(), CommandError> {
-        Ok(())
-    }
-
     async fn restart_delayed_event(
         &self,
         _room_id: String,

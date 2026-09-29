@@ -6,10 +6,15 @@ This document explains the initial architecture of the Matrix RTC Rust workspace
 
 The goal is to keep protocol logic in one Rust core crate and make all platform adaptation explicit at the edges.
 
-- `matrix-rtc-core` owns RTC domain behavior.
+- `matrix-rtc-core` owns generic MSC4143 RTC domain behavior and the participation
+  facade hosts program against.
+- `matrix-call-core` owns what Element Call layers on top: reactions, the raised
+  hand, MSC4075 notify.
 - `matrix-rtc-bridge` owns how that behavior reaches a Matrix homeserver.
 - `matrix-rtc-wasm` owns JavaScript-facing conversion and wasm export details.
 - `matrix-rtc-ffi` owns native binding-facing conversion and UniFFI boundary types.
+- `matrix-rtc-uniffi` owns the uniffi 0.31 surface of the participation facade,
+  built for web (and React Native) by uniffi-bindgen-react-native.
 - `matrix-rtc-livekit-proto` owns the pure MSC4195 control plane (identity
   derivations, token shapes, dialect choices) shared by the native transport
   and the web binding.
@@ -22,21 +27,25 @@ a transport crate *how bytes flow*. Only the top-level facade
 Arrows point at what a crate depends on:
 
 ```
- matrix-rtc-wasm ─────────────────┐       matrix-rtc-ffi
-   │     │                        │            │      ╎
-   │     │                        │            │      ╎ feature "media"
-   │     ▼                        │            ▼      ▼
-   │   matrix-rtc-livekit-proto   │         matrix-rtc-livekit ──┐
-   │     │        │               │            │                 │
-   │     │        ▼               ▼            ▼                 ▼
-   │     │      matrix-rtc-bridge ◀────────────┤   ┌─▶ matrix-rtc-media
-   │     │        │                            │   │      │
-   ▼     ▼        ▼                            ▼   │      ▼
-┌────────────────────────────────────────────────────────────────────┐
-│                          matrix-rtc-core                           │
-└────────────────────────────────────────────────────────────────────┘
+ matrix-rtc-wasm ─────────────────┐       matrix-rtc-ffi          matrix-rtc-uniffi ◀── web-rtc/
+   │     │                        │            │      ╎                 │
+   │     │                        │            │      ╎ feature "media" │
+   │     ▼                        │            ▼      ▼                 │
+   │   matrix-rtc-livekit-proto   │         matrix-rtc-livekit ──┐      │
+   │     │        │               │            │                 │      │
+   │     │        ▼               ▼            ▼                 ▼      │
+   │     │      matrix-rtc-bridge ◀────────────┤   ┌─▶ matrix-rtc-media │
+   │     │        ╎                            │   │      │             │
+   │     │        ╎ feature "matrix-sdk"       ▼   │      ▼             │
+   │     │        └╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌▶ matrix-call-core ◀┘             │
+   ▼     ▼                                     │                        │
+┌────────────────────────────────────────────────────────────────────────┐
+│                            matrix-rtc-core                             │
+└────────────────────────────────────────────────────────────────────────┘
    (matrix-rtc-wasm and matrix-rtc-livekit both take the ─▶ edge to
-    matrix-rtc-media; the ffi takes it only under "media")
+    matrix-rtc-media; the ffi takes it only under "media". Every crate that
+    exposes a *call* — ffi, wasm, livekit, media — sits on matrix-call-core;
+    the bridge reaches it only under "matrix-sdk", for the reactions pumps.)
 ```
 
 Two things that shape reveals. **`matrix-rtc-bridge` and `matrix-rtc-media` are
@@ -162,7 +171,151 @@ At this stage there is no persistence, network transport, or encryption key dist
   - In-memory membership is owned directly by `RtcSession`.
   - `RtcSessionManager` owns multiple `RtcSession` instances keyed by `(room_id, slot_id)`.
   - `RtcSession` exposes reactive membership snapshot subscriptions for a single session.
+- Participation facade (`participation.rs`, `session/facade.rs`): the four
+  outputs a host programs against — `memberships()`, `transports()`,
+  `key_map()`, `participation_status()` — readable at any time from a session
+  or by `(room, slot)` from the manager, plus a `ParticipationListener` that
+  fires on change only. `transports()` is a token-free projection (one entry
+  per distinct transport with the member ids on it); minting a token stays with
+  the transport crate. `Status` is per mechanism (keep-alive, sticky
+  publication, roster presence, key exchange) with a flat, severity-sorted
+  `impairments` list derived from it, so a host that renders one banner cannot
+  miss a condition it did not know to look for. Callbacks run synchronously on
+  the caller's task inside the input that changed the value; a listener never
+  re-enters the manager. `Joining`/`Leaving` are published explicitly around
+  `join`/`leave`, because the machine's own transient states are never
+  observable at an input boundary. Fields the core cannot know (MSC4195
+  delegation, transport tokens, homeserver reachability) are omitted, not faked.
   - TODO: add a manager-level lifecycle subscription API for session added/removed events.
+
+## `crates/matrix-call-core`
+
+- The `m.call` application layer over the core: Element Call emoji reactions,
+  the raised hand, and the MSC4075 ring/notify sent with a join. Nothing else
+  in the workspace is `m.call`-specific; the core speaks generic MSC4143.
+- `CallSessionManager<T: CallCommandSender>` wraps an `RtcSessionManager<T>` by
+  value — composition, not `Deref` — and shadows every input that can move a
+  roster or our own membership (`join`, `leave`, `heartbeat`, the five
+  room-state inputs), keeping the call state in step on the same call. A roster
+  input added to the core cannot bypass this layer by accident: it fails to
+  compile until it is forwarded.
+- `CallCommandSender: RtcCommandSender` adds the two room-event commands the
+  call layer needs (`send_room_event`, `redact_event`); one host object
+  implements both traits.
+- Bindings that expose a *call* (`matrix-rtc-ffi`, `matrix-rtc-wasm`) hold a
+  `CallSessionManager`; the one that exposes bare participation
+  (`matrix-rtc-uniffi`) holds the `RtcSessionManager` directly.
+- The only call-level edge left below this crate is in `matrix-rtc-bridge`'s
+  `matrix-sdk` feature: the SDK pumps are typed on `CallSessionManager` so the
+  reactions timeline can be fed. Recorded debt; the driver-based design in the
+  next increment dissolves it.
+
+### Notifications and ringing (MSC4075)
+
+Membership says who is *in* a session, never who should be *summoned* to one, so
+a mobile client had nothing to raise an incoming call from. `notification.rs`
+builds the `m.rtc.notification` that fills the gap; `CallSessionManager::join`
+sends it when the host set `CallJoinParams::notify`. Three decisions are worth knowing:
+
+- **The relation is what forced a breaking host change.** MSC4075 requires an
+  `m.reference` to the sender's own `m.rtc.member` event, and nothing in this
+  workspace had ever seen an event id — `send_sticky_event` returned `()` and
+  `RawStickyEvent` carried no id either (it does now, for reactions; see
+  below). Both `send_sticky_event` and
+  `send_state_event` now return `String`, filled from the send response at every
+  implementation site, and `OwnMembershipMachine::join` hands the membership's id
+  back to its caller. Not `Option<String>`: every Matrix send responds with an
+  event id, so an implementation that cannot produce one is broken, and failing
+  loudly beats a call that joins fine and quietly never rings. `send_state_event`
+  is included because the pre-MSC4354 Element Call dialect routes the membership
+  through it. Recovering the id from our own membership echoing back through sync
+  (what matrix-js-sdk does) was rejected for putting a full sync round trip in
+  front of the ring.
+- **Only the starter notifies.** The MSC leaves the question open, but every
+  joiner sending one rings the room once per participant, so the send is
+  suppressed unless the roster holds somebody *else*. "Else" is load-bearing:
+  the host feeds the room's whole sticky map, so our own membership is in it as
+  soon as the homeserver echoes it back, and a session outlives `leave()`
+  keeping the previous call's membership as a candidate. Counting either
+  concludes somebody else started the call and rings nobody. The check therefore
+  excludes memberships from our own user whose sending device is ours *or
+  unreported* — deliberately wider than the roster's own
+  `SupersededOwnParticipation` rule, which needs a known device and so leaves
+  such a candidate in. Being wrong that way costs one extra ring in an
+  unencrypted room; being wrong the other way is a call that silently never
+  rings.
+- **The content states the call fields twice.** The MSC nests them under
+  `application`; Element Call and ruma's `RtcNotificationEventContent` read them
+  at the top level, and ruma *requires* them there, so a purely nested event
+  fails to deserialize in the very SDK the mobile client uses. Both are written.
+  `element_call_compat` additionally strips `application` and `m.text` for the
+  byte-exact legacy shape.
+
+Receiving is not implemented: the MSC's ring conditions, lifetime expiry against
+`origin_server_ts`, `m.call.ring.ack` acknowledgements and the sender-side
+"still ringing" indication are all absent, and on mobile the first signal is a
+push notification that never passes through this workspace anyway.
+
+### Reactions and the raised hand (Element Call, unspecced)
+
+Element Call's reactions are ordinary room events that *relate to the reacting
+member's own membership event*: an emoji reaction is an `io.element.call.reaction`
+with an `m.reference` and `emoji` / `name` fields, a raised hand is an
+`m.reaction` annotation with key `🖐️`, lowered by redacting it. Nothing in the
+content is trusted beyond that relation — the receiver checks that the reaction's
+sender is the membership's sender, which the homeserver authenticated. The
+protocol lives in `reactions.rs` and is exercised through `CallSessionManager`;
+the decisions worth knowing:
+
+- **Only the protocol is in the SDK; sound and display are the host's.** The
+  media crate has no playout path, and capture and render are platform-side by
+  design, so a received reaction carries a sound *hint* (`ReactionSound`,
+  resolved from Element Call's catalogue by `name`; unknown names map to the
+  generic sound) and the host plays its bundled asset. Element Call's "play
+  reaction sounds" toggle is therefore a host setting; what the SDK owns is the
+  gating — an enable flag, the three-second per-member active window Element Call
+  applies on receipt, and a send cooldown that refuses what peers would drop.
+- **The membership event id moves, and the hand follows it.** A sticky refresh
+  re-sends the membership and the new event replaces the old in the sticky map;
+  matrix-js-sdk's `CallMembership.eventId` follows it, and Element Call drops a
+  raised hand whose membership event has moved on, re-querying the new event's
+  relations. So `OwnMembershipMachine` now tracks the latest event id, and the
+  heartbeat re-annotates our hand onto the new event (redacting the old
+  annotation) whenever it has moved — every 30 minutes at the default lifetime.
+  Peers may see the hand drop for one round trip in between; that is the
+  protocol's, not ours. As a *receiver* we are more lenient: a hand stays up for
+  as long as the member is in the call, and a reaction is validated against every
+  membership event id seen for that member, not only the latest.
+- **Event ids had to reach the core.** `RawStickyEvent` and `JoinedMembership`
+  carry the membership event id (optional in the DTO, so a host that cannot
+  supply one still compiles — but its members cannot then be reacted for). The
+  roster republishes when only ids moved; nothing downstream churns on it, since
+  the media engine and key distribution diff by `member_id` and `membership_ts`.
+- **Hands raised before we joined come from `/relations`.** The timeline we see
+  live starts at our join; the annotation lives in the relations of the member's
+  membership event. The session lists membership events whose relations it has
+  not seen (`pending_relation_lookups`), the host answers each with
+  `rel_type=m.annotation`, `event_type=m.reaction` (`on_relations_received`), and
+  only hands are taken from the answer — an hour-old applause is not replayed.
+  The matrix-sdk bridge and the `matrix-js-sdk` host module do this on every
+  tick; an FFI host does it itself, one request per new membership event id.
+- **Inbound is the call layer's intake.** The core only ever sees sticky, slot
+  and to-device traffic. `RawTimelineEvent` (`on_room_timeline_events`) and
+  `on_event_redacted` are routed by *room* — a reaction names no slot — to every
+  session of the room, each keeping what relates to its own members. The matrix-sdk
+  bridge feeds them from a room event handler (`register_timeline_receiver` →
+  `run_timeline_bridge`, the same `Send`-handler-to-`spawn_local`-pump shape as
+  media keys); the web host from `RoomEvent.Timeline`, `MatrixEventEvent.Decrypted`
+  and `RoomEvent.Redaction`.
+- **Outbound is two commands of its own.** `CallCommandSender::send_room_event`
+  (a plain message-like send, encrypted by the client SDK in an encrypted room)
+  and `redact_event`, a supertrait-extension of `RtcCommandSender` so one host
+  object serves both layers; mirrored on the uniffi callback and the JS host
+  object.
+
+The media layer merges the result onto the roster: `Participant.hand_raised_at_ms`
+plus `CallEvent::HandRaised` / `HandLowered` / `Reaction`, so a UI can order
+tiles by who asked first without touching the core.
 
 ## `crates/matrix-rtc-bridge`
 
@@ -289,6 +442,16 @@ At this stage there is no persistence, network transport, or encryption key dist
   dependency, injected), drives the heartbeat, and joins roster entries to
   live livekit-js participants by `rtc_identity`.
 
+## `web-rtc`
+
+- `@element-hq/matrix-rtc`: the uniffi-bindgen-react-native build of
+  `matrix-rtc-uniffi` for web and Node — `ubrn build web` renders a wasm shim
+  crate (its own workspace and lockfile under `rust_modules/`), compiles it
+  with a size-tuned profile, runs `wasm-opt`, and the package wraps the
+  generated TypeScript with a loader, a console log sink, and a `MockHost` for
+  consumers' tests. The vitest suites run against `dist/`, what ships. Not
+  published yet.
+
 ## `crates/matrix-rtc-ffi`
 
 - Exposes UniFFI objects and records for Swift/Kotlin consumers.
@@ -314,6 +477,28 @@ At this stage there is no persistence, network transport, or encryption key dist
   runs on a dedicated multithreaded tokio runtime — the manager's `?Send`
   futures never touch it. Android gets a `JNI_OnLoad` that initialises
   libwebrtc.
+
+## `crates/matrix-rtc-uniffi`
+
+- The participation facade as a UniFFI **0.31** surface, built for
+  uniffi-bindgen-react-native: one generated API for web/wasm (`web-rtc/`) and
+  React Native. Bare MSC4143 participation only — no reactions, no notify;
+  those would come from `matrix-call-core` as a second surface.
+- Two uniffi majors live in the workspace on purpose: `matrix-rtc-ffi` is 0.29
+  (its Kotlin/Swift surface is frozen for the mobile apps) and this crate is
+  0.31 (what ubrn generates for). Cargo resolves them as unrelated packages and
+  nothing links both; `cargo tree -i` guards in CI prove it. Never add a 0.31
+  `uniffi` key to `[workspace.dependencies]`.
+- The host implements `RtcCommandSenderCallback` (the six RTC commands, JSON
+  content, wire types pre-translated) and pushes room state in through the
+  `RtcSessionManager` object; a `Participation` object is the per-slot handle
+  with `join`/`leave`/`heartbeat`, the four getters and four change listeners.
+  Every method is async: the core sits behind a `tokio::sync::Mutex`, and
+  blocking is impossible on wasm.
+- No `tokio` uniffi feature and no `async_runtime`: the core arms no timers,
+  so the exported futures only await the mutex and the host's own callbacks.
+  The tokio feature set is identical on every target, because ubrn's generated
+  wasm shim is a resolver-v1 crate that unifies target-specific features.
 
 ## `crates/matrix-rtc-livekit`
 
@@ -409,111 +594,6 @@ stored and signalled once it has been matched against the sender's member event:
   cannot take the `(member, index)` slot and suppress the genuine one.
 
 The outgoing key message declares `format: 0` as the spec requires.
-
-### Notifications and ringing (MSC4075)
-
-Membership says who is *in* a session, never who should be *summoned* to one, so
-a mobile client had nothing to raise an incoming call from. `notification.rs`
-builds the `m.rtc.notification` that fills the gap; `RtcSession::join` sends it
-when the host set `JoinSessionParams::notify`. Three decisions are worth knowing:
-
-- **The relation is what forced a breaking host change.** MSC4075 requires an
-  `m.reference` to the sender's own `m.rtc.member` event, and nothing in this
-  workspace had ever seen an event id — `send_sticky_event` returned `()` and
-  `RawStickyEvent` carried no id either (it does now, for reactions; see
-  below). Both `send_sticky_event` and
-  `send_state_event` now return `String`, filled from the send response at every
-  implementation site, and `OwnMembershipMachine::join` hands the membership's id
-  back to its caller. Not `Option<String>`: every Matrix send responds with an
-  event id, so an implementation that cannot produce one is broken, and failing
-  loudly beats a call that joins fine and quietly never rings. `send_state_event`
-  is included because the pre-MSC4354 Element Call dialect routes the membership
-  through it. Recovering the id from our own membership echoing back through sync
-  (what matrix-js-sdk does) was rejected for putting a full sync round trip in
-  front of the ring.
-- **Only the starter notifies.** The MSC leaves the question open, but every
-  joiner sending one rings the room once per participant, so the send is
-  suppressed unless the roster holds somebody *else*. "Else" is load-bearing:
-  the host feeds the room's whole sticky map, so our own membership is in it as
-  soon as the homeserver echoes it back, and a session outlives `leave()`
-  keeping the previous call's membership as a candidate. Counting either
-  concludes somebody else started the call and rings nobody. The check therefore
-  excludes memberships from our own user whose sending device is ours *or
-  unreported* — deliberately wider than the roster's own
-  `SupersededOwnParticipation` rule, which needs a known device and so leaves
-  such a candidate in. Being wrong that way costs one extra ring in an
-  unencrypted room; being wrong the other way is a call that silently never
-  rings.
-- **The content states the call fields twice.** The MSC nests them under
-  `application`; Element Call and ruma's `RtcNotificationEventContent` read them
-  at the top level, and ruma *requires* them there, so a purely nested event
-  fails to deserialize in the very SDK the mobile client uses. Both are written.
-  `element_call_compat` additionally strips `application` and `m.text` for the
-  byte-exact legacy shape.
-
-Receiving is not implemented: the MSC's ring conditions, lifetime expiry against
-`origin_server_ts`, `m.call.ring.ack` acknowledgements and the sender-side
-"still ringing" indication are all absent, and on mobile the first signal is a
-push notification that never passes through this workspace anyway.
-
-### Reactions and the raised hand (Element Call, unspecced)
-
-Element Call's reactions are ordinary room events that *relate to the reacting
-member's own membership event*: an emoji reaction is an `io.element.call.reaction`
-with an `m.reference` and `emoji` / `name` fields, a raised hand is an
-`m.reaction` annotation with key `🖐️`, lowered by redacting it. Nothing in the
-content is trusted beyond that relation — the receiver checks that the reaction's
-sender is the membership's sender, which the homeserver authenticated. The
-protocol lives in `reactions.rs` and is exercised through `RtcSession`; the
-decisions worth knowing:
-
-- **Only the protocol is in the SDK; sound and display are the host's.** The
-  media crate has no playout path, and capture and render are platform-side by
-  design, so a received reaction carries a sound *hint* (`ReactionSound`,
-  resolved from Element Call's catalogue by `name`; unknown names map to the
-  generic sound) and the host plays its bundled asset. Element Call's "play
-  reaction sounds" toggle is therefore a host setting; what the SDK owns is the
-  gating — an enable flag, the three-second per-member active window Element Call
-  applies on receipt, and a send cooldown that refuses what peers would drop.
-- **The membership event id moves, and the hand follows it.** A sticky refresh
-  re-sends the membership and the new event replaces the old in the sticky map;
-  matrix-js-sdk's `CallMembership.eventId` follows it, and Element Call drops a
-  raised hand whose membership event has moved on, re-querying the new event's
-  relations. So `OwnMembershipMachine` now tracks the latest event id, and the
-  heartbeat re-annotates our hand onto the new event (redacting the old
-  annotation) whenever it has moved — every 30 minutes at the default lifetime.
-  Peers may see the hand drop for one round trip in between; that is the
-  protocol's, not ours. As a *receiver* we are more lenient: a hand stays up for
-  as long as the member is in the call, and a reaction is validated against every
-  membership event id seen for that member, not only the latest.
-- **Event ids had to reach the core.** `RawStickyEvent` and `JoinedMembership`
-  carry the membership event id (optional in the DTO, so a host that cannot
-  supply one still compiles — but its members cannot then be reacted for). The
-  roster republishes when only ids moved; nothing downstream churns on it, since
-  the media engine and key distribution diff by `member_id` and `membership_ts`.
-- **Hands raised before we joined come from `/relations`.** The timeline we see
-  live starts at our join; the annotation lives in the relations of the member's
-  membership event. The session lists membership events whose relations it has
-  not seen (`pending_relation_lookups`), the host answers each with
-  `rel_type=m.annotation`, `event_type=m.reaction` (`on_relations_received`), and
-  only hands are taken from the answer — an hour-old applause is not replayed.
-  The matrix-sdk bridge and the `matrix-js-sdk` host module do this on every
-  tick; an FFI host does it itself, one request per new membership event id.
-- **Inbound needed a new intake.** The core only ever saw sticky, slot and
-  to-device traffic. `RawTimelineEvent` (`on_room_timeline_events`) and
-  `on_event_redacted` are routed by *room* — a reaction names no slot — to every
-  session of the room, each keeping what relates to its own members. The matrix-sdk
-  bridge feeds them from a room event handler (`register_timeline_receiver` →
-  `run_timeline_bridge`, the same `Send`-handler-to-`spawn_local`-pump shape as
-  media keys); the web host from `RoomEvent.Timeline`, `MatrixEventEvent.Decrypted`
-  and `RoomEvent.Redaction`.
-- **Outbound needed two commands.** `RtcCommandSender::send_room_event` (a plain
-  message-like send, encrypted by the client SDK in an encrypted room) and
-  `redact_event`, mirrored on the uniffi callback and the JS host object.
-
-The media layer merges the result onto the roster: `Participant.hand_raised_at_ms`
-plus `CallEvent::HandRaised` / `HandLowered` / `Reaction`, so a UI can order
-tiles by who asked first without touching the core.
 
 ### Slots and the join conditions
 

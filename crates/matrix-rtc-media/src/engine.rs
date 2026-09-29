@@ -40,7 +40,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::{DiscardedKey, JoinedMembership, RaisedHand, ReceivedReaction};
+use matrix_call_core::{RaisedHand, ReceivedReaction};
+use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::constraints::MediaConstraints;
@@ -2548,7 +2549,7 @@ mod tests {
                 sender: "@bob:example.org".to_owned(),
                 emoji: "👏".to_owned(),
                 name: "clapping".to_owned(),
-                sound: matrix_rtc_core::ReactionSound::Named("clap".to_owned()),
+                sound: matrix_call_core::ReactionSound::Named("clap".to_owned()),
             })
             .unwrap();
         assert_eq!(

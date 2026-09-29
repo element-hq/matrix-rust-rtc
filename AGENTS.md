@@ -62,7 +62,8 @@ This project is in active development.
 - `cargo fmt`
 - `make clippy`
 - `cargo test`
-- Web bindings: `cd web && npm run build && npm test`
+- Web bindings (wasm-bindgen, `web/`): `cd web && npm run build && npm run test:vitest`
+- Web bindings (uniffi, `web-rtc/`): `make web-rtc-build && make web-rtc-test`
 - Android bindings: `./scripts/build-android-aar.sh`
 - iOS bindings (macOS): `./scripts/build-ios-xcframework.sh`
 
@@ -85,6 +86,9 @@ Then run binding tasks for any touched binding surface:
 - If changes touch `crates/matrix-rtc-ffi/**`, `mobile/**`, or `scripts/build-*.sh`:
   - `./scripts/build-android-aar.sh`
   - `./scripts/build-ios-xcframework.sh` (on macOS)
+- If changes touch `crates/matrix-rtc-uniffi/**`, `crates/matrix-rtc-core/src/participation.rs`, or `web-rtc/**`:
+  - `make web-rtc-clippy`
+  - `make web-rtc-build && make web-rtc-test`
 
 If a required platform/toolchain is not available locally, document the skip reason in the PR description and ensure the corresponding CI job passes before merge.
 

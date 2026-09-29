@@ -6,7 +6,7 @@
 
 # Makefile for common development tasks
 
-.PHONY: help setup build-check fmt fmt-check clippy test build-ffi build-mobile build-android build-ios clean backend-up backend-down backend-logs test-e2e interop-up interop-down interop-logs interop-trust test-interop
+.PHONY: help setup build-check fmt fmt-check clippy test build-ffi build-mobile build-android build-ios clean backend-up backend-down backend-logs test-e2e interop-up interop-down interop-logs interop-trust test-interop web-rtc-build web-rtc-test web-rtc-clippy web-rtc-dev
 
 help:
 	@echo "Matrix RTC Development Commands"
@@ -45,6 +45,12 @@ help:
 	@echo "  make build-ffi          Build FFI crate only"
 	@echo "  make test-ffi-media     Run the media FFI smoke tests (needs libwebrtc build)"
 	@echo ""
+	@echo "Web bindings (uniffi 0.31, web-rtc/):"
+	@echo "  make web-rtc-build      Build the npm package (ubrn -> wasm -> dist/)"
+	@echo "  make web-rtc-test       Run its vitest suites and the shipped-types check"
+	@echo "  make web-rtc-clippy     Clippy the uniffi crate on wasm32 and the host"
+	@echo "  make web-rtc-dev        Serve the demo page"
+	@echo ""
 	@echo "Release artifacts (media, mobile-release profile; see RELEASING.md):"
 	@echo "  make release-android    Android AAR as the release workflow builds it"
 	@echo "  make release-ios        iOS xcframework + zip + Sources/MatrixRtc as the release workflow builds it"
@@ -57,6 +63,7 @@ setup:
 	cargo install cargo-ndk
 	rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 	rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+	rustup target add wasm32-unknown-unknown
 	@echo "✅ Setup complete!"
 
 fmt:
@@ -125,6 +132,22 @@ clean:
 	rm -rf mobile/android/matrixrtc/src/main/java
 	rm -rf mobile/android/matrixrtc/build
 	rm -rf mobile/android/debuginfo
+	rm -rf web-rtc/dist web-rtc/src/generated web-rtc/src/index.web.ts web-rtc/rust_modules
+
+# The uniffi 0.31 surface and its npm package. Node is not assumed by
+# `quality-check`; run these when touching the crate or the package.
+web-rtc-build:
+	cd web-rtc && npm ci && npm run build
+
+web-rtc-test: web-rtc-build
+	cd web-rtc && npm test && npm run typecheck && npm run test:types
+
+web-rtc-clippy:
+	cargo clippy -p matrix-rtc-uniffi --target wasm32-unknown-unknown -- -D warnings
+	cargo clippy -p matrix-rtc-uniffi --all-targets -- -D warnings
+
+web-rtc-dev:
+	cd web-rtc && npm run dev
 
 backend-up:
 	docker compose -f demo/backend/docker-compose.yml up -d --wait

@@ -15,6 +15,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-call-core = { path = "../matrix-call-core" }
 # Deliberately WITHOUT the `matrix-sdk` feature — only `compat`, which is pure
 # JSON translation with no git dependencies and no async runtime. That is the
 # whole of what an FFI host needs from this crate: the host owns its Matrix
@@ -26,8 +27,8 @@ serde_json = { workspace = true }
 thiserror.workspace = true
 # `rt-multi-thread` and `time` are needed by the slim build too, not just
 # `media`: every join spawns its keep-alive driver on the runtime in
-# `src/runtime.rs`, and the core arms a `delayBeforeUse` timer on the
-# key-rotation path. See that module for why it has to be multi-threaded.
+# `src/runtime.rs`, and `tokio::time::sleep` needs a timer to fire at all.
+# See that module for why it has to be multi-threaded.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
 # `tokio`: the manager handle's exported methods are async, and
 # `async_runtime = "tokio"` needs uniffi's tokio integration (async_compat).

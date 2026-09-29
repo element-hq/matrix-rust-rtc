@@ -16,6 +16,9 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The call layer (reactions, raised hand, MSC4075 notify) the `sdk` pumps feed.
+# Optional so the base build stays generic MSC4143 plus `compat`, wasm-clean.
+matrix-call-core = { path = "../matrix-call-core", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
@@ -74,7 +77,7 @@ web-time = "1"
 # `StickyEvents` need. Their `encryption_info().sender_device` is the only
 # source for a member event's sending device now that MSC4143 has dropped
 # `member.claimed_device_id`. See `sdk::snapshot`.
-matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:tokio", "matrix-sdk/unstable-msc4354"]
+matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:matrix-call-core", "dep:tokio", "matrix-sdk/unstable-msc4354"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

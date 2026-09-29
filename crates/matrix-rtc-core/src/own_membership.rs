@@ -53,7 +53,7 @@
 //! the delayed leave is armed one step earlier than the membership.
 
 use serde_json::{Value, json};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
@@ -65,6 +65,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
 use crate::event::RawStickyEventContent;
+use crate::participation::{DelayedLeaveOutcome, JoinProgress, KeepAlive, MembershipPublication};
 use crate::session::{LeaveCode, LeaveReason};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -86,7 +87,7 @@ const DELAYED_LEAVE_PROBE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 /// so the sticky refresh is decided by comparing timestamps when the host
 /// happens to call [`OwnMembershipMachine::heartbeat`], not by a task waking
 /// itself up.
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -261,10 +262,25 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     /// sticky map: the join's, then each refresh's. `None` until we join and
     /// again once we leave.
     ///
-    /// Element Call relates reactions and the raised hand to this id and drops
-    /// a raised hand whose membership event has moved on, so a refresh is what
-    /// makes the session re-annotate its hand (see [`crate::reactions`]).
+    /// Applications relate events to it — Element Call its reactions and
+    /// raised hand, which it drops once the membership event has moved on, so
+    /// a refresh is what makes the call layer re-annotate its hand.
     latest_event_id: Arc<Mutex<Option<String>>>,
+    /// Since when, and with what error, restarting the delayed leave has been
+    /// failing. `None` while healthy. Read by [`Self::keep_alive_status`].
+    restart_failing: Mutex<Option<(u64, String)>>,
+    /// Since when, and with what error, refreshing the sticky entry has been
+    /// failing. `None` while healthy. Read by
+    /// [`Self::membership_publication`].
+    refresh_failing: Mutex<Option<(u64, String)>>,
+    /// Whether the join's delayed leave was armed, kept for
+    /// [`Self::join_progress`] even after a leave cleared `keep_alive_info`.
+    delayed_leave_armed_once: AtomicBool,
+    /// Whether the host has heartbeated at least once since joining.
+    heartbeat_seen: AtomicBool,
+    /// What the leave did: whether the leave event went out, and what became
+    /// of the armed delayed leave. Read by [`Self::leave_outcome`].
+    leave_outcome: Mutex<(bool, Option<DelayedLeaveOutcome>)>,
 }
 
 /// The membership event we last put in the sticky map, and when.
@@ -315,6 +331,11 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             published_lifetime_ms: AtomicU64::new(sticky_duration_ms),
             last_sticky: Arc::new(Mutex::new(None)),
             latest_event_id: Arc::new(Mutex::new(None)),
+            restart_failing: Mutex::new(None),
+            refresh_failing: Mutex::new(None),
+            delayed_leave_armed_once: AtomicBool::new(false),
+            heartbeat_seen: AtomicBool::new(false),
+            leave_outcome: Mutex::new((false, None)),
         }
     }
 
@@ -377,6 +398,98 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// see [`Self::published_lifetime_ms`] for why it cannot move afterwards.
     pub fn membership_lifetime_ms(&self) -> u64 {
         self.published_lifetime_ms.load(Ordering::Relaxed)
+    }
+
+    /// The dead man's switch as one of its mutually exclusive states, for the
+    /// participation facade.
+    ///
+    /// Computed from the clock at the moment of the call: a delay whose full
+    /// period has elapsed since the last successful restart has fired whether
+    /// or not anybody has heartbeated since, so it reads as
+    /// [`KeepAlive::Expired`].
+    pub fn keep_alive_status(&self) -> KeepAlive {
+        let info = self.keep_alive_info.lock().unwrap().clone();
+        match info {
+            Some(info) => {
+                let fires_at_ts = info.last_restart_ms.saturating_add(info.timeout_ms);
+                if now_ms() > fires_at_ts {
+                    return KeepAlive::Expired {
+                        since_ts: fires_at_ts,
+                    };
+                }
+                match self.restart_failing.lock().unwrap().clone() {
+                    Some((since_ts, last_error)) => KeepAlive::RestartFailing {
+                        since_ts,
+                        fires_at_ts,
+                        last_error,
+                    },
+                    None => KeepAlive::Armed {
+                        delay_ms: info.timeout_ms,
+                        last_restart_ts: info.last_restart_ms,
+                        fires_at_ts,
+                    },
+                }
+            }
+            None => match self.delayed_leave_support() {
+                // Nothing armed and nothing refused: the next heartbeat arms one.
+                DelayedLeaveSupport::Unknown | DelayedLeaveSupport::Supported => {
+                    KeepAlive::Unavailable {
+                        permanent: false,
+                        next_probe_ts: Some(0),
+                    }
+                }
+                DelayedLeaveSupport::Unsupported {
+                    last_probe_ms,
+                    permanent,
+                } => KeepAlive::Unavailable {
+                    permanent,
+                    next_probe_ts: (!permanent)
+                        .then(|| last_probe_ms.saturating_add(DELAYED_LEAVE_PROBE_INTERVAL_MS)),
+                },
+            },
+        }
+    }
+
+    /// Our sticky membership on the server, for the participation facade.
+    ///
+    /// Before the join event went out (or after a leave) there is nothing
+    /// published, and this reports a publication that expired at the epoch.
+    pub fn membership_publication(&self) -> MembershipPublication {
+        let lifetime_ms = self.membership_lifetime_ms();
+        let last_published_ts = self
+            .last_sticky
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|sticky| sticky.sent_at_ms)
+            .unwrap_or_default();
+        let (refresh_failing_since_ts, last_refresh_error) =
+            match self.refresh_failing.lock().unwrap().clone() {
+                Some((since_ts, error)) => (Some(since_ts), Some(error)),
+                None => (None, None),
+            };
+        MembershipPublication {
+            lifetime_ms,
+            last_published_ts,
+            expires_at_ts: last_published_ts.saturating_add(lifetime_ms),
+            refresh_failing_since_ts,
+            last_refresh_error,
+        }
+    }
+
+    /// How far the join got, for a failed join's diagnostics.
+    pub fn join_progress(&self) -> JoinProgress {
+        JoinProgress {
+            has_sent_delayed_leave_event: self.delayed_leave_armed_once.load(Ordering::Relaxed),
+            has_sent_member_join_event: self.last_sticky.lock().unwrap().is_some(),
+            has_started_heartbeat: self.heartbeat_seen.load(Ordering::Relaxed),
+        }
+    }
+
+    /// What the last [`Self::leave`] did: whether the leave event went out,
+    /// and what became of the dead man's switch.
+    pub fn leave_outcome(&self) -> (bool, Option<DelayedLeaveOutcome>) {
+        *self.leave_outcome.lock().unwrap()
     }
 
     /// Gets the delayed event ID, if one is active.
@@ -461,6 +574,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             // Store the delayed event ID for later cancellation
             Ok(delayed_event_id) => {
                 *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+                self.delayed_leave_armed_once.store(true, Ordering::Relaxed);
                 let mut info_guard = self.keep_alive_info.lock().unwrap();
                 *info_guard = Some(KeepAliveInfo {
                     delayed_event_id,
@@ -639,6 +753,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             *guard = None;
         }
         *self.latest_event_id.lock().unwrap() = None;
+        self.leave_outcome.lock().unwrap().0 = true;
 
         // Cancel the delayed leave event if one exists
         if let Some(event_id) = self.delayed_event_id() {
@@ -654,11 +769,17 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 .cancel_delayed_event(room_id.clone(), event_id.clone())
                 .await
             {
-                Ok(()) => log::debug!("[{}] Delayed leave event canceled", room_id),
-                Err(error) => log::debug!(
-                    "[{room_id}] Delayed leave {event_id} could not be canceled ({error:?}); \
-                     it has most likely already fired, which leaves us departed either way.",
-                ),
+                Ok(()) => {
+                    self.leave_outcome.lock().unwrap().1 = Some(DelayedLeaveOutcome::Cancelled);
+                    log::debug!("[{}] Delayed leave event canceled", room_id)
+                }
+                Err(error) => {
+                    self.leave_outcome.lock().unwrap().1 = Some(DelayedLeaveOutcome::MayStillFire);
+                    log::debug!(
+                        "[{room_id}] Delayed leave {event_id} could not be canceled ({error:?}); \
+                         it has most likely already fired, which leaves us departed either way.",
+                    )
+                }
             }
 
             // Clear the stored event ID regardless: either it is canceled, or
@@ -698,6 +819,9 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     pub async fn heartbeat(&self) {
         let room_id = self.room_id.clone();
         log::trace!("[{}] Heartbeat: restarting keep-alive", room_id);
+        if self.state() == OwnMembershipState::Joined {
+            self.heartbeat_seen.store(true, Ordering::Relaxed);
+        }
 
         // Two independent clocks expire our membership, and the heartbeat tends
         // both: the sticky-map entry here, and the delayed leave below.
@@ -734,6 +858,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             .await
         {
             Ok(()) => {
+                *self.restart_failing.lock().unwrap() = None;
                 let mut guard = self.keep_alive_info.lock().unwrap();
                 if let Some(info) = guard.as_mut()
                     && info.delayed_event_id == event_id
@@ -742,6 +867,14 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 }
             }
             Err(error) => {
+                // Recorded so the facade can report a keep-alive that is about
+                // to fire; the first failure stamps the time, later ones only
+                // update the error.
+                {
+                    let mut failing = self.restart_failing.lock().unwrap();
+                    let since = failing.as_ref().map(|(since, _)| *since);
+                    *failing = Some((since.unwrap_or_else(now_ms), error.to_string()));
+                }
                 // Retry on the next beat rather than replacing it: a restart can
                 // fail transiently while the delay is still perfectly armed, and
                 // scheduling a second one would leak the first.
@@ -858,6 +991,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             // The refresh replaces our entry in the sticky map, so from here on
             // *this* is the event a peer's reaction must relate to.
             Ok(event_id) => {
+                *self.refresh_failing.lock().unwrap() = None;
                 *self.latest_event_id.lock().unwrap() = Some(event_id);
                 let mut guard = self.last_sticky.lock().unwrap();
                 // Only advance the clock if we are still tracking the same
@@ -871,6 +1005,11 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
                 }
             }
             Err(error) => {
+                {
+                    let mut failing = self.refresh_failing.lock().unwrap();
+                    let since = failing.as_ref().map(|(since, _)| *since);
+                    *failing = Some((since.unwrap_or_else(now_ms), error.to_string()));
+                }
                 log::warn!(
                     "[{room_id}] Failed to refresh sticky membership: {error:?}. \
                      Retrying on the next heartbeat.",
@@ -916,6 +1055,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         // Store the event ID
         {
             *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+            *self.restart_failing.lock().unwrap() = None;
             let mut info_guard = self.keep_alive_info.lock().unwrap();
             *info_guard = Some(KeepAliveInfo {
                 delayed_event_id,
@@ -1328,24 +1468,6 @@ mod tests {
             Ok(format!("delay-{scheduled}"))
         }
 
-        async fn send_room_event(
-            &self,
-            _room_id: String,
-            _event_type: String,
-            _content: Value,
-        ) -> Result<String, CommandError> {
-            Ok("$room".to_string())
-        }
-
-        async fn redact_event(
-            &self,
-            _room_id: String,
-            _event_id: String,
-            _reason: Option<String>,
-        ) -> Result<(), CommandError> {
-            Ok(())
-        }
-
         async fn restart_delayed_event(
             &self,
             _room_id: String,
@@ -1462,24 +1584,6 @@ mod tests {
             _event_id: String,
         ) -> Result<(), CommandError> {
             *self.restarts.lock().unwrap() += 1;
-            Ok(())
-        }
-
-        async fn send_room_event(
-            &self,
-            _room_id: String,
-            _event_type: String,
-            _content: Value,
-        ) -> Result<String, CommandError> {
-            Ok("$room".to_string())
-        }
-
-        async fn redact_event(
-            &self,
-            _room_id: String,
-            _event_id: String,
-            _reason: Option<String>,
-        ) -> Result<(), CommandError> {
             Ok(())
         }
 

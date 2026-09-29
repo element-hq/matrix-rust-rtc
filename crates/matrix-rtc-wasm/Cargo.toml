@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The call layer over the core: reactions, the raised hand and MSC4075 notify.
+matrix-call-core = { path = "../matrix-call-core" }
 # The media roster/pool engine (its actor runs on `spawn_local` here) and the
 # shared key handler; `bridge` for the compat dialects and `OpenIdToken`;
 # `proto` for the MSC4195 identity derivation and token shapes. None of these

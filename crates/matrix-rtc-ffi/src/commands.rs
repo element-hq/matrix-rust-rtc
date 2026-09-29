@@ -6,10 +6,11 @@
 //! FFI binding implementation of the command sender interface.
 //!
 //! This module provides UniFFI-facing types and the `FfiCommandSender` that implements
-//! `RtcCommandSender` by delegating to native callbacks.
+//! `RtcCommandSender` and `CallCommandSender` by delegating to native callbacks.
 //!
 //! DTOs are used to decouple core logic from FFI-specific types.
 
+use matrix_call_core::CallCommandSender;
 use matrix_rtc_bridge::compat::{MemberEventRoute, OutboundDialect};
 use matrix_rtc_core::{CommandError, RtcCommandSender, wire_event_type};
 use serde_json::Value;
@@ -129,18 +130,18 @@ pub struct FfiNotifyConfig {
     pub mention_room: bool,
 }
 
-impl From<FfiNotifyConfig> for matrix_rtc_core::NotifyConfig {
+impl From<FfiNotifyConfig> for matrix_call_core::NotifyConfig {
     fn from(value: FfiNotifyConfig) -> Self {
-        matrix_rtc_core::NotifyConfig {
+        matrix_call_core::NotifyConfig {
             notification_type: match value.notification_type {
-                FfiNotificationType::Ring => matrix_rtc_core::NotificationType::Ring,
+                FfiNotificationType::Ring => matrix_call_core::NotificationType::Ring,
                 FfiNotificationType::Notification => {
-                    matrix_rtc_core::NotificationType::Notification
+                    matrix_call_core::NotificationType::Notification
                 }
             },
             intent: value.intent,
             lifetime_ms: value.lifetime_ms,
-            mentions: matrix_rtc_core::Mentions {
+            mentions: matrix_call_core::Mentions {
                 user_ids: value.mention_user_ids,
                 room: value.mention_room,
             },
@@ -242,9 +243,9 @@ pub struct FfiReactionsConfig {
     pub send_cooldown_ms: u64,
 }
 
-impl From<FfiReactionsConfig> for matrix_rtc_core::ReactionsConfig {
+impl From<FfiReactionsConfig> for matrix_call_core::ReactionsConfig {
     fn from(value: FfiReactionsConfig) -> Self {
-        matrix_rtc_core::ReactionsConfig {
+        matrix_call_core::ReactionsConfig {
             enabled: value.enabled,
             active_window_ms: value.active_window_ms,
             send_cooldown_ms: value.send_cooldown_ms,
@@ -340,7 +341,7 @@ impl FfiJoinSessionParams {
 
     pub fn into_core(
         self,
-    ) -> Result<matrix_rtc_core::JoinSessionParams, matrix_rtc_core::CommandError> {
+    ) -> Result<matrix_call_core::CallJoinParams, matrix_rtc_core::CommandError> {
         let transport = match self.transport {
             Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport.into_core()?),
             None => matrix_rtc_core::TransportIntent::ReceiveOnly {
@@ -348,7 +349,7 @@ impl FfiJoinSessionParams {
             },
         };
         let encryption_config = self.encryption_config.map(Into::into);
-        Ok(matrix_rtc_core::JoinSessionParams {
+        let session = matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
             // Filled in by the join entry points, which generate a fresh id per
@@ -365,6 +366,9 @@ impl FfiJoinSessionParams {
             sticky_duration_ms: self.sticky_duration_ms,
             degraded_lifetime_ms: self.degraded_lifetime_ms,
             encryption_config,
+        };
+        Ok(matrix_call_core::CallJoinParams {
+            session,
             notify: self.notify.map(Into::into),
             reactions: self.reactions.map(Into::into),
         })
@@ -956,45 +960,6 @@ impl RtcCommandSender for FfiCommandSender {
         )
     }
 
-    async fn send_room_event(
-        &self,
-        room_id: String,
-        event_type: String,
-        content: Value,
-    ) -> Result<String, CommandError> {
-        let content_json = serde_json::to_string(&content)
-            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
-
-        // Verbatim, not through `wire_type`: a reaction is not a MatrixRTC type
-        // and has no unstable alias in that table.
-        let what = format!("room event [{room_id}] type={event_type}");
-        trace_command_content(&what, &content_json);
-
-        log_command(
-            &what,
-            self.callback
-                .send_room_event(room_id, event_type, content_json)
-                .await
-                .map_err(CommandError::from),
-        )
-    }
-
-    async fn redact_event(
-        &self,
-        room_id: String,
-        event_id: String,
-        reason: Option<String>,
-    ) -> Result<(), CommandError> {
-        let what = format!("redact [{room_id}] event_id={event_id}");
-        log_command(
-            &what,
-            self.callback
-                .redact_event(room_id, event_id, reason)
-                .await
-                .map_err(CommandError::from),
-        )
-    }
-
     async fn send_to_device_message(
         &self,
         recipients: Vec<matrix_rtc_core::ToDeviceRecipient>,
@@ -1067,6 +1032,49 @@ impl RtcCommandSender for FfiCommandSender {
             &what,
             self.callback
                 .send_state_event(room_id, wire_event_type, state_key, content_json)
+                .await
+                .map_err(CommandError::from),
+        )
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl CallCommandSender for FfiCommandSender {
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+    ) -> Result<String, CommandError> {
+        let content_json = serde_json::to_string(&content)
+            .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+
+        // Verbatim, not through `wire_type`: a reaction is not a MatrixRTC type
+        // and has no unstable alias in that table.
+        let what = format!("room event [{room_id}] type={event_type}");
+        trace_command_content(&what, &content_json);
+
+        log_command(
+            &what,
+            self.callback
+                .send_room_event(room_id, event_type, content_json)
+                .await
+                .map_err(CommandError::from),
+        )
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        let what = format!("redact [{room_id}] event_id={event_id}");
+        log_command(
+            &what,
+            self.callback
+                .redact_event(room_id, event_id, reason)
                 .await
                 .map_err(CommandError::from),
         )

@@ -153,12 +153,6 @@
 //!     async fn send_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value) -> Result<String, CommandError> {
 //!         Ok("$event".to_owned())
 //!     }
-//!     async fn send_room_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value) -> Result<String, CommandError> {
-//!         Ok("$event".to_owned())
-//!     }
-//!     async fn redact_event(&self, _room_id: String, _event_id: String, _reason: Option<String>) -> Result<(), CommandError> {
-//!         Ok(())
-//!     }
 //! }
 //!
 //! // Create an encryption manager
@@ -434,6 +428,20 @@ pub struct EncryptionManager<T: RtcCommandSender> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+    /// The last refused key per member, kept until a key from that member is
+    /// accepted, so "why can't I hear Bob?" has an answer after the fact.
+    rejected_keys: Arc<Mutex<HashMap<String, RejectedKey>>>,
+}
+
+/// A key that was refused and not yet superseded by an accepted one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RejectedKey {
+    /// Why it was refused.
+    pub reason: KeyRejection,
+    /// The user the message was attributed to, if it was attributable.
+    pub sender_user_id: Option<String>,
+    /// When it was refused (unix ms).
+    pub at_ts: u64,
 }
 
 /// A key that has been replaced but is still what we encrypt with, because its
@@ -508,6 +516,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
             superseded_key: Arc::new(RwLock::new(None)),
             rotation_due_at: Arc::new(Mutex::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
+            rejected_keys: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -746,6 +755,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         buffer.buffer.clear();
 
         *self.keys_without_membership.lock().unwrap() = Vec::new();
+        self.rejected_keys.lock().unwrap().clear();
 
         log::debug!(
             "[{}/{}] EncryptionManager state cleaned up",
@@ -1552,6 +1562,14 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// Signals a key to the application layer.
     /// Reports a refused key to the handler, so the reason leaves the core.
     async fn signal_discarded_key(&self, discarded: DiscardedKey) {
+        self.rejected_keys.lock().unwrap().insert(
+            discarded.member_id.clone(),
+            RejectedKey {
+                reason: discarded.reason.clone(),
+                sender_user_id: discarded.sender_user_id.clone(),
+                at_ts: self.timestamp_ms(),
+            },
+        );
         if let Some(handler) = &self.signal_handler {
             handler.clone().on_key_discarded(discarded).await;
         }
@@ -1873,6 +1891,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         // the older one last silently downgrades us to a key the sender has
         // stopped using.
         let map_key = key.member_id.clone();
+        self.rejected_keys.lock().unwrap().remove(&map_key);
         {
             let mut guard = self.inbound_keys.write().unwrap();
             let held = guard.entry(map_key).or_default();
@@ -1945,6 +1964,33 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     pub fn get_all_inbound_keys(&self) -> HashMap<String, Vec<InboundEncryptionKey>> {
         self.inbound_keys.read().unwrap().clone()
     }
+
+    /// Whether this manager distributes and signals media keys at all
+    /// (`EncryptionConfig::manage_media_keys`).
+    pub fn manages_media_keys(&self) -> bool {
+        self.config.manage_media_keys
+    }
+
+    /// The installed identity mapper, if any.
+    pub fn identity_mapper(&self) -> Option<RtcIdentityMapper> {
+        self.identity_mapper.clone()
+    }
+
+    /// Whether a rotated key is still inside its `delayBeforeUse` window, so
+    /// what is on the wire is not yet the key in `get_outbound_key`.
+    pub fn key_switch_pending(&self) -> bool {
+        let now = self.timestamp_ms();
+        self.superseded_key
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|superseded| now < superseded.in_use_until_ms)
+    }
+
+    /// The last refused key per member, for members we still hold no key of.
+    pub fn key_rejections(&self) -> HashMap<String, RejectedKey> {
+        self.rejected_keys.lock().unwrap().clone()
+    }
 }
 
 impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
@@ -1971,6 +2017,7 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
             superseded_key: self.superseded_key.clone(),
             rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
+            rejected_keys: self.rejected_keys.clone(),
         }
     }
 }
@@ -3616,22 +3663,6 @@ mod tests {
                 _delay_ms: u64,
             ) -> Result<String, CommandError> {
                 Ok("$delay".to_string())
-            }
-            async fn send_room_event(
-                &self,
-                _room_id: String,
-                _event_type: String,
-                _content: serde_json::Value,
-            ) -> Result<String, CommandError> {
-                Ok("$room".to_string())
-            }
-            async fn redact_event(
-                &self,
-                _room_id: String,
-                _event_id: String,
-                _reason: Option<String>,
-            ) -> Result<(), CommandError> {
-                Ok(())
             }
             async fn restart_delayed_event(
                 &self,

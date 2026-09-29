@@ -39,7 +39,12 @@ pub fn wire_event_type(event_type: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KEY_MESSAGE_TYPE, NOTIFICATION_EVENT_TYPE, SLOT_EVENT_TYPE};
+    use crate::{KEY_MESSAGE_TYPE, SLOT_EVENT_TYPE};
+
+    /// MSC4075's event type, which lives in the call layer; the wire table
+    /// still translates it because the notification leaves through the same
+    /// sticky send as everything else.
+    const NOTIFICATION_EVENT_TYPE: &str = "m.rtc.notification";
 
     #[test]
     fn maps_the_types_the_core_sends() {

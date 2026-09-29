@@ -1,0 +1,61 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-uniffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "UniFFI 0.31 surface of the MatrixRTC participation facade, for uniffi-bindgen-react-native (web/wasm and React Native)."
+
+# `lib` for the workspace's own tests, `cdylib`/`staticlib` for the bindings:
+# uniffi-bindgen-react-native's host build reads the uniffi metadata out of a
+# library artifact before it renders the wasm shim.
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+# MSC4195 pseudonymous participant identities, so `transport_identity` on a
+# membership is the name the LiveKit SFU knows the member by.
+matrix-rtc-livekit-proto = { path = "../matrix-rtc-livekit-proto" }
+# Only for `ElementCallCompat::Off`, the argument the identity mapper takes.
+matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+async-trait.workspace = true
+# The SAME feature set on every target, on purpose: the ubrn-generated wasm
+# shim is a cargo resolver-v1 crate that unifies target-specific features
+# into every build, so a native-only `rt-multi-thread` here would break the
+# wasm build. `rt` and `sync` are both in tokio's wasm-allowed set, and the
+# only tokio this crate uses is `tokio::sync::Mutex`, which needs no runtime.
+tokio = { workspace = true }
+
+# uniffi 0.31 is what uniffi-bindgen-react-native 0.31.x generates for. It is
+# a different major from the 0.29 the mobile crate (`matrix-rtc-ffi`) is
+# pinned to, and cargo resolves the two as unrelated packages; nothing links
+# both. Pinned exactly so the package's check-pins script can compare it
+# against the ubrn version. Deliberately NOT a `[workspace.dependencies]`
+# entry: that key is the 0.29 one.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# No `tokio` feature and no `async_runtime`: the exported futures only ever
+# await a `tokio::sync::Mutex` and the host's own callbacks, and uniffi drives
+# them from the foreign side.
+uniffi = "=0.31.2"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# What uniffi-bindgen-react-native's wasm mode builds on: no runtime, and
+# Send/Sync relaxed for the single-threaded JS environment.
+uniffi = { version = "=0.31.2", features = ["wasm-unstable-single-threaded"] }
+# Reports `panic!` messages to the JS console; installed by
+# `install_panic_hook`. Without it a panic surfaces as an opaque
+# `RuntimeError: unreachable`.
+console_error_panic_hook = "0.1.7"
+
+[dev-dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }

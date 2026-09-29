@@ -12,22 +12,22 @@
 //! real before it makes a noise.
 //!
 //! Only the sending half lives here: building the content. Who sends it and
-//! when is [`crate::session`]'s call (the first member to join, and only if the
-//! host asked for it via [`JoinSessionParams::notify`]); the receiving rules —
+//! when is [`crate::CallSessionManager`]'s call (the first member to join, and
+//! only if the host asked for it via [`CallJoinParams::notify`]); the receiving rules —
 //! push rules, lifetime expiry, ring acknowledgements — are not implemented.
 //!
 //! The MSC and the deployed ecosystem disagree about where the call fields go,
 //! so [`build_notification_content`] writes them in both places; its docs say
 //! why.
 //!
-//! [`JoinSessionParams::notify`]: crate::JoinSessionParams::notify
+//! [`CallJoinParams::notify`]: crate::CallJoinParams::notify
 
 use serde_json::{Map, Value, json};
 
 /// Event type for MatrixRTC notifications (MSC4075).
 ///
 /// The stable id, like every other type the core names; the wire spelling is a
-/// host-layer concern (see [`crate::wire_event_type`]).
+/// host-layer concern (see [`matrix_rtc_core::wire_event_type`]).
 pub const NOTIFICATION_EVENT_TYPE: &str = "m.rtc.notification";
 
 /// Default `lifetime` for a ring, in milliseconds. MSC4075's recommended value.
@@ -80,12 +80,12 @@ impl Default for Mentions {
 
 /// What the host asks for when it joins.
 ///
-/// `None` on [`JoinSessionParams::notify`] means "join quietly" — which is what
+/// `None` on [`CallJoinParams::notify`] means "join quietly" — which is what
 /// joining a call someone else started does. Element Call makes the same
 /// distinction by only passing a notification type when the app *starts* a
 /// call.
 ///
-/// [`JoinSessionParams::notify`]: crate::JoinSessionParams::notify
+/// [`CallJoinParams::notify`]: crate::CallJoinParams::notify
 #[derive(Clone, Debug)]
 pub struct NotifyConfig {
     /// Ring, or notify silently.

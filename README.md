@@ -113,7 +113,11 @@ for a runnable two-client example against the local backend.
   per-participant frame E2EE, the `MediaTransport` implementation, and the
   high-level `Call::join` facade. Native-only (pulls in `libwebrtc`).
 - `crates/matrix-rtc-core`: single-session machine plus room-scoped session
-  manager and MSC4143/MSC4354 event conversion boundary.
+  manager and MSC4143/MSC4354 event conversion boundary, with the participation
+  facade (memberships, transports, key map, status) a host programs against.
+- `crates/matrix-call-core`: the `m.call` application layer over the core —
+  Element Call reactions, the raised hand, MSC4075 ring/notify — as
+  `CallSessionManager`.
 - `crates/matrix-rtc-bridge`: the Matrix side — SDK-backed command sender and
   membership bridge into the core (behind the `matrix-sdk` feature), the
   `OpenIdTokenSource` trait, and `compat` for pre-2026 Element Call wire formats.
@@ -124,7 +128,11 @@ for a runnable two-client example against the local backend.
   cargo feature (default off, keeps the slim artifact libwebrtc-free).
 - `crates/matrix-rtc-wasm`: wasm bindings for the web (signalling only —
   browsers keep using livekit-js for media).
+- `crates/matrix-rtc-uniffi`: the participation facade as a UniFFI 0.31
+  surface, for uniffi-bindgen-react-native (web/wasm and React Native).
 - `web`: browser-first JavaScript package and wasm-pack build/test scaffold.
+- `web-rtc`: `@element-hq/matrix-rtc`, the uniffi-bindgen-react-native build of
+  `matrix-rtc-uniffi` for web and Node, with its vitest harness and demo page.
 - `mobile/android`: Gradle library module for the AAR; `Package.swift` +
   `Sources/MatrixRtc` (repo root): the Swift package over the released
   xcframework; `mobile/ios`: its local-development manifest and build output.
@@ -187,6 +195,9 @@ npm test
 ```
 
 The `web/` package uses `wasm-pack` to generate browser-first bindings under `web/pkg/`.
+
+The uniffi-based web package lives in `web-rtc/` (`make web-rtc-build`,
+`make web-rtc-test`, `make web-rtc-dev`); see `web-rtc/README.md`.
 
 ## Manual Binding Generation
 
@@ -252,6 +263,13 @@ Then run binding tasks when relevant:
 ```bash
 cd web && npm run build
 cd web && npm test
+```
+
+- If changes touch `crates/matrix-rtc-uniffi/**` or `web-rtc/**`:
+
+```bash
+make web-rtc-clippy
+make web-rtc-build && make web-rtc-test
 ```
 
 - If changes touch `crates/matrix-rtc-ffi/**`, `mobile/**`, or `scripts/build-*.sh`:

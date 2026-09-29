@@ -1,0 +1,18 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# uniffi-bindgen-react-native's build of crates/matrix-rtc-uniffi for the web.
+# Paths are relative to this package. The crate is a member of the repository
+# workspace (`rust.directory` is its root), so the host build ubrn runs first
+# uses the workspace lockfile; the wasm shim it renders under
+# rust_modules/wasm is its own workspace root with its own lockfile.
+rust:
+  directory: ..
+  manifestPath: crates/matrix-rtc-uniffi/Cargo.toml
+web:
+  wasmCrateName: matrix-rtc-wasm-shim
+  ts: src/generated
+  entrypoint: src/index.web.ts
+  manifestPatchFile: Cargo.patch.toml

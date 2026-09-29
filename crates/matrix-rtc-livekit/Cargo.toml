@@ -16,6 +16,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-call-core = { path = "../matrix-call-core" }
 # The Matrix side of the stack: `OpenIdTokenSource` (needed unconditionally, to
 # acquire the token the authorisation service wants) plus, under this crate's
 # `matrix-sdk` feature, the SDK-backed command sender / sticky bridge and the

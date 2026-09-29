@@ -10,8 +10,6 @@
 //! call intent.
 
 use crate::encryption::types::EncryptionConfig;
-use crate::notification::NotifyConfig;
-use crate::reactions::ReactionsConfig;
 use crate::session::{LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
@@ -156,21 +154,6 @@ pub struct JoinSessionParams {
     ///
     /// If not provided, defaults to `EncryptionConfig::default()`.
     pub encryption_config: Option<EncryptionConfig>,
-
-    /// Ask for an MSC4075 notification to be sent with this join.
-    ///
-    /// `None` — the default — joins quietly, which is what joining a call
-    /// someone else started does. Set it only when the user is *starting* the
-    /// call: the notification is still suppressed if somebody is already in the
-    /// session, but the intent to summon anyone at all is the application's to
-    /// state.
-    pub notify: Option<NotifyConfig>,
-
-    /// How this session handles Element Call reactions and the raised hand.
-    ///
-    /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
-    /// Element Call's three-second window. See [`crate::reactions`].
-    pub reactions: Option<ReactionsConfig>,
 }
 
 impl JoinSessionParams {
@@ -197,8 +180,6 @@ impl JoinSessionParams {
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
-            notify: None,
-            reactions: None,
         }
     }
 
@@ -223,8 +204,6 @@ impl JoinSessionParams {
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
-            notify: None,
-            reactions: None,
         }
     }
 
@@ -275,11 +254,6 @@ impl JoinSessionParams {
         self.degraded_lifetime_ms
             .unwrap_or(DEFAULT_DEGRADED_LIFETIME_MS)
             .min(MAX_STICKY_DURATION_MS)
-    }
-
-    /// The reactions configuration to use: the configured one or the default.
-    pub fn reactions(&self) -> ReactionsConfig {
-        self.reactions.clone().unwrap_or_default()
     }
 
     /// Gets the encryption configuration to use.

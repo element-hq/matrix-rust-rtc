@@ -15,10 +15,10 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch;
 
+use matrix_call_core::CallSessionManager;
 use matrix_rtc_bridge::compat::ElementCallCompat;
 use matrix_rtc_core::{
     EventConversionError, JoinedMembership as CoreJoinedMembership, RawStickyEvent,
-    RtcSessionManager,
 };
 mod commands;
 pub mod compat;
@@ -53,8 +53,8 @@ pub enum MatrixRtcFfiError {
     Reaction(String),
 }
 
-impl From<matrix_rtc_core::ReactionError> for MatrixRtcFfiError {
-    fn from(error: matrix_rtc_core::ReactionError) -> Self {
+impl From<matrix_call_core::ReactionError> for MatrixRtcFfiError {
+    fn from(error: matrix_call_core::ReactionError) -> Self {
         Self::Reaction(error.to_string())
     }
 }
@@ -268,7 +268,7 @@ pub struct FfiTimelineEvent {
 }
 
 impl FfiTimelineEvent {
-    fn into_core(self) -> Option<matrix_rtc_core::RawTimelineEvent> {
+    fn into_core(self) -> Option<matrix_call_core::RawTimelineEvent> {
         let content = serde_json::from_str(&self.content_json)
             .inspect_err(|error| {
                 log::warn!(
@@ -278,7 +278,7 @@ impl FfiTimelineEvent {
                 );
             })
             .ok()?;
-        Some(matrix_rtc_core::RawTimelineEvent {
+        Some(matrix_call_core::RawTimelineEvent {
             room_id: self.room_id,
             event_id: self.event_id,
             sender: self.sender,
@@ -310,8 +310,8 @@ pub struct FfiRelationLookup {
     pub membership_event_id: String,
 }
 
-impl From<matrix_rtc_core::RelationLookup> for FfiRelationLookup {
-    fn from(lookup: matrix_rtc_core::RelationLookup) -> Self {
+impl From<matrix_call_core::RelationLookup> for FfiRelationLookup {
+    fn from(lookup: matrix_call_core::RelationLookup) -> Self {
         Self {
             member_id: lookup.member_id,
             membership_event_id: lookup.membership_event_id,
@@ -333,8 +333,8 @@ pub struct FfiRaisedHand {
     pub raised_at_ms: u64,
 }
 
-impl From<matrix_rtc_core::RaisedHand> for FfiRaisedHand {
-    fn from(hand: matrix_rtc_core::RaisedHand) -> Self {
+impl From<matrix_call_core::RaisedHand> for FfiRaisedHand {
+    fn from(hand: matrix_call_core::RaisedHand) -> Self {
         Self {
             member_id: hand.member_id,
             sender: hand.sender,
@@ -364,7 +364,7 @@ pub struct FfiReactionKind {
 /// the catalogue. The SDK plays nothing itself.
 #[uniffi::export]
 pub fn reaction_catalog() -> Vec<FfiReactionKind> {
-    matrix_rtc_core::KNOWN_REACTIONS
+    matrix_call_core::KNOWN_REACTIONS
         .iter()
         .map(|kind| FfiReactionKind {
             name: kind.name.to_owned(),
@@ -378,7 +378,7 @@ pub fn reaction_catalog() -> Vec<FfiReactionKind> {
 /// `generic` for a name outside the catalogue, or `None` for a silent one.
 #[uniffi::export]
 pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_core::sound_for(&name)
+    matrix_call_core::sound_for(&name)
         .asset_name()
         .map(str::to_owned)
 }
@@ -405,7 +405,7 @@ pub struct RtcSessionManagerHandle {
     /// An async mutex because every entry point is async and holds it across
     /// awaits into the host. `Arc` so a heartbeat driver can hold a `Weak` to it
     /// without keeping the manager alive past the handle.
-    inner: Arc<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
+    inner: Arc<TokioMutex<CallSessionManager<FfiCommandSender>>>,
     /// One driver per joined session, keyed by `(room_id, slot_id)`. Dropping
     /// the entry stops its task. A `std::sync::Mutex` on purpose: it is only
     /// ever held for a map insert or remove, never across an await.
@@ -440,7 +440,7 @@ struct HeartbeatDriver {
 
 /// Runs one session's keep-alive until the session ends or the handle goes away.
 async fn run_heartbeat(
-    manager: Weak<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
+    manager: Weak<TokioMutex<CallSessionManager<FfiCommandSender>>>,
     room_id: String,
     slot_id: String,
     interval: Duration,
@@ -495,7 +495,7 @@ impl RtcSessionManagerHandle {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(TokioMutex::new(RtcSessionManager::new())),
+            inner: Arc::new(TokioMutex::new(CallSessionManager::new())),
             heartbeats: Mutex::new(HashMap::new()),
             command_sender: Mutex::new(None),
             element_call_compat: Mutex::new(HashMap::new()),
@@ -839,7 +839,7 @@ impl RtcSessionManagerHandle {
         // Not always a fresh id: see `compat::member_id` for the one generation
         // where a fresh one makes us mark ourselves departed on our own join.
         let member_id = compat::member_id(compat, &user_id, &device_id);
-        core_params.membership_id = Some(member_id.clone());
+        core_params.session.membership_id = Some(member_id.clone());
 
         // Before the join, not after: the join itself sends the membership (and
         // arms the delayed leave), so a dialect registered afterwards would let
@@ -847,7 +847,7 @@ impl RtcSessionManagerHandle {
         self.set_element_call_compat(&room_id, &user_id, &device_id, &slot_id, compat);
 
         // Hold the guard across the join, rather than swapping a placeholder
-        // `RtcSessionManager::new()` in and unlocking for the duration. That
+        // `CallSessionManager::new()` in and unlocking for the duration. That
         // pattern had two failure modes: any call landing during the join —
         // `member_count`, or a sticky snapshot — operated on the *placeholder*,
         // so events arriving in that window were applied to it and then thrown
@@ -942,7 +942,7 @@ impl RtcSessionManagerHandle {
         room_id: String,
         events: Vec<FfiTimelineEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
-        let events: Vec<matrix_rtc_core::RawTimelineEvent> = events
+        let events: Vec<matrix_call_core::RawTimelineEvent> = events
             .into_iter()
             .filter_map(FfiTimelineEvent::into_core)
             .collect();
@@ -994,7 +994,7 @@ impl RtcSessionManagerHandle {
         target_event_id: String,
         events: Vec<FfiTimelineEvent>,
     ) -> Result<(), MatrixRtcFfiError> {
-        let events: Vec<matrix_rtc_core::RawTimelineEvent> = events
+        let events: Vec<matrix_call_core::RawTimelineEvent> = events
             .into_iter()
             .filter_map(FfiTimelineEvent::into_core)
             .collect();
@@ -1051,7 +1051,7 @@ impl RtcSessionManagerHandle {
         room_id: String,
         slot_id: String,
     ) -> Result<Vec<FfiRaisedHand>, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
+        let mut manager = self.inner.lock().await;
         Ok(manager
             .raised_hands(&room_id, &slot_id)
             .unwrap_or_default()
