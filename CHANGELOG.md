@@ -8,6 +8,15 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- Participation facade on `RtcSessionManager` / `RtcSession`: `memberships()`, `transports()`, `key_map()` and a per-mechanism `Status` (keep-alive, sticky publication, roster presence, key exchange, sorted impairments) plus a `ParticipationListener` that fires on change only.
+- `matrix-rtc-uniffi`: a UniFFI 0.31 surface of the participation facade for uniffi-bindgen-react-native, and `web-rtc/`, the npm package (`@element-hq/matrix-rtc`, not yet published) that builds it for web and Node with a vitest harness and a demo page.
+
+### Breaking
+
+- Element Call reactions, the raised hand and MSC4075 notify moved from `matrix-rtc-core` to the new `matrix-call-core` crate (`CallSessionManager`, `CallCommandSender`, `CallJoinParams`); the mobile (`matrix-rtc-ffi`) and web (`matrix-rtc-wasm`) binding APIs are unchanged. The bare `WasmRtcSession.join` now ignores `notify` and `reactions` (with a warning); use the manager for call features.
+
 ## v0.4.0-rc.1 - 2026-09-25
 
 ### Added

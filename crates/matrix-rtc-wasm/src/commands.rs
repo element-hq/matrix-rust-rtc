@@ -6,13 +6,15 @@
 //! WASM binding implementation of the command sender interface.
 //!
 //! This module provides the `JsCommandSender` that implements `RtcCommandSender`
-//! by delegating to a JavaScript object that provides the actual Matrix SDK integration.
+//! and `CallCommandSender` by delegating to a JavaScript object that provides the
+//! actual Matrix SDK integration.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
+use matrix_call_core::CallCommandSender;
 use matrix_rtc_bridge::compat::{MemberEventRoute, OutboundDialect};
 use matrix_rtc_core::{
     CommandError, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient, wire_event_type,
@@ -559,7 +561,11 @@ impl RtcCommandSender for JsCommandSender {
             })
             .collect())
     }
+}
 
+// Same shape as above: the call layer's two room-event methods.
+#[async_trait(?Send)]
+impl CallCommandSender for JsCommandSender {
     async fn send_room_event(
         &self,
         room_id: String,

@@ -913,7 +913,7 @@ mod tests {
     /// Element Call build.
     #[test]
     fn a_notification_is_flattened_into_what_element_call_sends() {
-        // As `matrix_rtc_core::build_notification_content` writes it: the MSC's
+        // As `matrix_call_core::build_notification_content` writes it: the MSC's
         // `application` block plus the top-level copies every deployed receiver
         // actually reads.
         let spec = json!({

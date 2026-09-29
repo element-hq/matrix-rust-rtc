@@ -1,0 +1,36 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-call-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The m.call application layer over matrix-rtc-core: Element Call reactions, the raised hand, and MSC4075 ring/notify."
+
+[features]
+# Exposes the mock call command sender for tests in sibling crates.
+testing = ["matrix-rtc-core/testing"]
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+async-trait.workspace = true
+# Same feature set as the core on every target: this crate arms no timers
+# either, and a target-specific tokio feature would leak into the wasm build of
+# any resolver-v1 shim that wraps it.
+tokio = { workspace = true }
+# Element Call keeps only the first grapheme of a reaction's emoji; a grapheme
+# is not a `char` (one visible emoji can be several code points joined), so
+# this pure-Rust, wasm-safe segmenter does the split.
+unicode-segmentation = "1"
+
+[dev-dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+tokio = { version = "1", features = ["rt", "macros", "sync"] }

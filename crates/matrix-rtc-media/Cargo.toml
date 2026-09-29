@@ -13,6 +13,7 @@ description = "Transport-agnostic MatrixRTC media model: participants, frame str
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-call-core = { path = "../matrix-call-core" }
 # The engine's actor loop multiplexes channels with `tokio::select!`
 # (`macros`). Timers are NOT tokio's on every target — see `src/rt.rs` and the
 # per-target sections below.

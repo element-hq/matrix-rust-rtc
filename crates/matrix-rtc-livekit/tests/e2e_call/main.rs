@@ -671,7 +671,7 @@ async fn run(
 /// call event stream and roster, and alice's second reaction inside the cooldown
 /// must be refused locally.
 async fn verify_reactions(alice: &Call, bob: &Call) -> Result<bool, Box<dyn Error>> {
-    use matrix_rtc_core::ReactionError;
+    use matrix_call_core::ReactionError;
     use matrix_rtc_livekit::CallError;
 
     const DEADLINE: Duration = Duration::from_secs(60);

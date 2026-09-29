@@ -10,10 +10,17 @@
 //!
 //! - [`SdkCommandSender`] implements [`RtcCommandSender`], turning the core's
 //!   outbound commands (join/leave member events, dead man's switch delayed
-//!   events) into Matrix Client-Server requests.
-//! - [`run_membership_bridge`] feeds the room's live membership into an
-//!   [`RtcSessionManager`], so the core discovers every peer's `m.rtc.member`
+//!   events) into Matrix Client-Server requests, and [`CallCommandSender`] for
+//!   the call layer's plain room events and redactions.
+//! - [`run_membership_bridge`] feeds the room's live membership into a
+//!   [`CallSessionManager`], so the core discovers every peer's `m.rtc.member`
 //!   membership.
+//!
+//! The pumps are typed on [`CallSessionManager`] rather than the generic
+//! `RtcSessionManager`: the timeline bridge and the raised-hand backfill are
+//! call-level inputs, and roster inputs must reach the call state through the
+//! same manager or it falls behind. This is the one deliberate call-level edge
+//! in the bridge; a driver-based design that dissolves it is a later step.
 //!
 //! Requires the `matrix-sdk` feature. Membership has two carriers:
 //!
@@ -52,10 +59,13 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
+use matrix_call_core::{
+    ANNOTATION_EVENT_TYPE, CallCommandSender, CallSessionManager, REACTION_EVENT_TYPE,
+    RawTimelineEvent,
+};
 use matrix_rtc_core::{
-    ANNOTATION_EVENT_TYPE, CommandError, EventOrigin, REACTION_EVENT_TYPE, RawSlotEvent,
-    RawSlotEventContent, RawStickyEvent, RawStickyEventContent, RawTimelineEvent, RtcCommandSender,
-    RtcSessionManager, SLOT_EVENT_TYPE, ToDeviceDelivery, ToDeviceRecipient,
+    CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent, RawStickyEvent,
+    RawStickyEventContent, RtcCommandSender, SLOT_EVENT_TYPE, ToDeviceDelivery, ToDeviceRecipient,
 };
 
 use crate::compat::{MemberEventRoute, OutboundDialect, element_call_state};
@@ -446,32 +456,6 @@ impl RtcCommandSender for SdkCommandSender {
         Ok(response.event_id.to_string())
     }
 
-    async fn send_room_event(
-        &self,
-        room_id: String,
-        event_type: String,
-        content: Value,
-    ) -> Result<String, CommandError> {
-        let room = self.room(&room_id)?;
-        // Verbatim, not through `wire_event_type`: a reaction is not a MatrixRTC
-        // type and has no unstable alias for ruma to resolve.
-        self.send_room_message(&room, &event_type, &content).await
-    }
-
-    async fn redact_event(
-        &self,
-        room_id: String,
-        event_id: String,
-        reason: Option<String>,
-    ) -> Result<(), CommandError> {
-        let room = self.room(&room_id)?;
-        let event_id = EventId::parse(&event_id).map_err(command_error)?;
-        room.redact(&event_id, reason.as_deref(), None)
-            .await
-            .map_err(command_error)?;
-        Ok(())
-    }
-
     async fn send_to_device_message(
         &self,
         recipients: Vec<ToDeviceRecipient>,
@@ -594,6 +578,36 @@ impl RtcCommandSender for SdkCommandSender {
             );
         }
         Ok(deliveries)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+impl CallCommandSender for SdkCommandSender {
+    async fn send_room_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+    ) -> Result<String, CommandError> {
+        let room = self.room(&room_id)?;
+        // Verbatim, not through `wire_event_type`: a reaction is not a MatrixRTC
+        // type and has no unstable alias for ruma to resolve.
+        self.send_room_message(&room, &event_type, &content).await
+    }
+
+    async fn redact_event(
+        &self,
+        room_id: String,
+        event_id: String,
+        reason: Option<String>,
+    ) -> Result<(), CommandError> {
+        let room = self.room(&room_id)?;
+        let event_id = EventId::parse(&event_id).map_err(command_error)?;
+        room.redact(&event_id, reason.as_deref(), None)
+            .await
+            .map_err(command_error)?;
+        Ok(())
     }
 }
 
@@ -914,7 +928,7 @@ async fn element_call_state_snapshot(room: &Room) -> Vec<RawStickyEvent> {
 /// below.
 async fn feed_room_state(
     room: &Room,
-    manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: &Arc<Mutex<CallSessionManager<SdkCommandSender>>>,
     state_membership: bool,
 ) {
     // Skipped entirely in state mode, so don't pay for it either.
@@ -968,7 +982,7 @@ async fn feed_room_state(
 /// the latest state.
 async fn tick(
     room: &Room,
-    manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: &Arc<Mutex<CallSessionManager<SdkCommandSender>>>,
     state_membership: bool,
 ) {
     let room_id = room.room_id().as_str();
@@ -1043,7 +1057,7 @@ const RAISED_HAND_LOOKUP_LIMIT: u32 = 50;
 /// trips.
 async fn backfill_raised_hands(
     room: &Room,
-    manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: &Arc<Mutex<CallSessionManager<SdkCommandSender>>>,
 ) {
     let room_id = room.room_id().as_str();
     let lookups = manager.lock().await.pending_relation_lookups(room_id);
@@ -1221,7 +1235,7 @@ pub fn register_timeline_receiver(
 /// Intended to be `spawn_local`ed next to [`run_membership_bridge`].
 pub async fn run_timeline_bridge(
     room_id: String,
-    manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: Arc<Mutex<CallSessionManager<SdkCommandSender>>>,
     mut rx: mpsc::UnboundedReceiver<TimelineIngest>,
 ) {
     while let Some(ingest) = rx.recv().await {
@@ -1278,7 +1292,7 @@ async fn state_wake(room_updates: &mut broadcast::Receiver<matrix_sdk::sync::Roo
 /// Intended to be `tokio::spawn`ed. Returns when a wake source closes.
 pub async fn run_membership_bridge(
     room: Room,
-    manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: Arc<Mutex<CallSessionManager<SdkCommandSender>>>,
     state_membership: bool,
 ) {
     let room_id = room.room_id().to_string();

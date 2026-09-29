@@ -6,6 +6,8 @@
 [workspace]
 members = [
     "crates/matrix-rtc-core",
+    "crates/matrix-call-core",
+    "crates/matrix-rtc-uniffi",
     "crates/matrix-rtc-bridge",
     "crates/matrix-rtc-media",
     "crates/matrix-rtc-wasm",

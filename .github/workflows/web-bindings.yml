@@ -1,0 +1,91 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# The uniffi 0.31 surface (crates/matrix-rtc-uniffi) and its web package
+# (web-rtc/): the crate's own gate on both targets, then the
+# uniffi-bindgen-react-native build and the vitest suites against dist/.
+# Separate from lint.yml because the wasm shim build has its own cache and
+# takes minutes the lint jobs should not wait for.
+name: Web bindings (uniffi)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  crate:
+    name: matrix-rtc-uniffi
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (wasm32)
+        run: cargo clippy -p matrix-rtc-uniffi --target wasm32-unknown-unknown -- -D warnings
+      - name: Clippy (host)
+        run: cargo clippy -p matrix-rtc-uniffi --all-targets -- -D warnings
+      - name: Test
+        run: cargo test -p matrix-rtc-uniffi
+      # The two uniffi majors must never meet in one binary: the mobile crate
+      # is 0.29, this one 0.31, and cargo resolves them as unrelated packages.
+      - name: uniffi version isolation
+        run: |
+          ! cargo tree -p matrix-rtc-ffi --all-features -i uniffi@0.31.2 2>/dev/null | grep -q uniffi
+          ! cargo tree -p matrix-rtc-uniffi -i uniffi@0.29.5 2>/dev/null | grep -q uniffi
+
+  package:
+    name: web-rtc
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      # The workspace build ubrn runs first to read the uniffi metadata.
+      - uses: Swatinem/rust-cache@v2
+      # The generated shim is its own workspace with its own target dir.
+      - name: Cache the wasm shim target
+        uses: actions/cache@v4
+        with:
+          path: web-rtc/rust_modules/wasm/target
+          key: web-rtc-shim-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/matrix-rtc-uniffi/Cargo.toml', 'web-rtc/Cargo.patch.toml', 'web-rtc/package-lock.json') }}
+          restore-keys: web-rtc-shim-${{ runner.os }}-
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web-rtc/package-lock.json
+      - name: Install
+        working-directory: web-rtc
+        run: npm ci
+      - name: Build
+        working-directory: web-rtc
+        run: npm run build
+      - name: Typecheck
+        working-directory: web-rtc
+        run: npm run typecheck
+      - name: Test
+        working-directory: web-rtc
+        run: npm test
+      - name: Shipped types
+        working-directory: web-rtc
+        run: npm run test:types
+      - name: Size summary
+        working-directory: web-rtc
+        run: |
+          wasm=dist/generated/wasm-bindgen/index_bg.wasm
+          echo "### web-rtc wasm" >> "$GITHUB_STEP_SUMMARY"
+          echo "raw: $(stat -c %s "$wasm") bytes, gzip: $(gzip -c "$wasm" | wc -c) bytes" >> "$GITHUB_STEP_SUMMARY"
