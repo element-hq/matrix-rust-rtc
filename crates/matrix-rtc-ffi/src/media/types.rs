@@ -835,20 +835,119 @@ pub trait OpenIdTokenProvider: Send + Sync {
     async fn get_open_id_token(&self) -> Result<FfiOpenIdToken, MediaFfiError>;
 }
 
-/// Adapts the host's provider to the transport's token source.
+/// Adapts the host's provider to the transport's token source. Transitional:
+/// the host's `MatrixBackend` replaces it.
 pub(super) struct TokenProviderAdapter(pub(super) std::sync::Arc<dyn OpenIdTokenProvider>);
 
 #[async_trait]
-impl matrix_rtc_livekit::OpenIdTokenSource for TokenProviderAdapter {
-    async fn open_id_token(
+impl matrix_rtc_core::MatrixBackend for TokenProviderAdapter {
+    fn own_user_id(&self) -> String {
+        String::new()
+    }
+
+    fn own_device_id(&self) -> String {
+        String::new()
+    }
+
+    async fn send_sticky_event(
         &self,
-    ) -> Result<matrix_rtc_livekit::OpenIdToken, matrix_rtc_livekit::OpenIdTokenError> {
+        _room_id: String,
+        _event_type: String,
+        _content: serde_json::Value,
+        _duration_ms: u64,
+    ) -> Result<String, matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn send_delayed_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _state_key: Option<String>,
+        _content: serde_json::Value,
+        _delay_ms: u64,
+    ) -> Result<String, matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn restart_delayed_event(
+        &self,
+        _room_id: String,
+        _delay_id: String,
+    ) -> Result<(), matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn cancel_delayed_event(
+        &self,
+        _room_id: String,
+        _delay_id: String,
+    ) -> Result<(), matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn send_to_device_message(
+        &self,
+        _recipients: Vec<matrix_rtc_core::ToDeviceRecipient>,
+        _message_type: String,
+        _content: serde_json::Value,
+    ) -> Result<Vec<matrix_rtc_core::ToDeviceDelivery>, matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn send_state_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _state_key: String,
+        _content: serde_json::Value,
+    ) -> Result<String, matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn send_room_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _content: serde_json::Value,
+    ) -> Result<String, matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn redact_event(
+        &self,
+        _room_id: String,
+        _event_id: String,
+        _reason: Option<String>,
+    ) -> Result<(), matrix_rtc_core::CommandError> {
+        Err(matrix_rtc_core::CommandError::from_message(
+            "token provider cannot send",
+        ))
+    }
+
+    async fn openid_token(
+        &self,
+    ) -> Result<matrix_rtc_core::OpenIdToken, matrix_rtc_core::BackendError> {
         let token = self
             .0
             .get_open_id_token()
             .await
-            .map_err(|error| matrix_rtc_livekit::OpenIdTokenError(error.to_string()))?;
-        Ok(matrix_rtc_livekit::OpenIdToken {
+            .map_err(|error| matrix_rtc_core::BackendError::new(error.to_string()))?;
+        Ok(matrix_rtc_core::OpenIdToken {
             access_token: token.access_token,
             token_type: token.token_type,
             matrix_server_name: token.matrix_server_name,

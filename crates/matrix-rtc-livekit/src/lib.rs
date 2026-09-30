@@ -63,7 +63,7 @@ pub use token::{MemberClaims, SfuToken};
 // Re-exported because `LiveKitTransportConfig` and `connect`/`connect_e2ee` name
 // these in this crate's own signatures — a host implementing the token source
 // should not need a second dependency to do it.
-pub use matrix_rtc_bridge::{OpenIdToken, OpenIdTokenError, OpenIdTokenSource};
+pub use matrix_rtc_core::{MatrixBackend, OpenIdToken};
 pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
 
 /// Android initialisation, re-exported so consumers (e.g. the FFI crate)
@@ -78,11 +78,11 @@ pub mod android {
 }
 
 #[cfg(feature = "matrix-sdk")]
-pub use call::{Call, CallError, CallOptions, discover_livekit_transport, open_slot};
+pub use call::{Call, CallError, CallOptions, open_slot};
 // The SDK-backed bridge itself lives in `matrix-rtc-bridge`; re-exported so a
 // host driving a call keeps one dependency.
 #[cfg(feature = "matrix-sdk")]
-pub use matrix_rtc_bridge::{SdkCommandSender, run_membership_bridge};
+pub use matrix_rtc_bridge::SdkBackend;
 
 /// Obtain a fresh OpenID token and exchange it for an SFU JWT.
 ///
@@ -91,9 +91,9 @@ pub use matrix_rtc_bridge::{SdkCommandSender, run_membership_bridge};
 async fn acquire_token(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,
-    token_source: &dyn OpenIdTokenSource,
+    backend: &dyn MatrixBackend,
 ) -> Result<SfuToken, Error> {
-    let openid_token = token_source.open_id_token().await?;
+    let openid_token = backend.openid_token().await?;
     match config.token_endpoint {
         TokenEndpoint::Msc4195 => {
             token::get_token(
@@ -126,14 +126,14 @@ async fn acquire_token(
 /// Connect to the LiveKit SFU for a MatrixRTC slot.
 ///
 /// Performs the full MSC4195 flow: obtain a Matrix OpenID token from the host
-/// (`token_source`), exchange it for an SFU JWT at the authorisation service,
+/// (`backend`), exchange it for an SFU JWT at the authorisation service,
 /// and connect to the returned SFU URL. The connection is subscribe-only.
 pub async fn connect(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,
-    token_source: &dyn OpenIdTokenSource,
+    backend: &dyn MatrixBackend,
 ) -> Result<LiveKitConnection, Error> {
-    let sfu_token = acquire_token(http, config, token_source).await?;
+    let sfu_token = acquire_token(http, config, backend).await?;
     LiveKitSession::connect(&sfu_token).await
 }
 
@@ -151,14 +151,14 @@ pub async fn connect(
 pub async fn connect_e2ee(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,
-    token_source: &dyn OpenIdTokenSource,
+    backend: &dyn MatrixBackend,
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     auto_subscribe: bool,
 ) -> Result<LiveKitConnection, Error> {
     use livekit::RoomOptions;
     use livekit::e2ee::{E2eeOptions, EncryptionType};
 
-    let sfu_token = acquire_token(http, config, token_source).await?;
+    let sfu_token = acquire_token(http, config, backend).await?;
 
     // RoomOptions is #[non_exhaustive]; mutate a default instance.
     let mut options = RoomOptions::default();
@@ -187,7 +187,7 @@ pub enum Error {
 
     /// Obtaining the Matrix OpenID token from the host failed.
     #[error(transparent)]
-    OpenIdToken(#[from] OpenIdTokenError),
+    OpenIdToken(#[from] matrix_rtc_core::BackendError),
 
     /// Connecting to or operating the LiveKit SFU room failed.
     #[error("LiveKit room error: {0}")]

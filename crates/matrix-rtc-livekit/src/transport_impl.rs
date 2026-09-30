@@ -45,7 +45,7 @@ use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_stream::native::NativeVideoStream;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use matrix_rtc_bridge::OpenIdTokenSource;
+use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_media::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
@@ -72,7 +72,7 @@ const AUDIO_CHANNELS: i32 = 1;
 /// globally unique per membership, so one ring serves all foci).
 pub struct LiveKitMediaTransport {
     http: reqwest::Client,
-    token_source: Arc<dyn OpenIdTokenSource>,
+    backend: Arc<dyn MatrixBackend>,
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     auto_subscribe: bool,
     /// How a `(user, device, member_id)` triple becomes an SFU participant
@@ -93,12 +93,12 @@ impl LiveKitMediaTransport {
     /// [`crate::MediaKeyBridge`] importing the core's media keys.
     pub fn new(
         http: reqwest::Client,
-        token_source: Arc<dyn OpenIdTokenSource>,
+        backend: Arc<dyn MatrixBackend>,
         key_provider: livekit::e2ee::key_provider::KeyProvider,
     ) -> Self {
         Self {
             http,
-            token_source,
+            backend,
             key_provider,
             auto_subscribe: true,
             identity_mapper: Arc::new(pseudonymous_identity),
@@ -161,7 +161,7 @@ impl LiveKitMediaTransport {
         let connection = connect_e2ee(
             &self.http,
             &config,
-            self.token_source.as_ref(),
+            self.backend.as_ref(),
             self.key_provider.clone(),
             self.auto_subscribe,
         )

@@ -26,7 +26,9 @@ use std::env;
 use std::error::Error;
 
 use livekit::RoomEvent;
-use matrix_rtc_livekit::{LiveKitTransportConfig, MemberClaims, TokenEndpoint, connect};
+use matrix_rtc_livekit::{
+    LiveKitTransportConfig, MemberClaims, SdkBackend, TokenEndpoint, connect,
+};
 
 fn required(name: &str) -> Result<String, Box<dyn Error>> {
     env::var(name).map_err(|_| format!("missing required env var {name}").into())
@@ -92,7 +94,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "connecting to the SFU for room {} slot {}...",
         config.room_id, config.slot_id
     );
-    let connection = connect(&http, &config, &client).await?;
+    let connection = connect(&http, &config, &SdkBackend::new(client.clone())).await?;
     println!("connected to the SFU; waiting for tracks (join the call from another client)...");
 
     // 5. Log room events, highlighting subscribed remote tracks.
