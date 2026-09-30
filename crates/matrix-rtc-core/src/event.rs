@@ -242,13 +242,12 @@ impl RawStickyEvent {
     ) -> Result<CallMembershipEvent, EventConversionError> {
         self.check_convertible()?;
 
-        let application_type = self.content.application.application_type.clone();
         let member_id = self.content.member.id.clone();
 
         // `join` also requires an application type: MSC4143 makes the application
         // object REQUIRED on a joining member event.
-        let joined = self.content.member.is_join()
-            && application_type.as_deref().is_some_and(|t| !t.is_empty());
+        let joined =
+            self.content.member.is_join() && self.content.application.application_type().is_some();
 
         if !joined {
             return Ok(CallMembershipEvent::Left(self.into_left(member_id)));
@@ -278,7 +277,7 @@ impl RawStickyEvent {
             member_id,
             membership_event_id: self.event_id,
             membership_ts: self.content.created_ts,
-            application: application_type,
+            application: self.content.application,
             transports: transports
                 .published
                 .into_iter()
@@ -324,15 +323,12 @@ impl RawStickyEventContent {
     pub(crate) fn for_join(
         slot_id: String,
         member_id: String,
-        application_type: String,
+        application: ApplicationInfo,
         transports: MemberTransports,
     ) -> Self {
         Self {
             slot_id,
-            application: ApplicationInfo {
-                application_type: Some(application_type),
-                ..ApplicationInfo::default()
-            },
+            application,
             member: MemberInfo {
                 id: Some(member_id.clone()),
                 membership: Some(Membership::Join),
@@ -448,7 +444,11 @@ mod tests {
             CallMembershipEvent::Joined(joined) => {
                 assert_eq!(joined.member_id, "xyzABCDEF0123");
                 assert_eq!(joined.sticky_key, "xyzABCDEF0123");
-                assert_eq!(joined.application.as_deref(), Some("m.call"));
+                assert_eq!(joined.application.application_type(), Some("m.call"));
+                assert_eq!(
+                    joined.application.extra.get("m.call.voice_only"),
+                    Some(&serde_json::json!(true)),
+                );
                 assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
                 assert_eq!(joined.origin.sender_device_id(), Some("DEVICEID"));
                 match &joined.transports[..] {
@@ -544,7 +544,7 @@ mod tests {
         let built = RawStickyEventContent::for_join(
             "m.call#ROOM".to_owned(),
             "xyzABCDEF0123".to_owned(),
-            "m.call".to_owned(),
+            "m.call".into(),
             MemberTransports::publishing(RawRtcTransport {
                 transport_type: "livekit".to_owned(),
                 extra_fields: Default::default(),
@@ -563,6 +563,23 @@ mod tests {
         assert_eq!(
             parsed.transports.unwrap().can_subscribe,
             vec!["livekit".to_owned()]
+        );
+    }
+
+    #[test]
+    fn built_join_content_carries_application_properties() {
+        let built = RawStickyEventContent::for_join(
+            "org.example.board#ROOM".to_owned(),
+            "xyzABCDEF0123".to_owned(),
+            ApplicationInfo::new("org.example.board")
+                .with_extra("board_id", serde_json::json!("b1")),
+            MemberTransports::default(),
+        );
+
+        let json = serde_json::to_value(&built).unwrap();
+        assert_eq!(
+            json.pointer("/application"),
+            Some(&serde_json::json!({ "type": "org.example.board", "board_id": "b1" })),
         );
     }
 }

@@ -594,7 +594,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
         let content = build_notification_content(
             notify,
-            &params.application,
+            params.application.application_type().unwrap_or_default(),
             &params.user_id,
             &params.device_id,
             member_event_id,
@@ -1525,7 +1525,8 @@ impl MemberInfo {
     }
 }
 
-/// MSC4143: Application info
+/// MSC4143 `content.application`. The core reads only `type`; the rest is the
+/// application's and passes through untouched, in both directions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplicationInfo {
     #[serde(rename = "type")]
@@ -1535,9 +1536,40 @@ pub struct ApplicationInfo {
 }
 
 impl ApplicationInfo {
+    /// An application of `application_type` with no further properties.
+    pub fn new(application_type: impl Into<String>) -> Self {
+        Self {
+            application_type: Some(application_type.into()),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    /// Adds an application-defined property, e.g. `m.call.voice_only`.
+    pub fn with_extra(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.extra.insert(key.into(), value);
+        self
+    }
+
+    /// The application `type`, when one is set and non-empty.
+    pub fn application_type(&self) -> Option<&str> {
+        self.application_type.as_deref().filter(|t| !t.is_empty())
+    }
+
     /// True when no application fields are set (used to skip serialization for leave events).
     pub fn is_empty(&self) -> bool {
         self.application_type.is_none() && self.extra.is_empty()
+    }
+}
+
+impl From<String> for ApplicationInfo {
+    fn from(application_type: String) -> Self {
+        Self::new(application_type)
+    }
+}
+
+impl From<&str> for ApplicationInfo {
+    fn from(application_type: &str) -> Self {
+        Self::new(application_type)
     }
 }
 
@@ -1652,8 +1684,8 @@ pub struct JoinedMembership {
     /// same device where `member_id` alone cannot. The js-sdk's encryption
     /// manager keys on the same value as `membershipTs`.
     pub membership_ts: Option<u64>,
-    /// Application type from `content.application.type`.
-    pub application: Option<String>,
+    /// `content.application`; a joined membership always has a `type`.
+    pub application: ApplicationInfo,
     /// Transports this member publishes on (`content.transports.published`).
     pub transports: Vec<RtcTransport>,
     /// Transport types this member can subscribe to

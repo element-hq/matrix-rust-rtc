@@ -1477,7 +1477,7 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         sticky_key: member.sticky_key,
         member_id: member.member_id,
         membership_event_id: member.membership_event_id,
-        application: member.application,
+        application: member.application.application_type,
         transports: member.transports.iter().map(Into::into).collect(),
         can_subscribe: member.can_subscribe,
     }

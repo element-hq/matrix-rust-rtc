@@ -2030,7 +2030,7 @@ mod tests {
             member_id: "bob-device456-uuid".to_string(),
             membership_event_id: None,
             membership_ts: None,
-            application: Some("m.call".to_string()),
+            application: "m.call".into(),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
         }

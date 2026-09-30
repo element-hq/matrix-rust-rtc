@@ -388,7 +388,7 @@ impl Peer {
             member_id: self.member_id.clone(),
             membership_event_id: None,
             membership_ts: None,
-            application: Some("m.call".to_owned()),
+            application: "m.call".into(),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
         }

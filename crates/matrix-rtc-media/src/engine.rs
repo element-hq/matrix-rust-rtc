@@ -2440,7 +2440,7 @@ mod tests {
             member_id: member_id.to_owned(),
             membership_event_id: None,
             membership_ts: None,
-            application: Some("m.call".to_owned()),
+            application: "m.call".into(),
             transports: vec![RtcTransport::LiveKit(LiveKitTransport {
                 livekit_service_url: focus.to_owned(),
             })],

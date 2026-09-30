@@ -12,7 +12,7 @@
 use crate::encryption::types::EncryptionConfig;
 use crate::notification::NotifyConfig;
 use crate::reactions::ReactionsConfig;
-use crate::session::{LeaveCode, LeaveReason};
+use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
@@ -124,8 +124,9 @@ pub struct JoinSessionParams {
     /// The slot ID for the session (e.g., "m.call#ROOM").
     pub slot_id: String,
 
-    /// The application type, usually "m.call".
-    pub application: String,
+    /// `content.application` to publish. A `String` or `&str` converts into a
+    /// type-only one.
+    pub application: ApplicationInfo,
 
     /// What this member does with transports.
     pub transport: TransportIntent,
@@ -182,7 +183,7 @@ impl JoinSessionParams {
         device_id: String,
         room_id: String,
         slot_id: String,
-        application: String,
+        application: impl Into<ApplicationInfo>,
         transport: RtcTransport,
     ) -> Self {
         Self {
@@ -191,7 +192,7 @@ impl JoinSessionParams {
             membership_id: None,
             room_id,
             slot_id,
-            application,
+            application: application.into(),
             transport: TransportIntent::Publish(transport),
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
@@ -208,7 +209,7 @@ impl JoinSessionParams {
         device_id: String,
         room_id: String,
         slot_id: String,
-        application: String,
+        application: impl Into<ApplicationInfo>,
         transport: TransportIntent,
     ) -> Self {
         Self {
@@ -217,7 +218,7 @@ impl JoinSessionParams {
             membership_id: None,
             room_id,
             slot_id,
-            application,
+            application: application.into(),
             transport,
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
@@ -306,7 +307,7 @@ impl JoinSessionParams {
         if self.slot_id.is_empty() {
             return Err("slot_id is required");
         }
-        if self.application.is_empty() {
+        if self.application.application_type().is_none() {
             return Err("application is required");
         }
         Ok(())

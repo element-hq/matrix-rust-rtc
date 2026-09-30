@@ -1502,7 +1502,7 @@ mod tests {
         assert_eq!(joined.member_id, "@alice:example.io:V5cP8FErcB");
         // The core keys the roster by one and binds media keys by the other.
         assert_eq!(joined.sticky_key, joined.member_id);
-        assert_eq!(joined.application.as_deref(), Some("m.call"));
+        assert_eq!(joined.application.application_type(), Some("m.call"));
         assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
         // The claimed device is what a media key gets addressed to; without it
         // `remote_identity` returns `None` and the peer's media is unattributable.

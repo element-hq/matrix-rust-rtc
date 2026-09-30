@@ -65,7 +65,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
 use crate::event::RawStickyEventContent;
-use crate::session::{LeaveCode, LeaveReason};
+use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::{MemberTransports, RtcTransport};
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
@@ -226,8 +226,8 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     slot_id: String,
     /// Our `member.id`, which doubles as the sticky key (MSC4143).
     sticky_key: String,
-    /// Application type (for application.type in MSC4143, e.g., "m.call").
-    application_type: String,
+    /// `content.application` of our join (MSC4143), e.g. `{"type": "m.call"}`.
+    application: ApplicationInfo,
     /// Current state of the membership machine.
     state: Arc<Mutex<OwnMembershipState>>,
     /// Information about the active delayed event, if any.
@@ -285,14 +285,15 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     /// * `room_id` - The room ID for the session
     /// * `slot_id` - The slot ID for the session
     /// * `sticky_key` - Our `member.id`, which doubles as the sticky key
-    /// * `application_type` - Application type (for MSC4143 application.type, e.g., "m.call")
+    /// * `application` - `content.application`: the type (e.g. "m.call") plus any
+    ///   application-defined properties
     /// * `timings` - The three lifetimes the membership runs on
     pub fn new(
         command_sender: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,
-        application_type: String,
+        application: impl Into<ApplicationInfo>,
         timings: MembershipTimings,
     ) -> Self {
         let MembershipTimings {
@@ -305,7 +306,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             room_id,
             slot_id,
             sticky_key,
-            application_type,
+            application: application.into(),
             state: Arc::new(Mutex::new(OwnMembershipState::NotJoined)),
             keep_alive_info: Arc::new(Mutex::new(None)),
             keep_alive_timeout_ms,
@@ -324,14 +325,14 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         room_id: String,
         slot_id: String,
         sticky_key: String,
-        application_type: String,
+        application: impl Into<ApplicationInfo>,
     ) -> Self {
         Self::new(
             command_sender,
             room_id,
             slot_id,
             sticky_key,
-            application_type,
+            application,
             MembershipTimings::default(),
         )
     }
@@ -427,7 +428,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
-        let application_type = self.application_type.clone();
+        let application = self.application.clone();
         let keep_alive_timeout_ms = self.keep_alive_timeout_ms;
 
         // Update state to Joining first
@@ -490,8 +491,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         }
 
         // Step 2: Send join membership event
-        let join_content =
-            self.build_join_content(&slot_id, &sticky_key, &application_type, transports);
+        let join_content = self.build_join_content(&slot_id, &sticky_key, application, transports);
 
         log::info!(
             "[{}] Sending join membership event (step 2 of dead man's switch)",
@@ -582,13 +582,13 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         &self,
         slot_id: &str,
         sticky_key: &str,
-        application_type: &str,
+        application: ApplicationInfo,
         transports: MemberTransports,
     ) -> Value {
         let content = RawStickyEventContent::for_join(
             slot_id.to_string(),
             sticky_key.to_string(),
-            application_type.to_string(),
+            application,
             transports,
         );
         serde_json::to_value(content).expect("m.rtc.member content is always serializable")

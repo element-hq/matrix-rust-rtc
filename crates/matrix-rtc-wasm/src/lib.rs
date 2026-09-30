@@ -1093,7 +1093,7 @@ impl WasmJoinSessionParams {
             membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
-            application: self.application,
+            application: self.application.into(),
             transport: match transport {
                 Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport),
                 None => matrix_rtc_core::TransportIntent::ReceiveOnly {

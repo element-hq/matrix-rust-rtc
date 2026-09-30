@@ -359,7 +359,7 @@ impl FfiJoinSessionParams {
             membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
-            application: self.application,
+            application: self.application.into(),
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
