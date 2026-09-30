@@ -1,0 +1,37 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+//! The call application over `matrix-rtc-core`, which is application-agnostic:
+//! Element Call's reactions and raised hand ([`reactions`]), MSC4075 ringing
+//! ([`notification`]), and the host-facing [`CallSessionManager`].
+
+mod manager;
+pub mod notification;
+pub mod reactions;
+
+pub use manager::{CallJoinParams, CallSessionManager};
+pub use notification::{
+    DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
+    NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,
+};
+pub use reactions::{
+    ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, DEFAULT_REACTION_ACTIVE_MS, GENERIC_SOUND,
+    KNOWN_REACTIONS, RAISED_HAND_KEY, REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionKind,
+    ReactionSound, ReactionsConfig, ReceivedReaction, RelationLookup, build_raised_hand_content,
+    build_reaction_content, first_grapheme, reaction_kind, sound_for,
+};
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+use web_time::{SystemTime, UNIX_EPOCH};
+
+/// Milliseconds since the Unix epoch: a clock read, never a timer.
+pub(crate) fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}

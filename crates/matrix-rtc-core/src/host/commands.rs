@@ -116,9 +116,7 @@ pub trait RtcCommandSender: MaybeSend {
     ///
     /// The event id the homeserver assigned. Every Matrix send responds with
     /// one, so an implementation that cannot produce it is broken rather than
-    /// merely terse — hence no `Option`. The core needs it for MSC4075, which
-    /// requires an `m.reference` relation from a notification to the member
-    /// event that justifies it.
+    /// merely terse — hence no `Option`.
     async fn send_sticky_event(
         &self,
         room_id: String,
@@ -261,10 +259,9 @@ pub trait RtcCommandSender: MaybeSend {
 
     /// Send a plain room event: message-like, neither sticky nor state.
     ///
-    /// Used for the Element Call reactions (`io.element.call.reaction`) and the
-    /// raised-hand `m.reaction` annotation. In an encrypted room the event must
-    /// go out encrypted like any other message; a client SDK's ordinary send
-    /// does that on its own.
+    /// Only applications send these. In an encrypted room the event must go out
+    /// encrypted like any other message; a client SDK's ordinary send does that
+    /// on its own.
     ///
     /// # Arguments
     ///
@@ -276,8 +273,7 @@ pub trait RtcCommandSender: MaybeSend {
     /// # Returns
     ///
     /// The event id the homeserver assigned, on the same terms as
-    /// [`send_sticky_event`](Self::send_sticky_event). A raised hand is lowered
-    /// by redacting this very event, so the id has to come back.
+    /// [`send_sticky_event`](Self::send_sticky_event).
     async fn send_room_event(
         &self,
         room_id: String,
@@ -287,8 +283,7 @@ pub trait RtcCommandSender: MaybeSend {
 
     /// Redact one of our own room events.
     ///
-    /// Used to lower a raised hand: Element Call has no "hand lowered" event,
-    /// the annotation is simply redacted.
+    /// Only applications redact.
     ///
     /// # Arguments
     ///

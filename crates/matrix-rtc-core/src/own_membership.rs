@@ -260,10 +260,6 @@ pub struct OwnMembershipMachine<T: RtcCommandSender> {
     /// The event id of the member event currently representing us in the
     /// sticky map: the join's, then each refresh's. `None` until we join and
     /// again once we leave.
-    ///
-    /// Element Call relates reactions and the raised hand to this id and drops
-    /// a raised hand whose membership event has moved on, so a refresh is what
-    /// makes the session re-annotate its hand (see [`crate::reactions`]).
     latest_event_id: Arc<Mutex<Option<String>>>,
 }
 

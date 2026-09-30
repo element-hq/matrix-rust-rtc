@@ -25,11 +25,13 @@
 #![cfg(target_arch = "wasm32")]
 
 use matrix_rtc_bridge::compat::{ElementCallCompat, ingest};
+use matrix_rtc_call::{
+    CallJoinParams, CallSessionManager, Mentions, NotificationType, NotifyConfig,
+};
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership, KeyOrigin,
-    LeaveSessionParams, Mentions, NotificationType, NotifyConfig, RawRtcTransport, RawSlotEvent,
-    RawStickyEvent, ReceivedEncryptionKey, RtcSession, RtcSessionManager, RtcTransport,
-    SlotEncryption,
+    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, ReceivedEncryptionKey,
+    RtcSession, RtcSessionManager, RtcTransport, SlotEncryption,
 };
 
 mod commands;
@@ -46,9 +48,9 @@ use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-/// WebAssembly-facing wrapper around `RtcSessionManager`.
+/// WebAssembly-facing wrapper around the call layer's `CallSessionManager`.
 pub struct WasmRtcSessionManager {
-    inner: RtcSessionManager<JsCommandSender>,
+    inner: CallSessionManager<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
     command_sender: Option<Arc<JsCommandSender>>,
     /// The Element Call compat mode each room was joined in, installed by
@@ -65,7 +67,7 @@ impl WasmRtcSessionManager {
     /// Creates an empty session manager instance for JS consumers.
     pub fn new() -> Self {
         Self {
-            inner: RtcSessionManager::new(),
+            inner: CallSessionManager::new(RtcSessionManager::new()),
             command_sender: None,
             element_call_compat: std::collections::HashMap::new(),
         }
@@ -288,7 +290,7 @@ impl WasmRtcSessionManager {
         // Not always a fresh id: see `ingest::member_id` for the one generation
         // where a fresh one makes us mark ourselves departed on our own join.
         let member_id = ingest::member_id(mode, &user_id, &device_id);
-        core_params.membership_id = Some(member_id.clone());
+        core_params.rtc.membership_id = Some(member_id.clone());
 
         // Before the join, not after: the join itself sends the membership
         // (and arms the delayed leave), so a dialect registered afterwards
@@ -812,7 +814,7 @@ pub fn reaction_catalog() -> Result<JsValue, JsError> {
         emoji: &'static str,
         sound: Option<&'static str>,
     }
-    let catalogue: Vec<Kind> = matrix_rtc_core::KNOWN_REACTIONS
+    let catalogue: Vec<Kind> = matrix_rtc_call::KNOWN_REACTIONS
         .iter()
         .map(|kind| Kind {
             name: kind.name,
@@ -828,7 +830,7 @@ pub fn reaction_catalog() -> Result<JsValue, JsError> {
 /// one.
 #[wasm_bindgen(js_name = reactionSoundFor)]
 pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_core::sound_for(&name)
+    matrix_rtc_call::sound_for(&name)
         .asset_name()
         .map(str::to_owned)
 }
@@ -971,12 +973,12 @@ fn default_true() -> bool {
 }
 
 fn default_reaction_window_ms() -> u64 {
-    matrix_rtc_core::DEFAULT_REACTION_ACTIVE_MS
+    matrix_rtc_call::DEFAULT_REACTION_ACTIVE_MS
 }
 
-impl From<WasmReactionsConfig> for matrix_rtc_core::ReactionsConfig {
+impl From<WasmReactionsConfig> for matrix_rtc_call::ReactionsConfig {
     fn from(value: WasmReactionsConfig) -> Self {
-        matrix_rtc_core::ReactionsConfig {
+        matrix_rtc_call::ReactionsConfig {
             enabled: value.enabled,
             active_window_ms: value.active_window_ms,
             send_cooldown_ms: value.send_cooldown_ms,
@@ -1079,10 +1081,10 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
 }
 
 impl WasmJoinSessionParams {
-    pub fn into_core(self) -> Result<JoinSessionParams, JsError> {
+    pub fn into_core(self) -> Result<CallJoinParams, JsError> {
         let transport = self.transport.map(|t| t.into_core()).transpose()?;
         let encryption_config = self.encryption_config.map(Into::into);
-        Ok(JoinSessionParams {
+        let rtc = JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
             // Filled in by the join entry points, which generate a fresh id per
@@ -1103,9 +1105,12 @@ impl WasmJoinSessionParams {
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
             degraded_lifetime_ms: self.degraded_lifetime_ms,
-            reactions: self.reactions.map(Into::into),
             encryption_config,
+        };
+        Ok(CallJoinParams {
+            rtc,
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
+            reactions: self.reactions.map(Into::into),
         })
     }
 }
@@ -1186,7 +1191,7 @@ impl WasmLeaveSessionParams {
 }
 
 #[wasm_bindgen]
-/// WebAssembly-facing single-session API.
+/// WebAssembly-facing single-session API: MatrixRTC only, no call features.
 pub struct WasmRtcSession {
     inner: RtcSession<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
@@ -1276,7 +1281,16 @@ impl WasmRtcSession {
         let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
 
-        let mut core_params = params.into_core()?;
+        let CallJoinParams {
+            rtc: mut core_params,
+            notify,
+            ..
+        } = params.into_core()?;
+        if notify.is_some() {
+            log::warn!(
+                "WasmRtcSession::join: `notify` ignored; use WasmRtcSessionManager to start a call"
+            );
+        }
         let member_id = matrix_rtc_core::generate_member_id();
         core_params.membership_id = Some(member_id.clone());
 

@@ -16,6 +16,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch;
 
 use matrix_rtc_bridge::compat::ElementCallCompat;
+use matrix_rtc_call::CallSessionManager;
 use matrix_rtc_core::{
     EventConversionError, JoinedMembership as CoreJoinedMembership, RawStickyEvent,
     RtcSessionManager,
@@ -53,8 +54,8 @@ pub enum MatrixRtcFfiError {
     Reaction(String),
 }
 
-impl From<matrix_rtc_core::ReactionError> for MatrixRtcFfiError {
-    fn from(error: matrix_rtc_core::ReactionError) -> Self {
+impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
+    fn from(error: matrix_rtc_call::ReactionError) -> Self {
         Self::Reaction(error.to_string())
     }
 }
@@ -310,8 +311,8 @@ pub struct FfiRelationLookup {
     pub membership_event_id: String,
 }
 
-impl From<matrix_rtc_core::RelationLookup> for FfiRelationLookup {
-    fn from(lookup: matrix_rtc_core::RelationLookup) -> Self {
+impl From<matrix_rtc_call::RelationLookup> for FfiRelationLookup {
+    fn from(lookup: matrix_rtc_call::RelationLookup) -> Self {
         Self {
             member_id: lookup.member_id,
             membership_event_id: lookup.membership_event_id,
@@ -319,7 +320,7 @@ impl From<matrix_rtc_core::RelationLookup> for FfiRelationLookup {
     }
 }
 
-/// A member whose hand is up (mirrors `matrix_rtc_core::RaisedHand`).
+/// A member whose hand is up (mirrors `matrix_rtc_call::RaisedHand`).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FfiRaisedHand {
     /// `member.id` of the membership the hand belongs to.
@@ -333,8 +334,8 @@ pub struct FfiRaisedHand {
     pub raised_at_ms: u64,
 }
 
-impl From<matrix_rtc_core::RaisedHand> for FfiRaisedHand {
-    fn from(hand: matrix_rtc_core::RaisedHand) -> Self {
+impl From<matrix_rtc_call::RaisedHand> for FfiRaisedHand {
+    fn from(hand: matrix_rtc_call::RaisedHand) -> Self {
         Self {
             member_id: hand.member_id,
             sender: hand.sender,
@@ -364,7 +365,7 @@ pub struct FfiReactionKind {
 /// the catalogue. The SDK plays nothing itself.
 #[uniffi::export]
 pub fn reaction_catalog() -> Vec<FfiReactionKind> {
-    matrix_rtc_core::KNOWN_REACTIONS
+    matrix_rtc_call::KNOWN_REACTIONS
         .iter()
         .map(|kind| FfiReactionKind {
             name: kind.name.to_owned(),
@@ -378,7 +379,7 @@ pub fn reaction_catalog() -> Vec<FfiReactionKind> {
 /// `generic` for a name outside the catalogue, or `None` for a silent one.
 #[uniffi::export]
 pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_core::sound_for(&name)
+    matrix_rtc_call::sound_for(&name)
         .asset_name()
         .map(str::to_owned)
 }
@@ -405,7 +406,7 @@ pub struct RtcSessionManagerHandle {
     /// An async mutex because every entry point is async and holds it across
     /// awaits into the host. `Arc` so a heartbeat driver can hold a `Weak` to it
     /// without keeping the manager alive past the handle.
-    inner: Arc<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
+    inner: Arc<TokioMutex<CallSessionManager<FfiCommandSender>>>,
     /// One driver per joined session, keyed by `(room_id, slot_id)`. Dropping
     /// the entry stops its task. A `std::sync::Mutex` on purpose: it is only
     /// ever held for a map insert or remove, never across an await.
@@ -440,7 +441,7 @@ struct HeartbeatDriver {
 
 /// Runs one session's keep-alive until the session ends or the handle goes away.
 async fn run_heartbeat(
-    manager: Weak<TokioMutex<RtcSessionManager<FfiCommandSender>>>,
+    manager: Weak<TokioMutex<CallSessionManager<FfiCommandSender>>>,
     room_id: String,
     slot_id: String,
     interval: Duration,
@@ -495,7 +496,9 @@ impl RtcSessionManagerHandle {
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            inner: Arc::new(TokioMutex::new(RtcSessionManager::new())),
+            inner: Arc::new(TokioMutex::new(CallSessionManager::new(
+                RtcSessionManager::new(),
+            ))),
             heartbeats: Mutex::new(HashMap::new()),
             command_sender: Mutex::new(None),
             element_call_compat: Mutex::new(HashMap::new()),
@@ -839,7 +842,7 @@ impl RtcSessionManagerHandle {
         // Not always a fresh id: see `compat::member_id` for the one generation
         // where a fresh one makes us mark ourselves departed on our own join.
         let member_id = compat::member_id(compat, &user_id, &device_id);
-        core_params.membership_id = Some(member_id.clone());
+        core_params.rtc.membership_id = Some(member_id.clone());
 
         // Before the join, not after: the join itself sends the membership (and
         // arms the delayed leave), so a dialect registered afterwards would let

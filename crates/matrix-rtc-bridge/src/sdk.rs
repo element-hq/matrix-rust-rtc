@@ -53,9 +53,9 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 use matrix_rtc_core::{
-    ANNOTATION_EVENT_TYPE, CommandError, EventOrigin, REACTION_EVENT_TYPE, RawSlotEvent,
-    RawSlotEventContent, RawStickyEvent, RawStickyEventContent, RawTimelineEvent, RtcCommandSender,
-    RtcSessionManager, SLOT_EVENT_TYPE, ToDeviceDelivery, ToDeviceRecipient,
+    ApplicationIntake, CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent,
+    RawStickyEvent, RawStickyEventContent, RawTimelineEvent, RelationsRequest, RtcCommandSender,
+    SLOT_EVENT_TYPE, ToDeviceDelivery, ToDeviceRecipient,
 };
 
 use crate::compat::{MemberEventRoute, OutboundDialect, element_call_state};
@@ -912,9 +912,9 @@ async fn element_call_state_snapshot(room: &Room) -> Vec<RawStickyEvent> {
 /// `state_membership` says the room's membership lives in room state rather than
 /// in sticky events, which changes what we can honestly say about slots — see
 /// below.
-async fn feed_room_state(
+async fn feed_room_state<M: ApplicationIntake<SdkCommandSender>>(
     room: &Room,
-    manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: &Arc<Mutex<M>>,
     state_membership: bool,
 ) {
     // Skipped entirely in state mode, so don't pay for it either.
@@ -930,7 +930,8 @@ async fn feed_room_state(
         .map(|state| state.is_encrypted());
     let room_id = room.room_id().as_str();
 
-    let mut manager = manager.lock().await;
+    let mut guard = manager.lock().await;
+    let manager = guard.rtc();
     // Encryption first: it decides how the slots that follow resolve.
     match encrypted {
         Ok(encrypted) => {
@@ -966,9 +967,9 @@ async fn feed_room_state(
 /// Both halves run every tick because both can change at any time — a slot can
 /// close, a member can leave the room — and MSC4143 requires clients to respect
 /// the latest state.
-async fn tick(
+async fn tick<M: ApplicationIntake<SdkCommandSender>>(
     room: &Room,
-    manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: &Arc<Mutex<M>>,
     state_membership: bool,
 ) {
     let room_id = room.room_id().as_str();
@@ -1014,71 +1015,64 @@ async fn tick(
     if let Err(error) = manager
         .lock()
         .await
+        .rtc()
         .set_current_sticky_state(room_id, current)
         .await
     {
         log::warn!("[{room_id}] failed to apply the current membership: {error}");
     }
 
-    backfill_raised_hands(room, manager).await;
+    backfill_relations(room, manager).await;
 }
 
-/// How many annotations to ask for per membership event. A member has one
-/// raised hand at a time; anything beyond a handful is noise (repeats, or
-/// annotations from other senders, which the core discards).
-const RAISED_HAND_LOOKUP_LIMIT: u32 = 50;
+/// Relations asked for per event; a call wants one raised hand per member.
+const RELATIONS_LOOKUP_LIMIT: u32 = 50;
 
-/// Fetches the raised-hand annotations of every membership event the core has
-/// not seen the relations of yet, and feeds them back.
-///
-/// This is how hands raised before we joined become visible: the timeline we
-/// receive live starts at our join, but the annotation lives in the relations
-/// of the member's membership event. One `/relations` request per new
-/// membership event id — a join, or a peer's sticky refresh — not per tick,
-/// because asking marks the id as fetched. A failed request leaves it pending,
-/// so the next tick asks again.
-///
-/// Runs after the membership is applied, so the lookups are for the roster the
-/// core actually holds. The manager lock is not held across the HTTP round
-/// trips.
-async fn backfill_raised_hands(
+/// Fetches the relations the application asks for. How a call learns of hands
+/// raised before we joined: they live in the relations of membership events,
+/// not in the live timeline. A failed fetch stays pending for the next tick.
+/// The manager lock is not held across the HTTP round trips.
+async fn backfill_relations<M: ApplicationIntake<SdkCommandSender>>(
     room: &Room,
-    manager: &Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: &Arc<Mutex<M>>,
 ) {
     let room_id = room.room_id().as_str();
-    let lookups = manager.lock().await.pending_relation_lookups(room_id);
+    let requests = manager.lock().await.pending_relations(room_id);
 
-    for lookup in lookups {
-        let event_id = match OwnedEventId::try_from(lookup.membership_event_id.as_str()) {
-            Ok(event_id) => event_id,
+    for RelationsRequest {
+        event_id,
+        rel_type,
+        event_type,
+    } in requests
+    {
+        let target = match OwnedEventId::try_from(event_id.as_str()) {
+            Ok(target) => target,
             Err(error) => {
                 // Not a real event id, so there is nothing to fetch — and
                 // nothing to retry. Answer with no relations so it stops being
                 // asked for.
                 log::warn!(
-                    "[{room_id}] membership event id {} of {} is unparseable ({error}); no \
-                     raised hand can relate to it",
-                    lookup.membership_event_id,
-                    lookup.member_id,
+                    "[{room_id}] event id {event_id} is unparseable ({error}); nothing can \
+                     relate to it",
                 );
-                manager.lock().await.on_relations_received(
-                    room_id,
-                    &lookup.membership_event_id,
-                    &[],
-                );
+                manager
+                    .lock()
+                    .await
+                    .on_relations_received(room_id, &event_id, &[]);
                 continue;
             }
         };
 
         let options = RelationsOptions {
-            limit: Some(UInt::from(RAISED_HAND_LOOKUP_LIMIT)),
+            limit: Some(UInt::from(RELATIONS_LOOKUP_LIMIT)),
             include_relations: IncludeRelations::RelationsOfTypeAndEventType(
-                RelationType::Annotation,
-                TimelineEventType::Reaction,
+                RelationType::from(rel_type.as_str()),
+                TimelineEventType::from(event_type.as_str()),
             ),
             ..RelationsOptions::default()
         };
-        match room.relations(event_id, options).await {
+        let wanted = std::slice::from_ref(&event_type);
+        match room.relations(target, options).await {
             Ok(relations) => {
                 let events: Vec<RawTimelineEvent> = relations
                     .chunk
@@ -1088,6 +1082,7 @@ async fn backfill_raised_hands(
                             room_id,
                             event.raw(),
                             event.encryption_info().map(Arc::as_ref),
+                            wanted,
                         ) {
                             Some(TimelineIngest::Event(event)) => Some(event),
                             _ => None,
@@ -1095,32 +1090,26 @@ async fn backfill_raised_hands(
                     })
                     .collect();
                 log::debug!(
-                    "[{room_id}] {} annotation(s) fetched for {}'s membership event {}",
+                    "[{room_id}] {} {rel_type} {event_type} relation(s) fetched for {event_id}",
                     events.len(),
-                    lookup.member_id,
-                    lookup.membership_event_id,
                 );
-                manager.lock().await.on_relations_received(
-                    room_id,
-                    &lookup.membership_event_id,
-                    &events,
-                );
+                manager
+                    .lock()
+                    .await
+                    .on_relations_received(room_id, &event_id, &events);
             }
             Err(error) => log::warn!(
-                "[{room_id}] could not fetch the annotations of {}'s membership event {} \
-                 ({error}); a hand they raised before we joined stays unknown until the next tick",
-                lookup.member_id,
-                lookup.membership_event_id,
+                "[{room_id}] could not fetch the {rel_type} relations of {event_id} ({error}); \
+                 retrying on the next tick",
             ),
         }
     }
 }
 
-/// One inbound signal for the core's reactions intake, carried from the
-/// (`Send`) event handler to whatever drives the (`!Send`) manager.
+/// Carried from the (`Send`) event handler to whatever drives the (`!Send`)
+/// manager.
 #[derive(Clone, Debug)]
 pub enum TimelineIngest {
-    /// A reaction or raised-hand event.
     Event(RawTimelineEvent),
     /// A redaction, by the id of the event it redacts.
     Redacted {
@@ -1129,8 +1118,7 @@ pub enum TimelineIngest {
     },
 }
 
-/// Reads one message-like room event into what the core's reactions intake
-/// takes, or `None` for any other event type.
+/// A redaction, or an event whose type is in `event_types`; `None` otherwise.
 ///
 /// Generic over the `Raw` payload because the SDK hands the same JSON out under
 /// different type parameters (a sync handler's `AnySyncMessageLikeEvent`, a
@@ -1146,6 +1134,7 @@ pub fn timeline_ingest_from_raw<T>(
     room_id: &str,
     raw: &Raw<T>,
     encryption_info: Option<&EncryptionInfo>,
+    event_types: &[String],
 ) -> Option<TimelineIngest> {
     let event_type: String = raw.get_field("type").ok().flatten()?;
     match event_type.as_str() {
@@ -1158,7 +1147,7 @@ pub fn timeline_ingest_from_raw<T>(
             });
             redacts.map(|event_id| TimelineIngest::Redacted { event_id })
         }
-        REACTION_EVENT_TYPE | ANNOTATION_EVENT_TYPE => {
+        _ if event_types.contains(&event_type) => {
             let origin = match encryption_info {
                 Some(info) => EventOrigin::encrypted(
                     info.sender_device.as_ref().map(|device| device.to_string()),
@@ -1187,8 +1176,7 @@ pub fn timeline_ingest_from_raw<T>(
     }
 }
 
-/// Registers a room event handler that forwards reactions, raised hands and
-/// redactions to `tx`.
+/// Forwards redactions and the events of `event_types` to `tx`.
 ///
 /// The handler runs on the sync task and must stay `Send`, which is why it only
 /// forwards: the manager is `!Send` and is driven from the channel's other end
@@ -1198,16 +1186,22 @@ pub fn timeline_ingest_from_raw<T>(
 pub fn register_timeline_receiver(
     room: &Room,
     tx: mpsc::UnboundedSender<TimelineIngest>,
+    event_types: Vec<String>,
 ) -> EventHandlerHandle {
     let room_id = room.room_id().to_string();
+    let event_types = Arc::new(event_types);
     room.add_event_handler(
         move |event: Raw<AnySyncMessageLikeEvent>, encryption_info: Option<EncryptionInfo>| {
             let tx = tx.clone();
             let room_id = room_id.clone();
+            let event_types = event_types.clone();
             async move {
-                if let Some(ingest) =
-                    timeline_ingest_from_raw(&room_id, &event, encryption_info.as_ref())
-                {
+                if let Some(ingest) = timeline_ingest_from_raw(
+                    &room_id,
+                    &event,
+                    encryption_info.as_ref(),
+                    &event_types,
+                ) {
                     let _ = tx.send(ingest);
                 }
             }
@@ -1215,13 +1209,13 @@ pub fn register_timeline_receiver(
     )
 }
 
-/// Drives the core's reactions intake from what
-/// [`register_timeline_receiver`] forwards, until the channel closes.
+/// Drives the application's intake from [`register_timeline_receiver`] until
+/// the channel closes.
 ///
 /// Intended to be `spawn_local`ed next to [`run_membership_bridge`].
-pub async fn run_timeline_bridge(
+pub async fn run_timeline_bridge<M: ApplicationIntake<SdkCommandSender>>(
     room_id: String,
-    manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: Arc<Mutex<M>>,
     mut rx: mpsc::UnboundedReceiver<TimelineIngest>,
 ) {
     while let Some(ingest) = rx.recv().await {
@@ -1276,9 +1270,9 @@ async fn state_wake(room_updates: &mut broadcast::Receiver<matrix_sdk::sync::Roo
 /// Opt-in; see [`crate::compat`] and delete the parameter with it.
 ///
 /// Intended to be `tokio::spawn`ed. Returns when a wake source closes.
-pub async fn run_membership_bridge(
+pub async fn run_membership_bridge<M: ApplicationIntake<SdkCommandSender>>(
     room: Room,
-    manager: Arc<Mutex<RtcSessionManager<SdkCommandSender>>>,
+    manager: Arc<Mutex<M>>,
     state_membership: bool,
 ) {
     let room_id = room.room_id().to_string();
@@ -1333,6 +1327,13 @@ mod tests {
 
     use super::*;
 
+    fn wanted() -> Vec<String> {
+        vec![
+            "io.element.call.reaction".to_owned(),
+            "m.reaction".to_owned(),
+        ]
+    }
+
     fn raw_event(json: &str) -> Raw<AnySyncTimelineEvent> {
         Raw::from_json_string(json.to_owned()).expect("valid json")
     }
@@ -1353,14 +1354,14 @@ mod tests {
             }"#,
         );
         let Some(TimelineIngest::Event(event)) =
-            timeline_ingest_from_raw("!room:example.org", &raw, None)
+            timeline_ingest_from_raw("!room:example.org", &raw, None, &wanted())
         else {
             panic!("a reaction must be read as an event");
         };
         assert_eq!(event.room_id, "!room:example.org");
         assert_eq!(event.event_id, "$reaction");
         assert_eq!(event.sender, "@bob:example.org");
-        assert_eq!(event.event_type, REACTION_EVENT_TYPE);
+        assert_eq!(event.event_type, "io.element.call.reaction");
         assert_eq!(event.origin_server_ts, 1234);
         assert_eq!(event.origin, EventOrigin::Cleartext);
         assert_eq!(event.content["emoji"], "👏");
@@ -1381,11 +1382,11 @@ mod tests {
             }"#,
         );
         let Some(TimelineIngest::Event(event)) =
-            timeline_ingest_from_raw("!room:example.org", &raw, None)
+            timeline_ingest_from_raw("!room:example.org", &raw, None, &wanted())
         else {
             panic!("an annotation must be read as an event");
         };
-        assert_eq!(event.event_type, ANNOTATION_EVENT_TYPE);
+        assert_eq!(event.event_type, "m.reaction");
         assert_eq!(event.content["m.relates_to"]["key"], "🖐️");
     }
 
@@ -1402,7 +1403,7 @@ mod tests {
             }"#,
         );
         assert!(matches!(
-            timeline_ingest_from_raw("!room:example.org", &pre_v11, None),
+            timeline_ingest_from_raw("!room:example.org", &pre_v11, None, &wanted()),
             Some(TimelineIngest::Redacted { event_id }) if event_id == "$hand"
         ));
 
@@ -1416,7 +1417,7 @@ mod tests {
             }"#,
         );
         assert!(matches!(
-            timeline_ingest_from_raw("!room:example.org", &v11, None),
+            timeline_ingest_from_raw("!room:example.org", &v11, None, &wanted()),
             Some(TimelineIngest::Redacted { event_id }) if event_id == "$hand"
         ));
     }
@@ -1432,7 +1433,21 @@ mod tests {
                 "content": { "msgtype": "m.text", "body": "🖐️" }
             }"#,
         );
-        assert!(timeline_ingest_from_raw("!room:example.org", &message, None).is_none());
+        assert!(timeline_ingest_from_raw("!room:example.org", &message, None, &wanted()).is_none());
+    }
+
+    #[test]
+    fn an_application_that_wants_no_timeline_gets_only_redactions() {
+        let hand = raw_event(
+            r#"{
+                "type": "m.reaction",
+                "event_id": "$hand",
+                "sender": "@bob:example.org",
+                "origin_server_ts": 5,
+                "content": {}
+            }"#,
+        );
+        assert!(timeline_ingest_from_raw("!room:example.org", &hand, None, &[]).is_none());
     }
 
     /// A join as observed from Element Call on the JS SDK, pre-sticky.

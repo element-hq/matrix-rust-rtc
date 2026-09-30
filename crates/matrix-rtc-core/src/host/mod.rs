@@ -8,5 +8,6 @@
 //! `send_room_event`, `redact_event`, `RawTimelineEvent` — is only for
 //! applications built on the core.
 
+pub(crate) mod application;
 pub(crate) mod commands;
 pub(crate) mod event;

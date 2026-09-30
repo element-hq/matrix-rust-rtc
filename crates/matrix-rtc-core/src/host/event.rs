@@ -117,11 +117,9 @@ pub struct RawStickyEvent {
     pub room_id: String,
     /// The event's id, when the host reports it.
     ///
-    /// Element Call's reactions and raised hand relate to the *membership
-    /// event* of the reacting member, so a member whose event id is unknown can
-    /// neither be reacted for nor have their reactions validated. Optional only
-    /// because a host may feed memberships it did not receive as events (a
-    /// translated pre-sticky state map, say); every real Matrix event has one.
+    /// Applications relate their events to it. Optional only because a host may
+    /// feed memberships it did not receive as events (a translated pre-sticky
+    /// state map); every real Matrix event has one.
     pub event_id: Option<String>,
     /// Sender user ID of the event.
     pub sender: String,
@@ -215,6 +213,18 @@ pub struct RawTimelineEvent {
     pub origin_server_ts: u64,
     /// The event's whole `content` object, decrypted.
     pub content: serde_json::Value,
+}
+
+/// Relations of one event an application wants the host to fetch
+/// (`GET /rooms/{room}/relations/{event_id}/{rel_type}/{event_type}`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationsRequest {
+    /// The event whose relations to fetch.
+    pub event_id: String,
+    /// The relation type, e.g. `m.annotation`.
+    pub rel_type: String,
+    /// The type of the relating events, e.g. `m.reaction`.
+    pub event_type: String,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
