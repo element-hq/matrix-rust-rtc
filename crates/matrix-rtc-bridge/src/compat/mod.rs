@@ -95,10 +95,12 @@
 
 use serde_json::Value;
 
+pub mod dialect_backend;
 pub mod element_call;
 pub mod element_call_state;
 pub mod ingest;
 
+pub use dialect_backend::DialectBackend;
 pub use element_call::{
     ElementCallDialect, LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent,
 };

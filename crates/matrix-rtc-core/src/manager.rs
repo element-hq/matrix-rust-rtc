@@ -135,6 +135,22 @@ impl<T: MatrixBackend + 'static> RtcSessionManager<T> {
             })?
             .clone();
 
+        // Only where the room's slot state is known; an unsupplied condition is
+        // not enforced, here as in the projection.
+        if self
+            .slot_state(&params.room_id, &params.slot_id)
+            .is_some_and(|state| !state.is_open())
+        {
+            log::warn!(
+                "[{}/{}] join rejected: the slot is not open",
+                params.room_id,
+                params.slot_id,
+            );
+            return Err(JoinError::SlotClosed {
+                slot_id: params.slot_id,
+            });
+        }
+
         let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
         let session = self.session_for_key(key);
 

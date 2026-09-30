@@ -11,19 +11,17 @@
 //! transport-free — nothing here knows what a LiveKit SFU is — so a second
 //! transport can reuse it unchanged.
 //!
-//! Three pieces, in increasing order of how much they depend on:
+//! Four pieces, in increasing order of how much they depend on:
 //!
 //! - [`compat`] — translation between the current MSC4143 wire format and the
 //!   pre-2026 dialects Element Call still speaks. Pure JSON in, pure JSON out;
-//!   no Matrix SDK, no async runtime. Available unconditionally.
-//! - [`OpenIdTokenSource`] — the host's route to a Matrix OpenID token, which a
-//!   transport exchanges for its own credentials. The trait is always available
-//!   so a transport can name it; the `matrix_sdk::Client` implementation sits
-//!   behind the `matrix-sdk` feature.
-//! - [`sdk`] — the SDK-backed bridge proper: [`SdkCommandSender`] carries the
-//!   core's outbound commands (memberships, delayed leaves, to-device keys) to a
-//!   `matrix_sdk::Client`, and [`run_membership_bridge`] feeds inbound
-//!   membership — sticky events and/or room state — back into the core. Behind
+//!   no Matrix SDK, no async runtime. Available unconditionally, with
+//!   [`DialectBackend`], the backend wrapper that renders sends in a room's
+//!   dialect.
+//! - [`feeder`] — how a `MatrixBackend` feeds the manager: subscribe, seed,
+//!   order, funnel. Unconditional; a plain future the binding spawns.
+//! - [`transports`] — which transport a join publishes on.
+//! - [`sdk`] — the `matrix_sdk::Client` implementation of the backend. Behind
 //!   the `matrix-sdk` feature.
 //!
 //! # Why `matrix-sdk` is off by default
@@ -40,6 +38,8 @@ use async_trait::async_trait;
 use matrix_rtc_core::MaybeSend;
 
 pub mod compat;
+pub mod feeder;
+pub mod transports;
 
 #[cfg(feature = "matrix-sdk")]
 pub mod sdk;
@@ -51,9 +51,13 @@ pub use sdk::{
 };
 
 pub use compat::{
-    ElementCallCompat, ElementCallDialect, ElementCallStateDialect, LEGACY_KEY_EVENT_TYPE,
-    LegacyKeyMessage, MemberContent, MemberEventRoute, OutboundDialect, STATE_MEMBER_EVENT_TYPE,
-    StateMemberEvent, StateMembership,
+    DialectBackend, ElementCallCompat, ElementCallDialect, ElementCallStateDialect,
+    LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent, MemberEventRoute, OutboundDialect,
+    STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
+};
+pub use feeder::{
+    AttachOptions, RoomAttachment, RoomFeeder, RoomFeederRun, RoomModes, SessionFeeder,
+    SessionFeederRun,
 };
 
 pub use matrix_rtc_core::OpenIdToken;

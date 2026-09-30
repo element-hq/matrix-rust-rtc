@@ -72,6 +72,12 @@ pub enum JoinError {
     /// Invalid transport configuration.
     #[error("invalid transport configuration")]
     InvalidTransport,
+
+    /// The room's slot state holds no open slot of this id, so a membership
+    /// would be one every client treats as left. Somebody with the power level
+    /// has to open the slot first.
+    #[error("slot '{slot_id}' is not open in this room")]
+    SlotClosed { slot_id: String },
 }
 
 /// Errors that can occur when attempting to leave an RTC session.
