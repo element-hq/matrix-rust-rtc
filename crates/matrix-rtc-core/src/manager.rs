@@ -19,6 +19,7 @@ use crate::error::{CommandError, JoinError, LeaveError};
 use crate::host::commands::RtcCommandSender;
 use crate::host::event::{EventConversionError, RawStickyEvent, RawTimelineEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
+use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
 use crate::reactions::{RaisedHand, ReactionError, ReceivedReaction, RelationLookup};
 use crate::session::{JoinedMembership, RtcMembershipEvent, RtcSession};
 use crate::slot::{
@@ -43,6 +44,7 @@ pub struct RtcSessionManager<T: RtcCommandSender> {
     room_members: HashMap<String, HashSet<String>>,
     /// Room encryption per room, for rooms where the host reports it.
     room_encryption: HashMap<String, RoomEncryption>,
+    membership_listeners: MembershipListeners,
 }
 
 impl<T: RtcCommandSender + 'static> Default for RtcSessionManager<T> {
@@ -63,6 +65,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             rooms_with_slot_state: HashSet::new(),
             room_members: HashMap::new(),
             room_encryption: HashMap::new(),
+            membership_listeners: MembershipListeners::default(),
         }
     }
 
@@ -75,12 +78,27 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             rooms_with_slot_state: HashSet::new(),
             room_members: HashMap::new(),
             room_encryption: HashMap::new(),
+            membership_listeners: MembershipListeners::default(),
         }
     }
 
     /// Sets the command sender for this manager.
     pub fn set_command_sender(&mut self, command_sender: Arc<T>) {
         self.command_sender = Some(command_sender);
+    }
+
+    /// For applications, which send through the same host sender as the core.
+    pub fn command_sender(&self) -> Option<&Arc<T>> {
+        self.command_sender.as_ref()
+    }
+
+    /// Replays every existing session's joined memberships to it first. Listeners
+    /// cannot be removed.
+    pub fn add_membership_listener(&mut self, listener: Arc<dyn MembershipListener>) {
+        for (key, session) in &self.sessions {
+            listener.on_memberships(&key.room_id, &key.slot_id, session.members());
+        }
+        self.membership_listeners.add(listener);
     }
 
     /// Returns true if this manager has a command sender configured.
@@ -136,7 +154,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// The session is **kept**, not removed: it is keyed by `(room_id, slot_id)`
     /// and stays usable for a later join in the same process. See
     /// [`RtcSession::leave`] for why, and for what it does and does not clear —
-    /// a rejoin therefore starts with the previous call's roster in place, which
+    /// a rejoin therefore starts with the previous call's joined memberships in place, which
     /// [`RtcSession::join`] accounts for.
     ///
     /// # Arguments
@@ -190,7 +208,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// # One call, at most one key rotation
     ///
-    /// Everything the state says is applied before the roster is republished, so
+    /// Everything the state says is applied before the joined memberships are republished, so
     /// a change of any size costs at most one rotation — three people hanging up
     /// together mint one key between them, not three. Key rotation has no
     /// debounce of its own and cannot have one (the core owns no timer), so this
@@ -766,8 +784,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
 
     /// Everything the manager and its sessions believe, as JSON.
     ///
-    /// Meant to be attached to a bug report or dumped to the log when a roster
-    /// looks wrong: it answers "which sessions exist, what room state do they
+    /// Meant to be attached to a bug report or dumped to the log when the joined
+    /// memberships look wrong: it answers "which sessions exist, what room state do they
     /// have, and why is each candidate in or out" in one shot. Contains no key
     /// material.
     pub fn debug_snapshot(&self) -> serde_json::Value {
@@ -827,6 +845,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         let room_members = self.room_members.get(&key.room_id).cloned();
         let command_sender = self.command_sender.clone();
         let log_tag = key.to_string();
+        let membership_scope = MembershipScope {
+            room_id: key.room_id.clone(),
+            slot_id: key.slot_id.clone(),
+            listeners: self.membership_listeners.clone(),
+        };
 
         self.sessions.entry(key).or_insert_with(|| {
             log::info!(
@@ -844,6 +867,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
                 None => RtcSession::new(),
             };
             session.set_log_tag(log_tag);
+            session.set_membership_scope(membership_scope);
             if let Some(slot) = slot {
                 session.seed_slot_state(slot);
             }
@@ -887,7 +911,7 @@ impl SessionKey {
 /// `slot_id xN` per session, for the one-line routing summary.
 ///
 /// Which slots a room's sticky events landed in is the first thing to check
-/// when a roster looks wrong: a typo in `slot_id` silently creates a second,
+/// when the joined memberships look wrong: a typo in `slot_id` silently creates a second,
 /// empty session rather than failing.
 fn describe_batches(batches: &HashMap<SessionKey, Vec<RtcMembershipEvent>>) -> String {
     if batches.is_empty() {

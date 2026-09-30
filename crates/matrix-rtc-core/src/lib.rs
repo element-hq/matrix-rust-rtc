@@ -15,6 +15,7 @@ mod host;
 mod join;
 mod manager;
 mod maybe_send;
+mod membership_listener;
 mod notification;
 mod own_membership;
 pub mod reactions;
@@ -40,6 +41,7 @@ pub use host::event::{
 pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
 pub use maybe_send::MaybeSend;
+pub use membership_listener::MembershipListener;
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,
@@ -66,6 +68,12 @@ pub use transport::{
     LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
 };
 pub use wire::wire_event_type;
+
+/// Test doubles for crates built on the core, behind the `testing` feature.
+#[cfg(feature = "testing")]
+pub mod testing {
+    pub use crate::host::commands::MockCommandSender;
+}
 
 #[cfg(test)]
 mod tests {
@@ -208,7 +216,7 @@ mod tests {
             .expect("leave should succeed");
     }
 
-    fn roster(
+    fn joined_memberships(
         manager: &RtcSessionManager<crate::host::commands::MockCommandSender>,
     ) -> Vec<crate::session::JoinedMembership> {
         manager
@@ -297,10 +305,10 @@ mod tests {
     /// one did.
     ///
     /// The session survives `leave()` on purpose — it is keyed by `(room, slot)`
-    /// and a host may still want the roster after hanging up — so the second
-    /// join starts with the first call's roster already in place. Nothing else
+    /// and a host may still want the joined memberships after hanging up — so the second
+    /// join starts with the first call's joined memberships already in place. Nothing else
     /// changes: the incumbent's membership is byte-identical across our leave and
-    /// rejoin, so there is no roster transition for the second call to ride on.
+    /// rejoin, so there is no membership change for the second call to ride on.
     /// If distribution only ever happens on a membership *change*, the second
     /// call silently never distributes and the incumbent is left at
     /// `MISSING_KEY` — which is what an Android integration hit, four runs out of
@@ -310,7 +318,7 @@ mod tests {
         let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
-        // First call: bob arrives after we joined, so the roster changes while we
+        // First call: bob arrives after we joined, so the joined memberships change while we
         // hold a key and distribution is triggered.
         join_as(&mut manager, "alice-a").await;
         admit_peer(&mut manager, "@bob:example.org", "BOBDEV", "bob-a").await;
@@ -554,7 +562,7 @@ mod tests {
 
     /// MSC4143 requires a fresh `member.id` per join, so the previous
     /// participation of this very device is not a peer — it is us, one call ago.
-    /// Leaving it in the roster gives the media layer a phantom member to open a
+    /// Leaving it in the joined memberships gives the media layer a phantom member to open a
     /// receive stream for and to expect a key from.
     #[tokio::test]
     async fn a_rejoin_does_not_advertise_the_previous_participation() {
@@ -568,13 +576,13 @@ mod tests {
 
         join_as(&mut manager, "alice-b").await;
 
-        let member_ids: Vec<_> = roster(&manager)
+        let member_ids: Vec<_> = joined_memberships(&manager)
             .into_iter()
             .map(|membership| membership.member_id)
             .collect();
         assert!(
             !member_ids.iter().any(|id| id == "alice-a"),
-            "our superseded participation is still in the roster: {member_ids:?}"
+            "our superseded participation is still joined: {member_ids:?}"
         );
     }
 
@@ -583,7 +591,7 @@ mod tests {
     /// session is torn down separately with no ordering guarantee. Pinned so a
     /// future "just drop the session on leave" refactor has to argue with a test.
     #[tokio::test]
-    async fn a_left_session_still_publishes_the_peer_roster() {
+    async fn a_left_session_still_publishes_the_peer_memberships() {
         let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
@@ -593,10 +601,10 @@ mod tests {
 
         assert_eq!(manager.session_count(), 1, "the session should survive");
         assert!(
-            roster(&manager)
+            joined_memberships(&manager)
                 .iter()
                 .any(|membership| membership.member_id == "bob-a"),
-            "the peer roster should survive our own departure"
+            "the peer memberships should survive our own departure"
         );
         assert_eq!(
             manager.member_count(ROOM_ID, "m.call#ROOM"),
@@ -693,7 +701,7 @@ mod tests {
     /// Re-applying the same sticky state must publish nothing at all.
     ///
     /// `set_current_sticky_state` rebuilds the candidate set from scratch, and
-    /// used to refresh after *each* event in the batch. The roster was therefore
+    /// used to refresh after *each* event in the batch. The joined memberships were therefore
     /// republished on the way up — one member, then two, then three — so the
     /// first publication of every tick looked like everyone but one participant
     /// leaving. The encryption manager believed it and rotated the key, once per
@@ -732,7 +740,7 @@ mod tests {
 
         assert!(
             !snapshots.has_changed().unwrap(),
-            "an unchanged sticky state must not republish the roster; every \
+            "an unchanged sticky state must not republish the joined memberships; every \
              republication is a membership diff the encryption manager acts on",
         );
         assert_eq!(manager.member_count(ROOM_ID, "m.call#ROOM"), Some(3));

@@ -41,6 +41,11 @@ getrandom = { version = "0.2", features = ["js"] }
 # clock read only — the no-timers rule above is untouched.
 web-time = "1"
 
+[features]
+# Exposes `testing::MockCommandSender`, the recording command sender the core's
+# own tests use, to the crates built on it.
+testing = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
 futures = "0.3"

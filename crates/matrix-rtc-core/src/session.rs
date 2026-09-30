@@ -20,6 +20,7 @@ use crate::error::{CommandError, JoinError, LeaveError};
 use crate::host::commands::RtcCommandSender;
 use crate::host::event::{EventOrigin, RawTimelineEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
+use crate::membership_listener::MembershipScope;
 use crate::notification::{
     NOTIFICATION_EVENT_TYPE, NotifyConfig, build_notification_content,
     notification_sticky_duration_ms,
@@ -86,7 +87,7 @@ const UNATTRIBUTED_LOG_TAG: &str = "-/-";
 /// Why a candidate member event is, or is not, projected as joined.
 ///
 /// A plain `bool` here made the most confusing failure in the whole SDK
-/// invisible: a member vanishing from the roster because of room state they
+/// invisible: a member vanishing from the joined memberships because of room state they
 /// have nothing to do with. Carrying the reason costs nothing and turns that
 /// into one readable log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,6 +155,8 @@ pub struct RtcSession<T: RtcCommandSender> {
     encryption_manager: Option<EncryptionManager<T>>,
     /// Element Call reactions and raised hands, ours and our peers'.
     reactions: ReactionsState,
+    /// Set when a manager created this session.
+    membership_scope: Option<MembershipScope>,
     /// `room_id/slot_id`, prefixed to this session's log lines.
     ///
     /// A session does not otherwise know which slot it belongs to — the manager
@@ -177,6 +180,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             encryption_manager: None,     // Don't clone the encryption manager
             own_participation: None,      // A clone holds no machine, so it is not joined
             reactions: ReactionsState::new(), // Not joined, so no hand of ours to carry
+            membership_scope: self.membership_scope.clone(), // Shares the watch, so shares its listeners
             log_tag: self.log_tag.clone(),
         }
     }
@@ -199,6 +203,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             encryption_manager: None,
             own_participation: None,
             reactions: ReactionsState::new(),
+            membership_scope: None,
             log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
@@ -219,6 +224,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             encryption_manager: None,
             own_participation: None,
             reactions: ReactionsState::new(),
+            membership_scope: None,
             log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
         }
     }
@@ -229,6 +235,16 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// standalone [`RtcSession`] keeps the placeholder tag.
     pub(crate) fn set_log_tag(&mut self, log_tag: String) {
         self.log_tag = log_tag;
+    }
+
+    /// Called by the manager on creation.
+    pub(crate) fn set_membership_scope(&mut self, scope: MembershipScope) {
+        self.membership_scope = Some(scope);
+    }
+
+    /// The joined set as last published.
+    pub(crate) fn members(&self) -> &[JoinedMembership] {
+        &self.members
     }
 
     /// Sets the command sender for this session.
@@ -478,20 +494,20 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         // Store the encryption manager
         self.encryption_manager = Some(encryption_manager);
 
-        // Re-evaluate the roster: we now have an `own_participation`, so any
+        // Re-evaluate the joined memberships: we now have an `own_participation`, so any
         // still-sticky participation of this device from a previous call stops
-        // counting as a member. This also publishes the roster the media layer's
+        // counting as a member. This also publishes the joined memberships the media layer's
         // engine will boot from.
         self.refresh().await;
 
         // Drive the first distribution from the join itself, unconditionally.
         //
         // `on_memberships_update` is otherwise only reachable through
-        // `refresh()`, which returns early when the roster is unchanged — and a
+        // `refresh()`, which returns early when the joined memberships are unchanged — and a
         // session outlives a `leave()`, so a second join in the same process
-        // starts with the previous call's roster already in place and has no
+        // starts with the previous call's joined memberships already in place and has no
         // change to ride on. Without this, the first call in a process
-        // distributes its key (the peer's arrival moved the roster) and every
+        // distributes its key (the peer's arrival changed the joined memberships) and every
         // later one silently distributes nothing, leaving peers at
         // `MISSING_KEY` for the whole call.
         //
@@ -637,15 +653,15 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     ///
     /// - Hosts feed sticky *deltas*. An unchanged peer membership is never
     ///   re-delivered, so a session reset to pristine would rejoin into an empty
-    ///   roster and never learn about the members already in the call.
-    /// - A host that has hung up may still want the roster — "3 people are in
+    ///   joined memberships and never learn about the members already in the call.
+    /// - A host that has hung up may still want the joined memberships — "3 people are in
     ///   this call" outlives our own participation.
     /// - The media session is torn down separately, with no ordering guarantee
     ///   relative to this call. Dropping the membership channel here would make a
     ///   still-running engine stop tracking membership mid-call.
     ///
     /// Because the session outlives a leave, [`Self::join`] must not depend on the
-    /// roster changing after it returns — it drives the first key distribution
+    /// joined memberships changing after it returns — it drives the first key distribution
     /// itself.
     ///
     /// # Arguments
@@ -696,7 +712,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.own_participation = None;
         self.reactions.reset_own();
 
-        // Republish the roster now that we are no longer part of it, rather than
+        // Republish the joined memberships now that we are no longer among them, rather than
         // waiting for the host's next sticky delta. Room state and peer
         // candidates are deliberately kept: they are room truth a host feeding
         // deltas will never re-deliver, and a host that has hung up may still
@@ -729,7 +745,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
             // A rotation coalesced into a key's `delayBeforeUse` window needs
             // somebody to come back for it once the window closes, and in a call
-            // whose roster has gone quiet nothing else will. This tick is the only
+            // whose joined memberships have gone quiet nothing else will. This tick is the only
             // periodic one the core is given, so it doubles as that collector: the
             // rotation lands within one heartbeat of falling due rather than
             // waiting for the next membership change. A consumer that wants it on
@@ -1054,7 +1070,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         for event in events {
             // Deliberately *not* `apply_membership_event`: this loop rebuilds
             // the whole candidate set, and publishing after each event would
-            // announce every partial roster on the way — starting with a
+            // announce every partial set of joined memberships on the way — starting with a
             // one-member one, which reads as everybody else leaving. Refresh
             // happens once, below.
             self.record_membership_event(event);
@@ -1103,9 +1119,9 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// because a batch must not publish per event. [`set_current_state`] rebuilds
     /// the candidate set from scratch, so refreshing inside the loop announces
     /// every intermediate state as though it were real: the first event of a
-    /// six-member snapshot publishes a *one*-member roster, which the encryption
+    /// six-member snapshot publishes a *one*-member set, which the encryption
     /// manager reads as five members leaving and answers with a key rotation.
-    /// The five are re-added an instant later, so the roster ends up correct and
+    /// The five are re-added an instant later, so the joined memberships end up correct and
     /// the rotation is pure waste — once per sticky tick, per session, and with
     /// a to-device send to every remaining member. That is quadratic in the
     /// participant count and was rotating keys every few seconds in a ten-device
@@ -1209,7 +1225,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         // recipient is unreachable (a device cannot send itself a to-device
         // message). The encryption manager already filters it out of its
         // recipients; this is the same rule applied one level up, where the
-        // published roster is decided.
+        // published joined memberships are decided.
         //
         // The device must match, not just the user: other devices of our own
         // user are ordinary peers. A candidate whose sending device the host did
@@ -1296,6 +1312,9 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         self.reactions.sync_roster(&self.members);
         self.membership_snapshots_tx
             .send_replace(self.members.clone());
+        if let Some(scope) = &self.membership_scope {
+            scope.notify(&self.members);
+        }
 
         if let Some(ref encryption_manager) = self.encryption_manager {
             let _ = encryption_manager.on_memberships_update().await;
@@ -1407,7 +1426,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Everything this session believes, as JSON, for bug reports.
     ///
     /// Logs tell you what happened; this tells you where things ended up, which
-    /// is the other half of diagnosing "the roster is wrong". Deliberately
+    /// is the other half of diagnosing "the joined memberships are wrong". Deliberately
     /// includes the *candidates* and why each is excluded — the joined set
     /// alone cannot explain an absence.
     pub fn debug_snapshot(&self) -> serde_json::Value {

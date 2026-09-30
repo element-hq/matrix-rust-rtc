@@ -244,7 +244,7 @@ pub struct EncryptionConfig {
     /// The two costs it trades against each other: an arrival can read up to this
     /// much of the call from before they joined, and a member who leaves stays
     /// readable for up to this much plus `delay_before_use_ms`. Against that, it is
-    /// what bounds key traffic in a call whose roster keeps moving, to one rotation
+    /// what bounds key traffic in a call whose joined memberships keep changing, to one rotation
     /// per period.
     ///
     /// Values below `delay_before_use_ms` have no effect: a key that has not come

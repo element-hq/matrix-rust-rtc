@@ -392,8 +392,9 @@ impl RtcCommandSender for NoopCommandSender {
 
 /// A mock implementation of `RtcCommandSender` that captures sent events for testing.
 ///
-/// Useful for verifying that the core sends the correct events.
-#[cfg(test)]
+/// Useful for verifying that the core sends the correct events. Exported under
+/// the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 #[derive(Default)]
 pub struct MockCommandSender {
     pub sticky_events: std::sync::Mutex<Vec<(String, String, Value, u64)>>,
@@ -408,7 +409,7 @@ pub struct MockCommandSender {
     pub redactions: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl MockCommandSender {
     pub fn new() -> Self {
         Self::default()
@@ -441,7 +442,7 @@ impl MockCommandSender {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl RtcCommandSender for MockCommandSender {
