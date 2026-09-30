@@ -6,12 +6,12 @@
 //! FFI binding implementation of the command sender interface.
 //!
 //! This module provides UniFFI-facing types and the `FfiCommandSender` that implements
-//! `RtcCommandSender` by delegating to native callbacks.
+//! `MatrixBackend` by delegating to native callbacks.
 //!
 //! DTOs are used to decouple core logic from FFI-specific types.
 
 use matrix_rtc_bridge::compat::{MemberEventRoute, OutboundDialect};
-use matrix_rtc_core::{CommandError, RtcCommandSender, wire_event_type};
+use matrix_rtc_core::{CommandError, MatrixBackend, wire_event_type};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -668,7 +668,7 @@ pub struct FfiToDeviceDelivery {
 /// sending commands back to the native Matrix SDK.
 ///
 /// Note: The native callbacks are invoked synchronously during the send_* calls.
-/// The callbacks passed to the core's RtcCommandSender methods are invoked immediately
+/// The callbacks passed to the core's MatrixBackend methods are invoked immediately
 /// based on the native callback's return value.
 pub struct FfiCommandSender {
     callback: Arc<dyn CommandSenderCallback>,
@@ -769,7 +769,17 @@ fn trace_command_content(what: &str, content_json: &str) {
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl RtcCommandSender for FfiCommandSender {
+impl MatrixBackend for FfiCommandSender {
+    // Placeholders until the host callback carries the identity; the backend
+    // work replaces this sender.
+    fn own_user_id(&self) -> String {
+        String::new()
+    }
+
+    fn own_device_id(&self) -> String {
+        String::new()
+    }
+
     async fn send_sticky_event(
         &self,
         room_id: String,
@@ -861,9 +871,34 @@ impl RtcCommandSender for FfiCommandSender {
         &self,
         room_id: String,
         event_type: String,
+        state_key: Option<String>,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
+        // A caller that names a state key has done its own routing.
+        if let Some(state_key) = state_key {
+            let content_json = serde_json::to_string(&content)
+                .map_err(|e| CommandError::SerializationError(e.to_string()))?;
+            let what = format!(
+                "delayed state [{room_id}] type={event_type} state_key={state_key} \
+                 delay={delay_ms}ms"
+            );
+            trace_command_content(&what, &content_json);
+            return log_command(
+                &what,
+                self.callback
+                    .send_delayed_state_event(
+                        room_id,
+                        event_type,
+                        state_key,
+                        content_json,
+                        delay_ms,
+                    )
+                    .await
+                    .map_err(CommandError::from),
+            );
+        }
+
         // The delayed leave is a member event like any other, and a peer that
         // cannot read it is a peer we stay visible to forever — so it goes
         // through the same routing as the join it is paired with. No lifetime:
@@ -1449,6 +1484,7 @@ mod tests {
             .send_delayed_event(
                 "!room:example.org".to_string(),
                 "m.rtc.member".to_string(),
+                None,
                 serde_json::json!({
                     "slot_id": "m.call#ROOM",
                     "sticky_key": "alice-device-a"

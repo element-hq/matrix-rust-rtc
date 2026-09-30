@@ -527,7 +527,7 @@ impl RtcSessionManagerHandle {
             Err(error) => log::error!("manager: could not retain the command sender: {error}"),
         }
         let mut manager = self.inner.lock().await;
-        manager.set_command_sender(command_sender);
+        manager.set_backend(command_sender);
         Ok(())
     }
 

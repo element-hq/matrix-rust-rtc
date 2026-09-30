@@ -13,7 +13,7 @@
 //! The crate body is `cfg`-gated to `wasm32` because it cannot compile anywhere
 //! else: its futures wrap JS promises and are therefore `!Send`, while
 //! `matrix-rtc-core`'s command traits are `Send` on every target *but* wasm32
-//! (see [`matrix_rtc_core::RtcCommandSender`]). On other targets this compiles
+//! (see [`matrix_rtc_core::MatrixBackend`]). On other targets this compiles
 //! to an empty crate so a workspace-wide `cargo check`/`clippy` still passes.
 //!
 //! The consequence is that a host-target build no longer type-checks this crate.
@@ -87,7 +87,7 @@ impl WasmRtcSessionManager {
         // on every target. `expect` so this goes away by itself if that changes.
         #[expect(clippy::arc_with_non_send_sync)]
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
-        self.inner.set_command_sender(command_sender.clone());
+        self.inner.set_backend(command_sender.clone());
         self.command_sender = Some(command_sender);
     }
 
@@ -1224,7 +1224,7 @@ impl WasmRtcSession {
         // on every target. `expect` so this goes away by itself if that changes.
         #[expect(clippy::arc_with_non_send_sync)]
         let command_sender: Arc<JsCommandSender> = Arc::new(JsCommandSender::new(client));
-        self.inner.set_command_sender(command_sender.clone());
+        self.inner.set_backend(command_sender.clone());
         self.command_sender = Some(command_sender);
     }
 

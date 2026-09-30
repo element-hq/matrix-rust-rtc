@@ -8,7 +8,7 @@
 //! This is what makes the Rust stack a first-class MatrixRTC participant against
 //! a real homeserver:
 //!
-//! - [`SdkCommandSender`] implements [`RtcCommandSender`], turning the core's
+//! - [`SdkCommandSender`] implements [`MatrixBackend`], turning the core's
 //!   outbound commands (join/leave member events, dead man's switch delayed
 //!   events) into Matrix Client-Server requests.
 //! - [`run_membership_bridge`] feeds the room's live membership into an
@@ -53,9 +53,9 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 use matrix_rtc_core::{
-    ApplicationIntake, CommandError, EventOrigin, RawSlotEvent, RawSlotEventContent,
-    RawStickyEvent, RawStickyEventContent, RawTimelineEvent, RelationsRequest, RtcCommandSender,
-    SLOT_EVENT_TYPE, ToDeviceDelivery, ToDeviceRecipient,
+    ApplicationIntake, CommandError, EventOrigin, MatrixBackend, RawSlotEvent, RawSlotEventContent,
+    RawStickyEvent, RawStickyEventContent, RawTimelineEvent, RelationsRequest, SLOT_EVENT_TYPE,
+    ToDeviceDelivery, ToDeviceRecipient,
 };
 
 use crate::compat::{MemberEventRoute, OutboundDialect, element_call_state};
@@ -132,7 +132,7 @@ fn wire_event_type(event_type: String) -> MessageLikeEventType {
     MessageLikeEventType::from(event_type)
 }
 
-/// An [`RtcCommandSender`] backed by a `matrix_sdk::Client`.
+/// An [`MatrixBackend`] backed by a `matrix_sdk::Client`.
 ///
 /// Clone-cheap: holds only a `Client` (itself an `Arc` inside).
 #[derive(Clone)]
@@ -248,7 +248,21 @@ fn rtc_request_config() -> matrix_sdk::config::RequestConfig {
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl RtcCommandSender for SdkCommandSender {
+impl MatrixBackend for SdkCommandSender {
+    fn own_user_id(&self) -> String {
+        self.client
+            .user_id()
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+    }
+
+    fn own_device_id(&self) -> String {
+        self.client
+            .device_id()
+            .map(|id| id.to_string())
+            .unwrap_or_default()
+    }
+
     async fn send_sticky_event(
         &self,
         room_id: String,
@@ -317,6 +331,7 @@ impl RtcCommandSender for SdkCommandSender {
         &self,
         room_id: String,
         event_type: String,
+        state_key: Option<String>,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
@@ -324,6 +339,25 @@ impl RtcCommandSender for SdkCommandSender {
         let delay = DelayParameters::Timeout {
             timeout: Duration::from_millis(delay_ms),
         };
+
+        // A caller that names a state key has done its own routing.
+        if let Some(state_key) = state_key {
+            let raw = serde_json::value::to_raw_value(&content).map_err(command_error)?;
+            let request = delayed_state_event::unstable::Request::new_raw(
+                room_id,
+                state_key,
+                StateEventType::from(event_type),
+                delay,
+                Raw::<AnyStateEventContent>::from_json(raw),
+            );
+            return Ok(self
+                .client
+                .send(request)
+                .with_request_config(rtc_request_config())
+                .await
+                .map_err(delayed_command_error)?
+                .delay_id);
+        }
 
         // The delayed leave is a member event like any other, and a peer that
         // cannot read it is a peer we stay visible to forever — so it goes

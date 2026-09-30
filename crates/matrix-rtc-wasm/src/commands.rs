@@ -5,7 +5,7 @@
 
 //! WASM binding implementation of the command sender interface.
 //!
-//! This module provides the `JsCommandSender` that implements `RtcCommandSender`
+//! This module provides the `JsCommandSender` that implements `MatrixBackend`
 //! by delegating to a JavaScript object that provides the actual Matrix SDK integration.
 
 use std::cell::RefCell;
@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
 use matrix_rtc_bridge::compat::{MemberEventRoute, OutboundDialect};
 use matrix_rtc_core::{
-    CommandError, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient, wire_event_type,
+    CommandError, MatrixBackend, ToDeviceDelivery, ToDeviceRecipient, wire_event_type,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -34,7 +34,7 @@ fn to_plain_js<T: Serialize>(value: &T) -> Result<JsValue, CommandError> {
         .map_err(|e| CommandError::SerializationError(e.to_string()))
 }
 
-/// WASM implementation of the RtcCommandSender trait.
+/// WASM implementation of the MatrixBackend trait.
 ///
 /// This sender delegates to a JavaScript object that provides the actual Matrix SDK integration.
 /// The client must implement methods: sendStickyEvent(roomId, type, content, durationMs),
@@ -195,7 +195,17 @@ impl JsCommandSender {
 // Unconditionally `?Send`: this crate is only ever built for wasm32, where the
 // core's trait takes the `?Send` shape, and these futures wrap JS promises.
 #[async_trait(?Send)]
-impl RtcCommandSender for JsCommandSender {
+impl MatrixBackend for JsCommandSender {
+    // Placeholders until the host object carries the identity; the backend
+    // work replaces this sender.
+    fn own_user_id(&self) -> String {
+        String::new()
+    }
+
+    fn own_device_id(&self) -> String {
+        String::new()
+    }
+
     async fn send_sticky_event(
         &self,
         room_id: String,
@@ -350,9 +360,38 @@ impl RtcCommandSender for JsCommandSender {
         &self,
         room_id: String,
         event_type: String,
+        state_key: Option<String>,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
+        // A caller that names a state key has done its own routing.
+        if let Some(state_key) = state_key {
+            self.log_command(&format!(
+                "send_delayed_event as state: room={room_id}, type={event_type}, \
+                 state_key={state_key}, delay={delay_ms}ms",
+            ));
+            let promise = self
+                .call_js_promise_method(
+                    "sendDelayedStateEvent",
+                    vec![
+                        JsValue::from_str(&room_id),
+                        JsValue::from_str(&event_type),
+                        JsValue::from_str(&state_key),
+                        to_plain_js(&content)?,
+                        JsValue::from_f64(delay_ms as f64),
+                    ],
+                )
+                .map_err(JsCommandSender::convert_js_error)?;
+            let js_result = wasm_bindgen_futures::JsFuture::from(promise)
+                .await
+                .map_err(JsCommandSender::convert_js_error)?;
+            return js_result.as_string().ok_or_else(|| {
+                CommandError::SendError(
+                    "sendDelayedStateEvent did not return a string delay id".to_owned(),
+                )
+            });
+        }
+
         // The delayed leave is a member event like any other, and a peer that
         // cannot read it is a peer we stay visible to forever — so it goes
         // through the same routing as the join it is paired with. No lifetime:

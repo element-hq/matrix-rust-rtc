@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::host::commands::RtcCommandSender;
+use crate::host::backend::MatrixBackend;
 use crate::host::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
@@ -26,11 +26,11 @@ use crate::slot::{
 };
 
 /// Holds and routes all active RTC sessions.
-pub struct RtcSessionManager<T: RtcCommandSender> {
+pub struct RtcSessionManager<T: MatrixBackend> {
     sessions: HashMap<SessionKey, RtcSession<T>>,
     /// Command sender for sending events to Matrix rooms.
     /// This is passed to sessions when they are created or when they need to send commands.
-    command_sender: Option<Arc<T>>,
+    backend: Option<Arc<T>>,
     /// Slot events per `(room, slot)`, kept unresolved because resolving them
     /// also depends on the room's encryption state, which can arrive later or
     /// change. Held here as well as on the sessions so that state arriving
@@ -46,20 +46,20 @@ pub struct RtcSessionManager<T: RtcCommandSender> {
     membership_listeners: MembershipListeners,
 }
 
-impl<T: RtcCommandSender + 'static> Default for RtcSessionManager<T> {
+impl<T: MatrixBackend + 'static> Default for RtcSessionManager<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
+impl<T: MatrixBackend + 'static> RtcSessionManager<T> {
     // TODO(msc4143): add a manager-level lifecycle subscription API that emits
     // when sessions are created/removed (separate from per-session membership snapshots).
-    /// Creates an empty session manager without a command sender.
+    /// Creates an empty session manager without a backend.
     pub fn new() -> Self {
         Self {
             sessions: HashMap::new(),
-            command_sender: None,
+            backend: None,
             slots: HashMap::new(),
             rooms_with_slot_state: HashSet::new(),
             room_members: HashMap::new(),
@@ -68,11 +68,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         }
     }
 
-    /// Creates an empty session manager with a command sender.
-    pub fn with_command_sender(command_sender: Arc<T>) -> Self {
+    /// Creates an empty session manager with a backend.
+    pub fn with_backend(backend: Arc<T>) -> Self {
         Self {
             sessions: HashMap::new(),
-            command_sender: Some(command_sender),
+            backend: Some(backend),
             slots: HashMap::new(),
             rooms_with_slot_state: HashSet::new(),
             room_members: HashMap::new(),
@@ -81,14 +81,14 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         }
     }
 
-    /// Sets the command sender for this manager.
-    pub fn set_command_sender(&mut self, command_sender: Arc<T>) {
-        self.command_sender = Some(command_sender);
+    /// Sets the backend for this manager.
+    pub fn set_backend(&mut self, backend: Arc<T>) {
+        self.backend = Some(backend);
     }
 
     /// For applications, which send through the same host sender as the core.
-    pub fn command_sender(&self) -> Option<&Arc<T>> {
-        self.command_sender.as_ref()
+    pub fn backend(&self) -> Option<&Arc<T>> {
+        self.backend.as_ref()
     }
 
     /// Replays every existing session's joined memberships to it first. Listeners
@@ -100,9 +100,9 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         self.membership_listeners.add(listener);
     }
 
-    /// Returns true if this manager has a command sender configured.
-    pub fn has_command_sender(&self) -> bool {
-        self.command_sender.is_some()
+    /// Returns true if this manager has a backend configured.
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
     }
 
     /// Joins an RTC session with the given parameters.
@@ -118,19 +118,19 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// Returns the event id of the membership event this join sent; see
     /// [`RtcSession::join`].
-    /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
+    /// Returns `Err(JoinError)` if validation fails, backend not configured, or commands fail.
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
-        let command_sender = self
-            .command_sender
+        let backend = self
+            .backend
             .as_ref()
             .ok_or_else(|| {
                 log::warn!(
-                    "[{}/{}] join rejected: the manager has no command sender",
+                    "[{}/{}] join rejected: the manager has no backend",
                     params.room_id,
                     params.slot_id,
                 );
                 JoinError::CommandError(crate::error::CommandError::from_message(
-                    "no command sender configured",
+                    "no backend configured",
                 ))
             })?
             .clone();
@@ -138,9 +138,9 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         let key = SessionKey::new(params.room_id.clone(), params.slot_id.clone());
         let session = self.session_for_key(key);
 
-        // If the session doesn't have a command sender yet, set it
-        if !session.has_command_sender() {
-            session.set_command_sender(command_sender);
+        // If the session doesn't have a backend yet, set it
+        if !session.has_backend() {
+            session.set_backend(backend);
         }
 
         session.join(params).await
@@ -639,16 +639,16 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         slot_id: String,
         content: RawSlotEventContent,
     ) -> Result<(), CommandError> {
-        let command_sender = self
-            .command_sender
+        let backend = self
+            .backend
             .as_ref()
-            .ok_or_else(|| CommandError::from_message("no command sender configured"))?;
+            .ok_or_else(|| CommandError::from_message("no backend configured"))?;
 
         let content =
             serde_json::to_value(content).expect("m.rtc.slot content is always serializable");
 
         // The event id goes nowhere: nothing relates to a slot event.
-        command_sender
+        backend
             .send_state_event(room_id, SLOT_EVENT_TYPE.to_owned(), slot_id, content)
             .await
             .map(|_event_id| ())
@@ -668,7 +668,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             .collect();
 
         serde_json::json!({
-            "has_command_sender": self.command_sender.is_some(),
+            "has_backend": self.backend.is_some(),
             "session_count": self.sessions.len(),
             "rooms_with_slot_state": self.rooms_with_slot_state,
             "known_slots": self.slots.keys().map(SessionKey::to_string).collect::<Vec<_>>(),
@@ -715,7 +715,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
                 .unwrap_or(SlotState::Closed)
         });
         let room_members = self.room_members.get(&key.room_id).cloned();
-        let command_sender = self.command_sender.clone();
+        let backend = self.backend.clone();
         let log_tag = key.to_string();
         let membership_scope = MembershipScope {
             room_id: key.room_id.clone(),
@@ -734,8 +734,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
                 room_members.as_ref().map(HashSet::len),
             );
 
-            let mut session = match command_sender {
-                Some(sender) => RtcSession::with_command_sender(sender),
+            let mut session = match backend {
+                Some(sender) => RtcSession::with_backend(sender),
                 None => RtcSession::new(),
             };
             session.set_log_tag(log_tag);

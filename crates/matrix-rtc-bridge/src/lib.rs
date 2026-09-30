@@ -38,7 +38,6 @@
 
 use async_trait::async_trait;
 use matrix_rtc_core::MaybeSend;
-use serde::{Deserialize, Serialize};
 
 pub mod compat;
 
@@ -57,19 +56,7 @@ pub use compat::{
     StateMemberEvent, StateMembership,
 };
 
-/// A Matrix OpenID token, as returned by the Client-Server API
-/// `POST /_matrix/client/v3/user/{userId}/openid/request_token` endpoint.
-///
-/// `Serialize` because a transport's authorisation service is expected to
-/// receive the whole object verbatim and validate it against the homeserver
-/// itself; this crate never inspects the fields.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct OpenIdToken {
-    pub access_token: String,
-    pub token_type: String,
-    pub matrix_server_name: String,
-    pub expires_in: u64,
-}
+pub use matrix_rtc_core::OpenIdToken;
 
 /// Obtaining an OpenID token from the host failed.
 ///

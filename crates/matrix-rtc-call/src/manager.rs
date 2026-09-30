@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use matrix_rtc_core::{
     ApplicationIntake, CommandError, JoinError, JoinSessionParams, JoinedMembership, LeaveError,
-    LeaveSessionParams, RawTimelineEvent, RelationsRequest, RtcCommandSender, RtcSessionManager,
+    LeaveSessionParams, MatrixBackend, RawTimelineEvent, RelationsRequest, RtcSessionManager,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -128,12 +128,12 @@ impl Shared {
 
 /// Owns the core manager; everything the call does not wrap is reached through
 /// [`Self::rtc`], [`Self::rtc_mut`] or `Deref`.
-pub struct CallSessionManager<T: RtcCommandSender> {
+pub struct CallSessionManager<T: MatrixBackend> {
     rtc: RtcSessionManager<T>,
     shared: Arc<Mutex<Shared>>,
 }
 
-impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
+impl<T: MatrixBackend + 'static> CallSessionManager<T> {
     /// `rtc` may already hold sessions; their joined memberships are replayed.
     pub fn new(mut rtc: RtcSessionManager<T>) -> Self {
         let shared = Arc::new(Mutex::new(Shared {
@@ -154,9 +154,9 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         Self { rtc, shared }
     }
 
-    /// A call layer over a fresh core manager sending through `command_sender`.
-    pub fn with_command_sender(command_sender: Arc<T>) -> Self {
-        Self::new(RtcSessionManager::with_command_sender(command_sender))
+    /// A call layer over a fresh core manager sending through `backend`.
+    pub fn with_backend(backend: Arc<T>) -> Self {
+        Self::new(RtcSessionManager::with_backend(backend))
     }
 
     /// The core manager, for everything generic.
@@ -200,11 +200,11 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         }
     }
 
-    fn command_sender(&self) -> Result<Arc<T>, CommandError> {
+    fn backend(&self) -> Result<Arc<T>, CommandError> {
         self.rtc
-            .command_sender()
+            .backend()
             .cloned()
-            .ok_or_else(|| CommandError::from_message("no command sender configured"))
+            .ok_or_else(|| CommandError::from_message("no backend configured"))
     }
 
     /// The core join, then the notification if we started the call. Returns
@@ -282,7 +282,7 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         params: &JoinSessionParams,
         member_event_id: &str,
     ) {
-        let Ok(command_sender) = self.command_sender() else {
+        let Ok(backend) = self.backend() else {
             return;
         };
         let members = self
@@ -290,14 +290,7 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
             .subscribe_membership_snapshots(&params.room_id, &params.slot_id)
             .map(|snapshots| snapshots.borrow().clone())
             .unwrap_or_default();
-        notify_session_started(
-            command_sender.as_ref(),
-            notify,
-            params,
-            &members,
-            member_event_id,
-        )
-        .await;
+        notify_session_started(backend.as_ref(), notify, params, &members, member_event_id).await;
     }
 
     // ---- Reactions and raised hands (see `crate::reactions`) ----
@@ -418,9 +411,9 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         })
         .ok_or(ReactionError::NoSession)??;
         let (_, _, membership_event_id) = self.own_relation_target(room_id, slot_id)?;
-        let command_sender = self.command_sender()?;
+        let backend = self.backend()?;
 
-        let event_id = command_sender
+        let event_id = backend
             .send_room_event(
                 room_id.to_owned(),
                 REACTION_EVENT_TYPE.to_owned(),
@@ -453,9 +446,9 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
             return Ok(());
         }
         let (own, member_id, membership_event_id) = self.own_relation_target(room_id, slot_id)?;
-        let command_sender = self.command_sender()?;
+        let backend = self.backend()?;
 
-        let event_id = command_sender
+        let event_id = backend
             .send_room_event(
                 room_id.to_owned(),
                 ANNOTATION_EVENT_TYPE.to_owned(),
@@ -489,9 +482,9 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
             .rtc
             .own_member_id(room_id, slot_id)
             .ok_or(ReactionError::NotJoined)?;
-        let command_sender = self.command_sender()?;
+        let backend = self.backend()?;
 
-        command_sender
+        backend
             .redact_event(room_id.to_owned(), hand.reaction_event_id.clone(), None)
             .await?;
         log::info!(
@@ -525,7 +518,7 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         if current == hand.annotated_membership_event_id {
             return;
         }
-        let Ok(command_sender) = self.command_sender() else {
+        let Ok(backend) = self.backend() else {
             return;
         };
 
@@ -534,7 +527,7 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
              hand on it again",
             hand.annotated_membership_event_id,
         );
-        match command_sender
+        match backend
             .send_room_event(
                 room_id.to_owned(),
                 ANNOTATION_EVENT_TYPE.to_owned(),
@@ -551,7 +544,7 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
                         current,
                     );
                 });
-                if let Err(error) = command_sender
+                if let Err(error) = backend
                     .redact_event(room_id.to_owned(), hand.reaction_event_id.clone(), None)
                     .await
                 {
@@ -625,7 +618,7 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
 /// `join`, `leave` and `heartbeat` are inherent, so they win over the core's;
 /// `join` takes [`CallJoinParams`], so code written against the core's does not
 /// compile rather than silently skipping the notification.
-impl<T: RtcCommandSender> std::ops::Deref for CallSessionManager<T> {
+impl<T: MatrixBackend> std::ops::Deref for CallSessionManager<T> {
     type Target = RtcSessionManager<T>;
 
     fn deref(&self) -> &Self::Target {
@@ -633,13 +626,13 @@ impl<T: RtcCommandSender> std::ops::Deref for CallSessionManager<T> {
     }
 }
 
-impl<T: RtcCommandSender> std::ops::DerefMut for CallSessionManager<T> {
+impl<T: MatrixBackend> std::ops::DerefMut for CallSessionManager<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.rtc
     }
 }
 
-impl<T: RtcCommandSender + 'static> ApplicationIntake<T> for CallSessionManager<T> {
+impl<T: MatrixBackend + 'static> ApplicationIntake<T> for CallSessionManager<T> {
     fn rtc(&mut self) -> &mut RtcSessionManager<T> {
         &mut self.rtc
     }

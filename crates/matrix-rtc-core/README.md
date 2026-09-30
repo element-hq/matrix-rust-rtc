@@ -15,7 +15,7 @@ It does four things:
 - **Slots.** It resolves `m.rtc.slot` state, and opens and closes slots.
 
 The core does no I/O. The host feeds it events (`RawStickyEvent`, slot and room state, decrypted
-key messages), and it sends through a host-implemented `RtcCommandSender`. It spawns no tasks and
+key messages), and it sends through the host-implemented `MatrixBackend`. It spawns no tasks and
 arms no timers: the host calls `heartbeat` periodically while joined.
 
 ## Quick start: join a slot and follow its memberships
@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use matrix_rtc_core::{
     JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, RawStickyEvent,
-    RtcCommandSender, RtcSessionManager, RtcTransport,
+    MatrixBackend, RtcSessionManager, RtcTransport,
 };
 
 const ROOM: &str = "!room:example.org";
@@ -33,11 +33,11 @@ const SLOT: &str = "org.example.board#ROOM";
 
 async fn run(
     // The host's route to its Matrix client.
-    sender: Arc<impl RtcCommandSender + 'static>,
+    backend: Arc<impl MatrixBackend + 'static>,
     // The room's current sticky events, as the host's client reports them.
     sticky_events: Vec<RawStickyEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut manager = RtcSessionManager::with_command_sender(sender);
+    let mut manager = RtcSessionManager::with_backend(backend);
 
     // Told of every change to a session's joined memberships.
     manager.add_membership_listener(Arc::new(

@@ -331,9 +331,9 @@ impl Call {
                 ))
             }
         };
-        let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_command_sender(
-            Arc::new(SdkCommandSender::with_compat(client.clone(), dialect)),
-        )));
+        let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(Arc::new(
+            SdkCommandSender::with_compat(client.clone(), dialect),
+        ))));
         let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_membership_bridge(
             room.clone(),
             manager.clone(),
@@ -914,7 +914,7 @@ pub async fn open_slot(
     application: &str,
     encryption: Option<SlotEncryption>,
 ) -> Result<(), CallError> {
-    RtcSessionManager::with_command_sender(Arc::new(SdkCommandSender::new(client.clone())))
+    RtcSessionManager::with_backend(Arc::new(SdkCommandSender::new(client.clone())))
         .open_slot(
             room_id.to_owned(),
             slot_id.to_owned(),

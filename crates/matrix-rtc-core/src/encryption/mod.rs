@@ -124,21 +124,23 @@
 //! # Example Usage
 //!
 //! ```no_run
-//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
+//! use matrix_rtc_core::{CommandError, EncryptionConfig, EncryptionManager, JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, MatrixBackend, ToDeviceDelivery, ToDeviceRecipient};
 //! use async_trait::async_trait;
 //! use std::sync::Arc;
 //! use base64::{Engine as _, engine::general_purpose};
 //!
-//! // Implement RtcCommandSender for your platform
-//! struct MyCommandSender;
+//! // Implement MatrixBackend for your platform
+//! struct MyBackend;
 //!
 //! #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 //! #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-//! impl RtcCommandSender for MyCommandSender {
+//! impl MatrixBackend for MyBackend {
+//!     fn own_user_id(&self) -> String { "@alice:example.org".to_owned() }
+//!     fn own_device_id(&self) -> String { "DEVICE".to_owned() }
 //!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<String, CommandError> {
 //!         Ok("$event".to_owned())
-//!     }   
-//!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
+//!     }
+//!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _state_key: Option<String>, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
 //!         Ok(String::new())
 //!     }
 //!     async fn restart_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
@@ -162,11 +164,11 @@
 //! }
 //!
 //! // Create an encryption manager
-//! let command_sender = Arc::new(MyCommandSender);
+//! let backend = Arc::new(MyBackend);
 //! let get_memberships = || vec![];
 //!
 //! let mut manager = EncryptionManager::new(
-//!     command_sender,
+//!     backend,
 //!     "@alice:example.org".to_string(),
 //!     "device123".to_string(),
 //!     "xyzABCDEF0123".to_string(),  // member_id
@@ -244,7 +246,7 @@ fn system_clock() -> u64 {
 pub type RtcClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 use crate::error::CommandError;
-use crate::host::commands::{RtcCommandSender, ToDeviceRecipient};
+use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
@@ -353,9 +355,9 @@ pub type RtcIdentityMapper = Arc<dyn Fn(&str, &str, &str) -> String + Send + Syn
 /// - Signal new key material to the application layer
 /// - Handle key rotation with grace period support
 /// - Filter outdated keys to prevent decryption issues
-pub struct EncryptionManager<T: RtcCommandSender> {
+pub struct EncryptionManager<T: MatrixBackend> {
     /// Command sender for sending to-device messages
-    command_sender: Arc<T>,
+    backend: Arc<T>,
 
     /// Our own user ID (e.g., "@alice:example.org")
     own_user_id: String,
@@ -465,11 +467,11 @@ struct SignalledKey {
     use_after_ms: u64,
 }
 
-impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
+impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// Creates a new EncryptionManager.
     ///
     /// # Arguments
-    /// * `command_sender` - For sending to-device messages
+    /// * `backend` - For sending to-device messages
     /// * `own_user_id` - Our Matrix user ID (for RTC backend identity)
     /// * `own_device_id` - Our device ID (for RTC backend identity)
     /// * `own_member_id` - Our `member.id` from the `m.rtc.member` event (MSC4143)
@@ -478,7 +480,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// * `get_memberships` - Function to get current joined memberships
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        command_sender: Arc<T>,
+        backend: Arc<T>,
         own_user_id: String,
         own_device_id: String,
         own_member_id: String,
@@ -487,7 +489,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         get_memberships: impl Fn() -> Vec<JoinedMembership> + Send + 'static,
     ) -> Self {
         Self {
-            command_sender,
+            backend,
             own_user_id,
             own_member_id,
             own_device_id,
@@ -1489,7 +1491,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
         }
 
         let deliveries = match self
-            .command_sender
+            .backend
             .send_to_device_message(recipients, KEY_MESSAGE_TYPE.to_string(), content)
             .await
         {
@@ -1947,10 +1949,10 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     }
 }
 
-impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
+impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
     fn clone(&self) -> Self {
         Self {
-            command_sender: self.command_sender.clone(),
+            backend: self.backend.clone(),
             own_user_id: self.own_user_id.clone(),
             own_member_id: self.own_member_id.clone(),
             own_device_id: self.own_device_id.clone(),
@@ -1975,7 +1977,7 @@ impl<T: RtcCommandSender + 'static> Clone for EncryptionManager<T> {
     }
 }
 
-impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
+impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// Creates an Arc-wrapped clone of self.
     pub fn clone_arc(&self) -> Arc<Self> {
         Arc::new(self.clone())
@@ -1985,7 +1987,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
+    use crate::host::backend::{MockBackend, NoopBackend, ToDeviceDelivery};
     use crate::host::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
@@ -2057,7 +2059,7 @@ mod tests {
     }
 
     /// Who a rollout actually addressed, in order.
-    fn to_device_recipients(sender: &MockCommandSender) -> Vec<(String, String)> {
+    fn to_device_recipients(sender: &MockBackend) -> Vec<(String, String)> {
         sender
             .to_device_messages
             .lock()
@@ -2102,7 +2104,7 @@ mod tests {
     /// rotation, which needs a membership change.
     #[tokio::test]
     async fn keys_held_before_a_handler_exists_are_replayed_on_attach() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
         let mut manager = EncryptionManager::new(
             mock_sender,
@@ -2141,9 +2143,9 @@ mod tests {
     /// Builds a manager whose memberships come from a list a test can mutate,
     /// so a departure or arrival can be staged between rollouts.
     fn manager_over(
-        sender: Arc<MockCommandSender>,
+        sender: Arc<MockBackend>,
         memberships: Arc<Mutex<Vec<JoinedMembership>>>,
-    ) -> EncryptionManager<MockCommandSender> {
+    ) -> EncryptionManager<MockBackend> {
         EncryptionManager::new(
             sender,
             USER_ID.to_string(),
@@ -2161,7 +2163,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_index_is_signalled_once_however_often_memberships_update() {
         let memberships = Arc::new(Mutex::new(Vec::new()));
-        let mut manager = manager_over(Arc::new(MockCommandSender::new()), memberships.clone());
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
         manager.join().await.expect("join should succeed");
@@ -2206,7 +2208,7 @@ mod tests {
     /// call emptied.
     #[tokio::test]
     async fn a_departure_rotates_so_the_next_arrival_gets_the_live_key() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
@@ -2293,7 +2295,7 @@ mod tests {
     /// for the whole delay instead of just for their own key's delivery.
     #[tokio::test]
     async fn a_rotation_nobody_can_decrypt_is_usable_at_once() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
@@ -2394,7 +2396,7 @@ mod tests {
             ..bob_membership()
         };
         let memberships = Arc::new(Mutex::new(vec![bob_membership(), carol]));
-        let mut manager = manager_over(Arc::new(MockCommandSender::new()), memberships.clone());
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
         let clock = TestClock::new();
@@ -2453,7 +2455,7 @@ mod tests {
             ..bob_membership()
         };
         let memberships = Arc::new(Mutex::new(vec![bob_membership(), carol]));
-        let mut manager = manager_over(Arc::new(MockCommandSender::new()), memberships.clone());
+        let mut manager = manager_over(Arc::new(MockBackend::new()), memberships.clone());
         let clock = TestClock::new();
         manager.set_clock(clock.as_rtc_clock());
         manager.join().await.expect("join should succeed");
@@ -2543,7 +2545,7 @@ mod tests {
     /// tells the two joins apart.
     #[tokio::test]
     async fn a_rejoin_under_the_same_member_id_is_resent_the_current_key() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
             membership_ts: Some(1_000),
             ..bob_membership()
@@ -2630,7 +2632,7 @@ mod tests {
     /// moves. That alone must read as a new participation.
     #[tokio::test]
     async fn a_rejoin_no_feed_ever_saw_leave_is_still_served() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
             membership_ts: Some(1_000),
             ..bob_membership()
@@ -2665,7 +2667,7 @@ mod tests {
     /// an owed rotation.
     #[tokio::test]
     async fn a_membership_refresh_with_an_unchanged_timestamp_distributes_nothing() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
             membership_ts: Some(1_000),
             ..bob_membership()
@@ -2696,7 +2698,7 @@ mod tests {
     /// call unless they are handed that key too.
     #[tokio::test]
     async fn an_arrival_is_handed_the_key_we_keep_encrypting_with() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
         let handler = Arc::new(RecordingHandler::default());
@@ -2775,7 +2777,7 @@ mod tests {
     async fn an_identical_key_redelivery_is_not_reimported() {
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
         let mut manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -2813,7 +2815,7 @@ mod tests {
     async fn a_different_key_at_the_same_index_is_still_imported() {
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
         let mut manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -2840,7 +2842,7 @@ mod tests {
     /// the transport never uses is indistinguishable from not importing it.
     #[tokio::test]
     async fn replayed_keys_use_the_installed_identity_mapper() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
         let mut manager = EncryptionManager::new(
             mock_sender,
@@ -2881,7 +2883,7 @@ mod tests {
 
     #[tokio::test]
     async fn replaying_without_a_handler_is_a_no_op() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![]);
         let manager = EncryptionManager::new(
             mock_sender,
@@ -2900,7 +2902,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_manager_join_creates_first_key() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let get_memberships = create_mock_get_memberships(vec![]);
 
         let manager = EncryptionManager::new(
@@ -2927,7 +2929,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_index_increments() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![]);
 
         let manager = EncryptionManager::new(
@@ -2955,7 +2957,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_key_index_wraps() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![]);
 
         let manager = EncryptionManager::new(
@@ -2979,7 +2981,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_receive_key_stores_inbound() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
 
         let manager = EncryptionManager::new(
@@ -3015,7 +3017,7 @@ mod tests {
     /// fresh one; treating an equal timestamp as stale threw away the good key.
     #[tokio::test]
     async fn a_rekey_at_the_same_index_replaces_the_key_we_held() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
 
         let manager = EncryptionManager::new(
@@ -3046,9 +3048,9 @@ mod tests {
     }
 
     /// Helper: a manager with Bob joined, using the default (strict) config.
-    fn manager_with_bob() -> EncryptionManager<NoopCommandSender> {
+    fn manager_with_bob() -> EncryptionManager<NoopBackend> {
         EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -3059,7 +3061,7 @@ mod tests {
     }
 
     async fn assert_discarded(
-        manager: &EncryptionManager<NoopCommandSender>,
+        manager: &EncryptionManager<NoopBackend>,
         key: ReceivedEncryptionKey,
     ) {
         let member_id = key.member_id.clone();
@@ -3081,7 +3083,7 @@ mod tests {
     async fn a_refused_key_is_reported_with_its_reason() {
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
         let mut manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -3127,7 +3129,7 @@ mod tests {
     async fn a_key_from_the_wrong_device_is_reported_with_its_reason() {
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
         let mut manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -3216,7 +3218,7 @@ mod tests {
             ..bob_membership()
         };
         let manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -3236,7 +3238,7 @@ mod tests {
             ..bob_membership()
         };
         let manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -3256,7 +3258,7 @@ mod tests {
     async fn key_is_checked_against_a_claimed_device() {
         let claimed = |device_id: &str| {
             EncryptionManager::new(
-                Arc::new(NoopCommandSender),
+                Arc::new(NoopBackend),
                 USER_ID.to_string(),
                 DEVICE_ID.to_string(),
                 MEMBER_ID.to_string(),
@@ -3292,7 +3294,7 @@ mod tests {
             ..bob_membership()
         };
         let manager = EncryptionManager::new(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             USER_ID.to_string(),
             DEVICE_ID.to_string(),
             MEMBER_ID.to_string(),
@@ -3360,7 +3362,7 @@ mod tests {
         let manager = {
             let memberships = memberships.clone();
             EncryptionManager::new(
-                Arc::new(NoopCommandSender),
+                Arc::new(NoopBackend),
                 USER_ID.to_string(),
                 DEVICE_ID.to_string(),
                 MEMBER_ID.to_string(),
@@ -3422,7 +3424,7 @@ mod tests {
     /// defines as a number; `0` is raw bytes, base64 encoded.
     #[tokio::test]
     async fn distributed_key_declares_msc4143_format() {
-        let sender = Arc::new(MockCommandSender::new());
+        let sender = Arc::new(MockBackend::new());
         let manager = EncryptionManager::new(
             sender.clone(),
             USER_ID.to_string(),
@@ -3444,7 +3446,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_leave_cleans_up() {
-        let mock_sender = Arc::new(NoopCommandSender);
+        let mock_sender = Arc::new(NoopBackend);
         let get_memberships = create_mock_get_memberships(vec![]);
 
         let manager = EncryptionManager::new(
@@ -3485,7 +3487,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some(DEVICE_ID.to_string())),
             ..bob_membership()
         };
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let get_memberships = create_mock_get_memberships(vec![ghost, bob_membership()]);
         let manager = EncryptionManager::new(
             mock_sender.clone(),
@@ -3528,7 +3530,7 @@ mod tests {
             origin: EventOrigin::encrypted(Some("TABLET".to_string())),
             ..bob_membership()
         };
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let get_memberships = create_mock_get_memberships(vec![other_device]);
         let manager = EncryptionManager::new(
             mock_sender.clone(),
@@ -3561,7 +3563,7 @@ mod tests {
             origin: EventOrigin::encrypted(None),
             ..bob_membership()
         };
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let get_memberships = create_mock_get_memberships(vec![deviceless]);
         let manager = EncryptionManager::new(
             mock_sender.clone(),
@@ -3598,7 +3600,13 @@ mod tests {
 
         #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
         #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-        impl RtcCommandSender for FailsFirstRecipient {
+        impl MatrixBackend for FailsFirstRecipient {
+            fn own_user_id(&self) -> String {
+                "@alice:example.org".to_owned()
+            }
+            fn own_device_id(&self) -> String {
+                "DEVICE".to_owned()
+            }
             async fn send_sticky_event(
                 &self,
                 _room_id: String,
@@ -3612,6 +3620,7 @@ mod tests {
                 &self,
                 _room_id: String,
                 _event_type: String,
+                _state_key: Option<String>,
                 _content: serde_json::Value,
                 _delay_ms: u64,
             ) -> Result<String, CommandError> {
