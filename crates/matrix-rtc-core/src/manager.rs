@@ -13,16 +13,14 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, watch};
 
-use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::event::{EventConversionError, RawStickyEvent};
+use crate::host::commands::RtcCommandSender;
+use crate::host::event::{EventConversionError, RawStickyEvent, RawTimelineEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
-use crate::reactions::{
-    RaisedHand, RawTimelineEvent, ReactionError, ReceivedReaction, RelationLookup,
-};
-use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
+use crate::reactions::{RaisedHand, ReactionError, ReceivedReaction, RelationLookup};
+use crate::session::{JoinedMembership, RtcMembershipEvent, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
@@ -209,7 +207,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         room_id: &str,
         events: impl IntoIterator<Item = RawStickyEvent>,
     ) -> Result<(), EventConversionError> {
-        let mut batches: HashMap<SessionKey, Vec<CallMembershipEvent>> = HashMap::new();
+        let mut batches: HashMap<SessionKey, Vec<RtcMembershipEvent>> = HashMap::new();
 
         for event in events {
             if event.room_id != room_id {
@@ -221,8 +219,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             };
 
             let slot_id = match &event {
-                CallMembershipEvent::Joined(joined) => joined.slot_id.clone(),
-                CallMembershipEvent::Left(left) => left.slot_id.clone(),
+                RtcMembershipEvent::Joined(joined) => joined.slot_id.clone(),
+                RtcMembershipEvent::Left(left) => left.slot_id.clone(),
             };
 
             let key = SessionKey::new(room_id.to_owned(), slot_id);
@@ -860,8 +858,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     fn try_convert_membership_event(
         &self,
         event: RawStickyEvent,
-    ) -> Result<Option<CallMembershipEvent>, EventConversionError> {
-        match event.try_into_call_membership_event() {
+    ) -> Result<Option<RtcMembershipEvent>, EventConversionError> {
+        match event.try_into_membership_event() {
             Ok(event) => Ok(Some(event)),
             // Not an RTC member event at all — the host feeds us its whole
             // sticky map, so this is routine.
@@ -891,7 +889,7 @@ impl SessionKey {
 /// Which slots a room's sticky events landed in is the first thing to check
 /// when a roster looks wrong: a typo in `slot_id` silently creates a second,
 /// empty session rather than failing.
-fn describe_batches(batches: &HashMap<SessionKey, Vec<CallMembershipEvent>>) -> String {
+fn describe_batches(batches: &HashMap<SessionKey, Vec<RtcMembershipEvent>>) -> String {
     if batches.is_empty() {
         return "none".to_owned();
     }

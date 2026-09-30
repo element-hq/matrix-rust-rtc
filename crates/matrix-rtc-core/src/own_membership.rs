@@ -62,9 +62,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use crate::commands::RtcCommandSender;
 use crate::error::CommandError;
-use crate::event::RawStickyEventContent;
+use crate::host::commands::RtcCommandSender;
+use crate::host::event::RawStickyEventContent;
 use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::{MemberTransports, RtcTransport};
 
@@ -935,7 +935,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::commands::{
+    use crate::host::commands::{
         MockCommandSender, NoopCommandSender, ToDeviceDelivery, ToDeviceRecipient,
     };
     use crate::transport::RawRtcTransport;
@@ -1911,7 +1911,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_leave_uses_unstable_sticky_key_and_round_trips() {
-        use crate::event::RawStickyEventContent;
+        use crate::host::event::RawStickyEventContent;
 
         let mock_sender = Arc::new(MockCommandSender::new());
         test_machine(mock_sender.clone())

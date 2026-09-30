@@ -243,9 +243,9 @@ fn system_clock() -> u64 {
 /// time. See [`EncryptionManager::set_clock`].
 pub type RtcClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-use crate::commands::{RtcCommandSender, ToDeviceRecipient};
 use crate::error::CommandError;
-use crate::event::EventOrigin;
+use crate::host::commands::{RtcCommandSender, ToDeviceRecipient};
+use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
 
@@ -1985,8 +1985,8 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
-    use crate::event::EventOrigin;
+    use crate::host::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
+    use crate::host::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
 

@@ -14,11 +14,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 
-use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::event::EventOrigin;
+use crate::host::commands::RtcCommandSender;
+use crate::host::event::{EventOrigin, RawTimelineEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::notification::{
     NOTIFICATION_EVENT_TYPE, NotifyConfig, build_notification_content,
@@ -26,8 +26,8 @@ use crate::notification::{
 };
 use crate::own_membership::{MembershipTimings, OwnMembershipMachine, now_ms, transport_to_json};
 use crate::reactions::{
-    ANNOTATION_EVENT_TYPE, REACTION_EVENT_TYPE, RaisedHand, RawTimelineEvent, ReactionError,
-    ReactionsConfig, ReactionsState, ReceivedReaction, RelationLookup, build_raised_hand_content,
+    ANNOTATION_EVENT_TYPE, REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionsConfig,
+    ReactionsState, ReceivedReaction, RelationLookup, build_raised_hand_content,
     build_reaction_content, first_grapheme,
 };
 use crate::slot::{RoomEncryption, SlotState};
@@ -1039,7 +1039,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// Applies the initial membership events for this single session.
     pub async fn set_current_state(
         &mut self,
-        events: impl IntoIterator<Item = CallMembershipEvent>,
+        events: impl IntoIterator<Item = RtcMembershipEvent>,
     ) {
         // Replace, do not merge: `events` is the complete set for this slot, so
         // a candidate missing from it is gone.
@@ -1085,12 +1085,12 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     }
 
     /// Applies one membership event to this session.
-    pub async fn update(&mut self, event: CallMembershipEvent) {
+    pub async fn update(&mut self, event: RtcMembershipEvent) {
         self.apply_membership_event(event).await;
     }
 
     /// Applies one membership event and publishes the result.
-    async fn apply_membership_event(&mut self, event: CallMembershipEvent) {
+    async fn apply_membership_event(&mut self, event: RtcMembershipEvent) {
         if self.record_membership_event(event) {
             self.refresh().await;
         }
@@ -1112,9 +1112,9 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// call.
     ///
     /// [`set_current_state`]: Self::set_current_state
-    fn record_membership_event(&mut self, event: CallMembershipEvent) -> bool {
+    fn record_membership_event(&mut self, event: RtcMembershipEvent) -> bool {
         match event {
-            CallMembershipEvent::Joined(joined) => {
+            RtcMembershipEvent::Joined(joined) => {
                 let existing = self.candidates.iter().position(|candidate| {
                     candidate.sender == joined.sender && candidate.sticky_key == joined.sticky_key
                 });
@@ -1149,7 +1149,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
                     }
                 }
             }
-            CallMembershipEvent::Left(left) => {
+            RtcMembershipEvent::Left(left) => {
                 let before = self.candidates.len();
                 self.candidates.retain(|candidate| {
                     !(candidate.sender == left.sender && candidate.sticky_key == left.sticky_key)
@@ -1637,7 +1637,7 @@ impl LeaveReason {
 
 #[derive(Clone, Debug)]
 /// Membership event projection derived from sticky event content.
-pub enum CallMembershipEvent {
+pub enum RtcMembershipEvent {
     /// A member is connected for the slot.
     Joined(JoinedMembership),
     /// A member is disconnected for the slot.

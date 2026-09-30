@@ -1328,7 +1328,7 @@ pub async fn run_membership_bridge(
 
 #[cfg(test)]
 mod tests {
-    use matrix_rtc_core::{CallMembershipEvent, RtcTransport};
+    use matrix_rtc_core::{RtcMembershipEvent, RtcTransport};
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 
     use super::*;
@@ -1490,11 +1490,11 @@ mod tests {
         };
 
         let joined = match event
-            .try_into_call_membership_event()
+            .try_into_membership_event()
             .expect("converts to a membership event")
         {
-            CallMembershipEvent::Joined(joined) => joined,
-            CallMembershipEvent::Left(_) => panic!("a join must not project as a leave"),
+            RtcMembershipEvent::Joined(joined) => joined,
+            RtcMembershipEvent::Left(_) => panic!("a join must not project as a leave"),
         };
 
         assert_eq!(joined.slot_id, "m.call#ROOM");

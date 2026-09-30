@@ -157,7 +157,7 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Input boundary:
   - `RawStickyEvent`, `RawStickyEventUpdate`, and `StickyEventsUpdate` represent SDK-provided sticky snapshot/diff data.
 - Conversion:
-  - Converts only RTC membership event types (`m.rtc.member` and `org.matrix.msc4143.rtc.member`) into `CallMembershipEvent`.
+  - Converts only RTC membership event types (`m.rtc.member` and `org.matrix.msc4143.rtc.member`) into `RtcMembershipEvent`.
 - Session state:
   - In-memory membership is owned directly by `RtcSession`.
   - `RtcSessionManager` owns multiple `RtcSession` instances keyed by `(room_id, slot_id)`.

@@ -12,8 +12,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::{
-    ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveReason, LeftMembership,
-    MemberInfo, Membership,
+    ApplicationInfo, JoinedMembership, LeaveReason, LeftMembership, MemberInfo, Membership,
+    RtcMembershipEvent,
 };
 use crate::transport::MemberTransports;
 use thiserror::Error;
@@ -196,6 +196,27 @@ pub struct StickyEventsUpdate {
     pub removed: Vec<RawStickyEvent>,
 }
 
+/// A message-like room event, for applications; the core reads none. A
+/// redaction is not one of these: consumers take it as the redacted event's id.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawTimelineEvent {
+    /// Room the event was sent to.
+    pub room_id: String,
+    /// The event's id.
+    pub event_id: String,
+    /// The event's sender.
+    pub sender: String,
+    /// How the event reached us.
+    #[serde(default)]
+    pub origin: EventOrigin,
+    /// The event type, verbatim.
+    pub event_type: String,
+    /// The event's `origin_server_ts`.
+    pub origin_server_ts: u64,
+    /// The event's whole `content` object, decrypted.
+    pub content: serde_json::Value,
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 /// Conversion errors while mapping transport DTOs into domain membership events.
 pub enum EventConversionError {
@@ -237,9 +258,7 @@ impl RawStickyEvent {
     /// The remaining MSC4143 join conditions (an open `m.rtc.slot`, the sender
     /// still being joined to the room, and the event still being sticky) depend
     /// on state this layer does not see; they are applied by the session.
-    pub fn try_into_call_membership_event(
-        self,
-    ) -> Result<CallMembershipEvent, EventConversionError> {
+    pub fn try_into_membership_event(self) -> Result<RtcMembershipEvent, EventConversionError> {
         self.check_convertible()?;
 
         let member_id = self.content.member.id.clone();
@@ -250,7 +269,7 @@ impl RawStickyEvent {
             self.content.member.is_join() && self.content.application.application_type().is_some();
 
         if !joined {
-            return Ok(CallMembershipEvent::Left(self.into_left(member_id)));
+            return Ok(RtcMembershipEvent::Left(self.into_left(member_id)));
         }
 
         let member_id = member_id.expect("is_join() guarantees a non-empty member.id");
@@ -268,7 +287,7 @@ impl RawStickyEvent {
 
         let transports = self.content.transports.unwrap_or_default();
 
-        Ok(CallMembershipEvent::Joined(JoinedMembership {
+        Ok(RtcMembershipEvent::Joined(JoinedMembership {
             room_id: self.room_id,
             slot_id: self.content.slot_id,
             sender: self.sender,
@@ -293,10 +312,10 @@ impl RawStickyEvent {
     /// be interpreted as a left membership regardless of its content shape.
     pub fn try_into_left_membership_event(
         self,
-    ) -> Result<CallMembershipEvent, EventConversionError> {
+    ) -> Result<RtcMembershipEvent, EventConversionError> {
         self.check_convertible()?;
         let member_id = self.content.member.id.clone();
-        Ok(CallMembershipEvent::Left(self.into_left(member_id)))
+        Ok(RtcMembershipEvent::Left(self.into_left(member_id)))
     }
 
     fn into_left(self, member_id: Option<String>) -> LeftMembership {
@@ -398,9 +417,9 @@ mod tests {
         }
     }
 
-    fn parse(json: &str) -> CallMembershipEvent {
+    fn parse(json: &str) -> RtcMembershipEvent {
         event(serde_json::from_str(json).expect("content must parse"))
-            .try_into_call_membership_event()
+            .try_into_membership_event()
             .expect("conversion must succeed")
     }
 
@@ -441,7 +460,7 @@ mod tests {
     #[test]
     fn spec_shaped_join_event_parses() {
         match parse(JOIN_JSON) {
-            CallMembershipEvent::Joined(joined) => {
+            RtcMembershipEvent::Joined(joined) => {
                 assert_eq!(joined.member_id, "xyzABCDEF0123");
                 assert_eq!(joined.sticky_key, "xyzABCDEF0123");
                 assert_eq!(joined.application.application_type(), Some("m.call"));
@@ -458,7 +477,7 @@ mod tests {
                     other => panic!("expected one livekit transport, got {other:?}"),
                 }
             }
-            CallMembershipEvent::Left(_) => panic!("expected a joined membership"),
+            RtcMembershipEvent::Left(_) => panic!("expected a joined membership"),
         }
     }
 
@@ -468,10 +487,10 @@ mod tests {
     fn membership_leave_wins_over_join_shaped_content() {
         let json = JOIN_JSON.replace(r#""membership": "join""#, r#""membership": "leave""#);
         match parse(&json) {
-            CallMembershipEvent::Left(left) => {
+            RtcMembershipEvent::Left(left) => {
                 assert_eq!(left.member_id.as_deref(), Some("xyzABCDEF0123"));
             }
-            CallMembershipEvent::Joined(_) => panic!("membership=leave must not count as joined"),
+            RtcMembershipEvent::Joined(_) => panic!("membership=leave must not count as joined"),
         }
     }
 
@@ -487,8 +506,8 @@ mod tests {
             Some(Membership::Unknown("lurking".to_owned()))
         );
         assert!(matches!(
-            event(content).try_into_call_membership_event().unwrap(),
-            CallMembershipEvent::Left(_)
+            event(content).try_into_membership_event().unwrap(),
+            RtcMembershipEvent::Left(_)
         ));
     }
 
@@ -499,7 +518,7 @@ mod tests {
             r#""application": { "type": "m.call", "m.call.voice_only": true },"#,
             "",
         );
-        assert!(matches!(parse(&json), CallMembershipEvent::Left(_)));
+        assert!(matches!(parse(&json), RtcMembershipEvent::Left(_)));
     }
 
     #[test]
@@ -512,8 +531,8 @@ mod tests {
                       "msc4354_sticky_key": "abc" }}"#
             );
             match parse(&json) {
-                CallMembershipEvent::Left(left) => left.leave_reason.expect("leave_reason"),
-                CallMembershipEvent::Joined(_) => panic!("expected left"),
+                RtcMembershipEvent::Left(left) => left.leave_reason.expect("leave_reason"),
+                RtcMembershipEvent::Joined(_) => panic!("expected left"),
             }
         };
 
@@ -534,7 +553,7 @@ mod tests {
         let content: RawStickyEventContent = serde_json::from_str(JOIN_JSON).unwrap();
         assert!(matches!(
             event(content).try_into_left_membership_event().unwrap(),
-            CallMembershipEvent::Left(_)
+            RtcMembershipEvent::Left(_)
         ));
     }
 

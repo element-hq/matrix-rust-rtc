@@ -9,10 +9,9 @@
 //! (`RawStickyEvent`, `StickyEventsUpdate`). DTOs are used on purpose so the core
 //! is decoupled from SDK-specific event types (JS SDK objects, FFI structs, etc.).
 
-mod commands;
 mod encryption;
 mod error;
-mod event;
+mod host;
 mod join;
 mod manager;
 mod maybe_send;
@@ -24,7 +23,6 @@ mod slot;
 mod transport;
 mod wire;
 
-pub use commands::{RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
 pub use encryption::types::{
     EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, KeyOrigin, KeyRejection,
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
@@ -34,9 +32,10 @@ pub use encryption::{
     RtcIdentityMapper,
 };
 pub use error::{CommandError, JoinError, LeaveError};
-pub use event::{
+pub use host::commands::{RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
+pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
-    StickyEventsUpdate,
+    RawTimelineEvent, StickyEventsUpdate,
 };
 pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
 pub use manager::RtcSessionManager;
@@ -51,13 +50,13 @@ pub use own_membership::{
 };
 pub use reactions::{
     ANNOTATION_EVENT_TYPE, DEFAULT_REACTION_ACTIVE_MS, GENERIC_SOUND, KNOWN_REACTIONS,
-    RAISED_HAND_KEY, REACTION_EVENT_TYPE, RaisedHand, RawTimelineEvent, ReactionError,
-    ReactionKind, ReactionSound, ReactionsConfig, ReceivedReaction, RelationLookup,
-    build_raised_hand_content, build_reaction_content, first_grapheme, reaction_kind, sound_for,
+    RAISED_HAND_KEY, REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionKind, ReactionSound,
+    ReactionsConfig, ReceivedReaction, RelationLookup, build_raised_hand_content,
+    build_reaction_content, first_grapheme, reaction_kind, sound_for,
 };
 pub use session::{
-    ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
-    MemberInfo, Membership, RtcSession,
+    ApplicationInfo, JoinedMembership, LeaveCode, LeaveReason, LeftMembership, MemberInfo,
+    Membership, RtcMembershipEvent, RtcSession,
 };
 pub use slot::{
     EncryptionMechanism, OpenSlot, RawSlotEvent, RawSlotEventContent, RoomEncryption,
@@ -71,7 +70,7 @@ pub use wire::wire_event_type;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::NoopCommandSender;
+    use crate::host::commands::NoopCommandSender;
     use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
@@ -164,7 +163,7 @@ mod tests {
     /// Joins as alice under an explicit `member_id`, so a leave/rejoin pair can
     /// be told apart in the assertions.
     async fn join_as(
-        manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
         member_id: &str,
     ) {
         let mut params = JoinSessionParams::new(
@@ -183,7 +182,7 @@ mod tests {
 
     /// Feeds the current sticky state containing one peer, the way a host does.
     async fn admit_peer(
-        manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
         user_id: &str,
         device_id: &str,
         member_id: &str,
@@ -198,7 +197,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn leave_call(manager: &mut RtcSessionManager<crate::commands::MockCommandSender>) {
+    async fn leave_call(manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>) {
         manager
             .leave(
                 ROOM_ID.to_owned(),
@@ -210,7 +209,7 @@ mod tests {
     }
 
     fn roster(
-        manager: &RtcSessionManager<crate::commands::MockCommandSender>,
+        manager: &RtcSessionManager<crate::host::commands::MockCommandSender>,
     ) -> Vec<crate::session::JoinedMembership> {
         manager
             .subscribe_membership_snapshots(ROOM_ID, "m.call#ROOM")
@@ -220,8 +219,8 @@ mod tests {
     }
 
     async fn encrypted_call_manager(
-        sender: Arc<crate::commands::MockCommandSender>,
-    ) -> RtcSessionManager<crate::commands::MockCommandSender> {
+        sender: Arc<crate::host::commands::MockCommandSender>,
+    ) -> RtcSessionManager<crate::host::commands::MockCommandSender> {
         let mut manager = RtcSessionManager::with_command_sender(sender);
         manager.on_room_encryption_received(ROOM_ID, true).await;
         manager
@@ -308,7 +307,7 @@ mod tests {
     /// four.
     #[tokio::test]
     async fn a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         // First call: bob arrives after we joined, so the roster changes while we
@@ -355,7 +354,7 @@ mod tests {
 
     /// Joins as alice, asking for an MSC4075 notification.
     async fn join_and_notify(
-        manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
         member_id: &str,
         notify: NotifyConfig,
     ) {
@@ -376,7 +375,7 @@ mod tests {
 
     /// Every sticky send of the notification type, as `(content, duration_ms)`.
     fn notifications_sent(
-        sender: &crate::commands::MockCommandSender,
+        sender: &crate::host::commands::MockCommandSender,
     ) -> Vec<(serde_json::Value, u64)> {
         sender
             .sticky_events
@@ -393,7 +392,7 @@ mod tests {
     /// join's sticky send reported has to come back out as the relation target.
     #[tokio::test]
     async fn starting_a_call_notifies_the_room() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         let mut notify = NotifyConfig::ring();
@@ -450,7 +449,7 @@ mod tests {
     /// caller hits "call" and nobody's phone rings.
     #[tokio::test]
     async fn our_own_membership_does_not_count_as_somebody_else() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         // The echo of our own membership, under the very id we are about to
@@ -476,7 +475,7 @@ mod tests {
     /// call in the process until the app restarts.
     #[tokio::test]
     async fn a_stale_participation_of_ours_does_not_count_either() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = RtcSessionManager::with_command_sender(sender.clone());
         manager
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
@@ -509,7 +508,7 @@ mod tests {
     /// an ordinary peer, and one already in the call started it.
     #[tokio::test]
     async fn another_device_of_ours_already_in_the_call_counts() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         admit_peer(
@@ -531,7 +530,7 @@ mod tests {
     /// time, even if the host asked for a notification.
     #[tokio::test]
     async fn joining_an_occupied_session_notifies_nobody() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         admit_peer(&mut manager, "@bob:example.org", "BOBDEV", "bob-a").await;
@@ -545,7 +544,7 @@ mod tests {
 
     #[tokio::test]
     async fn joining_quietly_notifies_nobody() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         join_as(&mut manager, "alice-a").await;
@@ -559,7 +558,7 @@ mod tests {
     /// receive stream for and to expect a key from.
     #[tokio::test]
     async fn a_rejoin_does_not_advertise_the_previous_participation() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         join_as(&mut manager, "alice-a").await;
@@ -585,7 +584,7 @@ mod tests {
     /// future "just drop the session on leave" refactor has to argue with a test.
     #[tokio::test]
     async fn a_left_session_still_publishes_the_peer_roster() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         join_as(&mut manager, "alice-a").await;
@@ -1051,7 +1050,7 @@ mod tests {
     /// to-device traffic to the other member.
     #[tokio::test]
     async fn slot_encryption_turns_key_distribution_on() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = RtcSessionManager::with_command_sender(sender.clone());
 
         manager.on_room_encryption_received(ROOM_ID, true).await;
@@ -1080,7 +1079,7 @@ mod tests {
     /// keys are distributed there however the client is configured.
     #[tokio::test]
     async fn absent_slot_encryption_turns_key_distribution_off() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = RtcSessionManager::with_command_sender(sender.clone());
 
         manager.on_room_encryption_received(ROOM_ID, false).await;
@@ -1101,7 +1100,7 @@ mod tests {
     /// preference, then lets bob in so a membership change triggers key
     /// distribution (if it is enabled at all).
     async fn join_and_admit_a_peer(
-        manager: &mut RtcSessionManager<crate::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
         local_manage_media_keys: bool,
     ) {
         let mut params = JoinSessionParams::new(
@@ -1136,7 +1135,7 @@ mod tests {
     /// nothing is a legitimate choice rather than a broken join.
     #[tokio::test]
     async fn a_receive_only_member_joins_and_publishes_nothing() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = RtcSessionManager::with_command_sender(sender.clone());
 
         let params = JoinSessionParams::with_transport_intent(
@@ -1175,7 +1174,7 @@ mod tests {
     /// rather than emitted empty.
     #[tokio::test]
     async fn a_receive_only_member_with_no_cue_omits_transports() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = RtcSessionManager::with_command_sender(sender.clone());
 
         let params = JoinSessionParams::with_transport_intent(
@@ -1199,7 +1198,7 @@ mod tests {
     /// declares it can receive on that type too.
     #[tokio::test]
     async fn a_publishing_member_advertises_its_transport() {
-        let sender = Arc::new(crate::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
         let mut manager = RtcSessionManager::with_command_sender(sender.clone());
 
         let params = JoinSessionParams::new(
@@ -1267,10 +1266,10 @@ mod tests {
             },
         };
 
-        let membership_event = event.try_into_call_membership_event().unwrap();
+        let membership_event = event.try_into_membership_event().unwrap();
 
         match membership_event {
-            CallMembershipEvent::Joined(joined) => {
+            RtcMembershipEvent::Joined(joined) => {
                 assert_eq!(joined.transports.len(), 1);
                 match &joined.transports[0] {
                     RtcTransport::LiveKit(livekit) => {
@@ -1282,7 +1281,7 @@ mod tests {
                     RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),
                 }
             }
-            CallMembershipEvent::Left(_) => panic!("Expected Joined membership"),
+            RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),
         }
     }
 
@@ -1323,10 +1322,10 @@ mod tests {
             },
         };
 
-        let membership_event = event.try_into_call_membership_event().unwrap();
+        let membership_event = event.try_into_membership_event().unwrap();
 
         match membership_event {
-            CallMembershipEvent::Joined(joined) => {
+            RtcMembershipEvent::Joined(joined) => {
                 assert_eq!(joined.transports.len(), 1);
                 match &joined.transports[0] {
                     RtcTransport::Unsupported(unsupported) => {
@@ -1336,7 +1335,7 @@ mod tests {
                     RtcTransport::LiveKit(_) => panic!("Expected Unsupported transport"),
                 }
             }
-            CallMembershipEvent::Left(_) => panic!("Expected Joined membership"),
+            RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),
         }
     }
 }

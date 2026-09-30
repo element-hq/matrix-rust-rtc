@@ -48,7 +48,7 @@ use tokio::sync::{broadcast, watch};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::error::CommandError;
-use crate::event::EventOrigin;
+use crate::host::event::RawTimelineEvent;
 use crate::session::JoinedMembership;
 
 /// Event type of an Element Call emoji reaction.
@@ -254,34 +254,6 @@ impl Default for ReactionsConfig {
             send_cooldown_ms: DEFAULT_REACTION_ACTIVE_MS,
         }
     }
-}
-
-/// One message-like room event, as a host hands it to the core.
-///
-/// The reactions intake takes every event the host cares to forward and picks
-/// out the two types it reads; anything else is ignored. Redactions are not
-/// events here — a redaction only names its target, and hosts already resolve
-/// that per room version — so they arrive through
-/// [`crate::RtcSessionManager::on_event_redacted`] instead.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RawTimelineEvent {
-    /// Room the event was sent to.
-    pub room_id: String,
-    /// The event's id.
-    pub event_id: String,
-    /// The event's sender.
-    pub sender: String,
-    /// How the event reached us. Compared against the membership's origin: a
-    /// reaction from a different device than the membership's is logged, and
-    /// accepted, as Element Call accepts it.
-    #[serde(default)]
-    pub origin: EventOrigin,
-    /// The event type: [`REACTION_EVENT_TYPE`] or [`ANNOTATION_EVENT_TYPE`].
-    pub event_type: String,
-    /// The event's `origin_server_ts`, which is when a hand counts as raised.
-    pub origin_server_ts: u64,
-    /// The event's whole `content` object, decrypted.
-    pub content: Value,
 }
 
 /// Content of an `io.element.call.reaction` event.
@@ -878,6 +850,7 @@ impl ReactionsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::event::EventOrigin;
 
     fn event(event_type: &str, sender: &str, content: Value) -> RawTimelineEvent {
         RawTimelineEvent {
@@ -1050,10 +1023,10 @@ mod tests {
 
     use tokio::sync::broadcast::error::TryRecvError;
 
-    use crate::commands::MockCommandSender;
-    use crate::event::{RawStickyEvent, RawStickyEventContent};
+    use crate::host::commands::MockCommandSender;
+    use crate::host::event::{RawStickyEvent, RawStickyEventContent};
     use crate::join::{JoinSessionParams, LeaveSessionParams};
-    use crate::session::{CallMembershipEvent, MemberInfo, Membership, RtcSession};
+    use crate::session::{MemberInfo, Membership, RtcMembershipEvent, RtcSession};
     use crate::transport::{LiveKitTransport, RtcTransport};
 
     const ROOM: &str = "!room:example.org";
@@ -1085,7 +1058,7 @@ mod tests {
         device: &str,
         member_id: &str,
         event_id: &str,
-    ) -> CallMembershipEvent {
+    ) -> RtcMembershipEvent {
         RawStickyEvent {
             room_id: ROOM.to_owned(),
             event_id: Some(event_id.to_owned()),
@@ -1108,7 +1081,7 @@ mod tests {
                 created_ts: None,
             },
         }
-        .try_into_call_membership_event()
+        .try_into_membership_event()
         .expect("a join-shaped event converts")
     }
 
@@ -1566,7 +1539,7 @@ mod tests {
             .expect("join slot B");
 
         let mut bob_in_a = member_event(BOB, "BOBDEV", BOB_MEMBER, "$bob-member-1");
-        let CallMembershipEvent::Joined(joined) = &mut bob_in_a else {
+        let RtcMembershipEvent::Joined(joined) = &mut bob_in_a else {
             unreachable!()
         };
         let bob_raw = RawStickyEvent {

@@ -1240,7 +1240,7 @@ impl WasmRtcSession {
         let mut membership_events = Vec::new();
         for event in input.into_iter() {
             let event = RawStickyEvent::from(event);
-            match event.try_into_call_membership_event() {
+            match event.try_into_membership_event() {
                 Ok(event) => membership_events.push(event),
                 Err(EventConversionError::UnsupportedEventType { .. }) => continue,
                 Err(err) => return Err(JsError::new(&err.to_string())),
