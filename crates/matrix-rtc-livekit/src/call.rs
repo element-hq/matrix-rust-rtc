@@ -44,7 +44,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
-use matrix_rtc_bridge::SdkBackend;
 use matrix_rtc_call::compat::ingest::outbound_dialect;
 use matrix_rtc_call::compat::{self, DialectBackend, ElementCallCompat};
 use matrix_rtc_call::feeder::{
@@ -58,6 +57,7 @@ use matrix_rtc_core::{
     EncryptionConfig, JoinSessionParams, LiveKitTransport, MatrixBackend, RtcSessionManager,
     RtcTransport, SlotEncryption, TransportIntent, generate_member_id,
 };
+use matrix_rtc_matrix_sdk::SdkBackend;
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
     MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,

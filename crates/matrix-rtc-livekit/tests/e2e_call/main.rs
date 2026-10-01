@@ -179,7 +179,7 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
 
 /// Log in and start the sync service. Sliding sync enables the sticky-events
 /// extension, so `m.rtc.member` stickies flow into the base room's sticky map
-/// (see `matrix_rtc_bridge::sdk`); it also delivers the
+/// (see `matrix_rtc_matrix_sdk::sdk`); it also delivers the
 /// `org.matrix.msc3401.call.member` room state the `state_events` compat mode
 /// reads.
 ///

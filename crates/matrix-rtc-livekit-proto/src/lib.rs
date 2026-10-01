@@ -25,7 +25,7 @@ use matrix_rtc_call::compat::{ElementCallCompat, element_call_state};
 /// The participant-identity derivation a MatrixRTC generation's authorisation
 /// service uses.
 ///
-/// One of the two things the bridge's `compat` deliberately cannot own — the
+/// One of the two things `matrix_rtc_call::compat` deliberately cannot own — the
 /// other being [`TokenEndpoint`] — because the modern derivation hashes per
 /// MSC4195, which is a LiveKit document rather than a Matrix wire format. The
 /// `compat` module decides *which generation*; this decides *what that means
@@ -66,7 +66,7 @@ pub enum TokenEndpoint {
     #[default]
     Msc4195,
     /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
-    /// Temporary; see the bridge's `compat`.
+    /// Temporary; see `matrix_rtc_call::compat`.
     LegacyElementCall,
 }
 

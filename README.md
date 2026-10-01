@@ -119,8 +119,8 @@ for a runnable two-client example against the local backend.
   `MatrixBackend` and feeds the core, the dialect wrapper and `compat` for
   pre-2026 Element Call wire formats, and the transport choice. No Matrix SDK,
   so it tests in seconds against no git dependencies.
-- `crates/matrix-rtc-bridge`: `SdkBackend`, the `MatrixBackend` over
-  matrix-rust-sdk (behind the `matrix-sdk` feature). **No LiveKit**.
+- `crates/matrix-rtc-matrix-sdk`: `SdkBackend`, the `MatrixBackend` over
+  matrix-rust-sdk. **No LiveKit**.
 - `crates/matrix-rtc-ffi`: UniFFI-based Kotlin/Swift bindings — the
   room-scoped manager API always, plus the media layer behind the `media`
   cargo feature (default off, keeps the slim artifact libwebrtc-free).

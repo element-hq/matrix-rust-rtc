@@ -20,7 +20,7 @@
 //!   ([`keys`]).
 //!
 //! Everything Matrix-side belongs elsewhere and knows nothing about LiveKit:
-//! [`matrix_rtc_bridge`] is the `matrix_sdk::Client` backend, and
+//! `matrix_rtc_matrix_sdk` is the `matrix_sdk::Client` backend, and
 //! [`matrix_rtc_call`] feeds the core from it and translates the pre-2026
 //! Element Call wire dialects. With the `matrix-sdk` feature, [`call::Call`]
 //! composes them with this transport into a join/leave facade — start there.
@@ -79,10 +79,10 @@ pub mod android {
 
 #[cfg(feature = "matrix-sdk")]
 pub use call::{Call, CallError, CallOptions, open_slot};
-// The SDK-backed bridge itself lives in `matrix-rtc-bridge`; re-exported so a
+// The SDK backend lives in `matrix-rtc-matrix-sdk`; re-exported so a
 // host driving a call keeps one dependency.
 #[cfg(feature = "matrix-sdk")]
-pub use matrix_rtc_bridge::SdkBackend;
+pub use matrix_rtc_matrix_sdk::SdkBackend;
 
 /// Obtain a fresh OpenID token and exchange it for an SFU JWT.
 ///

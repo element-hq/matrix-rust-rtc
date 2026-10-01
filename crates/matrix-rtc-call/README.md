@@ -4,14 +4,14 @@ The call application over `matrix-rtc-core`: Element Call's reactions and raised
 hand, MSC4075 ringing, and the host-facing call manager — plus how a host's
 `MatrixBackend` reaches it, and how it interoperates with clients that speak an
 older wire format. None of it needs a Matrix SDK or a transport: the SDK
-backend is `matrix-rtc-bridge`, LiveKit is `matrix-rtc-livekit`.
+backend is `matrix-rtc-matrix-sdk`, LiveKit is `matrix-rtc-livekit`.
 
 ```
 matrix-rtc-core        what the protocol says
       ▲
 matrix-rtc-call        the call, its feeder and dialects   ← this crate
       ▲
-matrix-rtc-bridge      the matrix-rust-sdk backend
+matrix-rtc-matrix-sdk  the matrix-rust-sdk backend
 matrix-rtc-livekit     how bytes flow (MSC4195 SFU)
 ```
 

@@ -10,14 +10,7 @@
 //! hands back DTOs so neither depends on SDK types. Everything that does not
 //! need the SDK — the Element Call dialects, the feeder, the transport choice —
 //! lives in `matrix-rtc-call`.
-//!
-//! # Why `matrix-sdk` is a feature
-//!
-//! Without it this crate is empty, so a workspace build that does not need the
-//! SDK compiles no git dependencies.
 
-#[cfg(feature = "matrix-sdk")]
 pub mod sdk;
 
-#[cfg(feature = "matrix-sdk")]
 pub use sdk::{SdkBackend, TimelineIngest, timeline_ingest_from_raw};

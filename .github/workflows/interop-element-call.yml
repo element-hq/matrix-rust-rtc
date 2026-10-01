@@ -135,7 +135,7 @@ jobs:
         working-directory: interop
         run: npx playwright test
         env:
-          RUST_LOG: info,matrix_rtc_core=debug,matrix_rtc_bridge=debug,matrix_rtc_livekit=debug,livekit=warn,webrtc_sys=warn
+          RUST_LOG: info,matrix_rtc_core=debug,matrix_rtc_matrix_sdk=debug,matrix_rtc_call=debug,matrix_rtc_livekit=debug,livekit=warn,webrtc_sys=warn
 
       # Always, not only on failure: the lk-jwt logs are the sole visibility
       # into the OpenID/token hop, and a green run that logs oddities is how

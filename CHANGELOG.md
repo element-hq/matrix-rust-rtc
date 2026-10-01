@@ -10,7 +10,7 @@ log only.
 
 ### Breaking
 
-- `compat`, `feeder` and `transports` move from `matrix-rtc-bridge` to `matrix-rtc-call`; the bridge is now only `SdkBackend`.
+- `compat`, `feeder` and `transports` move from `matrix-rtc-bridge` to `matrix-rtc-call`, and what remains — `SdkBackend` — is renamed `matrix-rtc-matrix-sdk`, with no `matrix-sdk` feature.
 - One `MatrixBackend` trait (`matrix-rtc-core`) replaces `RtcCommandSender` and every inbound method on the managers and bindings (`set_current_sticky_state`/`set_current_membership`, `on_room_slots_received`, `on_room_members_received`, `on_room_encryption_received`, `receive_encryption_key`/`receive_legacy_encryption_key`, `on_room_timeline_events`, `on_event_redacted`, `on_relations_received`). A host implements the trait — the sends, a per-room subscription delivering the room's complete current sets, a to-device subscription, `/relations`, the OpenID token and `GET /rtc/transports` — and calls `attach_room`/`detach_room`; the feeder (`matrix_rtc_call::feeder`) does the feeding, including the pre-2026 compatibility funnels, for every host. Gone with it: `CommandSenderCallback`, `OpenIdTokenProvider`, `OpenIdTokenSource`, `SdkCommandSender`, `run_membership_bridge`, `discover_livekit_transport`, and the typed inbound records (`StickyEvent`, `SlotEvent`, `FfiTimelineEvent`, `FfiReceivedEncryptionKey`, `RawMemberEvent`, …).
 - `send_delayed_event` takes an optional state key; `send_delayed_state_event` is folded into it.
 - The compatibility mode is given when a room is attached, not on `join`; the FFI and wasm join params no longer take `user_id`/`device_id` (the backend knows them) and their `transport` is optional — the library picks from `rtc_transports()` when it is absent.

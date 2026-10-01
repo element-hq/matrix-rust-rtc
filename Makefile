@@ -72,7 +72,7 @@ license-headers-fix:
 	./scripts/check-license-headers.sh --fix
 
 # `--all-features` covers every target, including the SDK-backed half of the
-# livekit crate (`call`, the bridge's `sdk`) and the FFI's media surface.
+# livekit crate (`call`) and the FFI's media surface.
 clippy:
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
 

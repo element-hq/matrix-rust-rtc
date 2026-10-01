@@ -271,7 +271,7 @@ hit deliberately:
 | Module | What it does |
 | --- | --- |
 | **`call`** *(feature `matrix-sdk`)* | The high-level facade: `Call::join`/`Call::leave`, `open_slot`. The transport comes from the homeserver's `GET /rtc/transports` unless `CallOptions::livekit_transport` pins one. Start here. |
-| **`matrix-rtc-bridge`** *(separate crate)* | `SdkBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`). No LiveKit in it. Re-exported here (`SdkBackend`) so a host keeps one dependency. |
+| **`matrix-rtc-matrix-sdk`** *(separate crate)* | `SdkBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`). No LiveKit in it. Re-exported here (`SdkBackend`) so a host keeps one dependency. |
 | **`matrix-rtc-call`** *(separate crate)* | The feeder that subscribes through the backend and feeds the core, and `compat`, which translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`). |
 | **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the core's `MatrixBackend::openid_token`, so this layer is not hard-wired to a particular Matrix SDK. |
 | **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) picks the one a given compat generation's authorisation service issues. |
@@ -292,7 +292,7 @@ asserts a tone survives an encrypt→SFU→decrypt round trip.
 
 | Feature | Effect |
 | --- | --- |
-| `matrix-sdk` *(off by default)* | The `call` facade, `matrix-rtc-bridge`'s `SdkBackend`, and the examples. Depends on upstream matrix-rust-sdk with its `unstable-msc4354` feature, for MSC4354 sticky events. |
+| `matrix-sdk` *(off by default)* | The `call` facade, `matrix-rtc-matrix-sdk`'s `SdkBackend`, and the examples. Depends on upstream matrix-rust-sdk with its `unstable-msc4354` feature, for MSC4354 sticky events. |
 | `testing` | Test-only parts of `media` (tone generator, Goertzel detector), used by the examples and the e2e test. |
 
 ## Examples & tests
