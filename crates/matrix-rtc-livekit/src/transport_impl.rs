@@ -6,7 +6,7 @@
 //! [`MediaTransport`] implementation for the MSC4195 LiveKit transport.
 //!
 //! This is where LiveKit stops being visible: everything above this module
-//! (the [`matrix_rtc_media::CallEngine`], the `Call` facade's unified event
+//! (the [`matrix_rtc_media::CallEngine`], the `LiveKitCall` facade's unified event
 //! stream, and eventually the FFI) speaks the transport-neutral vocabulary of
 //! `matrix-rtc-media`, and this module translates it to SFU reality —
 //! the token exchange, the E2EE room connection, `RoomEvent`s, and
@@ -118,7 +118,7 @@ impl LiveKitMediaTransport {
     ///
     /// A builder rather than a `new` parameter: the MSC4195 derivation is the
     /// default and every spec-current caller leaves it alone. Both callers that
-    /// do substitute it — `Call::join` and the FFI media session — pass the same
+    /// do substitute it — `LiveKitCall::join` and the FFI media session — pass the same
     /// `Arc` they gave the core's encryption manager, which is the point: the
     /// derivation sites must not skew. Temporary; see [`crate::compat`].
     pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
@@ -134,7 +134,7 @@ impl LiveKitMediaTransport {
     }
 
     /// Typed variant of [`MediaTransport::connect`], for callers that need
-    /// access to the underlying [`LiveKitSession`] (the `Call` facade's
+    /// access to the underlying [`LiveKitSession`] (the `LiveKitCall` facade's
     /// deprecated raw accessors).
     pub async fn connect_livekit(
         &self,
@@ -255,7 +255,7 @@ pub struct LiveKitTransportConnection {
 }
 
 impl LiveKitTransportConnection {
-    /// The underlying session, for the `Call` facade's transition-period raw
+    /// The underlying session, for the `LiveKitCall` facade's transition-period raw
     /// accessors.
     pub fn session(&self) -> &LiveKitSession {
         &self.session

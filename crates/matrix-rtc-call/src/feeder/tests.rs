@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::CallSessionManager;
+use crate::room_state::CallRoomState;
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{EventEncryption, EventIn, ToDeviceMessageIn};
 use serde_json::json;
@@ -22,7 +22,7 @@ const ME: &str = "@mock:example.org";
 const BOB: &str = "@bob:example.org";
 
 type Backend = DialectBackend<MockBackend>;
-type Manager = Arc<Mutex<CallSessionManager<Backend>>>;
+type Manager = Arc<Mutex<CallRoomState<Backend>>>;
 
 struct Harness {
     mock: Arc<MockBackend>,
@@ -34,20 +34,13 @@ impl Harness {
     async fn attach(mode: ElementCallCompat) -> Self {
         let mock = Arc::new(MockBackend::new());
         let backend = Arc::new(DialectBackend::new(mock.clone()));
-        let manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
+        let manager = Arc::new(Mutex::new(CallRoomState::with_backend(
+            ROOM,
             backend.clone(),
         )));
-        let (attachment, run) = RoomFeeder::attach(
-            backend,
-            manager.clone(),
-            RoomModes::default(),
-            ROOM.to_owned(),
-            AttachOptions {
-                element_call_compat: mode,
-            },
-        )
-        .await
-        .expect("attach");
+        let (attachment, run) = RoomFeeder::attach(backend, manager.clone(), mode)
+            .await
+            .expect("attach");
         tokio::spawn(run.run());
         Self {
             mock,
@@ -73,7 +66,7 @@ impl Harness {
     }
 
     async fn member_count(&self) -> Option<usize> {
-        self.manager.lock().await.member_count(ROOM, SLOT)
+        self.manager.lock().await.member_count(SLOT)
     }
 
     async fn wait_until<F, Fut>(&self, mut condition: F)
@@ -343,7 +336,7 @@ async fn a_raised_hand_reaches_the_call_layer_and_a_redaction_lowers_it() {
                 .manager
                 .lock()
                 .await
-                .raised_hands(ROOM, SLOT)
+                .raised_hands(SLOT)
                 .is_some_and(|hands| hands.len() == 1)
         })
         .await;
@@ -355,14 +348,14 @@ async fn a_raised_hand_reaches_the_call_layer_and_a_redaction_lowers_it() {
                 .manager
                 .lock()
                 .await
-                .raised_hands(ROOM, SLOT)
+                .raised_hands(SLOT)
                 .is_some_and(|hands| hands.is_empty())
         })
         .await;
 }
 
 #[tokio::test]
-async fn nothing_delivered_after_detach_is_applied() {
+async fn nothing_delivered_after_the_attachment_drops_is_applied() {
     let harness = Harness::attach(ElementCallCompat::Off).await;
     harness.seed_room_state();
     let sink = harness.sink();
@@ -378,7 +371,7 @@ async fn nothing_delivered_after_detach_is_applied() {
         attachment,
         ..
     } = harness;
-    attachment.detach();
+    drop(attachment);
     assert!(
         subscription
             .cancelled
@@ -386,18 +379,15 @@ async fn nothing_delivered_after_detach_is_applied() {
     );
     sink.on_sticky_events(Vec::new());
     tokio::time::sleep(Duration::from_millis(20)).await;
-    assert_eq!(manager.lock().await.member_count(ROOM, SLOT), Some(1));
+    assert_eq!(manager.lock().await.member_count(SLOT), Some(1));
 }
 
 #[tokio::test]
 async fn the_to_device_feeder_subscribes_to_both_key_generations() {
     let mock = Arc::new(MockBackend::new());
     let backend = Arc::new(DialectBackend::new(mock.clone()));
-    let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
-        backend.clone(),
-    )));
-    let modes = RoomModes::default();
-    let (feeder, run) = ToDeviceFeeder::start(backend, manager, modes)
+    let registry: RoomRegistry<CallRoomState<Backend>> = RoomRegistry::default();
+    let (feeder, run) = ToDeviceFeeder::start(backend, registry)
         .await
         .expect("start");
     tokio::spawn(run.run());
@@ -451,38 +441,15 @@ async fn dropping_an_attachment_ends_its_subscription() {
 }
 
 #[tokio::test]
-async fn dropping_the_session_feeder_ends_its_subscription() {
+async fn dropping_the_to_device_feeder_ends_its_subscription() {
     let mock = Arc::new(MockBackend::new());
     let backend = Arc::new(DialectBackend::new(mock.clone()));
-    let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
-        backend.clone(),
-    )));
-    let (feeder, _run) = ToDeviceFeeder::start(backend, manager, RoomModes::default())
+    let registry: RoomRegistry<CallRoomState<Backend>> = RoomRegistry::default();
+    let (feeder, _run) = ToDeviceFeeder::start(backend, registry)
         .await
         .expect("start");
     let subscription = mock.to_device_subscription().unwrap();
 
     drop(feeder);
     assert!(subscription.cancelled.load(Ordering::SeqCst));
-}
-
-#[test]
-fn a_room_is_attached_once_and_freed_when_its_attach_fails() {
-    let rooms = AttachedRooms::<&str>::default();
-    let reservation = rooms.reserve(ROOM).expect("free");
-    assert!(rooms.reserve(ROOM).is_none(), "being attached");
-    assert_eq!(
-        rooms.remove(ROOM),
-        None,
-        "nothing to detach while attaching"
-    );
-
-    // The attach failed: the room is free again.
-    drop(reservation);
-    let reservation = rooms.reserve(ROOM).expect("free again");
-    reservation.fill("attached");
-    assert!(rooms.reserve(ROOM).is_none(), "attached");
-
-    assert_eq!(rooms.remove(ROOM), Some("attached"));
-    assert!(rooms.reserve(ROOM).is_some(), "free after detach");
 }

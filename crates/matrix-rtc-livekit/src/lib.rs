@@ -22,7 +22,7 @@
 //! Everything Matrix-side belongs elsewhere and knows nothing about LiveKit:
 //! `matrix_rtc_matrix_sdk` is the `matrix_sdk::Client` backend, and
 //! [`matrix_rtc_call`] feeds the core from it and translates the pre-2026
-//! Element Call wire dialects. With the `matrix-sdk` feature, [`call::Call`]
+//! Element Call wire dialects. With the `matrix-sdk` feature, [`call::LiveKitCall`]
 //! composes them with this transport into a join/leave facade — start there.
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
@@ -48,7 +48,7 @@ pub mod call;
 // Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite.
 // Scaffolding with a delete-by date; nothing else should depend on it. Lives in
 // `matrix-rtc-call` (it is pure Matrix wire translation, with no LiveKit in
-// it), and is re-exported because `CallOptions::element_call_compat` names
+// it), and is re-exported because `LiveKitCallOptions::element_call_compat` names
 // `ElementCallCompat` in this crate's own public API.
 pub use matrix_rtc_call::compat;
 
@@ -78,11 +78,11 @@ pub mod android {
 }
 
 #[cfg(feature = "matrix-sdk")]
-pub use call::{Call, CallError, CallOptions, open_slot};
+pub use call::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, open_slot};
 // The SDK backend lives in `matrix-rtc-matrix-sdk`; re-exported so a
 // host driving a call keeps one dependency.
 #[cfg(feature = "matrix-sdk")]
-pub use matrix_rtc_matrix_sdk::SdkBackend;
+pub use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 
 /// Obtain a fresh OpenID token and exchange it for an SFU JWT.
 ///

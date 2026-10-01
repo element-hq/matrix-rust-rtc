@@ -7,15 +7,15 @@
 //!
 //! The translation lives in [`matrix_rtc_call::compat`] and is applied by
 //! the library's feeder and dialect wrapper; nothing here re-implements a
-//! dialect. A page chooses the mode once, when it attaches the room
-//! (`attachRoom`'s `element_call_compat`), and delivers the same raw events in
+//! dialect. A page chooses the mode once, when it opens the room
+//! (`room`'s `element_call_compat`), and delivers the same raw events in
 //! every mode. This module owns only the mode-string vocabulary
 //! (`"off" | "sticky_events" | "state_events"`).
 
 use matrix_rtc_call::compat::ElementCallCompat;
 use wasm_bindgen::JsError;
 
-/// The page's mode vocabulary, shared by `attachRoom` and `connectMedia` so
+/// The page's mode vocabulary, shared by `room` and `connectMedia` so
 /// the two can never disagree by spelling.
 pub(crate) fn parse_compat(value: Option<&str>) -> Result<ElementCallCompat, JsError> {
     Ok(match value {

@@ -30,7 +30,6 @@ function getContentValue(content, key) {
 }
 
 const joinParams = {
-  room_id: ROOM_ID,
   slot_id: SLOT_ID,
   application: 'm.call',
   transport: { type: 'livekit', livekit_service_url: SFU },
@@ -54,28 +53,32 @@ describe('WASM bindings with a mock backend host', () => {
     });
   });
 
-  describe('WasmRtcSessionManager', () => {
-    it('attaches a room and subscribes to what it needs', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await manager.attachRoom(ROOM_ID, undefined);
+  describe('WasmRtcClient, WasmRtcRoom and WasmRtcCall', () => {
+    it('opens a room and subscribes to what it needs', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
+      expect(room.roomId).toBe(ROOM_ID);
 
       const subjects = host._subjects(ROOM_ID);
       expect(subjects.state_event_types).toEqual(['m.rtc.slot', 'org.matrix.msc4143.rtc.slot']);
       expect(host._toDevice()).not.toBeNull();
 
-      await expect(manager.attachRoom(ROOM_ID, undefined)).rejects.toThrow(/already attached/);
+      await expect(client.room(ROOM_ID, undefined)).rejects.toThrow(/already open/);
     });
 
-    it('join() without a transport takes the advertised one and sends the membership', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await manager.attachRoom(ROOM_ID, undefined);
+    it('joinCall() without a transport takes the advertised one and sends the membership', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
       host._clear();
 
       const { transport, ...withoutTransport } = joinParams;
       void transport;
-      const memberId = await manager.join(withoutTransport);
+      const call = await room.joinCall(withoutTransport);
+      const memberId = call.memberId;
       expect(memberId).toBeTruthy();
-      expect(await manager.ownMemberId(ROOM_ID, SLOT_ID)).toBe(memberId);
+      expect(call.roomId).toBe(ROOM_ID);
+      expect(call.slotId).toBe(SLOT_ID);
+      expect(call.isLive).toBe(true);
 
       const stickyEvents = host._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
@@ -104,13 +107,13 @@ describe('WASM bindings with a mock backend host', () => {
       expect(getContentValue(leaveReason, 'code')).toBe('delayed_leave');
     });
 
-    it('leave() with a leave reason works', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await manager.attachRoom(ROOM_ID, undefined);
-      await manager.join(joinParams);
+    it('leave() with a leave reason works and ends the call', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
+      const call = await room.joinCall(joinParams);
       host._clear();
 
-      await manager.leave(ROOM_ID, SLOT_ID, {
+      await call.leave({
         leave_reason: { code: 'leave', reason: 'user hung up' },
       });
 
@@ -125,33 +128,49 @@ describe('WASM bindings with a mock backend host', () => {
       const cancelledEvents = host._getCancelledEvents();
       expect(cancelledEvents.length).toBe(1);
       expect(cancelledEvents[0].delayId).toBe('delayed-event-0');
+
+      expect(call.isLive).toBe(false);
+      expect(await call.heartbeat()).toBe(false);
+      await expect(call.leave(undefined)).rejects.toThrow(/over/);
     });
 
-    it('detachRoom() leaves a joined session and ends the subscription', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await manager.attachRoom(ROOM_ID, undefined);
-      await manager.join(joinParams);
+    it('joining a joined slot is refused', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
+      await room.joinCall(joinParams);
+      await expect(room.joinCall(joinParams)).rejects.toThrow();
+    });
+
+    it('close() leaves a joined call, ends the subscription, and frees the room', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
+      const call = await room.joinCall(joinParams);
       host._clear();
 
-      await manager.detachRoom(ROOM_ID);
+      await room.close();
       expect(host._getCancelledEvents().length).toBe(1);
       expect(host._sink(ROOM_ID)).toBeUndefined();
-      // A no-op the second time.
-      await manager.detachRoom(ROOM_ID);
+      expect(call.isLive).toBe(false);
+      // A no-op the second time; the room's other methods reject.
+      await room.close();
+      await expect(room.joinCall(joinParams)).rejects.toThrow(/closed/);
+      // The room can be opened again.
+      const reopened = await client.room(ROOM_ID, undefined);
+      expect(reopened.roomId).toBe(ROOM_ID);
     });
 
-    it('join() into a room with no open slot is refused', async () => {
+    it('joinCall() into a room with no open slot is refused', async () => {
       const closed = mockBackendHost({ userId: USER_ID, deviceId: DEVICE_ID, slots: [] });
-      const manager = new bindings.WasmRtcSessionManager(closed);
-      await manager.attachRoom(ROOM_ID, undefined);
-      await expect(manager.join(joinParams)).rejects.toThrow(/not open/);
+      const client = new bindings.WasmRtcClient(closed);
+      const room = await client.room(ROOM_ID, undefined);
+      await expect(room.joinCall(joinParams)).rejects.toThrow(/not open/);
       expect(closed._getStickyEvents().length).toBe(0);
     });
 
     it('a sticky_events room mirrors the legacy fields on the membership', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await manager.attachRoom(ROOM_ID, { element_call_compat: 'sticky_events' });
-      await manager.join(joinParams);
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, { element_call_compat: 'sticky_events' });
+      await room.joinCall(joinParams);
 
       const content = host._getStickyEvents()[0].content;
       expect(getContentValue(getContentValue(content, 'member'), 'user_id')).toBe(USER_ID);
@@ -161,17 +180,12 @@ describe('WASM bindings with a mock backend host', () => {
   });
 
   describe('Error handling', () => {
-    it('join before attach throws', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await expect(manager.join(joinParams)).rejects.toThrow(/not attached/);
-    });
-
     it('join with missing required params throws', async () => {
-      const manager = new bindings.WasmRtcSessionManager(host);
-      await manager.attachRoom(ROOM_ID, undefined);
-      const { room_id, ...invalidParams } = joinParams;
-      void room_id;
-      await expect(manager.join(invalidParams)).rejects.toThrow(/invalid join params/);
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
+      const { slot_id, ...invalidParams } = joinParams;
+      void slot_id;
+      await expect(room.joinCall(invalidParams)).rejects.toThrow(/invalid join params/);
     });
   });
 });

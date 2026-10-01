@@ -18,7 +18,7 @@ For what the binding *is* and how to integrate it — the Matrix host contract, 
 
 ## The call model (`./call`)
 
-`MatrixRtcCall` composes a joined `WasmRtcSessionManager` slot with
+`MatrixRtcCall` composes a joined `WasmRtcCall` with
 `livekit-client` (an optional peer dependency, injected — so it is also
 mockable):
 
@@ -27,14 +27,13 @@ import { MatrixRtcCall } from 'matrix-rtc-wasm/call';
 import * as livekit from 'livekit-client';
 
 const call = new MatrixRtcCall({
-  manager,                 // WasmRtcSessionManager over the host's
-                           // MatrixBackendHost, room attached, slot joined
+  call: rtcCall,           // what `rtcRoom.joinCall(...)` returned
   bindings,                // the wasm module
   livekit,
   roomOptions: { e2ee: { worker: e2eeWorker } }, // omit to run without frame E2EE
 });
 call.onParticipants = (roster) => render(roster);
-await call.connect({ roomId, slotId, userId, deviceId, livekitServiceUrl });
+await call.connect({ userId, deviceId, livekitServiceUrl });
 ```
 
 Every roster entry is the Rust participant (`member_id`, `user_id`,
@@ -63,7 +62,7 @@ That runs:
 
 ```bash
 cd web
-npm test
+npm run test:vitest
 ```
 
 The tests are written to skip the runtime smoke check if `pkg/` has not been generated yet.

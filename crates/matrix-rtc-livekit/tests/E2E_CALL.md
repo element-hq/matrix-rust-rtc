@@ -22,30 +22,30 @@ registration).
 | Layer | What's exercised |
 | --- | --- |
 | **Room setup** | `alice` creates an **encrypted** room (`m.room.encryption`) with `shared` history visibility and invites `bob`; `bob` joins; both wait for the 2-member membership before any RTC signalling. |
-| **Signalling** | Each client publishes its own `m.rtc.member` membership as a sticky event (+ a dead-man's-switch delayed leave) and discovers the peer via `sticky_events().subscribe()` → `RtcSessionManager`. Both peers join the room before RTC signalling. Success = each side sees 2 members. |
+| **Signalling** | Each client publishes its own `m.rtc.member` membership as a sticky event (+ a dead-man's-switch delayed leave) and discovers the peer via `sticky_events().subscribe()` → the call crate's feeder → the room. Both peers join the room before RTC signalling. Success = each side sees 2 members. |
 | **Transport** | MSC4195 OpenID→JWT token exchange and SFU connect for both clients. |
-| **Encryption** | The core `EncryptionManager` generates a per-participant media key and distributes it to the peer as an Olm-encrypted `m.rtc.encryption_key` to-device message (`SdkBackend::send_to_device_message`). Each side imports received keys into its LiveKit `KeyProvider` (`MediaKeyBridge`), addressed by the MSC4195 pseudonymous identity. Success = `bob` imported `alice`'s key. |
+| **Encryption** | The core `EncryptionManager` generates a per-participant media key and distributes it to the peer as an Olm-encrypted `m.rtc.encryption_key` to-device message (`SdkMatrixBackend::send_to_device_message`). Each side imports received keys into its LiveKit `KeyProvider` (`MediaKeyBridge`), addressed by the MSC4195 pseudonymous identity. Success = `bob` imported `alice`'s key. |
 | **Media** | 440 Hz tone published by `alice`, **GCM frame-encrypted** at the SFU, decrypted and recorded by `bob`, verified with a Goertzel filter (`media::detect_tone > 0.5`). A WAV is written to `target/e2e/received-<label>.wav` — inside the repo, not the system temp dir — and uploaded as a CI artifact on failure. A scenario that records twice (the redial) keeps both files. The tone only decodes because the keys were exchanged and mapped correctly. |
-| **Multi-SFU** (`e2e_call_two_foci_*`) | The same flow with `alice` publishing on SFU 1 and `bob` on SFU 2 (the backend stack runs two SFU + lk-jwt pairs). Each client's `CallEngine` reads the peer's `transports` from their membership and opens a second connection to the peer's focus (MSC4195 multi-SFU). Tones flow in **both directions** (alice 440 Hz, bob 660 Hz) and are received through the transport-agnostic media API (`Call::participants` → `Call::remote_track` → frame streams) instead of raw LiveKit events. |
-| **Video + constraints** (same scenario) | `alice` publishes a synthetic half-bright/half-dark I420 pattern through `Call::publish` (camera track, simulcast + dynacast); `bob` receives it via `video_frames()` across the SFUs and verifies the luma split (robust to VP8 compression). Then `bob` exercises both constraint demand states: `visible = false` **pauses** the stream (frames stop, subscription kept — `set_enabled(false)`) and `visible = true` resumes it instantly; `enabled = false` turns it **off** (released as fully as the transport supports — LiveKit currently pauses here too, because its client-side resubscribe is unreliable at 0.7.48) and `enabled = true` brings frames back. |
+| **Multi-SFU** (`e2e_call_two_foci_*`) | The same flow with `alice` publishing on SFU 1 and `bob` on SFU 2 (the backend stack runs two SFU + lk-jwt pairs). Each client's `CallEngine` reads the peer's `transports` from their membership and opens a second connection to the peer's focus (MSC4195 multi-SFU). Tones flow in **both directions** (alice 440 Hz, bob 660 Hz) and are received through the transport-agnostic media API (`LiveKitCall::participants` → `LiveKitCall::remote_track` → frame streams) instead of raw LiveKit events. |
+| **Video + constraints** (same scenario) | `alice` publishes a synthetic half-bright/half-dark I420 pattern through `LiveKitCall::publish` (camera track, simulcast + dynacast); `bob` receives it via `video_frames()` across the SFUs and verifies the luma split (robust to VP8 compression). Then `bob` exercises both constraint demand states: `visible = false` **pauses** the stream (frames stop, subscription kept — `set_enabled(false)`) and `visible = true` resumes it instantly; `enabled = false` turns it **off** (released as fully as the transport supports — LiveKit currently pauses here too, because its client-side resubscribe is unreliable at 0.7.48) and `enabled = true` brings frames back. |
 
 ## How it's wired
 
-Each participant is a `matrix_rtc_livekit::Call` (`src/call.rs`) — the crate's
+Each participant is a `matrix_rtc_livekit::LiveKitCall` (`src/call.rs`) — the crate's
 join/leave facade, so the test exercises exactly what a consumer would use.
-Inside `Call::join`:
+Inside `LiveKitCall::join`:
 
 ```
 matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext auto-on)
         │
         ▼
- SdkBackend (bridge: src/sdk.rs) — the one MatrixBackend
+ SdkMatrixBackend (matrix-rtc-matrix-sdk: src/sdk.rs) — the one MatrixBackend
    sends: sticky / delayed / state / to-device (Olm)      reads: subscribe_room, subscribe_to_device,
         ▲                                                        relations, openid_token, rtc_transports
         │ DialectBackend (compat routing)                        │ complete current sets, on subscribe
         │                                                        ▼ and on every sticky / state wake
- CallSessionManager ◀── RoomFeeder / ToDeviceFeeder (call: src/feeder) ── spawn_local(run)
-   (join → own membership sticky + delayed leave; heartbeat)
+ RtcClient → RtcRoom ◀── RoomFeeder / ToDeviceFeeder (call: src/feeder) ── spawn_local(run)
+   └─ join_call → RtcCall (own membership sticky + delayed leave; heartbeat)
         │  └─ EncryptionManager: generates + distributes per-participant keys
         │        via the backend's send_to_device_message
         │  └─ MediaKeyBridge (src/keys.rs): received keys ──▶ LiveKit KeyProvider
@@ -54,7 +54,7 @@ matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext au
                                             └─ publish_tone / record_track (src/media.rs)
 ```
 
-The futures behind `Call::join` are `!Send` (the core `MatrixBackend` is
+The futures behind `LiveKitCall::join` are `!Send` (the core `MatrixBackend` is
 `?Send`), so the test runs on a single-thread `tokio::task::LocalSet`, with a
 300 s overall timeout so a wedged stack fails fast.
 
@@ -100,7 +100,7 @@ collisions. Overrides for pointing at another deployment:
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `HOMESERVER_URL` | `http://localhost:8008` | Synapse CS-API base URL |
-| `LIVEKIT_SERVICE_URL` | `http://localhost:6080` | `lk-jwt` `/get_token` base URL, pinned via `CallOptions::livekit_transport` (overrides the homeserver's MSC4143 transports endpoint) |
+| `LIVEKIT_SERVICE_URL` | `http://localhost:6080` | `lk-jwt` `/get_token` base URL, pinned via `LiveKitCallOptions::livekit_transport` (overrides the homeserver's MSC4143 transports endpoint) |
 | `SLOT_ID` | `m.call#ROOM` | MatrixRTC slot |
 | `ALICE` / `ALICE_PW`, `BOB` / `BOB_PW` | *(auto-provisioned)* | Use pre-existing users instead of registering throwaways (for stacks with closed registration) |
 | `INSECURE_TLS` | *(unset)* | set (any value) to accept self-signed certs on a remote TLS stack |

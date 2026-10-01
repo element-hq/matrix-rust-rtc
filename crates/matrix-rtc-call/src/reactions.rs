@@ -32,7 +32,7 @@
 //!
 //! - Our own raised hand is re-annotated onto the new membership event after
 //!   every refresh (and the old annotation redacted), or Element Call peers
-//!   would lower it for us. See [`crate::CallSessionManager::heartbeat`].
+//!   would lower it for us. See [`crate::RtcSession::heartbeat`].
 //! - As a receiver we are more lenient than Element Call: a hand stays raised
 //!   for as long as the member is in the call, whichever of their membership
 //!   events it was annotated on. A member's reaction is validated against every
@@ -388,7 +388,7 @@ pub struct ReceivedReaction {
 /// lists what it has not looked up yet, the host answers each with the
 /// `/relations` of that event (`rel_type=m.annotation`,
 /// `event_type=m.reaction`), fed back through
-/// [`crate::CallSessionManager::on_relations_received`].
+/// the call state's `on_relations_received`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationLookup {
     /// The member whose event it is.

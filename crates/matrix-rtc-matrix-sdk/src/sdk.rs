@@ -105,11 +105,11 @@ const RETRY_AFTER: Duration = Duration::from_secs(5);
 
 /// A [`MatrixBackend`] over a logged-in `matrix_sdk::Client`. Clone-cheap.
 #[derive(Clone)]
-pub struct SdkBackend {
+pub struct SdkMatrixBackend {
     client: Client,
 }
 
-impl SdkBackend {
+impl SdkMatrixBackend {
     pub fn new(client: Client) -> Self {
         Self { client }
     }
@@ -237,7 +237,7 @@ async fn resolve_to_device_encryption(client: &Client, info: &EncryptionInfo) ->
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
-impl MatrixBackend for SdkBackend {
+impl MatrixBackend for SdkMatrixBackend {
     fn own_user_id(&self) -> String {
         self.client
             .user_id()

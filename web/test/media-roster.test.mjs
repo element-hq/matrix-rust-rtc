@@ -96,17 +96,17 @@ describe('web media roster over a fake transport delegate', () => {
       slots: [openSlotEvent(SLOT_ID)],
       members: [USER_ID, '@peer:example.org', '@far:othersite.org'],
     });
-    const manager = new bindings.WasmRtcSessionManager(host);
-    await manager.attachRoom(ROOM_ID, undefined);
+    const client = new bindings.WasmRtcClient(host);
+    const room = await client.room(ROOM_ID, undefined);
 
     // Join, then deliver the sticky state as a server would echo it:
     // ourselves, plus one peer on our focus and one on a second focus.
-    const memberId = await manager.join({
-      room_id: ROOM_ID,
+    const call = await room.joinCall({
       slot_id: SLOT_ID,
       application: 'm.call',
       transport: { type: 'livekit', livekit_service_url: OWN_FOCUS },
     });
+    const memberId = call.memberId;
     host._sink(ROOM_ID).onStickyEvents([
       memberEventIn({ sender: USER_ID, deviceId: DEVICE_ID, memberId, slotId: SLOT_ID, focus: OWN_FOCUS }),
       memberEventIn({
@@ -126,10 +126,8 @@ describe('web media roster over a fake transport delegate', () => {
     ]);
 
     const { delegate, log } = fakeDelegate();
-    const session = await manager.connectMedia(
+    const session = await call.connectMedia(
       {
-        room_id: ROOM_ID,
-        slot_id: SLOT_ID,
         user_id: USER_ID,
         device_id: DEVICE_ID,
         livekit_service_url: OWN_FOCUS,

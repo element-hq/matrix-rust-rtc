@@ -112,15 +112,15 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
       slots: [openSlotEvent(SLOT_ID)],
       members: [USER_ID, '@peer:example.org'],
     });
-    const manager = new bindings.WasmRtcSessionManager(host);
-    await manager.attachRoom(ROOM_ID, undefined);
+    const client = new bindings.WasmRtcClient(host);
+    const rtcRoom = await client.room(ROOM_ID, undefined);
 
-    const memberId = await manager.join({
-      room_id: ROOM_ID,
+    const rtcCall = await rtcRoom.joinCall({
       slot_id: SLOT_ID,
       application: 'm.call',
       transport: { type: 'livekit', livekit_service_url: OWN_FOCUS },
     });
+    const memberId = rtcCall.memberId;
     // The sticky set as the server echoes it: ourselves plus one peer.
     host._sink(ROOM_ID).onStickyEvents([
       memberEventIn({ sender: USER_ID, deviceId: DEVICE_ID, memberId, slotId: SLOT_ID, focus: OWN_FOCUS }),
@@ -136,7 +136,7 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     const { module: livekit, instances } = fakeLivekit();
     const rosterUpdates = [];
     const call = new MatrixRtcCall({
-      manager,
+      call: rtcCall,
       bindings,
       livekit,
       fetchJson: () =>
@@ -148,8 +148,6 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     call.onParticipants = (roster) => rosterUpdates.push(roster);
 
     await call.connect({
-      roomId: ROOM_ID,
-      slotId: SLOT_ID,
       userId: USER_ID,
       deviceId: DEVICE_ID,
       livekitServiceUrl: OWN_FOCUS,

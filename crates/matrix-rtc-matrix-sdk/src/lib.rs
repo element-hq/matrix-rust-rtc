@@ -5,7 +5,7 @@
 
 //! The matrix-rust-sdk implementation of `matrix-rtc-core`'s `MatrixBackend`.
 //!
-//! [`SdkBackend`] turns a `matrix_sdk::Client` into the backend the core and
+//! [`SdkMatrixBackend`] turns a `matrix_sdk::Client` into the backend the core and
 //! the call layer drive: it sends, subscribes and reads through the SDK, and
 //! hands back DTOs so neither depends on SDK types. Everything that does not
 //! need the SDK — the Element Call dialects, the feeder, the transport choice —
@@ -13,4 +13,4 @@
 
 pub mod sdk;
 
-pub use sdk::{SdkBackend, TimelineIngest, timeline_ingest_from_raw};
+pub use sdk::{SdkMatrixBackend, TimelineIngest, timeline_ingest_from_raw};

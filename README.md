@@ -35,7 +35,7 @@ low-bandwidth mode). Everything underneath is hidden in Rust:
 
 ```rust,no_run
 use futures_util::StreamExt;
-use matrix_rtc_livekit::{Call, CallOptions};
+use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions};
 use matrix_rtc_media::{
     CallEvent, Dimensions, MediaConstraints, MediaStreamKind, PublishOptions, VideoDetail,
     VideoSourceConfig,
@@ -43,7 +43,7 @@ use matrix_rtc_media::{
 
 async fn video_call(room: &matrix_sdk::Room) -> Result<(), Box<dyn std::error::Error>> {
     // Membership signalling + key exchange + connections to every focus.
-    let call = Call::join(room, CallOptions::default()).await?;
+    let call = LiveKitCall::join(room, LiveKitCallOptions::default()).await?;
 
     // Publish the camera: push platform-captured I420 frames into the handle.
     let camera = call
@@ -86,7 +86,9 @@ The same model crosses the FFI boundary — on Android/Kotlin (media-enabled
 build, see below):
 
 ```kotlin
-val session = connectMediaSession(manager, config, tokenProvider)
+val room = client.room(roomId, FfiRoomOptions())
+val call = room.joinCall(params)
+val session = connectMediaSession(call, config)
 val stream = session.videoStream(memberId, FfiStreamKind.CAMERA)!!
 while (true) {
     val frame = stream.next() ?: break
@@ -111,18 +113,19 @@ for a runnable two-client example against the local backend.
   unit-tested against a fake transport.
 - `crates/matrix-rtc-livekit`: MSC4195 LiveKit transport — SFU token exchange,
   per-participant frame E2EE, the `MediaTransport` implementation, and the
-  high-level `Call::join` facade. Native-only (pulls in `libwebrtc`).
-- `crates/matrix-rtc-core`: single-session machine plus room-scoped session
-  manager and MSC4143/MSC4354 event conversion boundary.
-- `crates/matrix-rtc-call`: the call application — reactions, raised hand,
+  high-level `LiveKitCall::join` facade. Native-only (pulls in `libwebrtc`).
+- `crates/matrix-rtc-core`: the per-room MSC4143 core (`BaseRtcRoom`, a
+  `SlotSession` per slot) and the MSC4143/MSC4354 event conversion boundary.
+- `crates/matrix-rtc-call`: the host-facing objects (`RtcClient` → `RtcRoom` →
+  `RtcSession`/`RtcCall`) and the call application — reactions, raised hand,
   MSC4075 ringing — plus the feeder that subscribes through a host's
   `MatrixBackend` and feeds the core, the dialect wrapper and `compat` for
   pre-2026 Element Call wire formats, and the transport choice. No Matrix SDK,
   so it tests in seconds against no git dependencies.
-- `crates/matrix-rtc-matrix-sdk`: `SdkBackend`, the `MatrixBackend` over
+- `crates/matrix-rtc-matrix-sdk`: `SdkMatrixBackend`, the `MatrixBackend` over
   matrix-rust-sdk. **No LiveKit**.
 - `crates/matrix-rtc-ffi`: UniFFI-based Kotlin/Swift bindings — the
-  room-scoped manager API always, plus the media layer behind the `media`
+  client → room → call objects always, plus the media layer behind the `media`
   cargo feature (default off, keeps the slim artifact libwebrtc-free).
 - `crates/matrix-rtc-wasm`: wasm bindings for the web (signalling only —
   browsers keep using livekit-js for media).

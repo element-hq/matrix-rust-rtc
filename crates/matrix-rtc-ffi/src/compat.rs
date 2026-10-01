@@ -7,8 +7,8 @@
 //!
 //! The translation lives in [`matrix_rtc_call::compat`] and is applied by the
 //! library's feeder and dialect wrapper; nothing here re-implements a dialect.
-//! A host chooses the mode once, when it attaches the room
-//! ([`FfiAttachOptions::element_call_compat`](crate::FfiAttachOptions::element_call_compat)),
+//! A host chooses the mode once, when it opens the room
+//! ([`FfiRoomOptions::element_call_compat`](crate::FfiRoomOptions::element_call_compat)),
 //! and delivers the same raw events in every mode.
 //!
 //! What the mode decides: which room subjects the library subscribes to (no
@@ -17,13 +17,12 @@
 //! how an inbound media key is bound, the SFU participant identity and the
 //! token endpoint. Those must agree or the call connects and nothing decrypts.
 
-use matrix_rtc_call::compat::ingest;
-use matrix_rtc_call::compat::{ElementCallCompat, OutboundDialect};
+use matrix_rtc_call::compat::ElementCallCompat;
 
 /// Which MatrixRTC generation a session speaks, for interoperating with Element
 /// Call builds that predate the 2026 MSC4143 rewrite.
 ///
-/// Chosen when the room is attached, because it decides more than the wire
+/// Chosen when the room is opened, because it decides more than the wire
 /// format of one event: the
 /// `member.id` we join with, how an inbound media key is bound to a membership,
 /// the SFU participant identity, and which authorisation-service endpoint mints
@@ -69,20 +68,4 @@ impl From<FfiElementCallCompat> for ElementCallCompat {
 /// and every host not talking to Element Call, leave the field unset.
 pub(crate) fn resolve(compat: Option<FfiElementCallCompat>) -> ElementCallCompat {
     compat.unwrap_or_default().into()
-}
-
-/// See [`ingest::outbound_dialect`].
-pub(crate) fn outbound_dialect(
-    compat: ElementCallCompat,
-    user_id: &str,
-    device_id: &str,
-    room_id: &str,
-    slot_id: &str,
-) -> OutboundDialect {
-    ingest::outbound_dialect(compat, user_id, device_id, room_id, slot_id)
-}
-
-/// See [`ingest::member_id`].
-pub(crate) fn member_id(compat: ElementCallCompat, user_id: &str, device_id: &str) -> String {
-    ingest::member_id(compat, user_id, device_id)
 }

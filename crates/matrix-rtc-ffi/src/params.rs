@@ -86,8 +86,6 @@ impl From<FfiNotifyConfig> for matrix_rtc_call::NotifyConfig {
 /// FFI-friendly join session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiJoinSessionParams {
-    /// Room ID. The room must be attached first.
-    pub room_id: String,
     /// Slot ID (e.g., "m.call#ROOM")
     pub slot_id: String,
     /// Application type (e.g., "m.call")
@@ -226,7 +224,7 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
     }
 }
 
-/// Conversion from FFI join params to core join params.
+/// Conversion from FFI join params to the call layer's join options.
 impl FfiJoinSessionParams {
     /// One-line description for logs. Covers everything that decides whether a
     /// join is accepted and how the member is projected — including the
@@ -250,8 +248,7 @@ impl FfiJoinSessionParams {
         };
 
         format!(
-            "[{}/{}] application={} transport={} keep_alive={:?}ms encryption={} notify={:?}",
-            self.room_id,
+            "[{}] application={} transport={} keep_alive={:?}ms encryption={} notify={:?}",
             self.slot_id,
             self.application,
             transport,
@@ -281,35 +278,23 @@ impl FfiJoinSessionParams {
             .transpose()
     }
 
-    /// `user_id` and `device_id` come from the backend, `transport` from
-    /// [`Self::transport_intent`] or the library's choice.
-    pub fn into_core(
+    /// Who we are, the `member.id` and — when the join names none — the
+    /// transport are the library's to decide, so none of them is here. A
+    /// host-chosen `member.id` reused across joins would keep the MSC4195
+    /// participant identity stable while the key index restarts at 0, so peers
+    /// decrypt new media with a stale key and never recover.
+    pub(crate) fn into_call(
         self,
-        user_id: String,
-        device_id: String,
-        transport: matrix_rtc_core::TransportIntent,
-    ) -> Result<matrix_rtc_call::CallJoinParams, matrix_rtc_core::CommandError> {
-        let encryption_config = self.encryption_config.map(Into::into);
-        let rtc = matrix_rtc_core::JoinSessionParams {
-            user_id,
-            device_id,
-            // Filled in by the join entry points, which generate a fresh id per
-            // join and return it: a host-chosen `member.id` reused across joins
-            // keeps the MSC4195 participant identity stable while the key index
-            // restarts at 0, so peers decrypt new media with a stale key and
-            // never recover. The SDK owns it so that is not expressible.
-            membership_id: None,
-            room_id: self.room_id,
-            slot_id: self.slot_id,
-            application: self.application.into(),
-            transport,
-            keep_alive_timeout_ms: self.keep_alive_timeout_ms,
-            sticky_duration_ms: self.sticky_duration_ms,
-            degraded_lifetime_ms: self.degraded_lifetime_ms,
-            encryption_config,
-        };
-        Ok(matrix_rtc_call::CallJoinParams {
-            rtc,
+    ) -> Result<matrix_rtc_call::CallJoinOptions, matrix_rtc_core::CommandError> {
+        let transport = self.transport_intent()?;
+        let mut join = matrix_rtc_call::JoinOptions::new(self.slot_id, self.application);
+        join.transport = transport;
+        join.encryption_config = self.encryption_config.map(Into::into);
+        join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
+        join.sticky_duration_ms = self.sticky_duration_ms;
+        join.degraded_lifetime_ms = self.degraded_lifetime_ms;
+        Ok(matrix_rtc_call::CallJoinOptions {
+            join,
             notify: self.notify.map(Into::into),
             reactions: self.reactions.map(Into::into),
         })

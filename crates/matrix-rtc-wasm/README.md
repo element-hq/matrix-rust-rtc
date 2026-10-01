@@ -46,7 +46,7 @@ glue.
 
 ```js
 import init, * as bindings from 'matrix-rtc-wasm';
-import { ManagerOpQueue, MatrixRtcCall } from 'matrix-rtc-wasm/call';
+import { MatrixRtcCall } from 'matrix-rtc-wasm/call';
 import { MatrixHost, createMatrixSession } from 'matrix-rtc-wasm/matrix-js-sdk-host';
 import * as sdk from 'matrix-js-sdk';
 import * as livekit from 'livekit-client';
@@ -59,39 +59,43 @@ bindings.initLogging('info', '');
 const { client, userId, deviceId } =
   await createMatrixSession({ sdk, homeserverUrl, user, password });
 
-const managerOps = new ManagerOpQueue();       // see "Rules of the road"
 const host = new MatrixHost({ sdk, client });  // the MatrixBackendHost
-const manager = new bindings.WasmRtcSessionManager(host);
+const rtc = new bindings.WasmRtcClient(host);   // one per Matrix session; no I/O
 // Subscribes through the host and resolves once the room's current state is in.
-await managerOps.enqueue(() => manager.attachRoom(roomId, { element_call_compat: 'off' }));
+const rtcRoom = await rtc.room(roomId, { element_call_compat: 'off' });
 
 // 1. Publish our membership (starts the keep-alive machinery). The transport
 //    comes from the homeserver's /rtc/transports unless you pin one here.
-const memberId = await managerOps.enqueue(() =>
-  manager.join({
-    room_id: roomId,
-    slot_id: 'm.call#ROOM',
-    application: 'm.call',
-  }),
-);
+const rtcCall = await rtcRoom.joinCall({ slot_id: 'm.call#ROOM', application: 'm.call' });
 
 // 2. Attach media: roster + LiveKit connection lifecycle.
 const call = new MatrixRtcCall({
-  manager,
+  call: rtcCall,
   bindings,
   livekit,
-  managerOps,
   roomOptions: { e2ee: { worker: new E2EEWorker() } },
 });
 call.onParticipants = (roster) => render(roster); // entries carry rtc_identity
 call.onEvent = (event) => console.log(event);     // key_imported, stream_started, ...
-await call.connect({ roomId, slotId: 'm.call#ROOM', userId, deviceId,
-                     livekitServiceUrl: focusUrl });
+await call.connect({ userId, deviceId, livekitServiceUrl: focusUrl });
 
 // 3. Media is livekit-js as usual, via the rooms the wrapper opened.
 const room = call.rooms.get(focusUrl);
 await room.localParticipant.enableCameraAndMicrophone();
+
+// 4. Hang up: media, then our membership, then the room's subscription.
+await call.disconnect();
+await rtcCall.leave({});
+await rtcRoom.close();
 ```
+
+The objects are client → room → call. `rtc.room(...)` refuses a room that
+already has a live room object. `rtcRoom.close()` leaves every call joined
+through it, then unsubscribes; freeing a room or a call (`free()`, or garbage
+collection) sends no leave — the membership expires through its delayed
+leave. A call is over once left or once its room is closed (`isLive`), and
+joining the slot again yields a new one. The library does not detect
+incoming calls: a ring reaches the page through its own Matrix client.
 
 Every roster entry is
 `{ member_id, user_id, device_id, is_local, reachable, streams, rtc_identity }`;
@@ -104,7 +108,7 @@ Only needed when you bring your own Matrix stack instead of
 `matrix-rtc-wasm/matrix-js-sdk-host` (which implements all of this section;
 `web/src/matrix-js-sdk-host.mjs` is the reference).
 
-`new WasmRtcSessionManager(host)` takes a `MatrixBackendHost` (typed in the
+`new WasmRtcClient(host)` takes a `MatrixBackendHost` (typed in the
 generated `.d.ts`): identity, the sends, and the subscriptions Rust feeds
 itself from. Contents arrive as plain JS objects; every send returns a
 Promise. With matrix-js-sdk (v42+):
@@ -127,7 +131,7 @@ Promise. With matrix-js-sdk (v42+):
 
 `subscribeRoom` is where the room reaches Rust. Every subscription wants the
 room's encryption state, its joined members and its sticky events; `subjects`
-adds what the attached mode needs on top (`state_event_types`,
+adds what the room's mode needs on top (`state_event_types`,
 `timeline_event_types`). Deliver each as the room's **complete current set**,
 once as soon as you subscribe and again on every change (the first set may be
 the one at subscription time, not a later one):
@@ -153,14 +157,14 @@ messages are `{ sender, event_type, content, encryption }` with the Olm sender
 metadata and cross-signing status — MSC4153 discards keys from devices that are
 not cross-signed, so bootstrap cross-signing before joining anything encrypted.
 
-The page owns every clock: call `manager.heartbeat(roomId, slotId)` on an
-interval (`HEARTBEAT_INTERVAL_MS()`, 10 s) while joined — without it the dead
-man's switch fires and peers see you depart mid-call. `detachRoom(roomId)`
-leaves any joined slot in the room and cancels its subscription.
+The page owns every clock: call `rtcCall.heartbeat()` on an interval
+(`HEARTBEAT_INTERVAL_MS()`, 10 s) while joined — without it the dead man's
+switch fires and peers see you depart mid-call. `MatrixRtcCall.connect` starts
+that interval for you.
 
 ### Element Call compatibility
 
-Pass `element_call_compat` on `attachRoom` — `"off"` (default, spec-current),
+Pass `element_call_compat` when opening the room (`rtc.room`) — `"off"` (default, spec-current),
 `"sticky_events"` (Element Call "Matrix 2.0", 2025), or `"state_events"`
 (what deployed Element Call speaks) — and the library handles the rest:
 which room state it subscribes to, the inbound translation, outbound
@@ -175,15 +179,14 @@ no streams and its keys bind to nothing.
 
 ## Rules of the road
 
-- **One in-flight manager call at a time.** The wasm object throws
-  `"recursive use of an object"` on concurrent calls, and several methods
-  await your Matrix client mid-call. Route every manager call — attach,
-  join/leave, heartbeat — through one shared `ManagerOpQueue`. Sink calls
-  from your subscriptions are exempt: they only queue.
+- **Calls may overlap; frees may not.** Calls on the client, a room and a
+  call can be in flight together — each serialises inside Rust. Freeing an
+  object while one of its calls is pending throws, as does calling the media
+  session while its `disconnect()` runs.
 - **Plain objects, not ES `Map`s**, for everything you hand the binding
   (the binding already guarantees the reverse direction).
-- The `member.id` is generated per join and returned by `join(...)` — never
-  supply or reuse one; read it back with `ownMemberId` when needed.
+- The `member.id` is generated per join (`rtcCall.memberId`) — never supply
+  or reuse one.
 - Frame E2EE on the web means a **per-participant** key provider and
   `room.setE2EEEnabled(true)`; `MatrixRtcCall` does both (livekit-js's
   `ExternalE2EEKeyProvider` is shared-key — wrong for MSC4195).
@@ -196,7 +199,7 @@ no streams and its keys bind to nothing.
 ## Testing
 
 - `wasm-pack test --node crates/matrix-rtc-wasm` — the binding's own tests.
-- `cd web && npm test` — the wrapper and roster against fakes.
+- `cd web && npm run test:vitest` — the wrapper and roster against fakes.
 - `make test-interop` — the real thing: this binding in a browser sharing
   encrypted calls with the native stack and with Element Call (both
   dialects), against a real homeserver and SFU. See `interop/README.md`.

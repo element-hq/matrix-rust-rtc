@@ -5,20 +5,22 @@
 
 //! The call application over `matrix-rtc-core`, which is application-agnostic:
 //! Element Call's reactions and raised hand ([`reactions`]), MSC4075 ringing
-//! ([`notification`]), and the host-facing [`CallSessionManager`].
+//! ([`notification`]), and the host-facing [`RtcClient`] → [`RtcRoom`] →
+//! [`RtcSession`] / [`RtcCall`].
 //!
 //! It also holds how a host's `MatrixBackend` reaches the call, none of which
 //! needs a Matrix SDK: [`compat`], translation to and from the pre-2026
 //! dialects Element Call still speaks, with [`DialectBackend`], the backend
 //! wrapper that renders sends in a room's dialect; [`feeder`], which subscribes,
-//! seeds, orders and funnels a room into the manager; and [`transports`], which
+//! seeds, orders and funnels a room into the call; and [`transports`], which
 //! transport a join publishes on.
 
+mod client;
 pub mod compat;
 pub mod feeder;
-mod manager;
 pub mod notification;
 pub mod reactions;
+mod room_state;
 pub mod transports;
 
 pub use compat::{
@@ -27,11 +29,14 @@ pub use compat::{
     STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
 };
 pub use feeder::{
-    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomFeederRun, RoomModes,
-    RoomReservation, ToDeviceFeeder, ToDeviceFeederRun,
+    RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomFeederRun, RoomRegistry, ToDeviceFeeder,
+    ToDeviceFeederRun,
 };
 
-pub use manager::{CallJoinParams, CallSessionManager};
+pub use client::{
+    CallJoinOptions, JoinOptions, RoomOptions, RoomRuns, RtcCall, RtcClient, RtcError, RtcRoom,
+    RtcSession,
+};
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,

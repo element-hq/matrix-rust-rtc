@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! The FFI media session: the host-facing equivalent of the native `Call`
-//! facade's media half, layered on a slot the host has already joined
-//! through the [`RtcSessionManagerHandle`](crate::RtcSessionManagerHandle).
+//! The FFI media session: the host-facing equivalent of the native `LiveKitCall`
+//! facade's media half, layered on a call the host has already joined
+//! ([`RtcCall`](crate::RtcCall)).
 
 use std::sync::Arc;
 
@@ -30,13 +30,12 @@ use super::types::{
     FfiTileRoster, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
-use crate::RtcSessionManagerHandle;
+use crate::RtcCall;
 
-/// Identifies the joined slot to attach media to, and how to reach the SFU.
+/// How to reach the SFU for a joined call. The call itself says which room and
+/// slot.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct MediaSessionConfig {
-    pub room_id: String,
-    pub slot_id: String,
     pub user_id: String,
     pub device_id: String,
     /// The MSC4195 authorisation-service URL of the focus we publish on —
@@ -48,35 +47,33 @@ pub struct MediaSessionConfig {
     pub stability: Option<FfiStabilityConfig>,
 }
 
-/// Attach media to a joined slot: wire frame-key signalling into the core,
+/// Attach media to a joined call: wire frame-key signalling into the core,
 /// start the engine (which connects to every peer's focus), and connect the
 /// own-focus SFU with per-participant frame E2EE.
 ///
-/// Preconditions: the room is attached and `join` succeeded for this
-/// room/slot. The `member.id` comes from that join — the host neither chooses
-/// nor passes it. OpenID tokens for the SFU exchange come from the backend.
+/// The `member.id` comes from the call's join — the host neither chooses nor
+/// passes it. OpenID tokens for the SFU exchange come from the backend.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn connect_media_session(
-    manager: Arc<RtcSessionManagerHandle>,
+    call: Arc<RtcCall>,
     config: MediaSessionConfig,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
     // Everything media lives on the dedicated runtime; hopping onto it here
     // means every internally spawned task (engine actor, pool, IO) inherits
     // the right context regardless of which thread the FFI call came in on.
     runtime()
-        .spawn(build_media_session(manager, config))
+        .spawn(build_media_session(call, config))
         .await
         .map_err(|error| MediaFfiError::Transport(format!("media task panicked: {error}")))?
 }
 
 async fn build_media_session(
-    manager: Arc<RtcSessionManagerHandle>,
+    call: Arc<RtcCall>,
     config: MediaSessionConfig,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
+    let (room_id, slot_id) = (call.room_id(), call.slot_id());
     log::info!(
-        "media: connecting [{}/{}] user={} device={} focus={}",
-        config.room_id,
-        config.slot_id,
+        "media: connecting [{room_id}/{slot_id}] user={} device={} focus={}",
         config.user_id,
         config.device_id,
         config.livekit_service_url,
@@ -88,12 +85,10 @@ async fn build_media_session(
     // already published is not an error but a silence — peers sit in the roster
     // with no media, keys install under an identity the SFU never assigned, and
     // nothing logs a problem. See `crate::compat`.
-    let compat = manager.element_call_compat_for(&config.room_id);
+    let compat = call.element_call_compat();
     if compat != ElementCallCompat::Off {
         log::info!(
-            "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
-            config.room_id,
-            config.slot_id,
+            "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode {compat:?}",
         );
     }
     // Call it once and share the `Arc`: it has four uses here — the core's
@@ -109,67 +104,39 @@ async fn build_media_session(
 
     // Wire the core's encryption manager to the bridge and to the MSC4195
     // identity derivation, and take the membership snapshot channel the engine
-    // consumes.
-    let (memberships, raised_hands, reactions, member_id) = {
-        let mut mgr = manager.inner.lock().await;
-        // Read the `member.id` from the join rather than taking one from the
-        // host: it is what our MSC4195 participant identity is derived from, so
-        // a value that disagrees with the published membership would put our
-        // media on an identity no peer holds a key for.
-        let member_id = mgr
-            .own_member_id(&config.room_id, &config.slot_id)
-            .ok_or_else(|| {
-                log::warn!(
-                    "media: [{}/{}] has not joined — join the slot before connecting media",
-                    config.room_id,
-                    config.slot_id,
-                );
-                MediaFfiError::NotJoined(format!(
-                    "{}/{} has not joined — join the slot first",
-                    config.room_id, config.slot_id
-                ))
-            })?;
-        let raised_hands = mgr.subscribe_raised_hands(&config.room_id, &config.slot_id);
-        let reactions = mgr.subscribe_reactions(&config.room_id, &config.slot_id);
-        let memberships = mgr
-            .subscribe_membership_snapshots(&config.room_id, &config.slot_id)
-            .ok_or_else(|| {
-                log::warn!(
-                    "media: no session for [{}/{}] — join the slot before connecting media",
-                    config.room_id,
-                    config.slot_id,
-                );
-                MediaFfiError::NotJoined(format!(
-                    "no session for {}/{} — join the slot first",
-                    config.room_id, config.slot_id
-                ))
-            })?;
-        // Mapper before handler: the replay below derives identities through it,
-        // and installing it second would replay peer keys under the raw
-        // `member_id` fallback — an identity the SFU never uses, which is
-        // indistinguishable from importing nothing.
-        mgr.set_encryption_identity_mapper(
-            &config.room_id,
-            &config.slot_id,
-            identity_mapper.clone(),
+    // consumes. The `member.id` is the join's rather than the host's: it is
+    // what our MSC4195 participant identity is derived from, so a value that
+    // disagrees with the published membership would put our media on an
+    // identity no peer holds a key for.
+    let joined = call.inner();
+    if !joined.is_live() {
+        log::warn!("media: [{room_id}/{slot_id}] the call is over — join again first");
+        return Err(MediaFfiError::NotJoined(format!(
+            "{room_id}/{slot_id} is over — join the slot first"
+        )));
+    }
+    let member_id = joined.member_id().to_owned();
+    let raised_hands = joined.subscribe_raised_hands().await;
+    let reactions = joined.subscribe_reactions().await;
+    let memberships = joined.subscribe_memberships().await;
+    // Mapper before handler: the replay below derives identities through it,
+    // and installing it second would replay peer keys under the raw
+    // `member_id` fallback — an identity the SFU never uses, which is
+    // indistinguishable from importing nothing.
+    joined
+        .set_encryption_identity_mapper(identity_mapper.clone())
+        .await;
+    if !joined.set_encryption_signal_handler(bridge.clone()).await {
+        log::warn!(
+            "media: call [{room_id}/{slot_id}] has no encryption manager — join the slot first",
         );
-
-        if !mgr.set_encryption_signal_handler(&config.room_id, &config.slot_id, bridge.clone()) {
-            log::warn!(
-                "media: session [{}/{}] has no encryption manager — join the slot first",
-                config.room_id,
-                config.slot_id,
-            );
-            return Err(MediaFfiError::NotJoined(
-                "the session has no encryption manager — join the slot first".into(),
-            ));
-        }
-
-        (memberships, raised_hands, reactions, member_id)
-    };
+        return Err(MediaFfiError::NotJoined(
+            "the call has no encryption manager — join the slot first".into(),
+        ));
+    }
 
     let transport = Arc::new(
-        LiveKitMediaTransport::new(reqwest::Client::new(), manager.backend(), provider)
+        LiveKitMediaTransport::new(reqwest::Client::new(), call.backend(), provider)
             // The same mapper the core got, so our own identity, the peers' and the
             // key ring's all agree.
             .with_identity_mapper(identity_mapper.clone())
@@ -182,8 +149,8 @@ async fn build_media_session(
             }),
     );
     let ctx = ConnectionContext {
-        room_id: config.room_id.clone(),
-        slot_id: config.slot_id.clone(),
+        room_id: room_id.clone(),
+        slot_id: slot_id.clone(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: config.user_id.clone(),
@@ -229,11 +196,7 @@ async fn build_media_session(
     // the bug this replay exists to fix. Still before `connect_livekit`, so the
     // key ring is populated before the first frame can arrive.
     //
-    {
-        let mgr = manager.inner.lock().await;
-        mgr.replay_encryption_keys(&config.room_id, &config.slot_id)
-            .await;
-    }
+    joined.replay_encryption_keys().await;
 
     // Own focus connects synchronously so a broken SFU fails this call
     // instead of surfacing later as a dead session.
@@ -287,8 +250,8 @@ async fn build_media_session(
 /// unified event stream, per-stream constraints, frame streams, and local
 /// publications — with no transport types on the surface.
 ///
-/// End it with [`MediaSession::disconnect`]; leaving the slot itself stays a
-/// manager concern (`RtcSessionManagerHandle::leave`).
+/// End it with [`MediaSession::disconnect`]; leaving the slot itself stays the
+/// call's (`RtcCall::leave`).
 #[derive(uniffi::Object)]
 pub struct MediaSession {
     engine: CallEngine,
@@ -538,7 +501,7 @@ impl MediaSession {
 
     /// End the media session: emits `Ended { Left }`, closes every
     /// peer-focus connection, then the own-focus one. Leave the slot via the
-    /// manager separately.
+    /// call separately.
     ///
     /// (Named `disconnect` rather than `close`: uniffi already gives every
     /// Kotlin object an `AutoCloseable.close()` for handle disposal, and a
