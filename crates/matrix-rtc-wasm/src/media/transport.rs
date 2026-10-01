@@ -6,7 +6,7 @@
 //! The browser LiveKit transport: `matrix-rtc-media`'s transport traits over a
 //! JS delegate driving livekit-js.
 //!
-//! The division of labour mirrors [`JsCommandSender`](crate::JsCommandSender):
+//! The division of labour mirrors [`JsBackend`](crate::backend::JsBackend):
 //! Rust owns the protocol — token request building and response decoding
 //! (`matrix-rtc-livekit-proto`), identity derivation, connection keying, and
 //! the engine's pool/backoff policy — while JS owns the IO: the OpenID token

@@ -88,8 +88,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .danger_accept_invalid_certs(insecure_tls)
         .build()?;
 
-    // 4. Token exchange + SFU connect (subscribe-only). The `matrix_sdk::Client`
-    //    is the `OpenIdTokenSource` (via the `matrix-sdk` feature).
+    // 4. Token exchange + SFU connect (subscribe-only). `SdkBackend` over the
+    //    `matrix_sdk::Client` supplies the OpenID token.
     println!(
         "connecting to the SFU for room {} slot {}...",
         config.room_id, config.slot_id

@@ -287,17 +287,13 @@ Benign build noise with `MEDIA=1`: uniffi-bindgen warns about a missing
 **Host app responsibilities with media** (see the module docs in
 `crates/matrix-rtc-ffi/src/media/mod.rs` for the full flow):
 
-- Join the slot through the manager first, then call
-  `connectMediaSession(manager, config, tokenProvider)`.
-- Implement `OpenIdTokenProvider` with your Matrix client (it is called for
-  peers' foci too).
-- Feed decrypted `m.rtc.encryption_key` to-device messages to
-  `manager.receiveEncryptionKey(...)`; outbound keys already flow through
-  your `CommandSenderCallback`. Keys that arrive before
-  `connectMediaSession` are replayed into the transport on attach, so the
-  order of "join, receive keys, connect media" does not matter.
-- Include `transports_json` on the sticky events you feed in — without it
-  peers project as media-unreachable.
+- Attach the room and join the slot through the manager first, then call
+  `connectMediaSession(manager, config)`.
+- Media keys and the OpenID token (asked for peers' foci too) go through
+  the same `MatrixBackend` you built the manager with — there is nothing
+  extra to implement. Keys that arrive before `connectMediaSession` are
+  replayed into the transport on attach, so the order of "join, receive
+  keys, connect media" does not matter.
 - Render frames from `videoStream(...).next()`: either the safe `data(plane)`
   copies, or zero-copy via `planePtr(plane)`/`stride(plane)`/`planeLen(plane)`
   while holding the frame object.

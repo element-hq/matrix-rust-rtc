@@ -24,17 +24,19 @@ arms no timers: the host calls `heartbeat` periodically while joined.
 use std::sync::Arc;
 
 use matrix_rtc_core::{
-    JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, RawStickyEvent,
-    MatrixBackend, RtcSessionManager, RtcTransport,
+    JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, MatrixBackend,
+    RawStickyEvent, RtcSessionManager, RtcTransport,
 };
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "org.example.board#ROOM";
 
 async fn run(
-    // The host's route to its Matrix client.
+    // The host's Matrix client, behind the one trait the library knows.
     backend: Arc<impl MatrixBackend + 'static>,
-    // The room's current sticky events, as the host's client reports them.
+    // The room's current membership, already translated. In practice the
+    // feeder in `matrix-rtc-bridge` subscribes through the backend and
+    // produces these; a host does not build them by hand.
     sticky_events: Vec<RawStickyEvent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut manager = RtcSessionManager::with_backend(backend);
@@ -73,5 +75,11 @@ async fn run(
 ```
 
 The same memberships are also on a watch: `subscribe_membership_snapshots(room_id, slot_id)`.
+
+The core spawns nothing and never reads from the backend itself: the read half
+of `MatrixBackend` (room and to-device subscriptions, `/relations`, the OpenID
+token, `GET /rtc/transports`) is driven by `matrix_rtc_bridge::feeder`, which
+is what the bindings and the `Call` facade use. `testing::MockBackend` records
+every send and lets a test deliver sets into the sinks.
 
 For a call, use `matrix-rtc-call`'s `CallSessionManager`, which wraps this manager.
