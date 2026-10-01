@@ -105,7 +105,7 @@ wasm trait) and `matrix_rtc_bridge::SdkBackend` (a real `matrix_sdk::Client`)
 are two implementations, and the core cannot tell them apart.
 
 The core does nothing with the read half itself — it spawns no tasks. The
-**feeder** in `matrix-rtc-bridge` (`RoomFeeder`, `SessionFeeder`) subscribes
+**feeder** in `matrix-rtc-bridge` (`RoomFeeder`, `ToDeviceFeeder`) subscribes
 through the backend, orders what arrives (encryption and slots and members
 before the first membership, so nobody is briefly joined to a closed slot),
 derives `EventOrigin`/`KeyOrigin` from the decryption facts the client
@@ -168,7 +168,7 @@ below**. This is the topology of the e2e call test, `join_and_record`,
 `matrix_sdk::Client`, so it is gated on `matrix-sdk`. But the wiring under it
 is no longer its own: `Call::join`, the FFI's `RtcSessionManagerHandle` and the
 wasm `WasmRtcSessionManager` all do the same three things — wrap the backend in
-`DialectBackend`, start the `SessionFeeder`, attach rooms through `RoomFeeder`
+`DialectBackend`, start the `ToDeviceFeeder`, attach rooms through `RoomFeeder`
 — and then join. What differs between them is only where the backend comes
 from and how the feeder's run loop is spawned (`tokio::spawn`, the FFI runtime,
 `spawn_local`).
@@ -215,7 +215,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   knows what a LiveKit SFU is, so a second transport reuses it unchanged.
 - `feeder` (always available): `RoomFeeder::attach` subscribes a room through
   the backend and runs the routing described under "Who drives the call";
-  `SessionFeeder` does the same for to-device keys. `RoomAttachment::seeded`
+  `ToDeviceFeeder` does the same for to-device keys. `RoomAttachment::seeded`
   resolves once the room's current state has been applied, which is what the
   bindings' `attach_room` awaits.
 - `compat::dialect_backend::DialectBackend` (always available): the one

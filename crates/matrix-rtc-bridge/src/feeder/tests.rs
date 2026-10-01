@@ -390,14 +390,14 @@ async fn nothing_delivered_after_detach_is_applied() {
 }
 
 #[tokio::test]
-async fn the_session_feeder_subscribes_to_both_key_generations() {
+async fn the_to_device_feeder_subscribes_to_both_key_generations() {
     let mock = Arc::new(MockBackend::new());
     let backend = Arc::new(DialectBackend::new(mock.clone()));
     let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
         backend.clone(),
     )));
     let modes = RoomModes::default();
-    let (feeder, run) = SessionFeeder::start(backend, manager, modes)
+    let (feeder, run) = ToDeviceFeeder::start(backend, manager, modes)
         .await
         .expect("start");
     tokio::spawn(run.run());
@@ -457,7 +457,7 @@ async fn dropping_the_session_feeder_ends_its_subscription() {
     let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
         backend.clone(),
     )));
-    let (feeder, _run) = SessionFeeder::start(backend, manager, RoomModes::default())
+    let (feeder, _run) = ToDeviceFeeder::start(backend, manager, RoomModes::default())
         .await
         .expect("start");
     let subscription = mock.to_device_subscription().unwrap();

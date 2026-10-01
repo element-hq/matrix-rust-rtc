@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use matrix_rtc_bridge::compat::{DialectBackend, ElementCallCompat, ingest};
 use matrix_rtc_bridge::feeder::{
-    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
+    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, ToDeviceFeeder,
 };
 use matrix_rtc_bridge::transports;
 use matrix_rtc_call::{
@@ -69,7 +69,7 @@ pub struct WasmRtcSessionManager {
     /// The attached rooms, by room id. Freeing the manager detaches them.
     rooms: AttachedRooms<RoomAttachment>,
     /// The session-wide to-device subscription, started by the first attach.
-    session_feeder: RefCell<Option<SessionFeeder>>,
+    to_device_feeder: RefCell<Option<ToDeviceFeeder>>,
 }
 
 #[wasm_bindgen]
@@ -91,7 +91,7 @@ impl WasmRtcSessionManager {
             backend,
             modes: RoomModes::default(),
             rooms: AttachedRooms::default(),
-            session_feeder: RefCell::new(None),
+            to_device_feeder: RefCell::new(None),
         }
     }
 
@@ -121,7 +121,7 @@ impl WasmRtcSessionManager {
         )?;
         log::info!("manager: [{room_id}] attaching in {compat:?} mode");
 
-        self.ensure_session_feeder().await?;
+        self.ensure_to_device_feeder().await?;
 
         let (attachment, run) = RoomFeeder::attach(
             self.backend.clone(),
@@ -501,16 +501,16 @@ impl WasmRtcSessionManager {
 
 impl WasmRtcSessionManager {
     /// The session-wide to-device subscription, started once.
-    async fn ensure_session_feeder(&self) -> Result<(), JsError> {
-        if self.session_feeder.borrow().is_some() {
+    async fn ensure_to_device_feeder(&self) -> Result<(), JsError> {
+        if self.to_device_feeder.borrow().is_some() {
             return Ok(());
         }
         let (feeder, run) =
-            SessionFeeder::start(self.backend.clone(), self.inner.clone(), self.modes.clone())
+            ToDeviceFeeder::start(self.backend.clone(), self.inner.clone(), self.modes.clone())
                 .await
                 .map_err(|err| JsError::new(&err.to_string()))?;
         wasm_bindgen_futures::spawn_local(run.run());
-        *self.session_feeder.borrow_mut() = Some(feeder);
+        *self.to_device_feeder.borrow_mut() = Some(feeder);
         log::info!("manager: to-device subscription started");
         Ok(())
     }

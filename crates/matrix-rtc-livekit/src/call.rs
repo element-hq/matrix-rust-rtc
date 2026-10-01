@@ -47,7 +47,7 @@ use tokio::task::JoinHandle;
 use matrix_rtc_bridge::compat::ingest::outbound_dialect;
 use matrix_rtc_bridge::compat::{self, DialectBackend, ElementCallCompat};
 use matrix_rtc_bridge::feeder::{
-    AttachOptions, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
+    AttachOptions, RoomAttachment, RoomFeeder, RoomModes, ToDeviceFeeder,
 };
 use matrix_rtc_bridge::{SdkBackend, transports};
 use matrix_rtc_call::{
@@ -248,7 +248,7 @@ pub struct Call {
     heartbeat: AbortOnDrop,
     rotation_pump: AbortOnDrop,
     attachment: RoomAttachment,
-    session_feeder: SessionFeeder,
+    to_device_feeder: ToDeviceFeeder,
     _room_feed: AbortOnDrop,
     _session_feed: AbortOnDrop,
 }
@@ -316,8 +316,8 @@ impl Call {
         // to what the mode needs, seeds room state before membership and
         // funnels the dialects. Both run on this `LocalSet`.
         let modes = RoomModes::default();
-        let (session_feeder, session_run) =
-            SessionFeeder::start(backend.clone(), manager.clone(), modes.clone())
+        let (to_device_feeder, session_run) =
+            ToDeviceFeeder::start(backend.clone(), manager.clone(), modes.clone())
                 .await
                 .map_err(signalling_error)?;
         let session_feed = AbortOnDrop(tokio::task::spawn_local(session_run.run()));
@@ -580,7 +580,7 @@ impl Call {
                 // peers don't wait on the dead man's switch to notice.
                 drop(heartbeat);
                 attachment.detach();
-                session_feeder.stop();
+                to_device_feeder.stop();
                 if let Err(leave_error) = manager
                     .lock()
                     .await
@@ -636,7 +636,7 @@ impl Call {
             heartbeat,
             rotation_pump,
             attachment,
-            session_feeder,
+            to_device_feeder,
             _room_feed: room_feed,
             _session_feed: session_feed,
         })
@@ -831,7 +831,7 @@ impl Call {
             heartbeat,
             rotation_pump,
             attachment,
-            session_feeder,
+            to_device_feeder,
             room_id,
             slot_id,
             ..
@@ -852,7 +852,7 @@ impl Call {
         // After the leave, whose cancel of the delayed event still goes through
         // the backend; the feeders are not needed for that.
         attachment.detach();
-        session_feeder.stop();
+        to_device_feeder.stop();
         log::debug!(
             "[{room_id}] leave: matrix leave {}; shutting down the media engine",
             if leave_result.is_ok() {

@@ -31,7 +31,7 @@ is the feeder, over the core manager:
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use matrix_rtc_bridge::{AttachOptions, RoomFeeder, RoomModes, SessionFeeder};
+use matrix_rtc_bridge::{AttachOptions, RoomFeeder, RoomModes, ToDeviceFeeder};
 use matrix_rtc_bridge::compat::DialectBackend;
 use matrix_rtc_core::{
     JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, MatrixBackend,
@@ -60,7 +60,7 @@ async fn run(
     // returns the future that applies what arrives; run it where you like
     // (the futures are `!Send`: a `LocalSet`, or `spawn_local` on wasm).
     let modes = RoomModes::default();
-    let (_keys, keys_run) = SessionFeeder::start(backend.clone(), manager.clone(), modes.clone()).await?;
+    let (_keys, keys_run) = ToDeviceFeeder::start(backend.clone(), manager.clone(), modes.clone()).await?;
     tokio::task::spawn_local(keys_run.run());
     let (attachment, room_run) = RoomFeeder::attach(
         backend.clone(), manager.clone(), modes, ROOM.to_owned(), AttachOptions::default(),

@@ -51,7 +51,7 @@ pub use compat::{
 };
 pub use feeder::{
     AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomFeederRun, RoomModes,
-    RoomReservation, SessionFeeder, SessionFeederRun,
+    RoomReservation, ToDeviceFeeder, ToDeviceFeederRun,
 };
 
 pub use matrix_rtc_core::OpenIdToken;

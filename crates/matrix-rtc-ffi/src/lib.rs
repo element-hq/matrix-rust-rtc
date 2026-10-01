@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use matrix_rtc_bridge::compat::DialectBackend;
 use matrix_rtc_bridge::feeder::{
-    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
+    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, ToDeviceFeeder,
 };
 use matrix_rtc_bridge::transports;
 use matrix_rtc_call::CallSessionManager;
@@ -281,7 +281,7 @@ pub struct RtcSessionManagerHandle {
     /// The attached rooms, by room id. Dropping the handle detaches them.
     rooms: AttachedRooms<AttachedRoom>,
     /// The session-wide to-device subscription, started by the first attach.
-    session_feeder: TokioMutex<Option<(SessionFeeder, AbortOnDrop)>>,
+    to_device_feeder: TokioMutex<Option<(ToDeviceFeeder, AbortOnDrop)>>,
 }
 
 /// How often the keep-alive is driven.
@@ -363,7 +363,7 @@ impl RtcSessionManagerHandle {
             heartbeats: Mutex::new(HashMap::new()),
             modes: RoomModes::default(),
             rooms: AttachedRooms::default(),
-            session_feeder: TokioMutex::new(None),
+            to_device_feeder: TokioMutex::new(None),
         })
     }
 
@@ -385,7 +385,7 @@ impl RtcSessionManagerHandle {
         let compat = compat::resolve(options.element_call_compat);
         log::info!("manager: [{room_id}] attaching in {compat:?} mode");
 
-        self.ensure_session_feeder().await?;
+        self.ensure_to_device_feeder().await?;
 
         let (attachment, run) = RoomFeeder::attach(
             self.backend.clone(),
@@ -789,13 +789,13 @@ impl RtcSessionManagerHandle {
 
 impl RtcSessionManagerHandle {
     /// The session-wide to-device subscription, started once.
-    async fn ensure_session_feeder(&self) -> Result<(), MatrixRtcFfiError> {
-        let mut slot = self.session_feeder.lock().await;
+    async fn ensure_to_device_feeder(&self) -> Result<(), MatrixRtcFfiError> {
+        let mut slot = self.to_device_feeder.lock().await;
         if slot.is_some() {
             return Ok(());
         }
         let (feeder, run) =
-            SessionFeeder::start(self.backend.clone(), self.inner.clone(), self.modes.clone())
+            ToDeviceFeeder::start(self.backend.clone(), self.inner.clone(), self.modes.clone())
                 .await?;
         *slot = Some((feeder, AbortOnDrop(runtime::runtime().spawn(run.run()))));
         log::info!("manager: to-device subscription started");

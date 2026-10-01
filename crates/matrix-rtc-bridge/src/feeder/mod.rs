@@ -46,7 +46,7 @@ pub struct AttachOptions {
 }
 
 /// The compatibility mode of every attached room, shared between the room
-/// feeders that register it and the session feeder that binds legacy keys by
+/// feeders that register it and the to-device feeder that binds legacy keys by
 /// it.
 #[derive(Clone, Default)]
 pub struct RoomModes(Arc<StdMutex<HashMap<String, ElementCallCompat>>>);
@@ -710,20 +710,20 @@ impl ToDeviceSink for ChannelToDeviceSink {
 }
 
 /// The session-wide to-device subscription. Dropping it stops it.
-pub struct SessionFeeder {
+pub struct ToDeviceFeeder {
     subscription: Arc<dyn Subscription>,
     stop: mpsc::UnboundedSender<Option<ToDeviceMessageIn>>,
 }
 
-impl SessionFeeder {
+impl ToDeviceFeeder {
     /// Subscribes to media keys of both generations and returns the future
     /// that routes them to the manager. The caller spawns
-    /// [`SessionFeederRun::run`].
+    /// [`ToDeviceFeederRun::run`].
     pub async fn start<B, M>(
         backend: Arc<B>,
         manager: Arc<Mutex<M>>,
         modes: RoomModes,
-    ) -> Result<(SessionFeeder, SessionFeederRun<B, M>), BackendError>
+    ) -> Result<(ToDeviceFeeder, ToDeviceFeederRun<B, M>), BackendError>
     where
         B: MatrixBackend + 'static,
         M: ApplicationIntake<B>,
@@ -733,11 +733,11 @@ impl SessionFeeder {
         let event_types = KEY_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect();
         let subscription = backend.subscribe_to_device(event_types, sink).await?;
         Ok((
-            SessionFeeder {
+            ToDeviceFeeder {
                 subscription,
                 stop: tx,
             },
-            SessionFeederRun {
+            ToDeviceFeederRun {
                 manager,
                 modes,
                 rx,
@@ -751,7 +751,7 @@ impl SessionFeeder {
     }
 }
 
-impl Drop for SessionFeeder {
+impl Drop for ToDeviceFeeder {
     fn drop(&mut self) {
         self.subscription.cancel();
         let _ = self.stop.send(None);
@@ -759,14 +759,14 @@ impl Drop for SessionFeeder {
 }
 
 /// The future that routes media keys. Ends on stop.
-pub struct SessionFeederRun<B, M> {
+pub struct ToDeviceFeederRun<B, M> {
     manager: Arc<Mutex<M>>,
     modes: RoomModes,
     rx: mpsc::UnboundedReceiver<Option<ToDeviceMessageIn>>,
     _backend: Arc<B>,
 }
 
-impl<B, M> SessionFeederRun<B, M>
+impl<B, M> ToDeviceFeederRun<B, M>
 where
     B: MatrixBackend + 'static,
     M: ApplicationIntake<B>,

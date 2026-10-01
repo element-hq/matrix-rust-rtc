@@ -24,7 +24,7 @@ on the bridge.
 | Module | What it does |
 | --- | --- |
 | **`compat`** | Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite (today: Element Call on the JS SDK), in two generations. `StickyEvents` is the 2025 format — MSC4354 stickies with pre-2026 field names; reading it is always on, writing it is opt-in. `StateEvents` is the format before MSC4354, with membership as `org.matrix.msc3401.call.member` **room state**; opt-in in both directions, and visible to nobody but that generation. Pure JSON in, pure JSON out — no Matrix SDK, no async runtime. Scaffolding, to be deleted once Element Call catches up. |
-| **`feeder`** | What turns a host's `MatrixBackend` into a fed `CallSessionManager`. `RoomFeeder::attach(backend, manager, room_id, options)` subscribes to what the room's compatibility mode needs, applies encryption, slot state and joined members before the first membership, translates the member events (client-reported decryption facts → `EventOrigin`; the pre-2026 funnels), feeds timeline events, redactions and `/relations`, and reports `seeded` once the current state is in. `SessionFeeder` does the same for the to-device key messages. The core spawns nothing; the caller runs each feeder's future where it likes. |
+| **`feeder`** | What turns a host's `MatrixBackend` into a fed `CallSessionManager`. `RoomFeeder::attach(backend, manager, room_id, options)` subscribes to what the room's compatibility mode needs, applies encryption, slot state and joined members before the first membership, translates the member events (client-reported decryption facts → `EventOrigin`; the pre-2026 funnels), feeds timeline events, redactions and `/relations`, and reports `seeded` once the current state is in. `ToDeviceFeeder` does the same for the to-device key messages. The core spawns nothing; the caller runs each feeder's future where it likes. |
 | **`compat::dialect_backend`** | `DialectBackend<B>`: the one `MatrixBackend` wrapper applying a room's outbound dialect (member-event routing, legacy key type, pre-sticky leave as a delayed *state* event) before delegating. Registered at join, from the mode given at attach. |
 | **`transports`** | `choose(rtc_transports, override)`: the library's transport pick — the join's override, else the first LiveKit entry the homeserver advertises. |
 | **`sdk`** *(feature `matrix-sdk`)* | `SdkBackend` implements `MatrixBackend` over a `matrix_sdk::Client`: Client-Server requests for the sends, and for the reads a task per room subscription that delivers the complete current sets on subscribe and again on every sticky-store or room-state wake, plus the to-device handlers, `/relations`, the OpenID token and `GET /rtc/transports`. |
@@ -74,7 +74,7 @@ the edge — read the module docs before touching it.
 ## Who uses the feeder
 
 Every entry point does the same three things before joining — wrap the backend
-in `DialectBackend`, start a `SessionFeeder`, attach rooms with `RoomFeeder` —
+in `DialectBackend`, start a `ToDeviceFeeder`, attach rooms with `RoomFeeder` —
 and differs only in where the backend comes from and where the feeder's future
 runs: `matrix_rtc_livekit::Call::join` (`SdkBackend`, `spawn_local`),
 `matrix_rtc_ffi::RtcSessionManagerHandle` (the host's foreign trait, the FFI
