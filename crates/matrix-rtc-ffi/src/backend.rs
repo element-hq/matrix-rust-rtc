@@ -732,6 +732,8 @@ pub(crate) mod test_support {
         pub to_device_sink: Mutex<Option<(Vec<String>, Arc<ToDeviceSink>)>>,
         pub transports_json: Mutex<String>,
         pub relations_answers: Mutex<HashMap<String, Vec<FfiEventIn>>>,
+        /// Every subscription handed out, room and to-device, in order.
+        pub subscriptions: Mutex<Vec<Arc<MockSubscription>>>,
     }
 
     impl MockHost {
@@ -781,6 +783,27 @@ pub(crate) mod test_support {
 
         pub fn clear_to_device(&self) {
             self.to_device.lock().unwrap().clear();
+        }
+
+        fn subscription(&self) -> Arc<MockSubscription> {
+            let subscription = Arc::new(MockSubscription {
+                cancelled: AtomicBool::new(false),
+            });
+            self.subscriptions
+                .lock()
+                .unwrap()
+                .push(subscription.clone());
+            subscription
+        }
+
+        /// How many handed-out subscriptions are not cancelled.
+        pub fn live_subscriptions(&self) -> usize {
+            self.subscriptions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|subscription| !subscription.cancelled.load(Ordering::SeqCst))
+                .count()
         }
 
         pub fn room_sink(&self, room_id: &str) -> Arc<RoomSink> {
@@ -942,9 +965,7 @@ pub(crate) mod test_support {
                 .lock()
                 .unwrap()
                 .insert(room_id, (subjects, sink));
-            Ok(Arc::new(MockSubscription {
-                cancelled: AtomicBool::new(false),
-            }))
+            Ok(self.subscription())
         }
 
         fn subscribe_to_device(
@@ -953,9 +974,7 @@ pub(crate) mod test_support {
             sink: Arc<ToDeviceSink>,
         ) -> Result<Arc<dyn BackendSubscription>, FfiBackendError> {
             *self.to_device_sink.lock().unwrap() = Some((event_types, sink));
-            Ok(Arc::new(MockSubscription {
-                cancelled: AtomicBool::new(false),
-            }))
+            Ok(self.subscription())
         }
 
         async fn relations(

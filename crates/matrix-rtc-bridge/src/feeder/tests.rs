@@ -4,6 +4,7 @@
 // Please see LICENSE in the repository root for full details.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use matrix_rtc_call::CallSessionManager;
@@ -435,4 +436,53 @@ fn key_origin_treats_an_unreported_cross_signing_as_not_cross_signed() {
         key_origin(&EventEncryption::Cleartext, BOB),
         KeyOrigin::Cleartext
     ));
+}
+
+#[tokio::test]
+async fn dropping_an_attachment_ends_its_subscription() {
+    let Harness {
+        mock, attachment, ..
+    } = Harness::attach(ElementCallCompat::Off).await;
+    let subscription = mock.room_subscription(ROOM).unwrap();
+    assert!(!subscription.cancelled.load(Ordering::SeqCst));
+
+    drop(attachment);
+    assert!(subscription.cancelled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn dropping_the_session_feeder_ends_its_subscription() {
+    let mock = Arc::new(MockBackend::new());
+    let backend = Arc::new(DialectBackend::new(mock.clone()));
+    let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
+        backend.clone(),
+    )));
+    let (feeder, _run) = SessionFeeder::start(backend, manager, RoomModes::default())
+        .await
+        .expect("start");
+    let subscription = mock.to_device_subscription().unwrap();
+
+    drop(feeder);
+    assert!(subscription.cancelled.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_room_is_attached_once_and_freed_when_its_attach_fails() {
+    let rooms = AttachedRooms::<&str>::default();
+    let reservation = rooms.reserve(ROOM).expect("free");
+    assert!(rooms.reserve(ROOM).is_none(), "being attached");
+    assert_eq!(
+        rooms.remove(ROOM),
+        None,
+        "nothing to detach while attaching"
+    );
+
+    // The attach failed: the room is free again.
+    drop(reservation);
+    let reservation = rooms.reserve(ROOM).expect("free again");
+    reservation.fill("attached");
+    assert!(rooms.reserve(ROOM).is_none(), "attached");
+
+    assert_eq!(rooms.remove(ROOM), Some("attached"));
+    assert!(rooms.reserve(ROOM).is_some(), "free after detach");
 }

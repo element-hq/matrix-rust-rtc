@@ -26,12 +26,11 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use matrix_rtc_bridge::compat::{DialectBackend, ElementCallCompat, ingest};
 use matrix_rtc_bridge::feeder::{
-    AttachOptions, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
+    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
 };
 use matrix_rtc_bridge::transports;
 use matrix_rtc_call::{
@@ -67,8 +66,8 @@ pub struct WasmRtcSessionManager {
     backend: Arc<Backend>,
     /// Which generation each attached room is read and written for.
     modes: RoomModes,
-    /// The attached rooms, by room id.
-    rooms: RefCell<HashMap<String, RoomAttachment>>,
+    /// The attached rooms, by room id. Freeing the manager detaches them.
+    rooms: AttachedRooms<RoomAttachment>,
     /// The session-wide to-device subscription, started by the first attach.
     session_feeder: RefCell<Option<SessionFeeder>>,
 }
@@ -91,15 +90,16 @@ impl WasmRtcSessionManager {
             inner,
             backend,
             modes: RoomModes::default(),
-            rooms: RefCell::new(HashMap::new()),
+            rooms: AttachedRooms::default(),
             session_feeder: RefCell::new(None),
         }
     }
 
     /// Attaches a room: the library subscribes to what the room needs in the
     /// given mode and applies the current state. Resolves once that state is
-    /// applied, so a `join` issued afterwards sees it. Attaching an attached
-    /// room rejects.
+    /// applied, so a `join` issued afterwards sees it. Attaching a room that
+    /// is attached, or still being attached, rejects. Wait for the attach
+    /// before detaching the room.
     ///
     /// `options` is `{ element_call_compat?: "off" | "sticky_events" | "state_events" }`.
     #[wasm_bindgen(js_name = attachRoom)]
@@ -109,9 +109,9 @@ impl WasmRtcSessionManager {
         #[wasm_bindgen(unchecked_param_type = "AttachOptionsIn | null | undefined")]
         options: JsValue,
     ) -> Result<(), JsError> {
-        if self.rooms.borrow().contains_key(&room_id) {
+        let Some(reservation) = self.rooms.reserve(&room_id) else {
             return Err(JsError::new(&format!("{room_id} is already attached")));
-        }
+        };
         let options: Option<WasmAttachOptions> = serde_wasm_bindgen::from_value(options)
             .map_err(|err| JsError::new(&format!("invalid attach options: {err}")))?;
         let compat = compat::parse_compat(
@@ -137,7 +137,7 @@ impl WasmRtcSessionManager {
         wasm_bindgen_futures::spawn_local(run.run());
         attachment.seeded().await;
         log::info!("manager: [{room_id}] attached and seeded");
-        self.rooms.borrow_mut().insert(room_id, attachment);
+        reservation.fill(attachment);
         Ok(())
     }
 
@@ -159,7 +159,7 @@ impl WasmRtcSessionManager {
                 log::warn!("manager: leave before detach failed: {error}");
             }
         }
-        let attached = self.rooms.borrow_mut().remove(&room_id);
+        let attached = self.rooms.remove(&room_id);
         match attached {
             Some(attachment) => {
                 attachment.detach();

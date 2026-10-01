@@ -18,7 +18,7 @@ use tokio::sync::watch;
 
 use matrix_rtc_bridge::compat::DialectBackend;
 use matrix_rtc_bridge::feeder::{
-    AttachOptions, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
+    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
 };
 use matrix_rtc_bridge::transports;
 use matrix_rtc_call::CallSessionManager;
@@ -278,8 +278,8 @@ pub struct RtcSessionManagerHandle {
     heartbeats: Mutex<HashMap<(String, String), HeartbeatDriver>>,
     /// Which generation each attached room is read and written for.
     modes: RoomModes,
-    /// The attached rooms, by room id.
-    rooms: Mutex<HashMap<String, AttachedRoom>>,
+    /// The attached rooms, by room id. Dropping the handle detaches them.
+    rooms: AttachedRooms<AttachedRoom>,
     /// The session-wide to-device subscription, started by the first attach.
     session_feeder: TokioMutex<Option<(SessionFeeder, AbortOnDrop)>>,
 }
@@ -362,25 +362,26 @@ impl RtcSessionManagerHandle {
             backend,
             heartbeats: Mutex::new(HashMap::new()),
             modes: RoomModes::default(),
-            rooms: Mutex::new(HashMap::new()),
+            rooms: AttachedRooms::default(),
             session_feeder: TokioMutex::new(None),
         })
     }
 
     /// Attaches a room: the library subscribes to what the room needs in the
     /// given mode and applies the current state. Resolves once that state is
-    /// applied, so a `join` issued afterwards sees it. Attaching an attached
-    /// room is an error.
+    /// applied, so a `join` issued afterwards sees it. Attaching a room that
+    /// is attached, or still being attached, is an error. Wait for the attach
+    /// before detaching the room; cancelling the call ends the attach instead.
     pub async fn attach_room(
         &self,
         room_id: String,
         options: FfiAttachOptions,
     ) -> Result<(), MatrixRtcFfiError> {
-        if lock_mutex(&self.rooms)?.contains_key(&room_id) {
+        let Some(reservation) = self.rooms.reserve(&room_id) else {
             return Err(MatrixRtcFfiError::Attachment(format!(
                 "{room_id} is already attached"
             )));
-        }
+        };
         let compat = compat::resolve(options.element_call_compat);
         log::info!("manager: [{room_id}] attaching in {compat:?} mode");
 
@@ -400,13 +401,10 @@ impl RtcSessionManagerHandle {
         attachment.seeded().await;
         log::info!("manager: [{room_id}] attached and seeded");
 
-        lock_mutex(&self.rooms)?.insert(
-            room_id,
-            AttachedRoom {
-                attachment,
-                _feed: feed,
-            },
-        );
+        reservation.fill(AttachedRoom {
+            attachment,
+            _feed: feed,
+        });
         Ok(())
     }
 
@@ -429,7 +427,7 @@ impl RtcSessionManagerHandle {
             }
         }
 
-        let attached = lock_mutex(&self.rooms)?.remove(&room_id);
+        let attached = self.rooms.remove(&room_id);
         match attached {
             Some(room) => {
                 room.attachment.detach();
@@ -1178,7 +1176,11 @@ mod tests {
             .await;
         assert!(matches!(again, Err(MatrixRtcFfiError::Attachment(_))));
 
+        // The refused attach subscribed to nothing: the room and to-device.
+        assert_eq!(mock.live_subscriptions(), 2);
+
         manager.detach_room(ROOM.to_owned()).await.unwrap();
+        assert_eq!(mock.live_subscriptions(), 1, "only to-device is left");
         // Delivered after detach: not applied.
         mock.room_sink(ROOM).on_sticky_events(vec![member_event(
             "@bob:example.org",
@@ -1194,6 +1196,61 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_the_handle_ends_every_subscription() {
+        let mock = MockHost::new();
+        let manager = RtcSessionManagerHandle::new(mock.clone());
+        attach(
+            &manager,
+            &mock,
+            None,
+            false,
+            vec![open_slot(None)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(mock.live_subscriptions(), 2);
+
+        drop(manager);
+        assert_eq!(mock.live_subscriptions(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_attach_still_seeding_refuses_a_second_and_cancelling_it_frees_the_room() {
+        let mock = MockHost::new();
+        let manager = RtcSessionManagerHandle::new(mock.clone());
+        {
+            let first = manager.attach_room(ROOM.to_owned(), FfiAttachOptions::default());
+            tokio::pin!(first);
+            // Subscribed, never seeded.
+            tokio::select! {
+                _ = &mut first => panic!("an unseeded attach must not resolve"),
+                _ = async {
+                    while mock.subjects(ROOM).is_none() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                } => {}
+            }
+            let second = manager
+                .attach_room(ROOM.to_owned(), FfiAttachOptions::default())
+                .await;
+            assert!(matches!(second, Err(MatrixRtcFfiError::Attachment(_))));
+        }
+        // The first attach was dropped (its caller cancelled it): its room
+        // subscription ended and the room is free again.
+        assert_eq!(mock.live_subscriptions(), 1, "only to-device is left");
+        attach(
+            &manager,
+            &mock,
+            None,
+            false,
+            vec![open_slot(None)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(mock.live_subscriptions(), 2);
     }
 
     /// One room, three generations, one roster: a spec-current peer, a 2025

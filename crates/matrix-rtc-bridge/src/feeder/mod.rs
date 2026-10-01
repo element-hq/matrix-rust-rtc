@@ -245,8 +245,8 @@ impl RoomSink for ChannelRoomSink {
     }
 }
 
-/// A room the library is feeding. Dropping it does nothing; call
-/// [`detach`](Self::detach).
+/// A room the library is feeding. Dropping it detaches: the subscription
+/// ends, and nothing delivered afterwards is applied.
 pub struct RoomAttachment {
     room_id: String,
     subscription: Arc<dyn Subscription>,
@@ -277,10 +277,94 @@ impl RoomAttachment {
 
     /// Ends the subscription; nothing delivered afterwards is applied.
     pub fn detach(self) {
+        drop(self);
+    }
+}
+
+impl Drop for RoomAttachment {
+    fn drop(&mut self) {
         log::info!("[{}] detaching", self.room_id);
         self.modes.remove(&self.room_id);
         self.subscription.cancel();
         let _ = self.stop.send(RoomInput::Stop);
+    }
+}
+
+/// The rooms a binding has attached, one attachment per room id.
+///
+/// A room is reserved before the attach's first await, so a second attach of
+/// the same room fails instead of subscribing twice. Attach and detach of one
+/// room must not overlap: a detach while the attach is in flight finds nothing
+/// to detach.
+pub struct AttachedRooms<T>(Arc<StdMutex<HashMap<String, Option<T>>>>);
+
+impl<T> Default for AttachedRooms<T> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<T> Clone for AttachedRooms<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T> AttachedRooms<T> {
+    /// Reserves `room_id` for an attach, or `None` when it is attached or
+    /// being attached already.
+    pub fn reserve(&self, room_id: &str) -> Option<RoomReservation<T>> {
+        let mut rooms = self.lock();
+        if rooms.contains_key(room_id) {
+            return None;
+        }
+        rooms.insert(room_id.to_owned(), None);
+        Some(RoomReservation {
+            rooms: self.clone(),
+            room_id: room_id.to_owned(),
+            filled: false,
+        })
+    }
+
+    /// Takes an attached room out, to detach it. A room still being attached
+    /// stays reserved, and `None` is returned.
+    pub fn remove(&self, room_id: &str) -> Option<T> {
+        let mut rooms = self.lock();
+        match rooms.get(room_id) {
+            Some(Some(_)) => rooms.remove(room_id).flatten(),
+            _ => None,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<T>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A room reserved by [`AttachedRooms::reserve`]. [`fill`](Self::fill) it
+/// once attached; dropping it unfilled (the attach failed) frees the room.
+pub struct RoomReservation<T> {
+    rooms: AttachedRooms<T>,
+    room_id: String,
+    filled: bool,
+}
+
+impl<T> RoomReservation<T> {
+    pub fn fill(mut self, attached: T) {
+        self.rooms
+            .lock()
+            .insert(self.room_id.clone(), Some(attached));
+        self.filled = true;
+    }
+}
+
+impl<T> Drop for RoomReservation<T> {
+    fn drop(&mut self) {
+        if !self.filled {
+            self.rooms.lock().remove(&self.room_id);
+        }
     }
 }
 
@@ -625,8 +709,7 @@ impl ToDeviceSink for ChannelToDeviceSink {
     }
 }
 
-/// The session-wide to-device subscription. Dropping it does nothing; call
-/// [`stop`](Self::stop).
+/// The session-wide to-device subscription. Dropping it stops it.
 pub struct SessionFeeder {
     subscription: Arc<dyn Subscription>,
     stop: mpsc::UnboundedSender<Option<ToDeviceMessageIn>>,
@@ -664,6 +747,12 @@ impl SessionFeeder {
     }
 
     pub fn stop(self) {
+        drop(self);
+    }
+}
+
+impl Drop for SessionFeeder {
+    fn drop(&mut self) {
         self.subscription.cancel();
         let _ = self.stop.send(None);
     }

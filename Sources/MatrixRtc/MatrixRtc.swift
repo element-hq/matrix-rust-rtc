@@ -3360,8 +3360,9 @@ public protocol RtcSessionManagerHandleProtocol: AnyObject, Sendable {
     /**
      * Attaches a room: the library subscribes to what the room needs in the
      * given mode and applies the current state. Resolves once that state is
-     * applied, so a `join` issued afterwards sees it. Attaching an attached
-     * room is an error.
+     * applied, so a `join` issued afterwards sees it. Attaching a room that
+     * is attached, or still being attached, is an error. Wait for the attach
+     * before detaching the room; cancelling the call ends the attach instead.
      */
     func attachRoom(roomId: String, options: FfiAttachOptions) async throws 
     
@@ -3569,8 +3570,9 @@ public convenience init(backend: MatrixBackend) {
     /**
      * Attaches a room: the library subscribes to what the room needs in the
      * given mode and applies the current state. Resolves once that state is
-     * applied, so a `join` issued afterwards sees it. Attaching an attached
-     * room is an error.
+     * applied, so a `join` issued afterwards sees it. Attaching a room that
+     * is attached, or still being attached, is an error. Wait for the attach
+     * before detaching the room; cancelling the call ends the attach instead.
      */
 open func attachRoom(roomId: String, options: FfiAttachOptions)async throws   {
     return

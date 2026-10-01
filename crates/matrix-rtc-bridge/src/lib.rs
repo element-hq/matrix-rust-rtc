@@ -50,8 +50,8 @@ pub use compat::{
     STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
 };
 pub use feeder::{
-    AttachOptions, RoomAttachment, RoomFeeder, RoomFeederRun, RoomModes, SessionFeeder,
-    SessionFeederRun,
+    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomFeederRun, RoomModes,
+    RoomReservation, SessionFeeder, SessionFeederRun,
 };
 
 pub use matrix_rtc_core::OpenIdToken;
