@@ -198,8 +198,8 @@ pub struct ToDeviceMessageIn {
 /// room is encrypted.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomSubjects {
-    /// State event types, stable and unstable spellings both listed; a host
-    /// may deliver either.
+    /// State event types, stable and unstable spellings both listed; each is
+    /// delivered under its own type, and the library picks between them.
     pub state_event_types: Vec<String>,
     /// Message-like event types to forward as they arrive, redactions included.
     pub timeline_event_types: Vec<String>,

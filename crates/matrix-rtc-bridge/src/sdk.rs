@@ -737,16 +737,36 @@ async fn emit_room_subjects(
         }
     }
 
-    for event_type in &subjects.state_event_types {
-        if event_type == STATE_MEMBER_EVENT_TYPE {
-            sink.on_state_events(event_type.clone(), legacy_state_snapshot(room).await);
-        } else if event_type == matrix_rtc_core::SLOT_EVENT_TYPE {
-            // The unstable spelling is asked for alongside; one fetch answers
-            // both, delivered under the stable type.
-            match slot_snapshot(room).await {
-                Some(slots) => sink.on_state_events(event_type.clone(), slots),
-                None => all_read = false,
+    if subjects
+        .state_event_types
+        .iter()
+        .any(|event_type| event_type == STATE_MEMBER_EVENT_TYPE)
+    {
+        sink.on_state_events(
+            STATE_MEMBER_EVENT_TYPE.to_owned(),
+            legacy_state_snapshot(room).await,
+        );
+    }
+    // One fetch answers every other requested type, each delivered under its
+    // own type: the library tells the spellings apart, not us.
+    let fetched: Vec<&String> = subjects
+        .state_event_types
+        .iter()
+        .filter(|event_type| *event_type != STATE_MEMBER_EVENT_TYPE)
+        .collect();
+    if !fetched.is_empty() {
+        match state_snapshot(room, &fetched).await {
+            Some(events) => {
+                for event_type in fetched {
+                    let of_type = events
+                        .iter()
+                        .filter(|event| &event.event_type == event_type)
+                        .cloned()
+                        .collect();
+                    sink.on_state_events(event_type.clone(), of_type);
+                }
             }
+            None => all_read = false,
         }
     }
 
@@ -808,32 +828,30 @@ fn sticky_snapshot(room: &Room) -> Vec<EventIn> {
         .collect()
 }
 
-/// The room's `m.rtc.slot` state, or `None` when it could not be read.
+/// The room's state events of `event_types` (in practice the `m.rtc.slot`
+/// spellings), or `None` when it could not be read.
 ///
 /// Asks the homeserver (`GET /rooms/{id}/state`) instead of the SDK's store:
 /// the store only holds the types in sliding sync's `required_state`, which
 /// does not include the slot type, so it would report every room as slotless
-/// — and that closes every session. A failed fetch is `None`, never "no
-/// slots". Both spellings of the type are accepted.
-async fn slot_snapshot(room: &Room) -> Option<Vec<EventIn>> {
+/// — and that closes every session. A failed fetch is `None`, never "none".
+async fn state_snapshot(room: &Room, event_types: &[&String]) -> Option<Vec<EventIn>> {
     let room_id = room.room_id().to_string();
     let request = get_state_events::v3::Request::new(room.room_id().to_owned());
     let response = match room.client().send(request).await {
         Ok(response) => response,
         Err(error) => {
-            log::warn!("[{room_id}] failed to fetch room state for m.rtc.slot: {error}");
+            log::warn!("[{room_id}] failed to fetch room state: {error}");
             return None;
         }
     };
 
-    let slots: Vec<EventIn> = response
+    let events: Vec<EventIn> = response
         .room_state
         .into_iter()
         .filter_map(|raw| {
             let event_type = raw.get_field::<String>("type").ok().flatten()?;
-            if event_type != matrix_rtc_core::SLOT_EVENT_TYPE
-                && event_type != "org.matrix.msc4143.rtc.slot"
-            {
+            if !event_types.iter().any(|wanted| **wanted == event_type) {
                 return None;
             }
             Some(EventIn {
@@ -857,10 +875,10 @@ async fn slot_snapshot(room: &Room) -> Option<Vec<EventIn>> {
         .collect();
 
     log::debug!(
-        "[{room_id}] room state fetched: {} m.rtc.slot event(s)",
-        slots.len(),
+        "[{room_id}] room state fetched: {} event(s) of {event_types:?}",
+        events.len(),
     );
-    Some(slots)
+    Some(events)
 }
 
 /// The room's `org.matrix.msc3401.call.member` state, raw, from the SDK store

@@ -110,9 +110,6 @@ export async function createMatrixSession({
   return { client, userId: login.user_id, deviceId: login.device_id, password: pass };
 }
 
-/** MSC4143 slot state, both spellings; delivered as one set. */
-const SLOT_EVENT_TYPES = ['m.rtc.slot', 'org.matrix.msc4143.rtc.slot'];
-
 /**
  * The `MatrixBackendHost` the manager takes: `new WasmRtcSessionManager(host)`.
  */
@@ -210,16 +207,7 @@ export class MatrixHost {
     const feed = async () => {
       if (cancelled) return;
       sink.onEncryption(Boolean(room.currentState.getStateEvents('m.room.encryption', '')));
-      // One set per subject: the two slot spellings are one subject, so they
-      // go together under the first requested spelling rather than as two
-      // sets that would replace each other.
-      const slotTypes = subjects.state_event_types.filter((type) => SLOT_EVENT_TYPES.includes(type));
-      if (slotTypes.length > 0) {
-        const slots = slotTypes.flatMap((type) => room.currentState.getStateEvents(type));
-        sink.onStateEvents(slotTypes[0], await Promise.all(slots.map((ev) => this.eventIn(ev))));
-      }
       for (const type of subjects.state_event_types) {
-        if (SLOT_EVENT_TYPES.includes(type)) continue;
         const events = room.currentState.getStateEvents(type);
         sink.onStateEvents(type, await Promise.all(events.map((ev) => this.eventIn(ev))));
       }

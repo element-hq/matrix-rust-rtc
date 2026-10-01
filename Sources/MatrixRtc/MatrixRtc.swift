@@ -7021,7 +7021,7 @@ public func FfiConverterTypeFfiReceiveStats_lower(_ value: FfiReceiveStats) -> R
  */
 public struct FfiRoomSubjects {
     /**
-     * Stable and unstable spellings both listed; deliver either.
+     * Stable and unstable spellings both listed; deliver each under its own type.
      */
     public var stateEventTypes: [String]
     /**
@@ -7033,7 +7033,7 @@ public struct FfiRoomSubjects {
     // declare one manually.
     public init(
         /**
-         * Stable and unstable spellings both listed; deliver either.
+         * Stable and unstable spellings both listed; deliver each under its own type.
          */stateEventTypes: [String], 
         /**
          * Message-like types to forward as they arrive, redactions included.

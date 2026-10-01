@@ -153,6 +153,48 @@ fn to_legacy_state_member_event_in(event: EventIn) -> Option<LegacyStateMemberEv
     })
 }
 
+/// One slot's state event under each spelling of the slot type.
+#[derive(Default)]
+struct SlotEvents {
+    stable: Option<EventIn>,
+    unstable: Option<EventIn>,
+}
+
+impl SlotEvents {
+    /// The stable event where the room has one, else the unstable one: never
+    /// both.
+    fn current(&self) -> Option<&EventIn> {
+        self.stable.as_ref().or(self.unstable.as_ref())
+    }
+
+    fn of_type(&mut self, stable: bool) -> &mut Option<EventIn> {
+        if stable {
+            &mut self.stable
+        } else {
+            &mut self.unstable
+        }
+    }
+}
+
+/// Replaces every slot's event of one spelling with `events`, the room's
+/// complete set under that spelling; the other spelling's events are kept.
+fn replace_slot_events(
+    slots: &mut HashMap<String, SlotEvents>,
+    stable: bool,
+    events: Vec<EventIn>,
+) {
+    for slot in slots.values_mut() {
+        *slot.of_type(stable) = None;
+    }
+    for event in events {
+        let Some(slot_id) = event.state_key.clone() else {
+            continue;
+        };
+        *slots.entry(slot_id).or_default().of_type(stable) = Some(event);
+    }
+    slots.retain(|_, slot| slot.current().is_some());
+}
+
 /// An unparseable slot content resolves closed rather than vanishing: an
 /// unreadable slot is not an open one.
 fn to_slot_event(room_id: &str, event: EventIn) -> Option<RawSlotEvent> {
@@ -305,6 +347,9 @@ struct FeedState {
     seen_encryption: bool,
     seen_members: bool,
     seen_slots: bool,
+    /// The room's slots by slot id (state key), each under both spellings: a
+    /// delivery replaces only its own spelling's events.
+    slots: HashMap<String, SlotEvents>,
     /// The latest sticky set, as member events, once one arrived.
     sticky: Option<Vec<RawMemberEventIn>>,
     /// The latest pre-sticky membership state, once one arrived.
@@ -380,9 +425,13 @@ where
 
     async fn on_state(&mut self, event_type: String, events: Vec<EventIn>) {
         if SLOT_EVENT_TYPES.contains(&event_type.as_str()) {
-            let slots: Vec<RawSlotEvent> = events
-                .into_iter()
-                .filter_map(|event| to_slot_event(&self.room_id, event))
+            replace_slot_events(&mut self.state.slots, event_type == SLOT_EVENT_TYPE, events);
+            let slots: Vec<RawSlotEvent> = self
+                .state
+                .slots
+                .values()
+                .filter_map(SlotEvents::current)
+                .filter_map(|event| to_slot_event(&self.room_id, event.clone()))
                 .collect();
             self.manager
                 .lock()

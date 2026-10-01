@@ -143,7 +143,7 @@ fn events_into_core(events: Vec<FfiEventIn>) -> Vec<EventIn> {
 /// What the library wants delivered for one room; see [`MatrixBackend::subscribe_room`].
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FfiRoomSubjects {
-    /// Stable and unstable spellings both listed; deliver either.
+    /// Stable and unstable spellings both listed; deliver each under its own type.
     pub state_event_types: Vec<String>,
     /// Message-like types to forward as they arrive, redactions included.
     pub timeline_event_types: Vec<String>,

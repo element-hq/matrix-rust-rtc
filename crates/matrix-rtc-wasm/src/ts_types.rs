@@ -51,7 +51,7 @@ export interface ToDeviceMessageIn {
 
 /** What the library wants delivered for one room (`subscribeRoom`). */
 export interface RoomSubjects {
-    /** Stable and unstable spellings both listed; deliver either. */
+    /** Stable and unstable spellings both listed; deliver each under its own type. */
     state_event_types: string[];
     /** Message-like types to forward as they arrive, redactions included. */
     timeline_event_types: string[];

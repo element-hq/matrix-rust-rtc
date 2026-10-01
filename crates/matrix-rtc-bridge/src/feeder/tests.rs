@@ -196,6 +196,78 @@ async fn a_closed_slot_projects_the_member_out() {
     assert_eq!(harness.member_count().await, Some(0));
 }
 
+const UNSTABLE_SLOT_EVENT_TYPE: &str = "org.matrix.msc4143.rtc.slot";
+
+fn slot(event_type: &str, status: &str) -> EventIn {
+    EventIn {
+        event_type: event_type.to_owned(),
+        content: json!({ "status": status, "application": { "type": "m.call" } }),
+        ..open_slot()
+    }
+}
+
+/// Seeds encryption, members and a sticky member, then the given slot sets in
+/// order, and returns the projected member count once they are applied.
+async fn member_count_after_slots(sets: Vec<(&str, Vec<EventIn>)>) -> Option<usize> {
+    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let sink = harness.sink();
+    sink.on_encryption(false);
+    sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
+    sink.on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
+    for (event_type, events) in sets {
+        sink.on_state_events(event_type.to_owned(), events);
+    }
+    harness.attachment.seeded().await;
+    // Seeded on the first slot set; let the rest apply.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    harness.member_count().await
+}
+
+#[tokio::test]
+async fn an_empty_unstable_slot_set_does_not_close_the_stable_slot() {
+    let count = member_count_after_slots(vec![
+        (SLOT_EVENT_TYPE, vec![slot(SLOT_EVENT_TYPE, "open")]),
+        (UNSTABLE_SLOT_EVENT_TYPE, Vec::new()),
+    ])
+    .await;
+    assert_eq!(count, Some(1));
+}
+
+#[tokio::test]
+async fn an_unstable_slot_counts_when_the_room_has_no_stable_one() {
+    let count = member_count_after_slots(vec![
+        (SLOT_EVENT_TYPE, Vec::new()),
+        (
+            UNSTABLE_SLOT_EVENT_TYPE,
+            vec![slot(UNSTABLE_SLOT_EVENT_TYPE, "open")],
+        ),
+    ])
+    .await;
+    assert_eq!(count, Some(1));
+}
+
+#[tokio::test]
+async fn the_stable_slot_wins_over_the_unstable_one_in_either_order() {
+    for sets in [
+        vec![
+            (SLOT_EVENT_TYPE, vec![slot(SLOT_EVENT_TYPE, "closed")]),
+            (
+                UNSTABLE_SLOT_EVENT_TYPE,
+                vec![slot(UNSTABLE_SLOT_EVENT_TYPE, "open")],
+            ),
+        ],
+        vec![
+            (
+                UNSTABLE_SLOT_EVENT_TYPE,
+                vec![slot(UNSTABLE_SLOT_EVENT_TYPE, "open")],
+            ),
+            (SLOT_EVENT_TYPE, vec![slot(SLOT_EVENT_TYPE, "closed")]),
+        ],
+    ] {
+        assert_eq!(member_count_after_slots(sets).await, Some(0));
+    }
+}
+
 #[tokio::test]
 async fn pre_sticky_state_membership_is_funnelled() {
     let harness = Harness::attach(ElementCallCompat::StateEvents).await;
