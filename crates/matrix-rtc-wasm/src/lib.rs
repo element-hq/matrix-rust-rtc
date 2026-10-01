@@ -937,11 +937,12 @@ mod tests {
     }
 
     async fn attach(manager: &WasmRtcSessionManager, compat: Option<&str>) {
+        // A plain object, as a page passes: the default serializer turns a
+        // `json!` map into an ES `Map`, which reads back as no options at all.
         let options = match compat {
-            Some(compat) => serde_wasm_bindgen::to_value(&serde_json::json!({
-                "element_call_compat": compat
-            }))
-            .unwrap(),
+            Some(compat) => serde_json::json!({ "element_call_compat": compat })
+                .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+                .unwrap(),
             None => JsValue::UNDEFINED,
         };
         manager
