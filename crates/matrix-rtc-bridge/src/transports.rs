@@ -5,7 +5,9 @@
 
 //! Which transport a join publishes on, from what the homeserver advertises.
 
-use matrix_rtc_core::{CommandError, LiveKitTransport, RtcTransport, TransportIntent};
+use matrix_rtc_core::{
+    CommandError, LiveKitTransport, MatrixBackend, RtcTransport, TransportIntent,
+};
 use serde_json::Value;
 
 /// The join's own choice wins; otherwise the first LiveKit entry of the
@@ -37,11 +39,63 @@ pub fn choose(
         })
 }
 
+/// [`choose`], asking the backend for the homeserver's transports only when
+/// the join names none: a failing or missing endpoint must not fail a join
+/// whose own choice overrides it anyway.
+pub async fn resolve<B: MatrixBackend + ?Sized>(
+    backend: &B,
+    chosen: Option<TransportIntent>,
+) -> Result<TransportIntent, CommandError> {
+    if let Some(chosen) = chosen {
+        return Ok(chosen);
+    }
+    choose(&backend.rtc_transports().await?, None)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
+
+    use matrix_rtc_core::{BackendError, testing::MockBackend};
     use serde_json::json;
 
     use super::*;
+
+    fn livekit(url: &str) -> TransportIntent {
+        TransportIntent::Publish(RtcTransport::LiveKit(LiveKitTransport {
+            livekit_service_url: url.to_owned(),
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_join_that_names_a_transport_does_not_ask_the_homeserver() {
+        let backend = MockBackend::new();
+        *backend.transports.lock().unwrap() = Err(BackendError::new("homeserver down"));
+
+        let chosen = resolve(&backend, Some(livekit("https://override"))).await;
+
+        assert!(matches!(
+            chosen.unwrap(),
+            TransportIntent::Publish(RtcTransport::LiveKit(LiveKitTransport { livekit_service_url }))
+                if livekit_service_url == "https://override"
+        ));
+        assert_eq!(backend.transports_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_choice_the_homeserver_decides_and_its_failure_fails_the_join() {
+        let backend = MockBackend::new();
+        *backend.transports.lock().unwrap() =
+            Ok(json!([{ "type": "livekit", "livekit_service_url": "https://advertised" }]));
+        assert!(matches!(
+            resolve(&backend, None).await.unwrap(),
+            TransportIntent::Publish(RtcTransport::LiveKit(LiveKitTransport { livekit_service_url }))
+                if livekit_service_url == "https://advertised"
+        ));
+
+        *backend.transports.lock().unwrap() = Err(BackendError::new("homeserver down"));
+        assert!(resolve(&backend, None).await.is_err());
+    }
 
     #[test]
     fn the_first_livekit_entry_is_taken_in_homeserver_order() {

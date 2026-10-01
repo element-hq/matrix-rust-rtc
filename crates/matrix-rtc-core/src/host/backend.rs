@@ -627,7 +627,9 @@ pub struct MockBackend {
     /// What `relations` answers, by target event id; unknown ids answer empty.
     pub relations_answers: std::sync::Mutex<std::collections::HashMap<String, Vec<EventIn>>>,
     /// What `rtc_transports` answers.
-    pub transports: std::sync::Mutex<Value>,
+    pub transports: std::sync::Mutex<Result<Value, BackendError>>,
+    /// How many times `rtc_transports` was asked.
+    pub transports_requests: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -648,7 +650,8 @@ impl Default for MockBackend {
             to_device_subscriptions: Default::default(),
             relations_requests: Default::default(),
             relations_answers: Default::default(),
-            transports: std::sync::Mutex::new(Value::Array(Vec::new())),
+            transports: std::sync::Mutex::new(Ok(Value::Array(Vec::new()))),
+            transports_requests: Default::default(),
         }
     }
 }
@@ -909,6 +912,8 @@ impl MatrixBackend for MockBackend {
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
-        Ok(self.transports.lock().unwrap().clone())
+        self.transports_requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.transports.lock().unwrap().clone()
     }
 }

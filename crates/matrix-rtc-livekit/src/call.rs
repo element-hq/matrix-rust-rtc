@@ -371,13 +371,14 @@ impl Call {
 
         // The transport: the join's own choice, else the first LiveKit one the
         // homeserver advertises.
-        let advertised = backend.rtc_transports().await.map_err(signalling_error)?;
         let chosen = options
             .livekit_transport
             .clone()
             .map(|transport| TransportIntent::Publish(RtcTransport::LiveKit(transport)));
         let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
-            transports::choose(&advertised, chosen).map_err(signalling_error)?
+            transports::resolve(&*backend, chosen)
+                .await
+                .map_err(signalling_error)?
         else {
             return Err(CallError::Signalling(
                 "the chosen transport is not a LiveKit one".into(),
