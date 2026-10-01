@@ -14,14 +14,14 @@
 //! Only the sending half lives here: building the content, and
 //! [`notify_session_started`], which decides whether to send it (the first
 //! member to join, and only if the host asked for it via
-//! [`CallJoinParams::notify`]); the receiving rules —
+//! [`CallJoinOptions::notify`]); the receiving rules —
 //! push rules, lifetime expiry, ring acknowledgements — are not implemented.
 //!
 //! The MSC and the deployed ecosystem disagree about where the call fields go,
 //! so [`build_notification_content`] writes them in both places; its docs say
 //! why.
 //!
-//! [`CallJoinParams::notify`]: crate::CallJoinParams::notify
+//! [`CallJoinOptions::notify`]: crate::CallJoinOptions::notify
 
 use matrix_rtc_core::{JoinSessionParams, JoinedMembership, MatrixBackend};
 use serde_json::{Map, Value, json};
@@ -82,12 +82,12 @@ impl Default for Mentions {
 
 /// What the host asks for when it joins.
 ///
-/// `None` on [`CallJoinParams::notify`] means "join quietly" — which is what
+/// `None` on [`CallJoinOptions::notify`] means "join quietly" — which is what
 /// joining a call someone else started does. Element Call makes the same
 /// distinction by only passing a notification type when the app *starts* a
 /// call.
 ///
-/// [`CallJoinParams::notify`]: crate::CallJoinParams::notify
+/// [`CallJoinOptions::notify`]: crate::CallJoinOptions::notify
 #[derive(Clone, Debug)]
 pub struct NotifyConfig {
     /// Ring, or notify silently.
@@ -249,17 +249,18 @@ fn is_own_participation(member: &JoinedMembership, params: &JoinSessionParams) -
 /// Called at the tail of a join, with the session's roster as it stands after
 /// the join and the membership event id that join returned, which the
 /// notification relates to.
-/// [`crate::CallSessionManager::join`] calls it; a host driving a bare core
-/// session calls it itself. Never fails the join: the user is in the call
+/// [`crate::RtcRoom::join_call`] calls it; a host driving a bare core room calls
+/// it itself. Never fails the join: the user is in the call
 /// whether or not anyone else was told about it.
 pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
     backend: &T,
+    room_id: &str,
     notify: &NotifyConfig,
     params: &JoinSessionParams,
     members: &[JoinedMembership],
     member_event_id: &str,
 ) {
-    let tag = format!("{}/{}/{}", params.room_id, params.slot_id, params.device_id);
+    let tag = format!("{room_id}/{}/{}", params.slot_id, params.device_id);
 
     // MSC4075 leaves who sends the notification open, but every joiner
     // sending one would ring the room once per participant. Only the member
@@ -308,7 +309,7 @@ pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
 
     if let Err(error) = backend
         .send_sticky_event(
-            params.room_id.clone(),
+            room_id.to_owned(),
             NOTIFICATION_EVENT_TYPE.to_owned(),
             content,
             notification_sticky_duration_ms(notify.lifetime_ms()),

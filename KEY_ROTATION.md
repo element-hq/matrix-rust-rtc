@@ -294,10 +294,9 @@ judgement, not a technical one, and it is currently decided in favour of UX.
 drive it from a plain thread — so it cannot wake itself up when a rotation falls
 due. It exposes the deadline instead:
 
-- `RtcSessionManager::key_rotation_due_at_ms(room_id, slot_id)` — when one is owed,
-  if any.
-- `RtcSessionManager::flush_due_key_rotation(room_id, slot_id)` — performs it, if
-  due. A no-op otherwise, so it is safe on any tick.
+- `RtcSession::key_rotation_due_at_ms()` — when one is owed, if any.
+- `RtcSession::flush_due_key_rotation()` — performs it, if due. A no-op
+  otherwise, so it is safe on any tick.
 
 `matrix-rtc-livekit` is the reference driver, and it needs *two* wake-ups, because
 neither alone is enough:

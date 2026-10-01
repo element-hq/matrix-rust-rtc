@@ -148,13 +148,13 @@ pub struct EngineConfig {
     /// hands it over via [`CallEngine::adopt_own_connection`].
     pub own_connection_key: Option<String>,
     /// The call layer's raised-hand snapshots
-    /// (`CallSessionManager::subscribe_raised_hands`), merged onto the roster as
+    /// (`RtcCall::subscribe_raised_hands`), merged onto the roster as
     /// [`Participant::hand_raised_at_ms`] and reported as
     /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`]. `None` leaves
     /// every hand down.
     pub raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
     /// The call layer's emoji reactions
-    /// (`CallSessionManager::subscribe_reactions`),
+    /// (`RtcCall::subscribe_reactions`),
     /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
     /// reports no reactions.
     pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,

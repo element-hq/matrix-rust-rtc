@@ -919,7 +919,7 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
 /// Three people hang up together, seen as one membership change.
 ///
 /// This is the shape the real ingestion path produces:
-/// `RtcSessionManager::set_current_sticky_state` takes the **whole** sticky state
+/// `BaseRtcRoom::set_current_sticky_state` takes the **whole** sticky state
 /// and has deliberately no delta entry point, and `RtcSession::set_current_state`
 /// rebuilds the candidate set before refreshing once. So simultaneous hangups
 /// reach the policy as a single change and must cost a single key — which is also

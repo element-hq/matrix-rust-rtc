@@ -89,7 +89,7 @@ async function waitFor(probe, description, attempts = 100) {
   throw new Error(`timed out waiting for ${description}`);
 }
 
-describe('RTC manager with real-world data', () => {
+describe('RTC room with real-world data', () => {
   let bindings;
 
   beforeEach(async () => {
@@ -99,49 +99,47 @@ describe('RTC manager with real-world data', () => {
     bindings = await import(nodeBindingUrl.href);
   });
 
-  async function attached(sticky) {
+  async function opened(sticky) {
     const host = mockBackendHost({
       userId: ME,
       slots: [openSlotEvent(SLOT_ID)],
       members: [ME, BOB, ALICE],
       sticky,
     });
-    const manager = new bindings.WasmRtcSessionManager(host);
-    await manager.attachRoom(ROOM_ID, undefined);
-    return { host, manager };
+    const client = new bindings.WasmRtcClient(host);
+    const room = await client.room(ROOM_ID, undefined);
+    return { host, client, room };
   }
 
   // Sticky state is replace-not-merge: every set delivered to the sink carries
   // the room's complete membership, and absence is departure.
   it('ingests realistic sticky events and updates member count', async () => {
-    const { host, manager } = await attached([bobJoinEvent()]);
-    expect(await manager.session_count()).toBe(1);
-    expect(await manager.member_count(ROOM_ID, SLOT_ID)).toBe(1);
+    const { host, room } = await opened([bobJoinEvent()]);
+    expect(await room.memberCount(SLOT_ID)).toBe(1);
 
     host._sink(ROOM_ID).onStickyEvents([bobJoinEvent(), aliceJoinEvent()]);
-    await waitFor(async () => (await manager.member_count(ROOM_ID, SLOT_ID)) === 2, 'alice to join');
-    expect(await manager.session_count()).toBe(1);
+    await waitFor(async () => (await room.memberCount(SLOT_ID)) === 2, 'alice to join');
 
     host._sink(ROOM_ID).onStickyEvents([bobJoinEvent(), aliceLeaveEvent()]);
-    await waitFor(async () => (await manager.member_count(ROOM_ID, SLOT_ID)) === 1, 'alice to leave');
+    await waitFor(async () => (await room.memberCount(SLOT_ID)) === 1, 'alice to leave');
   });
 
   it('handles unknown transport types as unsupported', async () => {
     const eventWithUnknownTransport = {
       event_id: '$test',
       event_type: 'org.matrix.msc4143.rtc.member',
-      sender: '@test:example.org',
+      sender: BOB,
       origin_server_ts: 4,
       content: {
         application: { type: 'm.call' },
         slot_id: SLOT_ID,
         transports: { published: [{ type: 'unknown_transport' }], can_subscribe: ['unknown_transport'] },
-        member: { id: 'test-id', membership: 'join' },
+        member: { id: 'test-id', user_id: BOB, device_id: 'BOBDEVICE', membership: 'join' },
         sticky_key: 'test-id',
       },
       encryption: { kind: 'cleartext' },
     };
-    const { manager } = await attached([eventWithUnknownTransport]);
-    expect(await manager.session_count()).toBe(1);
+    const { room } = await opened([eventWithUnknownTransport]);
+    expect(await room.memberCount(SLOT_ID)).toBe(1);
   });
 });

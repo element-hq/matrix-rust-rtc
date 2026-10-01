@@ -56,10 +56,37 @@ open a session aborts the process from inside libwebrtc rather than throwing.
 It is idempotent, and the `RtcLogging` helpers below call it themselves, so setting
 logging up as your first SDK call covers it too.
 
+## The objects: client → room → call
+
+```kotlin
+val client = RtcClient(backend)                    // one per Matrix session; does no I/O
+val room = client.room(roomId, FfiRoomOptions()) // subscribes, resolves once the room's state is in
+room.memberCount("m.call#ROOM")                    // observe a slot without joining it
+val call = room.joinCall(FfiJoinSessionParams(slotId = "m.call#ROOM", application = "m.call"))
+val media = connectMediaSession(call, MediaSessionConfig(/* … */))
+// …
+call.leave(FfiLeaveSessionParams(leaveReason = null))  // the call object is over afterwards
+room.shutdown()                                    // leaves what is still joined, ends the subscription
+```
+
+- **Open a room only while you need it.** A room costs its subscriptions for as
+  long as its object lives; the client holds nothing about a room until you ask
+  for one, and its to-device key subscription runs only while a room is open.
+- **One live room object per room, one live call per slot.** Opening an open
+  room, or joining a joined slot, is refused.
+- **Dropping is not leaving.** A dropped room or call ends its subscriptions and
+  keep-alive but sends nothing; the membership expires through its delayed leave.
+  `leave()` and `shutdown()` are the clean paths; Kotlin's `close()` (or
+  `use {}`) frees the object, which is dropping it. Joining a slot whose call was
+  dropped leaves that participation first.
+- **The library does not detect incoming calls.** Ringing reaches the app
+  through its own SDK or push path; open the room when the user answers or
+  starts a call.
+
 ## Turn on logging first
 
 The SDK is silent until the host installs a logger. Do this before creating an
-`RtcSessionManagerHandle`, or you will see nothing at all — not even errors.
+`RtcClient`, or you will see nothing at all — not even errors.
 
 **Android**
 
@@ -98,7 +125,7 @@ plus third-party `livekit` and `webrtc_sys`.
 
 - `RtcLogging.log(level, message)` (or `logEvent(...)`) puts your own lines in the same
   timeline as the SDK's, which is usually how you tell an SDK bug from an integration one.
-- `manager.debugSnapshot()` returns JSON of every session, its room state, and each
+- `room.debugSnapshot()` returns JSON of the room's state, every slot, and each
   candidate member with the reason it is or is not joined — attach it to bug reports.
 - Key material, LiveKit JWTs and OpenID tokens are never logged at any level.
 
@@ -108,8 +135,8 @@ conventions the SDK follows.
 ## Staying in the call (keep-alive)
 
 Two independent clocks expire your membership, and the SDK tends both for you.
-`join()` starts a keep-alive driver and `leave()` stops it — **there is nothing
-to call.**
+`joinCall()` starts a keep-alive driver and `leave()` (or dropping the call)
+stops it — **there is nothing to call.**
 
 | Clock | Default | Kept alive by |
 | --- | --- | --- |
@@ -139,8 +166,8 @@ implement in a way that looks right and silently breaks the call:
   membership and shows you as having left a call you are still in.
 
 To drive the keep-alive from your own scheduler instead (a foreground service, a
-workmanager job), call `manager.heartbeat(roomId, slotId)` on your own cadence;
-it returns `false` when there is no joined session. The built-in driver runs
+workmanager job), call `call.heartbeat()` on your own cadence; it returns
+`false` once the call is over. The built-in driver runs
 regardless, so only reach for this if you need a different cadence.
 
 A client that dies without leaving stays visible to peers for up to
@@ -208,7 +235,7 @@ when (val event = session.nextEvent()) {
 Element Call is the only other MatrixRTC implementation there is to test against,
 and it still speaks a pre-2026 wire format — two of them, in fact, which disagree
 about where a membership lives rather than merely what it says. Pass
-`elementCallCompat` when you attach the room to speak one of them:
+`elementCallCompat` when you open the room to speak one of them:
 
 | Mode | Element Call generation | Membership lives in |
 | --- | --- | --- |
@@ -219,7 +246,7 @@ about where a membership lives rather than merely what it says. Pass
 It is one decision, not a wire-format flag: it also fixes the `member.id` you
 join with, how an inbound media key is bound to a membership, your SFU
 participant identity, and which token endpoint mints your JWT. Choose it once,
-when attaching the room — the join and the media session read it back from
+when opening the room — the join and the media session read it back from
 there. Getting a mode wrong
 produces no error: the call connects, the roster may even fill in, and nothing
 decrypts.
@@ -228,7 +255,7 @@ Reading the 2025 sticky dialect needs no mode and is always on. What your host
 must do differently:
 
 ```kotlin
-manager.attachRoom(roomId, FfiAttachOptions(
+val room = client.room(roomId, FfiRoomOptions(
     elementCallCompat = FfiElementCallCompat.STATE_EVENTS,
 ))
 ```
@@ -258,12 +285,12 @@ level for `m.rtc.slot` state; the room creator by default, or set it in the
 room's initial state):
 
 ```kotlin
-manager.openSlot(roomId, "m.call#ROOM", "m.call", FfiSlotEncryption.PerMember)
+room.openSlot("m.call#ROOM", "m.call", FfiSlotEncryption.PerMember)
 ```
 
 `encryption` must be `PerMember` in an encrypted room and `null` elsewhere — the
 mismatch resolves the slot closed for everyone. It needs the power level for
-`m.rtc.slot` state (by default the room creator), and `closeSlot(roomId, slotId)`
+`m.rtc.slot` state (by default the room creator), and `closeSlot(slotId)`
 ends the call for every member, which is not the same as leaving it.
 
 Two traps that cost whole debugging sessions on the native path, and are not

@@ -5,9 +5,9 @@
 
 //! In-memory RTC session membership model.
 //!
-//! This module stores the current participant view for a single RTC session and
-//! applies joined/left transitions from domain membership events produced by the
-//! manager layer.
+//! This module stores the current participant view for one `(room, slot)` and
+//! applies joined/left transitions from domain membership events routed to it
+//! by its [`BaseRtcRoom`](crate::BaseRtcRoom), the only thing that creates one.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
@@ -38,9 +38,7 @@ use log::*;
 pub enum SlotKnowledge {
     /// No room state has been supplied for this room, so the slot condition is
     /// not enforced. Hosts opt in by calling
-    /// [`RtcSessionManager::on_room_slots_received`].
-    ///
-    /// [`RtcSessionManager::on_room_slots_received`]: crate::RtcSessionManager::on_room_slots_received
+    /// [`BaseRtcRoom::on_slots_received`](crate::BaseRtcRoom::on_slots_received).
     #[default]
     Unsupplied,
     /// Room state has been supplied; this is the slot's resolved state. A slot
@@ -69,11 +67,6 @@ fn describe_exclusions(excluded: &[(&str, JoinCondition)]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
-
-/// Log tag for a session created outside a
-/// [`RtcSessionManager`](crate::RtcSessionManager), which is the only thing
-/// that knows the `(room, slot)` a session belongs to.
-const UNATTRIBUTED_LOG_TAG: &str = "-/-";
 
 /// Why a candidate member event is, or is not, projected as joined.
 ///
@@ -118,7 +111,7 @@ struct OwnParticipation {
 }
 
 /// Per-session MatrixRTC state machine and membership store.
-pub struct RtcSession<T: MatrixBackend> {
+pub struct SlotSession<T: MatrixBackend> {
     /// Member events that are join-shaped and still sticky. These are
     /// candidates only: the remaining MSC4143 join conditions depend on room
     /// state, which can change under them at any time.
@@ -143,18 +136,16 @@ pub struct RtcSession<T: MatrixBackend> {
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
     encryption_manager: Option<EncryptionManager<T>>,
-    /// Set when a manager created this session.
-    membership_scope: Option<MembershipScope>,
-    /// `room_id/slot_id`, prefixed to this session's log lines.
-    ///
-    /// A session does not otherwise know which slot it belongs to — the manager
-    /// holds that in its key — so without this every line from a multi-call
-    /// client is unattributable. Pre-formatted because it is used on paths that
-    /// run per event.
+    room_id: String,
+    slot_id: String,
+    membership_scope: MembershipScope,
+    /// `room_id/slot_id`, prefixed to this session's log lines, so every line
+    /// from a multi-call client is attributable. Pre-formatted because it is
+    /// used on paths that run per event.
     log_tag: String,
 }
 
-impl<T: MatrixBackend> Clone for RtcSession<T> {
+impl<T: MatrixBackend> Clone for SlotSession<T> {
     fn clone(&self) -> Self {
         Self {
             candidates: self.candidates.clone(),
@@ -167,16 +158,25 @@ impl<T: MatrixBackend> Clone for RtcSession<T> {
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             encryption_manager: None,     // Don't clone the encryption manager
             own_participation: None,      // A clone holds no machine, so it is not joined
+            room_id: self.room_id.clone(),
+            slot_id: self.slot_id.clone(),
             membership_scope: self.membership_scope.clone(), // Shares the watch, so shares its listeners
             log_tag: self.log_tag.clone(),
         }
     }
 }
 
-impl<T: MatrixBackend + 'static> RtcSession<T> {
-    /// Creates an empty session without a backend.
-    pub fn new() -> Self {
+impl<T: MatrixBackend + 'static> SlotSession<T> {
+    /// Creates an empty session for one `(room_id, slot_id)`; called by the
+    /// room on the slot's first use.
+    pub(crate) fn new(
+        room_id: String,
+        slot_id: String,
+        backend: Option<Arc<T>>,
+        membership_scope: MembershipScope,
+    ) -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
+        let log_tag = format!("{room_id}/{slot_id}");
 
         Self {
             candidates: Vec::new(),
@@ -185,46 +185,15 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
             room_members: None,
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
-            backend: None,
+            backend,
             own_membership_machine: None,
             encryption_manager: None,
             own_participation: None,
-            membership_scope: None,
-            log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
+            room_id,
+            slot_id,
+            membership_scope,
+            log_tag,
         }
-    }
-
-    /// Creates an empty session with a backend.
-    pub fn with_backend(backend: Arc<T>) -> Self {
-        let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
-
-        Self {
-            candidates: Vec::new(),
-            members: Vec::new(),
-            slot: SlotKnowledge::default(),
-            room_members: None,
-            room_encryption: RoomEncryption::default(),
-            membership_snapshots_tx,
-            backend: Some(backend),
-            own_membership_machine: None,
-            encryption_manager: None,
-            own_participation: None,
-            membership_scope: None,
-            log_tag: UNATTRIBUTED_LOG_TAG.to_owned(),
-        }
-    }
-
-    /// Names this session in its log lines, as `room_id/slot_id`.
-    ///
-    /// Called by [`RtcSessionManager`](crate::RtcSessionManager) on creation; a
-    /// standalone [`RtcSession`] keeps the placeholder tag.
-    pub(crate) fn set_log_tag(&mut self, log_tag: String) {
-        self.log_tag = log_tag;
-    }
-
-    /// Called by the manager on creation.
-    pub(crate) fn set_membership_scope(&mut self, scope: MembershipScope) {
-        self.membership_scope = Some(scope);
     }
 
     /// The joined set as last published.
@@ -246,7 +215,7 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
     /// session's encryption manager.
     ///
     /// Returns `false` if the session has not joined yet (no encryption manager
-    /// exists). Call after [`RtcSession::join`].
+    /// exists). Call after [`SlotSession::join`].
     pub fn set_encryption_signal_handler(
         &mut self,
         handler: Arc<dyn EncryptionKeySignalHandler>,
@@ -287,7 +256,7 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
     /// Performs a key rotation coalesced into a fresh key's window, if one is owed
     /// and due.
     ///
-    /// See `RtcSessionManager::flush_due_key_rotation` for why this is the
+    /// See `BaseRtcRoom::flush_due_key_rotation` for why this is the
     /// consumer's to call. Returns `false` if the session has not joined.
     pub async fn flush_due_key_rotation(&self) -> bool {
         match &self.encryption_manager {
@@ -308,7 +277,7 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///
     /// Returns `false` if the session has not joined yet. Call after
-    /// [`RtcSession::join`].
+    /// [`SlotSession::join`].
     pub fn set_encryption_identity_mapper(&mut self, mapper: RtcIdentityMapper) -> bool {
         match &mut self.encryption_manager {
             Some(manager) => {
@@ -403,8 +372,8 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
         };
         let machine = OwnMembershipMachine::new(
             backend.clone(),
-            params.room_id.clone(),
-            params.slot_id.clone(),
+            self.room_id.clone(),
+            self.slot_id.clone(),
             membership_id.clone(),
             params.application.clone(),
             MembershipTimings {
@@ -455,8 +424,8 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
             params.user_id.clone(),
             params.device_id.clone(),
             membership_id.clone(),
-            params.room_id.clone(),
-            params.slot_id.clone(),
+            self.room_id.clone(),
+            self.slot_id.clone(),
             get_memberships_for_encryption,
         );
         let manage_media_keys = encryption_config.manage_media_keys;
@@ -524,7 +493,7 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
     /// Only *own-participation* state is dropped: the membership machine, the
     /// encryption manager and our identity. Room state (`slot`, `room_members`,
     /// `room_encryption`) and peer `candidates` are kept, and the session itself
-    /// stays registered with its manager. Three reasons, all load-bearing:
+    /// stays registered with its room. Three reasons, all load-bearing:
     ///
     /// - Hosts feed sticky *deltas*. An unchanged peer membership is never
     ///   re-delivered, so a session reset to pristine would rejoin into an empty
@@ -928,9 +897,7 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
         self.members = members;
         self.membership_snapshots_tx
             .send_replace(self.members.clone());
-        if let Some(scope) = &self.membership_scope {
-            scope.notify(&self.members);
-        }
+        self.membership_scope.notify(&self.members);
 
         if let Some(ref encryption_manager) = self.encryption_manager {
             let _ = encryption_manager.on_memberships_update().await;
@@ -979,7 +946,7 @@ impl<T: MatrixBackend + 'static> RtcSession<T> {
     /// Sets the slot state on a session that has no members yet.
     ///
     /// Used when a session is created after its room state was already known;
-    /// [`RtcSession::set_slot_state`] is the one to use once it is live.
+    /// [`SlotSession::set_slot_state`] is the one to use once it is live.
     pub(crate) fn seed_slot_state(&mut self, state: SlotState) {
         debug_assert!(self.candidates.is_empty(), "seeding a populated session");
         self.slot = SlotKnowledge::Known(state);
@@ -1341,10 +1308,4 @@ pub struct LeftMembership {
     pub member_id: Option<String>,
     /// Optional leave reason (MSC4143).
     pub leave_reason: Option<LeaveReason>,
-}
-
-impl<T: MatrixBackend + 'static> Default for RtcSession<T> {
-    fn default() -> Self {
-        Self::new()
-    }
 }

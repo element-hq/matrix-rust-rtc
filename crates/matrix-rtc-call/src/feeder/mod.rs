@@ -3,16 +3,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! Feeds the manager from a `MatrixBackend`: subscribes to what a room needs
-//! in its compatibility mode, seeds room state before membership, funnels the
-//! pre-2026 dialects, and forwards timeline events, redactions, relations and
-//! media keys. The one place Matrix becomes core input, on every binding.
+//! Feeds one room's state from a `MatrixBackend`: subscribes to what the room
+//! needs in its compatibility mode, seeds room state before membership,
+//! funnels the pre-2026 dialects, and forwards timeline events, redactions and
+//! relations. Media keys arrive on one to-device subscription per client and
+//! are routed to the room they name through the [`RoomRegistry`]. The one place
+//! Matrix becomes core input, on every binding.
 //!
-//! Sinks only enqueue; `run()` does the work under the manager lock and is a
+//! Sinks only enqueue; `run()` does the work under the room's lock and is a
 //! plain future the binding spawns where its background work already runs.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 
 use matrix_rtc_core::{
     ApplicationIntake, BackendError, EventEncryption, EventIn, KEY_MESSAGE_TYPE, KeyOrigin,
@@ -39,44 +41,90 @@ const KEY_EVENT_TYPES: [&str; 3] = [
     LEGACY_KEY_EVENT_TYPE,
 ];
 
-/// How a room is attached.
-#[derive(Clone, Debug, Default)]
-pub struct AttachOptions {
-    pub element_call_compat: ElementCallCompat,
+/// The rooms a client holds, by room id: each one's compatibility mode, which
+/// binds a legacy media key, and a weak handle the to-device feeder routes keys
+/// to. Holding no strong reference is what lets a dropped room stop receiving
+/// keys without anyone unregistering it first.
+pub struct RoomRegistry<M>(Arc<StdMutex<HashMap<String, RegisteredRoom<M>>>>);
+
+struct RegisteredRoom<M> {
+    mode: ElementCallCompat,
+    room: Weak<Mutex<M>>,
 }
 
-/// The compatibility mode of every attached room, shared between the room
-/// feeders that register it and the session feeder that binds legacy keys by
-/// it.
-#[derive(Clone, Default)]
-pub struct RoomModes(Arc<StdMutex<HashMap<String, ElementCallCompat>>>);
+impl<M> Clone for RoomRegistry<M> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
-impl RoomModes {
+impl<M> Default for RoomRegistry<M> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+/// Registering a room the registry already holds a live entry for.
+#[derive(Debug, thiserror::Error)]
+#[error("{0} is already open")]
+pub struct RoomAlreadyOpen(pub String);
+
+impl<M> RoomRegistry<M> {
+    /// Refused while `room_id` has a live entry; an entry whose room was
+    /// dropped without unregistering is replaced.
+    pub fn register(
+        &self,
+        room_id: &str,
+        mode: ElementCallCompat,
+        room: &Arc<Mutex<M>>,
+    ) -> Result<(), RoomAlreadyOpen> {
+        let mut rooms = self.lock();
+        if rooms
+            .get(room_id)
+            .is_some_and(|entry| entry.room.strong_count() > 0)
+        {
+            return Err(RoomAlreadyOpen(room_id.to_owned()));
+        }
+        rooms.insert(
+            room_id.to_owned(),
+            RegisteredRoom {
+                mode,
+                room: Arc::downgrade(room),
+            },
+        );
+        Ok(())
+    }
+
+    /// Returns whether the registry is empty afterwards.
+    pub fn unregister(&self, room_id: &str) -> bool {
+        let mut rooms = self.lock();
+        rooms.remove(room_id);
+        rooms.is_empty()
+    }
+
+    /// The mode `room_id` was opened in, or `Off` for a room not held.
     pub fn mode(&self, room_id: &str) -> ElementCallCompat {
-        self.0
-            .lock()
-            .ok()
-            .and_then(|modes| modes.get(room_id).copied())
+        self.lock()
+            .get(room_id)
+            .map(|entry| entry.mode)
             .unwrap_or_default()
     }
 
-    pub fn is_attached(&self, room_id: &str) -> bool {
+    /// The live room for `room_id`, if one is held.
+    pub fn room(&self, room_id: &str) -> Option<Arc<Mutex<M>>> {
+        self.lock().get(room_id)?.room.upgrade()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Never held across an await, so a poisoned lock only means a panic
+    /// elsewhere mid-insert; the map itself is still consistent.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, RegisteredRoom<M>>> {
         self.0
             .lock()
-            .map(|modes| modes.contains_key(room_id))
-            .unwrap_or(false)
-    }
-
-    fn set(&self, room_id: &str, mode: ElementCallCompat) {
-        if let Ok(mut modes) = self.0.lock() {
-            modes.insert(room_id.to_owned(), mode);
-        }
-    }
-
-    fn remove(&self, room_id: &str) {
-        if let Ok(mut modes) = self.0.lock() {
-            modes.remove(room_id);
-        }
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -252,7 +300,6 @@ pub struct RoomAttachment {
     subscription: Arc<dyn Subscription>,
     stop: mpsc::UnboundedSender<RoomInput>,
     seeded: watch::Receiver<bool>,
-    modes: RoomModes,
 }
 
 impl RoomAttachment {
@@ -274,97 +321,13 @@ impl RoomAttachment {
     pub fn is_seeded(&self) -> bool {
         *self.seeded.borrow()
     }
-
-    /// Ends the subscription; nothing delivered afterwards is applied.
-    pub fn detach(self) {
-        drop(self);
-    }
 }
 
 impl Drop for RoomAttachment {
     fn drop(&mut self) {
         log::info!("[{}] detaching", self.room_id);
-        self.modes.remove(&self.room_id);
         self.subscription.cancel();
         let _ = self.stop.send(RoomInput::Stop);
-    }
-}
-
-/// The rooms a binding has attached, one attachment per room id.
-///
-/// A room is reserved before the attach's first await, so a second attach of
-/// the same room fails instead of subscribing twice. Attach and detach of one
-/// room must not overlap: a detach while the attach is in flight finds nothing
-/// to detach.
-pub struct AttachedRooms<T>(Arc<StdMutex<HashMap<String, Option<T>>>>);
-
-impl<T> Default for AttachedRooms<T> {
-    fn default() -> Self {
-        Self(Arc::default())
-    }
-}
-
-impl<T> Clone for AttachedRooms<T> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<T> AttachedRooms<T> {
-    /// Reserves `room_id` for an attach, or `None` when it is attached or
-    /// being attached already.
-    pub fn reserve(&self, room_id: &str) -> Option<RoomReservation<T>> {
-        let mut rooms = self.lock();
-        if rooms.contains_key(room_id) {
-            return None;
-        }
-        rooms.insert(room_id.to_owned(), None);
-        Some(RoomReservation {
-            rooms: self.clone(),
-            room_id: room_id.to_owned(),
-            filled: false,
-        })
-    }
-
-    /// Takes an attached room out, to detach it. A room still being attached
-    /// stays reserved, and `None` is returned.
-    pub fn remove(&self, room_id: &str) -> Option<T> {
-        let mut rooms = self.lock();
-        match rooms.get(room_id) {
-            Some(Some(_)) => rooms.remove(room_id).flatten(),
-            _ => None,
-        }
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Option<T>>> {
-        self.0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-/// A room reserved by [`AttachedRooms::reserve`]. [`fill`](Self::fill) it
-/// once attached; dropping it unfilled (the attach failed) frees the room.
-pub struct RoomReservation<T> {
-    rooms: AttachedRooms<T>,
-    room_id: String,
-    filled: bool,
-}
-
-impl<T> RoomReservation<T> {
-    pub fn fill(mut self, attached: T) {
-        self.rooms
-            .lock()
-            .insert(self.room_id.clone(), Some(attached));
-        self.filled = true;
-    }
-}
-
-impl<T> Drop for RoomReservation<T> {
-    fn drop(&mut self) {
-        if !self.filled {
-            self.rooms.lock().remove(&self.room_id);
-        }
     }
 }
 
@@ -372,38 +335,30 @@ impl<T> Drop for RoomReservation<T> {
 pub struct RoomFeeder;
 
 impl RoomFeeder {
-    /// Subscribes to what `room_id` needs in `options.element_call_compat`
-    /// and returns the attachment plus the future that applies what arrives.
-    /// The caller spawns [`RoomFeederRun::run`].
+    /// Subscribes to what `room` needs in `mode` and returns the attachment
+    /// plus the future that applies what arrives. The caller spawns
+    /// [`RoomFeederRun::run`].
     pub async fn attach<B, M>(
         backend: Arc<B>,
-        manager: Arc<Mutex<M>>,
-        modes: RoomModes,
-        room_id: String,
-        options: AttachOptions,
+        room: Arc<Mutex<M>>,
+        mode: ElementCallCompat,
     ) -> Result<(RoomAttachment, RoomFeederRun<B, M>), BackendError>
     where
         B: MatrixBackend + 'static,
         M: ApplicationIntake<B>,
     {
-        let mode = options.element_call_compat;
-        let timeline_event_types = manager.lock().await.timeline_event_types();
+        let (room_id, timeline_event_types) = {
+            let mut room = room.lock().await;
+            (room.rtc().room_id().to_owned(), room.timeline_event_types())
+        };
         let subjects = subjects_for(mode, timeline_event_types);
         log::info!("[{room_id}] attaching in {mode:?} mode: {subjects:?}");
 
         let (tx, rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn RoomSink> = Arc::new(ChannelRoomSink { tx: tx.clone() });
-        modes.set(&room_id, mode);
-        let subscription = match backend
+        let subscription = backend
             .subscribe_room(room_id.clone(), subjects, sink)
-            .await
-        {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                modes.remove(&room_id);
-                return Err(error);
-            }
-        };
+            .await?;
         let (seeded_tx, seeded_rx) = watch::channel(false);
 
         let attachment = RoomAttachment {
@@ -411,11 +366,10 @@ impl RoomFeeder {
             subscription,
             stop: tx,
             seeded: seeded_rx,
-            modes,
         };
         let run = RoomFeederRun {
             backend,
-            manager,
+            room,
             room_id,
             mode,
             rx,
@@ -441,10 +395,10 @@ struct FeedState {
     membership_dirty: bool,
 }
 
-/// The future that applies a room's inputs. Ends on detach.
+/// The future that applies a room's inputs. Ends when the attachment drops.
 pub struct RoomFeederRun<B, M> {
     backend: Arc<B>,
-    manager: Arc<Mutex<M>>,
+    room: Arc<Mutex<M>>,
     room_id: String,
     mode: ElementCallCompat,
     rx: mpsc::UnboundedReceiver<RoomInput>,
@@ -462,11 +416,11 @@ where
             match input {
                 RoomInput::Stop => break,
                 RoomInput::Encryption(encrypted) => {
-                    self.manager
+                    self.room
                         .lock()
                         .await
                         .rtc()
-                        .on_room_encryption_received(&self.room_id, encrypted)
+                        .on_encryption_received(encrypted)
                         .await;
                     self.state.seen_encryption = true;
                 }
@@ -487,16 +441,10 @@ where
                         .into_iter()
                         .map(|event| to_timeline_event(&self.room_id, event))
                         .collect();
-                    self.manager
-                        .lock()
-                        .await
-                        .on_room_timeline_events(&self.room_id, &events);
+                    self.room.lock().await.on_timeline_events(&events);
                 }
                 RoomInput::Redaction(event_id) => {
-                    self.manager
-                        .lock()
-                        .await
-                        .on_event_redacted(&self.room_id, &event_id);
+                    self.room.lock().await.on_event_redacted(&event_id);
                 }
             }
 
@@ -517,12 +465,7 @@ where
                 .filter_map(SlotEvents::current)
                 .filter_map(|event| to_slot_event(&self.room_id, event.clone()))
                 .collect();
-            self.manager
-                .lock()
-                .await
-                .rtc()
-                .on_room_slots_received(&self.room_id, slots)
-                .await;
+            self.room.lock().await.rtc().on_slots_received(slots).await;
             self.state.seen_slots = true;
         } else if event_type == STATE_MEMBER_EVENT_TYPE {
             self.state.legacy = Some(
@@ -555,11 +498,11 @@ where
             );
             return;
         }
-        self.manager
+        self.room
             .lock()
             .await
             .rtc()
-            .on_room_members_received(&self.room_id, user_ids)
+            .on_members_received(user_ids)
             .await;
         self.state.seen_members = true;
     }
@@ -578,11 +521,11 @@ where
         let legacy = self.state.legacy.clone().unwrap_or_default();
         let current = merge_current_membership(&self.room_id, sticky, legacy);
         if let Err(error) = self
-            .manager
+            .room
             .lock()
             .await
             .rtc()
-            .set_current_sticky_state(&self.room_id, current)
+            .set_current_sticky_state(current)
             .await
         {
             log::warn!(
@@ -599,9 +542,9 @@ where
     }
 
     /// The relations the application asks for, fetched without holding the
-    /// manager lock. A failed fetch is asked for again on the next apply.
+    /// room's lock. A failed fetch is asked for again on the next apply.
     async fn backfill_relations(&self) {
-        let requests = self.manager.lock().await.pending_relations(&self.room_id);
+        let requests = self.room.lock().await.pending_relations();
         for request in requests {
             match self
                 .backend
@@ -619,11 +562,10 @@ where
                         .filter(|event| event.event_type == request.event_type)
                         .map(|event| to_timeline_event(&self.room_id, event))
                         .collect();
-                    self.manager.lock().await.on_relations_received(
-                        &self.room_id,
-                        &request.event_id,
-                        &events,
-                    );
+                    self.room
+                        .lock()
+                        .await
+                        .on_relations_received(&request.event_id, &events);
                 }
                 Err(error) => log::warn!(
                     "[{}] could not fetch the {} relations of {} ({error}); retrying later",
@@ -656,7 +598,7 @@ struct MediaKey {
 /// A media key from a to-device message, in either generation, or `None` with
 /// the reason logged.
 pub fn parse_key_message(
-    modes: &RoomModes,
+    mode_of: impl Fn(&str) -> ElementCallCompat,
     message: ToDeviceMessageIn,
 ) -> Option<ReceivedEncryptionKey> {
     let origin = key_origin(&message.encryption, &message.sender);
@@ -667,7 +609,7 @@ pub fn parse_key_message(
             .and_then(Value::as_str)
             .unwrap_or_default();
         let key = parse_legacy_key(
-            modes.mode(room_id),
+            mode_of(room_id),
             &message.sender,
             message.encryption.sender_device_id(),
             &message.content,
@@ -709,21 +651,20 @@ impl ToDeviceSink for ChannelToDeviceSink {
     }
 }
 
-/// The session-wide to-device subscription. Dropping it stops it.
-pub struct SessionFeeder {
+/// The client-wide to-device subscription. Dropping it stops it.
+pub struct ToDeviceFeeder {
     subscription: Arc<dyn Subscription>,
     stop: mpsc::UnboundedSender<Option<ToDeviceMessageIn>>,
 }
 
-impl SessionFeeder {
+impl ToDeviceFeeder {
     /// Subscribes to media keys of both generations and returns the future
-    /// that routes them to the manager. The caller spawns
-    /// [`SessionFeederRun::run`].
+    /// that routes each to the room it names. The caller spawns
+    /// [`ToDeviceFeederRun::run`].
     pub async fn start<B, M>(
         backend: Arc<B>,
-        manager: Arc<Mutex<M>>,
-        modes: RoomModes,
-    ) -> Result<(SessionFeeder, SessionFeederRun<B, M>), BackendError>
+        registry: RoomRegistry<M>,
+    ) -> Result<(ToDeviceFeeder, ToDeviceFeederRun<B, M>), BackendError>
     where
         B: MatrixBackend + 'static,
         M: ApplicationIntake<B>,
@@ -733,13 +674,12 @@ impl SessionFeeder {
         let event_types = KEY_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect();
         let subscription = backend.subscribe_to_device(event_types, sink).await?;
         Ok((
-            SessionFeeder {
+            ToDeviceFeeder {
                 subscription,
                 stop: tx,
             },
-            SessionFeederRun {
-                manager,
-                modes,
+            ToDeviceFeederRun {
+                registry,
                 rx,
                 _backend: backend,
             },
@@ -751,7 +691,7 @@ impl SessionFeeder {
     }
 }
 
-impl Drop for SessionFeeder {
+impl Drop for ToDeviceFeeder {
     fn drop(&mut self) {
         self.subscription.cancel();
         let _ = self.stop.send(None);
@@ -759,14 +699,13 @@ impl Drop for SessionFeeder {
 }
 
 /// The future that routes media keys. Ends on stop.
-pub struct SessionFeederRun<B, M> {
-    manager: Arc<Mutex<M>>,
-    modes: RoomModes,
+pub struct ToDeviceFeederRun<B, M> {
+    registry: RoomRegistry<M>,
     rx: mpsc::UnboundedReceiver<Option<ToDeviceMessageIn>>,
     _backend: Arc<B>,
 }
 
-impl<B, M> SessionFeederRun<B, M>
+impl<B, M> ToDeviceFeederRun<B, M>
 where
     B: MatrixBackend + 'static,
     M: ApplicationIntake<B>,
@@ -776,26 +715,23 @@ where
             if !KEY_EVENT_TYPES.contains(&message.event_type.as_str()) {
                 continue;
             }
-            let Some(key) = parse_key_message(&self.modes, message) else {
+            let Some(key) = parse_key_message(|room_id| self.registry.mode(room_id), message)
+            else {
                 continue;
             };
-            if !self.modes.is_attached(&key.room_id) {
+            // A key for a room no live room object holds is dropped: nothing
+            // could use it, and keeping it would be state spanning rooms.
+            let Some(room) = self.registry.room(&key.room_id) else {
                 log::debug!(
-                    "[{}] dropping a media key for a room that is not attached",
+                    "[{}] dropping a media key for a room that is not open",
                     key.room_id
                 );
                 continue;
-            }
-            if let Err(error) = self
-                .manager
-                .lock()
-                .await
-                .rtc()
-                .receive_encryption_key(key)
-                .await
-            {
+            };
+            if let Err(error) = room.lock().await.rtc().receive_encryption_key(key).await {
                 log::warn!("a media key was rejected: {error}");
             }
         }
+        log::info!("to-device feeder stopped");
     }
 }

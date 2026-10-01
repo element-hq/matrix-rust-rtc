@@ -7,7 +7,7 @@
 members = [
     "crates/matrix-rtc-core",
     "crates/matrix-rtc-call",
-    "crates/matrix-rtc-bridge",
+    "crates/matrix-rtc-matrix-sdk",
     "crates/matrix-rtc-media",
     "crates/matrix-rtc-wasm",
     "crates/matrix-rtc-ffi",
@@ -19,7 +19,7 @@ resolver = "2"
 
 # Every member sets `publish = false`: distribution is the mobile artifacts
 # (AAR, xcframework) built by .github/workflows/release.yml, not crates.io. The
-# livekit and bridge crates could not be published anyway — they pin matrix-sdk
+# livekit and matrix-sdk crates could not be published anyway — they pin matrix-sdk
 # by git rev, which the registry rejects.
 [workspace.package]
 version = "0.4.0-rc.1"
@@ -53,8 +53,8 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 log = "0.4"
 async-trait = "0.1"
 
-# The Matrix SDK, used by matrix-rtc-bridge and matrix-rtc-livekit behind their
-# `matrix-sdk` feature. Upstream `main`, pinned to a rev so builds are
+# The Matrix SDK, used by matrix-rtc-matrix-sdk, and by matrix-rtc-livekit behind
+# its `matrix-sdk` feature. Upstream `main`, pinned to a rev so builds are
 # reproducible; the three crates MUST share one rev or cargo resolves two copies
 # of matrix-sdk and the `Client` one crate takes is not the one the other accepts.
 # MSC4354 sticky events come from its `unstable-msc4354` feature, which our
@@ -66,7 +66,7 @@ matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "
 # matrix-rust-sdk carries these git pins in its own `[patch]` tables. Cargo does
 # NOT propagate a dependency's `[patch]` to the consuming workspace, so they are
 # replicated here verbatim, or the SDK fails to build; a downstream workspace
-# that depends on matrix-rtc-bridge/-livekit with `matrix-sdk` on must do the
+# that depends on matrix-rtc-matrix-sdk, or -livekit with `matrix-sdk` on, must do the
 # same. Source: matrix-org/matrix-rust-sdk@c6ad52e Cargo.toml — keep in step when
 # bumping the rev above.
 [patch.crates-io]

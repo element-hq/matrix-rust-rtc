@@ -6,20 +6,20 @@ Please see LICENSE in the repository root for full details.
 */
 
 /**
- * The Matrix side of a web call: matrix-js-sdk behind the wasm manager's
+ * The Matrix side of a web call: matrix-js-sdk behind the wasm bindings'
  * `MatrixBackendHost` contract. One object, both halves:
  * - sends: sticky (MSC4354), delayed events (MSC4140 — restart is the restart
  *   action, never cancel+resend; a delayed STATE event when a state key is
  *   given), state events, plain room events, redactions, and Olm-encrypted
  *   per-device to-device messages;
  * - reads: `subscribeRoom` delivers the room's complete current sets into the
- *   sink the manager hands it — encryption, state events of the requested
+ *   sink the library hands it — encryption, state events of the requested
  *   types, joined members, the sticky set — first on subscribe and again on
  *   every change, plus timeline events and redactions as they arrive;
  *   `subscribeToDevice` delivers decrypted to-device messages with their Olm
  *   decryption metadata and MSC4153 cross-signing status; `relations`,
  *   `getOpenIdToken` and `rtcTransports` answer on request.
- * The manager parses every MatrixRTC content and applies the compatibility
+ * The library parses every MatrixRTC content and applies the compatibility
  * dialects itself; this file hands events over verbatim.
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
  * the module is injected (`sdk`), keeping it an optional peer dependency and
@@ -114,7 +114,7 @@ export async function createMatrixSession({
 export const READ_RETRY_MS = 5000;
 
 /**
- * The `MatrixBackendHost` the manager takes: `new WasmRtcSessionManager(host)`.
+ * The `MatrixBackendHost` the client takes: `new WasmRtcClient(host)`.
  */
 export class MatrixHost {
   /**
@@ -144,7 +144,7 @@ export class MatrixHost {
   // --- sends -------------------------------------------------------------
 
   sendStickyEvent(roomId, eventType, content, durationMs) {
-    // The manager chose the duration; pass it through verbatim.
+    // The library chose the duration; pass it through verbatim.
     return this.client._unstable_sendStickyEvent(roomId, durationMs, null, eventType, content);
   }
 
@@ -164,7 +164,7 @@ export class MatrixHost {
             content,
             stateKey,
           );
-    // The manager expects the bare MSC4140 delay id.
+    // The library expects the bare MSC4140 delay id.
     return response.delay_id;
   }
 
@@ -179,7 +179,7 @@ export class MatrixHost {
   async sendToDeviceMessage(recipients, messageType, content) {
     // Olm-encrypted, per specific device — never `*`. Resolving with nothing
     // reports every recipient as served; a throw reports the batch
-    // unattempted, and the manager re-sends on the next rollout.
+    // unattempted, and the library re-sends on the next rollout.
     await this.client.encryptAndSendToDevice(messageType, recipients, content);
   }
 
@@ -406,7 +406,7 @@ export class MatrixHost {
 
   // --- shapes ------------------------------------------------------------
 
-  /** One event as the manager takes it: content verbatim, decryption info as reported. */
+  /** One event as the library takes it: content verbatim, decryption info as reported. */
   async eventIn(event) {
     return this.eventShape(event, await this.eventEncryption(event));
   }
@@ -460,7 +460,7 @@ export class MatrixHost {
   /**
    * The room's active sticky events, decrypted. The sticky store does not
    * decrypt and keys encrypted events under `m.room.encrypted`, so iterate
-   * everything and decrypt; the manager filters by type.
+   * everything and decrypt; the library filters by type.
    */
   async stickySnapshot(room) {
     const events = [];

@@ -6,7 +6,7 @@ Please see LICENSE in the repository root for full details.
 */
 
 /**
- * The call: one wasm manager + one MatrixRtcCall over a joined slot, with
+ * The call: one wasm client, room and call + one MatrixRtcCall over it, with
  * tiles for humans and events for the test driver.
  * Everything protocol-shaped lives below this file (the wasm engine, the
  * MatrixHost); this is the app glue — join sequencing, publishing, tile
@@ -17,7 +17,7 @@ import * as livekit from 'livekit-client';
 import E2EEWorker from 'livekit-client/e2ee-worker?worker';
 import * as sdk from 'matrix-js-sdk';
 import init, * as bindings from 'matrix-rtc-wasm';
-import { ManagerOpQueue, MatrixRtcCall } from 'matrix-rtc-wasm/call';
+import { MatrixRtcCall } from 'matrix-rtc-wasm/call';
 import { MatrixHost, createMatrixSession } from 'matrix-rtc-wasm/matrix-js-sdk-host';
 import {
   AUDIO_RMS_FLOOR,
@@ -41,7 +41,6 @@ export class WebPeerApp {
     this.emit = emit;
     this.log = log;
     this.tilesElement = tilesElement;
-    this.managerOps = new ManagerOpQueue();
     this.tiles = new Map();
     this.meters = [];
     this.ready = init().then(() => {
@@ -65,7 +64,7 @@ export class WebPeerApp {
     this.deviceId = session.deviceId;
 
     this.host = new MatrixHost({ sdk, client: this.client, log: this.log });
-    this.manager = new bindings.WasmRtcSessionManager(this.host);
+    this.rtc = new bindings.WasmRtcClient(this.host);
 
     this.emit({ event: 'ready', user_id: this.userId, device_id: this.deviceId });
     return { userId: this.userId, deviceId: this.deviceId };
@@ -107,11 +106,13 @@ export class WebPeerApp {
     // the pre-sticky mode: that generation predates slots (a join in it leaves
     // the condition unenforced), and its Element Call ignores them anyway.
     if (mode !== 'state_events') {
-      await this.managerOps.enqueue(() =>
-        this.manager.openSlot(response.room_id, DEFAULT_SLOT_ID, 'm.call', {
-          type: 'm.per_member',
-        }),
-      );
+      // Opened only for the slot: `join` opens it again in its own mode.
+      const rtcRoom = await this.rtc.room(response.room_id, undefined);
+      try {
+        await rtcRoom.openSlot(DEFAULT_SLOT_ID, 'm.call', { type: 'm.per_member' });
+      } finally {
+        await rtcRoom.close();
+      }
     }
     this.emit({ event: 'room_created', room_id: response.room_id, room_name: name });
     return response.room_id;
@@ -136,31 +137,26 @@ export class WebPeerApp {
     this.compat = compat;
     this.log(`joining ${roomId} / ${slotId} on focus ${focusUrl}`);
 
-    // Attach before joining: the manager subscribes to the room through the
-    // host and applies its current state (encryption, slots, members,
-    // membership) before publishing ours.
-    await this.managerOps.enqueue(() =>
-      this.manager.attachRoom(roomId, {
-        element_call_compat: compat === 'off' ? undefined : compat,
-      }),
-    );
+    // Open before joining: the room subscribes through the host and applies
+    // its current state (encryption, slots, members, membership) before
+    // publishing ours.
+    this.rtcRoom = await this.rtc.room(roomId, {
+      element_call_compat: compat === 'off' ? undefined : compat,
+    });
 
-    const memberId = await this.managerOps.enqueue(() =>
-      this.manager.join({
-        room_id: roomId,
-        slot_id: slotId,
-        application: 'm.call',
-        // The demo pins the focus it discovered; omit to take the homeserver's.
-        transport: { type: 'livekit', livekit_service_url: focusUrl },
-      }),
-    );
+    this.rtcCall = await this.rtcRoom.joinCall({
+      slot_id: slotId,
+      application: 'm.call',
+      // The demo pins the focus it discovered; omit to take the homeserver's.
+      transport: { type: 'livekit', livekit_service_url: focusUrl },
+    });
+    const memberId = this.rtcCall.memberId;
     this.memberId = memberId;
 
     this.call = new MatrixRtcCall({
-      manager: this.manager,
+      call: this.rtcCall,
       bindings,
       livekit,
-      managerOps: this.managerOps,
       roomOptions: { e2ee: { worker: new E2EEWorker() } },
     });
     this.call.onParticipants = (roster) => this.onRoster(roster);
@@ -168,8 +164,6 @@ export class WebPeerApp {
     this.call.onRoomCreated = (room, key) => this.onRoomCreated(room, key);
 
     await this.call.connect({
-      roomId,
-      slotId,
       userId: this.userId,
       deviceId: this.deviceId,
       livekitServiceUrl: focusUrl,
@@ -223,9 +217,13 @@ export class WebPeerApp {
       await this.call.disconnect();
       this.call = null;
     }
-    if (this.roomId) {
-      await this.managerOps.enqueue(() => this.manager.leave(this.roomId, this.slotId, {}));
-      await this.managerOps.enqueue(() => this.manager.detachRoom(this.roomId));
+    if (this.rtcCall) {
+      await this.rtcCall.leave({});
+      this.rtcCall = null;
+    }
+    if (this.rtcRoom) {
+      await this.rtcRoom.close();
+      this.rtcRoom = null;
     }
     this.emit({ event: 'left' });
   }

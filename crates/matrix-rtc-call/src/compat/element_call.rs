@@ -317,7 +317,7 @@ pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessa
 /// The outbound half: rewrites what we send so a pre-2026 Element Call can read
 /// it.
 ///
-/// Opt-in per call ([`CallOptions::element_call_compat`](crate::CallOptions::element_call_compat)),
+/// Opt-in per call (`matrix_rtc_livekit::LiveKitCallOptions::element_call_compat`),
 /// because unlike the inbound normalisation this changes what every peer sees.
 ///
 /// Member events are rewritten **additively** — the MSC4143 fields all stay put

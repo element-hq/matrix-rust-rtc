@@ -4,8 +4,8 @@
 // Please see LICENSE in the repository root for full details.
 
 //! The web media session: the participant roster and connection lifecycle over
-//! livekit-js, layered on a slot the page has already joined through
-//! [`WasmRtcSessionManager`].
+//! livekit-js, layered on a call the page has already joined
+//! ([`WasmRtcCall`]).
 //!
 //! A port of the FFI's `connect_media_session` seam
 //! (`matrix-rtc-ffi/src/media/session.rs`) — same wiring, same order — minus
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_sys::{Function, Reflect};
-use matrix_rtc_bridge::compat::ElementCallCompat;
+use matrix_rtc_call::compat::ElementCallCompat;
 use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
@@ -29,16 +29,14 @@ use tokio::sync::{broadcast, watch};
 use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
-use crate::WasmRtcSessionManager;
+use crate::WasmRtcCall;
 
 /// livekit-js's `ExternalE2EEKeyProvider` default `keyringSize`.
 const LIVEKIT_JS_DEFAULT_KEY_RING_SIZE: u16 = 16;
 
-/// Identifies the joined slot to attach media to, and how to reach the SFU.
+/// How to reach the SFU for the call media attaches to.
 #[derive(Debug, Deserialize)]
 struct WasmMediaSessionConfig {
-    room_id: String,
-    slot_id: String,
     user_id: String,
     device_id: String,
     /// The MSC4195 authorisation-service URL of the focus we publish on —
@@ -119,18 +117,13 @@ fn set_local_key_index(delegate: &JsValue, index: u8) {
 }
 
 #[wasm_bindgen]
-impl WasmRtcSessionManager {
-    /// Attach media to a joined slot: wire frame-key signalling into the core,
+impl WasmRtcCall {
+    /// Attach media to this call: wire frame-key signalling into the core,
     /// start the engine (which connects to every peer's focus), and connect
-    /// the own-focus livekit-js room.
+    /// the own-focus livekit-js room. The `member.id` comes from the join —
+    /// the page neither chooses nor passes it.
     ///
-    /// Preconditions: the manager has a command sender, the page feeds it
-    /// sticky events/room state, and `join` succeeded for this room/slot. The
-    /// `member.id` comes from that join — the page neither chooses nor passes
-    /// it.
-    ///
-    /// `config` is `{ room_id, slot_id, user_id, device_id,
-    /// livekit_service_url, key_ring_size?, element_call_compat?, stability? }`;
+    /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, element_call_compat?, stability? }`;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
     /// implement `onParticipants(roster)`, `onEvent(event)`, and
@@ -145,10 +138,10 @@ impl WasmRtcSessionManager {
         let config: WasmMediaSessionConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|err| JsError::new(&format!("invalid media session config: {err}")))?;
 
+        let room_id = self.inner().room_id().to_owned();
+        let slot_id = self.inner().slot_id().to_owned();
         log::info!(
-            "media: connecting [{}/{}] user={} device={} focus={}",
-            config.room_id,
-            config.slot_id,
+            "media: connecting [{room_id}/{slot_id}] user={} device={} focus={}",
             config.user_id,
             config.device_id,
             config.livekit_service_url,
@@ -161,7 +154,7 @@ impl WasmRtcSessionManager {
         // silence — peers sit in the roster with no media, keys install under
         // an identity the SFU never assigned, and nothing logs a problem. The
         // config field is accepted only as a cross-check.
-        let compat = self.element_call_compat_for(&config.room_id);
+        let compat = self.element_call_compat();
         if let Some(requested) = config.element_call_compat.as_deref() {
             let requested = crate::compat::parse_compat(Some(requested))?;
             if requested != compat {
@@ -173,9 +166,8 @@ impl WasmRtcSessionManager {
         }
         if compat != ElementCallCompat::Off {
             log::info!(
-                "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
-                config.room_id,
-                config.slot_id,
+                "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode \
+                 {compat:?}",
             );
         }
         // Call it once and share the `Arc`: it has four uses here — the core's
@@ -201,36 +193,27 @@ impl WasmRtcSessionManager {
         // page: it is what our MSC4195 participant identity is derived from,
         // so a value that disagrees with the published membership would put
         // our media on an identity no peer holds a key for.
-        let mut inner = self.inner.lock().await;
-        let member_id = inner
-            .own_member_id(&config.room_id, &config.slot_id)
-            .ok_or_else(|| {
-                log::warn!(
-                    "media: [{}/{}] has not joined — join the slot before connecting media",
-                    config.room_id,
-                    config.slot_id,
-                );
-                JsError::new("the slot has not joined — join it before connecting media")
-            })?;
-        let memberships = inner
-            .subscribe_membership_snapshots(&config.room_id, &config.slot_id)
-            .ok_or_else(|| {
-                JsError::new("no session for the slot — join it before connecting media")
-            })?;
-        let raised_hands = inner.subscribe_raised_hands(&config.room_id, &config.slot_id);
-        let reactions = inner.subscribe_reactions(&config.room_id, &config.slot_id);
+        let call = self.inner();
+        if !call.is_live() {
+            return Err(JsError::new(
+                "the call is over — join the slot again before connecting media",
+            ));
+        }
+        let member_id = call.member_id().to_owned();
+        let memberships = call.subscribe_memberships().await;
+        let raised_hands = call.subscribe_raised_hands().await;
+        let reactions = call.subscribe_reactions().await;
 
         // Mapper before handler: the replay below derives identities through
         // it, and installing it second would replay peer keys under the raw
         // `member_id` fallback — an identity the SFU never uses, which is
         // indistinguishable from importing nothing.
-        inner.set_encryption_identity_mapper(&config.room_id, &config.slot_id, mapper.clone());
-        if !inner.set_encryption_signal_handler(&config.room_id, &config.slot_id, handler.clone()) {
+        call.set_encryption_identity_mapper(mapper.clone()).await;
+        if !call.set_encryption_signal_handler(handler.clone()).await {
             return Err(JsError::new(
-                "the session has no encryption manager — join the slot first",
+                "the call has no encryption manager — join the slot first",
             ));
         }
-        drop(inner);
 
         // `allow`, not `expect`: whether clippy fires this depends on the
         // toolchain (1.98 no longer does), and an unfulfilled expectation is
@@ -250,8 +233,8 @@ impl WasmRtcSessionManager {
             },
         ));
         let ctx = ConnectionContext {
-            room_id: config.room_id.clone(),
-            slot_id: config.slot_id.clone(),
+            room_id,
+            slot_id,
             member: OwnMemberClaims {
                 member_id: member_id.clone(),
                 user_id: config.user_id.clone(),
@@ -305,11 +288,7 @@ impl WasmRtcSessionManager {
         // After the listeners (so `key_imported` reaches the page for exactly
         // the keys it is most likely to be missing), before the connect (so
         // the ring is populated before the first frame can arrive).
-        self.inner
-            .lock()
-            .await
-            .replay_encryption_keys(&config.room_id, &config.slot_id)
-            .await;
+        call.replay_encryption_keys().await;
 
         // Own focus connects synchronously so a broken SFU fails this call
         // instead of surfacing later as a dead session.
@@ -379,7 +358,7 @@ impl WasmRtcSessionManager {
         // Optional but recommended: the heartbeat also flushes due rotations,
         // so without this a coalesced rotation waits for the next beat instead
         // of happening at the instant it is owed. The callback should call
-        // `manager.flushDueKeyRotation(roomId, slotId)`.
+        // `call.flushDueKeyRotation()`.
         if let Some(on_switch_complete) = delegate_callback(&delegate, "onSwitchComplete") {
             let mut switch_rx = switch_rx;
             wasm_bindgen_futures::spawn_local(async move {
@@ -429,10 +408,10 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 ///
 /// Roster changes, call events, and switch-complete moments arrive through
 /// the delegate's `onParticipants` / `onEvent` / `onSwitchComplete`
-/// callbacks, registered at [`WasmRtcSessionManager::connect_media`] time.
+/// callbacks, registered at [`WasmRtcCall::connect_media`] time.
 ///
 /// End it with [`WasmMediaSession::disconnect`]; leaving the slot itself stays
-/// a manager concern ([`WasmRtcSessionManager::leave`]).
+/// the call's ([`WasmRtcCall::leave`]).
 #[wasm_bindgen]
 pub struct WasmMediaSession {
     engine: CallEngine,
@@ -468,7 +447,7 @@ impl WasmMediaSession {
 
     /// Shut the media session down: stop the engine (closing peer-focus
     /// connections) and close the own-focus room through the delegate.
-    /// Leaving the slot is separate ([`WasmRtcSessionManager::leave`]).
+    /// Leaving the slot is separate ([`WasmRtcCall::leave`]).
     pub async fn disconnect(&mut self) -> Result<(), JsError> {
         self.engine.shutdown().await;
         self.own_connection

@@ -11,7 +11,10 @@
 use crate::backend::test_support::MockHost;
 use crate::backend::{FfiEventEncryption, FfiEventIn};
 use crate::params::FfiTransportConfig;
-use crate::{FfiAttachOptions, FfiJoinSessionParams, RtcSessionManagerHandle};
+use crate::{
+    FfiJoinSessionParams, FfiLeaveSessionParams, FfiRoomOptions, RtcCall, RtcClient, RtcRoom,
+};
+use std::sync::Arc;
 
 use super::session::{MediaSessionConfig, connect_media_session};
 use super::types::{
@@ -26,8 +29,6 @@ const DEAD_SFU_URL: &str = "http://127.0.0.1:9";
 
 fn config() -> MediaSessionConfig {
     MediaSessionConfig {
-        room_id: "!room:example.org".to_owned(),
-        slot_id: "m.call#ROOM".to_owned(),
         user_id: "@alice:example.org".to_owned(),
         device_id: "DEVICE".to_owned(),
         livekit_service_url: DEAD_SFU_URL.to_owned(),
@@ -35,25 +36,13 @@ fn config() -> MediaSessionConfig {
     }
 }
 
-#[test]
-fn connect_requires_a_joined_slot() {
-    let manager = RtcSessionManagerHandle::new(MockHost::new());
-    let result = runtime().block_on(connect_media_session(manager, config()));
-    assert!(
-        matches!(result, Err(MediaFfiError::NotJoined(_))),
-        "connecting media on an unjoined slot must fail with NotJoined",
-    );
-}
-
-#[test]
-fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
-    let mock = MockHost::new();
-    let manager = RtcSessionManagerHandle::new(mock.clone());
+/// Opens the room with an open slot, the way a host does on subscribe, and
+/// joins it. The room comes back too: dropping it would end the subscription.
+fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
+    let client = RtcClient::new(mock.clone());
     runtime().block_on(async {
-        // Attach, delivering the current sets the way a host does on subscribe.
-        let attach =
-            manager.attach_room("!room:example.org".to_owned(), FfiAttachOptions::default());
-        tokio::pin!(attach);
+        let open = client.room("!room:example.org".to_owned(), FfiRoomOptions::default());
+        tokio::pin!(open);
         let seed = async {
             while mock.subjects("!room:example.org").is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -79,11 +68,10 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
             sink.on_joined_members(vec!["@alice:example.org".to_owned()]);
             sink.on_sticky_events(Vec::new());
         };
-        let (attached, ()) = tokio::join!(attach, seed);
-        attached.unwrap();
-        manager
-            .join(FfiJoinSessionParams {
-                room_id: "!room:example.org".to_owned(),
+        let (room, ()) = tokio::join!(open, seed);
+        let room = room.unwrap();
+        let call = room
+            .join_call(FfiJoinSessionParams {
                 slot_id: "m.call#ROOM".to_owned(),
                 application: "m.call".to_owned(),
                 transport: Some(FfiTransportConfig {
@@ -101,12 +89,33 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
             })
             .await
             .unwrap();
-    });
+        (room, call)
+    })
+}
+
+#[test]
+fn connect_requires_a_live_call() {
+    let mock = MockHost::new();
+    let (_room, call) = joined_call(&mock);
+    runtime()
+        .block_on(call.leave(FfiLeaveSessionParams { leave_reason: None }))
+        .unwrap();
+    let result = runtime().block_on(connect_media_session(call, config()));
+    assert!(
+        matches!(result, Err(MediaFfiError::NotJoined(_))),
+        "connecting media on a call that has left must fail with NotJoined",
+    );
+}
+
+#[test]
+fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
+    let mock = MockHost::new();
+    let (_room, call) = joined_call(&mock);
 
     // Everything up to the SFU works — key bridge registration, engine
     // startup, and the (Rust-implemented) backend's token call — and the dead
     // endpoint surfaces as a clean Transport error, not a hang or a panic.
-    let result = runtime().block_on(connect_media_session(manager, config()));
+    let result = runtime().block_on(connect_media_session(call, config()));
     assert!(
         matches!(result, Err(MediaFfiError::Transport(_))),
         "expected a Transport error from the dead SFU endpoint, got {:?}",

@@ -20,12 +20,12 @@ pub mod token;
 
 pub use token::{MemberClaims, SfuToken, TokenServiceError};
 
-use matrix_rtc_bridge::compat::{ElementCallCompat, element_call_state};
+use matrix_rtc_call::compat::{ElementCallCompat, element_call_state};
 
 /// The participant-identity derivation a MatrixRTC generation's authorisation
 /// service uses.
 ///
-/// One of the two things the bridge's `compat` deliberately cannot own — the
+/// One of the two things `matrix_rtc_call::compat` deliberately cannot own — the
 /// other being [`TokenEndpoint`] — because the modern derivation hashes per
 /// MSC4195, which is a LiveKit document rather than a Matrix wire format. The
 /// `compat` module decides *which generation*; this decides *what that means
@@ -33,7 +33,7 @@ use matrix_rtc_bridge::compat::{ElementCallCompat, element_call_state};
 ///
 /// Call it once per call and share the returned `Arc`: it has four uses (the
 /// core's encryption manager, the media transport, our own identity, and the
-/// key ring — see `matrix-rtc-livekit`'s `call::Call::join`), and they must not
+/// key ring — see `matrix-rtc-livekit`'s `call::LiveKitCall::join`), and they must not
 /// skew. That matters more than it looks, because a divergence is not an error
 /// but a silence: peers appear in the roster with no media, their keys land
 /// under an identity the SFU never assigned, and nothing anywhere logs a
@@ -66,7 +66,7 @@ pub enum TokenEndpoint {
     #[default]
     Msc4195,
     /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
-    /// Temporary; see the bridge's `compat`.
+    /// Temporary; see `matrix_rtc_call::compat`.
     LegacyElementCall,
 }
 

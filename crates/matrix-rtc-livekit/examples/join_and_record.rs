@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! Join a MatrixRTC call with [`Call::join`] and record the first remote audio
+//! Join a MatrixRTC call with [`LiveKitCall::join`] and record the first remote audio
 //! track to a WAV file — the crate's quick start, runnable.
 //!
 //! Against the `demo/backend` stack (`make backend-up`), register two users
@@ -41,7 +41,7 @@ use std::time::Duration;
 use livekit::{RoomEvent, track::RemoteTrack};
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
-use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
+use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::RoomId;
 use matrix_sdk_ui::sync_service::SyncService;
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `Call::join` drives `!Send` futures internally, so it must run inside a
+    // `LiveKitCall::join` drives `!Send` futures internally, so it must run inside a
     // `LocalSet` — this runtime skeleton is part of the quick start.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -186,16 +186,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(insecure_tls)
         .build()?;
-    let mut call = Call::join(
+    let mut call = LiveKitCall::join(
         &room,
-        CallOptions {
+        LiveKitCallOptions {
             slot_id,
             livekit_transport: Some(LiveKitTransport {
                 livekit_service_url,
             }),
             http: Some(http),
             element_call_compat,
-            ..CallOptions::default()
+            ..LiveKitCallOptions::default()
         },
     )
     .await?;

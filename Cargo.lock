@@ -2682,26 +2682,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrix-rtc-bridge"
-version = "0.4.0-rc.1"
-dependencies = [
- "async-trait",
- "log",
- "matrix-rtc-call",
- "matrix-rtc-core",
- "matrix-sdk",
- "matrix-sdk-base",
- "serde",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "web-time",
-]
-
-[[package]]
 name = "matrix-rtc-call"
 version = "0.4.0-rc.1"
 dependencies = [
+ "async-trait",
  "log",
  "matrix-rtc-core",
  "serde",
@@ -2740,7 +2724,6 @@ dependencies = [
  "futures",
  "jni 0.21.1",
  "log",
- "matrix-rtc-bridge",
  "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit",
@@ -2764,10 +2747,10 @@ dependencies = [
  "jni 0.21.1",
  "livekit",
  "log",
- "matrix-rtc-bridge",
  "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit-proto",
+ "matrix-rtc-matrix-sdk",
  "matrix-rtc-media",
  "matrix-sdk",
  "matrix-sdk-ui",
@@ -2785,12 +2768,26 @@ name = "matrix-rtc-livekit-proto"
 version = "0.4.0-rc.1"
 dependencies = [
  "base64 0.22.1",
- "matrix-rtc-bridge",
+ "matrix-rtc-call",
  "matrix-rtc-core",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "matrix-rtc-matrix-sdk"
+version = "0.4.0-rc.1"
+dependencies = [
+ "async-trait",
+ "log",
+ "matrix-rtc-core",
+ "matrix-sdk",
+ "matrix-sdk-base",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -2820,7 +2817,6 @@ dependencies = [
  "futures",
  "js-sys",
  "log",
- "matrix-rtc-bridge",
  "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit-proto",

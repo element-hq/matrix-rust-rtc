@@ -5,26 +5,24 @@
 
 //! Native UniFFI bindings for the MatrixRTC core.
 //!
-//! The host implements one [`MatrixBackend`] with its Matrix client; the
-//! handle attaches rooms, and the library subscribes, orders and feeds itself.
+//! The host implements one [`MatrixBackend`] with its Matrix client and
+//! builds an [`RtcClient`] over it; the client opens an [`RtcRoom`] per room,
+//! and a room hands out an [`RtcCall`] per slot joined. The library
+//! subscribes, orders and feeds itself.
 //! This module defines the UniFFI-facing DTOs and object wrappers and converts
 //! them into core DTOs so `matrix-rtc-core` stays decoupled from FFI types.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::watch;
 
-use matrix_rtc_bridge::compat::DialectBackend;
-use matrix_rtc_bridge::feeder::{
-    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
-};
-use matrix_rtc_bridge::transports;
-use matrix_rtc_call::CallSessionManager;
-use matrix_rtc_core::{
-    JoinedMembership as CoreJoinedMembership, MatrixBackend as CoreBackend, RtcSessionManager,
-};
+#[cfg(feature = "media")]
+use matrix_rtc_call::compat::DialectBackend;
+use matrix_rtc_call::{self as call, RtcError};
+use matrix_rtc_core::JoinedMembership as CoreJoinedMembership;
+#[cfg(feature = "media")]
+use matrix_rtc_core::MatrixBackend as CoreBackend;
 mod backend;
 pub mod compat;
 mod logging;
@@ -50,9 +48,6 @@ pub use params::{
 #[cfg(feature = "media")]
 pub mod media;
 
-type Backend = DialectBackend<FfiBackend>;
-type Manager = CallSessionManager<Backend>;
-
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MatrixRtcFfiError {
     #[error("invalid input: {0}")]
@@ -64,9 +59,12 @@ pub enum MatrixRtcFfiError {
     /// message says which.
     #[error("reaction: {0}")]
     Reaction(String),
-    /// The room is not attached (or already is, for `attach_room`).
+    /// The room is open already (for `RtcClient::room`), or has been shut down.
     #[error("room attachment: {0}")]
     Attachment(String),
+    /// The call has left, or its room was shut down; join again for a new one.
+    #[error("the call is over: {0}")]
+    CallOver(String),
     /// The host's backend failed a read.
     #[error("backend: {0}")]
     Backend(String),
@@ -75,6 +73,18 @@ pub enum MatrixRtcFfiError {
 impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
     fn from(error: matrix_rtc_call::ReactionError) -> Self {
         Self::Reaction(error.to_string())
+    }
+}
+
+impl From<RtcError> for MatrixRtcFfiError {
+    fn from(error: RtcError) -> Self {
+        match error {
+            RtcError::RoomAlreadyOpen(error) => Self::Attachment(error.to_string()),
+            RtcError::Backend(error) => Self::Backend(error.to_string()),
+            RtcError::Reaction(error) => Self::Reaction(error.to_string()),
+            error @ RtcError::SessionOver => Self::CallOver(error.to_string()),
+            error => Self::InvalidInput(error.to_string()),
+        }
     }
 }
 
@@ -236,9 +246,9 @@ pub struct JoinedMembership {
     pub can_subscribe: Vec<String>,
 }
 
-/// How a room is attached.
+/// How a room is opened.
 #[derive(Clone, Debug, Default, uniffi::Record)]
-pub struct FfiAttachOptions {
+pub struct FfiRoomOptions {
     /// Which MatrixRTC generation the room is read and written for. Unset (or
     /// `Off`) is spec-current. One decision for the room: what the library
     /// subscribes to, how it renders our sends, the `member.id` we join with,
@@ -248,195 +258,129 @@ pub struct FfiAttachOptions {
     pub element_call_compat: Option<FfiElementCallCompat>,
 }
 
-/// Aborts the wrapped task when dropped.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// A room the handle is feeding.
-struct AttachedRoom {
-    attachment: RoomAttachment,
-    _feed: AbortOnDrop,
-}
-
-#[derive(uniffi::Object)]
-pub struct RtcSessionManagerHandle {
-    /// An async mutex because every entry point is async and holds it across
-    /// awaits into the host. `Arc` so a heartbeat driver can hold a `Weak` to it
-    /// without keeping the manager alive past the handle.
-    inner: Arc<TokioMutex<Manager>>,
-    /// The host's backend behind the dialect wrapper. The manager holds the
-    /// same `Arc`.
-    backend: Arc<Backend>,
-    /// One driver per joined session, keyed by `(room_id, slot_id)`. Dropping
-    /// the entry stops its task. A `std::sync::Mutex` on purpose: it is only
-    /// ever held for a map insert or remove, never across an await.
-    heartbeats: Mutex<HashMap<(String, String), HeartbeatDriver>>,
-    /// Which generation each attached room is read and written for.
-    modes: RoomModes,
-    /// The attached rooms, by room id. Dropping the handle detaches them.
-    rooms: AttachedRooms<AttachedRoom>,
-    /// The session-wide to-device subscription, started by the first attach.
-    session_feeder: TokioMutex<Option<(SessionFeeder, AbortOnDrop)>>,
-}
-
-/// How often the keep-alive is driven.
+/// How often each call's keep-alive is driven.
 ///
-/// Three ticks inside the 30 s default delayed-leave timeout, so a skipped tick
-/// (the manager was busy) or one slow round trip cannot let the switch fire.
+/// Three ticks inside the 30 s default delayed-leave timeout, so one slow round
+/// trip cannot let the switch fire.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Owns the task that drives one session's keep-alive.
-struct HeartbeatDriver {
-    /// Dropped to ask the task to stop; it observes the closed channel.
-    _stop: tokio::sync::mpsc::Sender<()>,
-}
-
-/// Runs one session's keep-alive until the session ends or the handle goes away.
-async fn run_heartbeat(
-    manager: Weak<TokioMutex<Manager>>,
-    room_id: String,
-    slot_id: String,
-    interval: Duration,
-    mut stop: tokio::sync::mpsc::Receiver<()>,
-) {
-    loop {
-        tokio::select! {
-            // The driver was dropped (leave, rejoin, or the handle died), so a
-            // stop takes effect at once rather than at the end of the interval.
-            _ = stop.recv() => break,
-            _ = tokio::time::sleep(interval) => {}
-        }
-
-        let Some(manager) = manager.upgrade() else {
-            log::debug!("[{room_id}/{slot_id}] heartbeat: manager gone, stopping");
-            break;
-        };
-
-        // Skip rather than queue behind an in-flight FFI call: the next tick is
-        // 10 s away and the dead man's switch has 30 s, so waiting our turn
-        // behind a slow host would only make the beat later than it needs to be.
-        let still_joined = match manager.try_lock() {
-            Ok(mut guard) => guard.heartbeat(&room_id, &slot_id).await,
-            Err(_) => {
-                log::debug!("[{room_id}/{slot_id}] heartbeat: manager busy, skipping a tick");
-                true
-            }
-        };
-
-        // `false` means the session is gone or has left — `leave` takes the
-        // membership machine, so a beat racing a leave is a no-op and lands
-        // here. Nothing left to keep alive.
-        if !still_joined {
-            log::debug!("[{room_id}/{slot_id}] heartbeat: no longer joined, stopping");
-            break;
-        }
-    }
-}
-
-struct SubscriptionState {
-    receiver: watch::Receiver<Vec<CoreJoinedMembership>>,
-    initial_pending: bool,
-}
-
+/// One per Matrix session, over the host's backend. Creating it does no I/O;
+/// the library holds nothing about a room until the host opens one.
 #[derive(uniffi::Object)]
-pub struct MembershipSnapshotSubscription {
-    state: Mutex<SubscriptionState>,
+pub struct RtcClient {
+    client: call::RtcClient<FfiBackend>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
-impl RtcSessionManagerHandle {
-    /// One handle per Matrix session, over the host's backend.
+impl RtcClient {
     #[uniffi::constructor]
     pub fn new(backend: Arc<dyn MatrixBackend>) -> Arc<Self> {
-        log::info!("manager: created over the host backend");
-        let backend = Arc::new(DialectBackend::new(Arc::new(FfiBackend::new(backend))));
+        log::info!("client: created over the host backend");
         Arc::new(Self {
-            inner: Arc::new(TokioMutex::new(CallSessionManager::new(
-                RtcSessionManager::with_backend(backend.clone()),
-            ))),
-            backend,
-            heartbeats: Mutex::new(HashMap::new()),
-            modes: RoomModes::default(),
-            rooms: AttachedRooms::default(),
-            session_feeder: TokioMutex::new(None),
+            client: call::RtcClient::new(Arc::new(FfiBackend::new(backend))),
         })
     }
 
-    /// Attaches a room: the library subscribes to what the room needs in the
-    /// given mode and applies the current state. Resolves once that state is
-    /// applied, so a `join` issued afterwards sees it. Attaching a room that
-    /// is attached, or still being attached, is an error. Wait for the attach
-    /// before detaching the room; cancelling the call ends the attach instead.
-    pub async fn attach_room(
+    /// Opens a room: the library subscribes to what the room needs in the
+    /// given mode and applies its current state. Resolves once that state is
+    /// applied, so a `join_call` issued afterwards sees it.
+    ///
+    /// Opening a room that already has a live room object is an error.
+    /// Cancelling the call leaves nothing behind. Dropping the returned room
+    /// ends its subscriptions without leaving; `shutdown` leaves first.
+    pub async fn room(
         &self,
         room_id: String,
-        options: FfiAttachOptions,
-    ) -> Result<(), MatrixRtcFfiError> {
-        let Some(reservation) = self.rooms.reserve(&room_id) else {
-            return Err(MatrixRtcFfiError::Attachment(format!(
-                "{room_id} is already attached"
-            )));
-        };
+        options: FfiRoomOptions,
+    ) -> Result<Arc<RtcRoom>, MatrixRtcFfiError> {
         let compat = compat::resolve(options.element_call_compat);
-        log::info!("manager: [{room_id}] attaching in {compat:?} mode");
+        log::info!("client: [{room_id}] opening in {compat:?} mode");
+        let (room, runs) = self
+            .client
+            .room(
+                room_id.clone(),
+                call::RoomOptions {
+                    element_call_compat: compat,
+                },
+            )
+            .await?;
+        // Both feeds end on their own — the room's when the room goes, the
+        // to-device one when the last room does — so they run detached.
+        let (feed, to_device) = runs.into_futures();
+        runtime::runtime().spawn(feed);
+        if let Some(to_device) = to_device {
+            runtime::runtime().spawn(to_device);
+        }
+        room.seeded().await;
+        log::info!("client: [{room_id}] open and seeded");
+        Ok(Arc::new(RtcRoom {
+            room_id,
+            room: TokioRwLock::new(Some(room)),
+        }))
+    }
+}
 
-        self.ensure_session_feeder().await?;
+/// One open room. Everything room-scoped is here; our own participation is on
+/// the [`RtcCall`] that `join_call` returns.
+#[derive(uniffi::Object)]
+pub struct RtcRoom {
+    room_id: String,
+    /// `None` once shut down.
+    room: TokioRwLock<Option<call::RtcRoom<FfiBackend>>>,
+}
 
-        let (attachment, run) = RoomFeeder::attach(
-            self.backend.clone(),
-            self.inner.clone(),
-            self.modes.clone(),
-            room_id.clone(),
-            AttachOptions {
-                element_call_compat: compat,
-            },
+impl RtcRoom {
+    async fn open(
+        &self,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, call::RtcRoom<FfiBackend>>, MatrixRtcFfiError>
+    {
+        tokio::sync::RwLockReadGuard::try_map(self.room.read().await, Option::as_ref).map_err(
+            |_| MatrixRtcFfiError::Attachment(format!("{} has been shut down", self.room_id)),
         )
-        .await?;
-        let feed = AbortOnDrop(runtime::runtime().spawn(run.run()));
-        attachment.seeded().await;
-        log::info!("manager: [{room_id}] attached and seeded");
-
-        reservation.fill(AttachedRoom {
-            attachment,
-            _feed: feed,
-        });
-        Ok(())
     }
 
-    /// Detaches a room: leaves any session joined in it, then ends the
-    /// subscription. Nothing delivered afterwards is applied. Detaching an
-    /// unattached room is a no-op.
-    pub async fn detach_room(&self, room_id: String) -> Result<(), MatrixRtcFfiError> {
-        let joined: Vec<(String, String)> = lock_mutex(&self.heartbeats)?
-            .keys()
-            .filter(|(room, _)| *room == room_id)
-            .cloned()
-            .collect();
-        for (room, slot) in joined {
-            log::info!("manager: [{room}/{slot}] leaving before detaching");
-            if let Err(error) = self
-                .leave(room, slot, FfiLeaveSessionParams { leave_reason: None })
-                .await
-            {
-                log::warn!("manager: leave before detach failed: {error}");
-            }
-        }
+    /// [`Self::join_call`] with the keep-alive interval spelled out, so a test
+    /// can beat faster than a call ships with.
+    pub(crate) async fn join_call_every(
+        &self,
+        params: FfiJoinSessionParams,
+        interval: Duration,
+    ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
+        log::info!(
+            "room: [{}] join requested {}",
+            self.room_id,
+            params.summary()
+        );
+        let options = params.into_call().map_err(|error| {
+            log::warn!("room: join rejected before it started: {error}");
+            MatrixRtcFfiError::InvalidInput(error.to_string())
+        })?;
+        let room = self.open().await?;
+        let joined = room.join_call(options).await.inspect_err(|error| {
+            log::warn!("room: [{}] join failed: {error}", self.room_id);
+        })?;
+        let joined = Arc::new(joined);
+        log::info!(
+            "room: [{}/{}] joined as {}",
+            self.room_id,
+            joined.slot_id(),
+            joined.member_id()
+        );
+        Ok(Arc::new(RtcCall {
+            heartbeat: Mutex::new(Some(HeartbeatDriver::start(&joined, interval))),
+            call: joined,
+            #[cfg(feature = "media")]
+            compat: room.element_call_compat(),
+            #[cfg(feature = "media")]
+            backend: room.backend().clone(),
+        }))
+    }
+}
 
-        let attached = self.rooms.remove(&room_id);
-        match attached {
-            Some(room) => {
-                room.attachment.detach();
-                self.backend.clear_dialect(&room_id);
-                log::info!("manager: [{room_id}] detached");
-            }
-            None => log::debug!("manager: [{room_id}] detach of a room that is not attached"),
-        }
-        Ok(())
+#[uniffi::export(async_runtime = "tokio")]
+impl RtcRoom {
+    pub fn room_id(&self) -> String {
+        self.room_id.clone()
     }
 
     /// Opens a slot, by publishing its `m.rtc.slot` state event.
@@ -455,27 +399,20 @@ impl RtcSessionManagerHandle {
     /// and `null` elsewhere; the mismatch resolves the slot closed for everyone.
     pub async fn open_slot(
         &self,
-        room_id: String,
         slot_id: String,
         application_type: String,
         encryption: Option<FfiSlotEncryption>,
     ) -> Result<(), MatrixRtcFfiError> {
         log::info!(
-            "manager: [{room_id}/{slot_id}] opening slot: application={application_type} \
+            "room: [{}/{slot_id}] opening slot: application={application_type} \
              encryption={encryption:?}",
+            self.room_id,
         );
-
-        let manager = self.inner.lock().await;
-        manager
-            .open_slot(
-                room_id,
-                slot_id,
-                application_type,
-                encryption.map(Into::into),
-            )
+        let room = self.open().await?;
+        room.open_slot(slot_id, application_type, encryption.map(Into::into))
             .await
             .map_err(|error| {
-                log::warn!("manager: could not open the slot: {error}");
+                log::warn!("room: could not open the slot: {error}");
                 MatrixRtcFfiError::InvalidInput(error.to_string())
             })
     }
@@ -484,387 +421,290 @@ impl RtcSessionManagerHandle {
     ///
     /// Every member of it becomes left as soon as clients apply the new state —
     /// this ends the call for everyone, not just for us. Leaving is
-    /// [`Self::leave`].
-    pub async fn close_slot(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<(), MatrixRtcFfiError> {
-        log::info!("manager: [{room_id}/{slot_id}] closing slot");
-
-        let manager = self.inner.lock().await;
-        manager.close_slot(room_id, slot_id).await.map_err(|error| {
-            log::warn!("manager: could not close the slot: {error}");
+    /// [`RtcCall::leave`].
+    pub async fn close_slot(&self, slot_id: String) -> Result<(), MatrixRtcFfiError> {
+        log::info!("room: [{}/{slot_id}] closing slot", self.room_id);
+        let room = self.open().await?;
+        room.close_slot(slot_id).await.map_err(|error| {
+            log::warn!("room: could not close the slot: {error}");
             MatrixRtcFfiError::InvalidInput(error.to_string())
         })
     }
 
-    /// A JSON dump of everything the manager and its sessions currently
-    /// believe: sessions, room state per room, and every candidate member with
-    /// the reason it is or is not projected as joined.
-    ///
-    /// For bug reports and for answering "what does Rust think the state is
-    /// right now?" without a debugger. Contains no key material.
-    pub async fn debug_snapshot(&self) -> Result<String, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager.debug_snapshot().to_string())
+    /// How many members are joined to a slot, without joining it.
+    pub async fn member_count(&self, slot_id: String) -> Result<u64, MatrixRtcFfiError> {
+        Ok(self.open().await?.member_count(&slot_id).await as u64)
     }
 
-    pub async fn session_count(&self) -> Result<u64, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager.session_count() as u64)
-    }
-
-    pub async fn member_count(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<Option<u64>, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager
-            .member_count(&room_id, &slot_id)
-            .map(|count| count as u64))
-    }
-
-    /// Observe the joined roster of one session.
-    ///
-    /// Returns `None` if no session exists for `(room_id, slot_id)` — a session
-    /// appears when the first member event for that slot arrives, or when this
-    /// manager joins it.
+    /// Observe a slot's joined roster, without joining it.
     ///
     /// The subscription yields the current roster on its first
     /// `nextSnapshot()` and then only on change, so a host can attach at any
     /// point without missing the state it attached to.
     pub async fn subscribe_membership_snapshots(
         &self,
-        room_id: String,
         slot_id: String,
-    ) -> Result<Option<Arc<MembershipSnapshotSubscription>>, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager
-            .subscribe_membership_snapshots(&room_id, &slot_id)
-            .map(|receiver| {
-                Arc::new(MembershipSnapshotSubscription {
-                    state: Mutex::new(SubscriptionState {
-                        receiver,
-                        initial_pending: true,
-                    }),
-                })
-            }))
+    ) -> Result<Arc<MembershipSnapshotSubscription>, MatrixRtcFfiError> {
+        let receiver = self.open().await?.observe(&slot_id).await;
+        Ok(MembershipSnapshotSubscription::new(receiver))
     }
 
-    /// Joins a session in an attached room, returning the `member.id` it
-    /// joined as.
+    /// A JSON dump of everything the room currently believes: its room state,
+    /// and every candidate member of each slot with the reason it is or is not
+    /// projected as joined.
     ///
-    /// The SDK generates that id; hosts do not supply one. MSC4143 requires a
-    /// fresh `member.id` on every join, and reusing one is silently destructive:
-    /// the MSC4195 participant identity is derived from it, so a repeat join
-    /// keeps the identity peers already hold a key for while our key index
-    /// restarts at 0 — every peer then decrypts our media with the previous
-    /// call's key and never recovers. Read it back with [`Self::own_member_id`].
+    /// For bug reports and for answering "what does Rust think the state is
+    /// right now?" without a debugger. Contains no key material.
+    pub async fn debug_snapshot(&self) -> Result<String, MatrixRtcFfiError> {
+        Ok(self.open().await?.debug_snapshot().await.to_string())
+    }
+
+    /// Joins a call slot, returning our participation in it.
     ///
-    /// Fails when the room is not attached, or when its state holds no open
-    /// slot of this id.
-    pub async fn join(&self, params: FfiJoinSessionParams) -> Result<String, MatrixRtcFfiError> {
-        log::info!("manager: join requested {}", params.summary());
+    /// The SDK generates the `member.id` (read it from [`RtcCall::member_id`]);
+    /// hosts do not supply one. MSC4143 requires a fresh `member.id` on every
+    /// join, and reusing one is silently destructive: the MSC4195 participant
+    /// identity is derived from it, so a repeat join keeps the identity peers
+    /// already hold a key for while our key index restarts at 0 — every peer
+    /// then decrypts our media with the previous call's key and never recovers.
+    ///
+    /// The returned call keeps itself alive every 10 seconds until it leaves or
+    /// is dropped. Fails when the room's state holds no open slot of this id,
+    /// or while the slot is joined through a live call of this room.
+    pub async fn join_call(
+        &self,
+        params: FfiJoinSessionParams,
+    ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
+        self.join_call_every(params, HEARTBEAT_INTERVAL).await
+    }
 
-        // Kept for the keep-alive driver, which outlives `params`.
-        let room_id = params.room_id.clone();
-        let slot_id = params.slot_id.clone();
-        if !self.modes.is_attached(&room_id) {
-            return Err(MatrixRtcFfiError::Attachment(format!(
-                "{room_id} is not attached; attach the room before joining"
-            )));
-        }
-        let compat = self.modes.mode(&room_id);
-        let user_id = self.backend.own_user_id();
-        let device_id = self.backend.own_device_id();
-
-        // The join's own choice, else the first LiveKit transport the
-        // homeserver advertises.
-        let chosen = params.transport_intent().map_err(|e| {
-            log::warn!("manager: join rejected before it started: {e}");
-            MatrixRtcFfiError::InvalidInput(e.to_string())
-        })?;
-        let transport = match chosen {
-            Some(chosen) => chosen,
-            None => {
-                let advertised = self.backend.rtc_transports().await?;
-                transports::choose(&advertised, None).map_err(|e| {
-                    log::warn!("manager: join rejected: {e}");
-                    MatrixRtcFfiError::InvalidInput(e.to_string())
-                })?
+    /// Leaves every slot joined through this room, then ends its
+    /// subscriptions. Every call of the room is over afterwards; a second
+    /// shutdown is a no-op.
+    ///
+    /// (Named `shutdown` rather than `close`: uniffi already gives every
+    /// object a `close()` — Kotlin's `AutoCloseable` — that frees it, which
+    /// for a room is dropping it: its subscriptions end and nothing is left.)
+    pub async fn shutdown(&self) {
+        let room = self.room.write().await.take();
+        match room {
+            Some(room) => {
+                room.close().await;
+                log::info!("room: [{}] shut down", self.room_id);
             }
-        };
-
-        let mut core_params = params
-            .into_core(user_id.clone(), device_id.clone(), transport)
-            .map_err(|e| {
-                log::warn!("manager: join rejected before it started: {e}");
-                MatrixRtcFfiError::InvalidInput(e.to_string())
-            })?;
-        // Not always a fresh id: see `compat::member_id` for the one generation
-        // where a fresh one makes us mark ourselves departed on our own join.
-        let member_id = compat::member_id(compat, &user_id, &device_id);
-        core_params.rtc.membership_id = Some(member_id.clone());
-
-        // Before the join, not after: the join itself sends the membership (and
-        // arms the delayed leave), so a dialect registered afterwards would let
-        // exactly the two events that announce us go out spec-current.
-        self.backend.set_dialect(
-            &room_id,
-            compat::outbound_dialect(compat, &user_id, &device_id, &room_id, &slot_id),
-        );
-
-        // Hold the guard across the join. Serialising is safe because no host
-        // callback re-enters a handle: the backend's sinks only enqueue.
-        let mut manager = self.inner.lock().await;
-        let result = {
-            manager.join(core_params).await.map_err(|e| {
-                log::warn!("manager: join failed: {e}");
-                MatrixRtcFfiError::InvalidInput(e.to_string())
-            })
-        };
-
-        if result.is_ok() {
-            log::info!("manager: join succeeded as {member_id}");
-            drop(manager);
-            self.start_heartbeat(room_id, slot_id);
+            None => log::debug!("room: [{}] already shut down", self.room_id),
         }
+    }
+}
 
-        result.map(|_| member_id)
+/// Our participation in one call slot. Over after [`leave`](Self::leave), after
+/// its room shuts down, or once dropped; joining again yields a new one. Dropping
+/// it sends no leave: the keep-alive stops, and the membership expires through
+/// its delayed leave unless the slot is joined again, which leaves it first.
+#[derive(uniffi::Object)]
+pub struct RtcCall {
+    call: Arc<call::RtcCall<FfiBackend>>,
+    /// `None` once stopped.
+    heartbeat: Mutex<Option<HeartbeatDriver>>,
+    /// The room's mode and backend, for the media layer.
+    #[cfg(feature = "media")]
+    compat: matrix_rtc_call::compat::ElementCallCompat,
+    #[cfg(feature = "media")]
+    backend: Arc<DialectBackend<FfiBackend>>,
+}
+
+impl RtcCall {
+    fn stop_heartbeat(&self) {
+        if let Ok(mut driver) = lock_mutex(&self.heartbeat)
+            && driver.take().is_some()
+        {
+            log::debug!("call: [{}] keep-alive stopped", self.call.slot_id());
+        }
     }
 
-    /// Our `member.id` in one session, or `None` if there is no such session or
-    /// it has not joined.
+    #[cfg(feature = "media")]
+    pub(crate) fn inner(&self) -> &Arc<call::RtcCall<FfiBackend>> {
+        &self.call
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn element_call_compat(&self) -> matrix_rtc_call::compat::ElementCallCompat {
+        self.compat
+    }
+
+    #[cfg(feature = "media")]
+    pub(crate) fn backend(&self) -> Arc<dyn CoreBackend> {
+        self.backend.clone()
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl RtcCall {
+    pub fn room_id(&self) -> String {
+        self.call.room_id().to_owned()
+    }
+
+    pub fn slot_id(&self) -> String {
+        self.call.slot_id().to_owned()
+    }
+
+    /// Our `member.id` in this participation.
+    pub fn member_id(&self) -> String {
+        self.call.member_id().to_owned()
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.call.is_live()
+    }
+
+    /// The event id of our current membership event, or `None` once over.
+    /// Moves on every sticky refresh, so read it at the moment of use.
+    pub async fn membership_event_id(&self) -> Option<String> {
+        self.call.membership_event_id().await
+    }
+
+    pub async fn member_count(&self) -> u64 {
+        self.call.member_count().await as u64
+    }
+
+    /// The slot's joined roster as it changes; see
+    /// [`RtcRoom::subscribe_membership_snapshots`].
+    pub async fn subscribe_membership_snapshots(&self) -> Arc<MembershipSnapshotSubscription> {
+        MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await)
+    }
+
+    /// Restarts the keep-alive: reschedules the delayed leave, and re-sends the
+    /// membership if its sticky entry is halfway to expiring.
     ///
-    /// Changes on every join (MSC4143), so read it when needed rather than
-    /// caching what [`Self::join`] returned.
-    pub async fn own_member_id(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<Option<String>, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager.own_member_id(&room_id, &slot_id))
-    }
-
-    /// The event id of our current membership event in one session, or `None`
-    /// if there is no such session or it has not joined. Moves on every sticky
-    /// refresh, so read it at the moment of use.
-    pub async fn own_membership_event_id(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<Option<String>, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager.own_membership_event_id(&room_id, &slot_id))
+    /// **Hosts do not need to call this** — the call drives it every 10
+    /// seconds until it leaves. It is exported for hosts that would rather
+    /// drive the keep-alive from their own scheduler, and for tests.
+    ///
+    /// Returns `false` once there is nothing left to keep alive.
+    pub async fn heartbeat(&self) -> bool {
+        self.call.heartbeat().await
     }
 
     // ---- Reactions and raised hands ----
     //
     // Element Call's reactions are ordinary room events relating to the
     // reacting member's membership event. The library reads them from the
-    // attached room (timeline events, redactions and the relations of each
-    // membership event); the host plays any sound. Results surface on the media
-    // session as `FfiCallEvent::HandRaised` / `HandLowered` / `Reaction` and on
+    // room (timeline events, redactions and the relations of each membership
+    // event); the host plays any sound. Results surface on the media session
+    // as `FfiCallEvent::HandRaised` / `HandLowered` / `Reaction` and on
     // `FfiParticipant.hand_raised_at_ms`, and here as `raised_hands`.
 
-    /// Sends an Element Call emoji reaction in one session. `name` is what
-    /// peers pick a sound by (see [`reaction_catalog`]); only the first
-    /// grapheme of `emoji` is sent. Returns the event id.
+    /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
+    /// by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
+    /// sent. Returns the event id.
     ///
     /// Fails inside the send cooldown (Element Call's three seconds by
     /// default), since peers would drop the reaction anyway.
     pub async fn send_reaction(
         &self,
-        room_id: String,
-        slot_id: String,
         emoji: String,
         name: String,
     ) -> Result<String, MatrixRtcFfiError> {
-        let mut manager = self.inner.lock().await;
-        Ok(manager
-            .send_reaction(&room_id, &slot_id, &emoji, &name)
-            .await?)
+        Ok(self.call.send_reaction(&emoji, &name).await?)
     }
 
-    /// Raises our hand in one session. Idempotent while it is up; the hand
-    /// follows our membership across sticky refreshes on its own.
-    pub async fn raise_hand(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<(), MatrixRtcFfiError> {
-        let mut manager = self.inner.lock().await;
-        Ok(manager.raise_hand(&room_id, &slot_id).await?)
+    /// Raises our hand. Idempotent while it is up; the hand follows our
+    /// membership across sticky refreshes on its own.
+    pub async fn raise_hand(&self) -> Result<(), MatrixRtcFfiError> {
+        Ok(self.call.raise_hand().await?)
     }
 
-    /// Lowers our hand in one session by redacting the annotation. A no-op
-    /// when it is down.
-    pub async fn lower_hand(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<(), MatrixRtcFfiError> {
-        let mut manager = self.inner.lock().await;
-        Ok(manager.lower_hand(&room_id, &slot_id).await?)
+    /// Lowers our hand by redacting the annotation. A no-op when it is down.
+    pub async fn lower_hand(&self) -> Result<(), MatrixRtcFfiError> {
+        Ok(self.call.lower_hand().await?)
     }
 
-    /// The raised hands of one session, oldest first; empty if there is no
-    /// such session.
-    pub async fn raised_hands(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<Vec<FfiRaisedHand>, MatrixRtcFfiError> {
-        let manager = self.inner.lock().await;
-        Ok(manager
-            .raised_hands(&room_id, &slot_id)
-            .unwrap_or_default()
+    /// The slot's raised hands, oldest first.
+    pub async fn raised_hands(&self) -> Vec<FfiRaisedHand> {
+        self.call
+            .raised_hands()
+            .await
             .into_iter()
             .map(Into::into)
-            .collect())
+            .collect()
     }
 
-    /// Restarts the keep-alive for one session: reschedules the delayed leave,
-    /// and re-sends the membership if its sticky entry is halfway to expiring.
-    ///
-    /// **Hosts do not need to call this** — [`Self::join`] starts a driver that
-    /// does it every 10 seconds, and [`Self::leave`] stops it. It is exported
-    /// for hosts that would rather drive the keep-alive from their own scheduler
-    /// (a foreground service, a workmanager job), and for tests.
-    ///
-    /// Returns `false` if there is no joined session for `(room_id, slot_id)`,
-    /// which means there is nothing to keep alive.
-    pub async fn heartbeat(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Result<bool, MatrixRtcFfiError> {
-        let mut manager = self.inner.lock().await;
-        Ok(manager.heartbeat(&room_id, &slot_id).await)
-    }
-
-    pub async fn leave(
-        &self,
-        room_id: String,
-        slot_id: String,
-        params: FfiLeaveSessionParams,
-    ) -> Result<(), MatrixRtcFfiError> {
+    /// Leaves the slot; the call is over afterwards. A failed leave leaves it
+    /// live, so it can be retried.
+    pub async fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
         log::info!(
-            "manager: leave requested [{room_id}/{slot_id}] reason={:?}",
+            "call: [{}/{}] leave requested reason={:?}",
+            self.call.room_id(),
+            self.call.slot_id(),
             params.leave_reason,
         );
-
-        let core_params = params.into_core();
-
         // Stop the keep-alive first, so it cannot re-arm a delayed leave after
-        // the leave below cancels it. A beat already in flight is harmless: it
-        // holds the manager lock we are about to take, and once `leave` has
-        // taken the membership machine any later beat is a no-op.
-        self.stop_heartbeat(&room_id, &slot_id);
-
-        // Held across the leave, for the reasons in `join` above.
-        let mut manager = self.inner.lock().await;
-        let result = {
-            manager
-                .leave(room_id, slot_id, core_params)
-                .await
-                .map_err(|e| {
-                    log::warn!("manager: leave failed: {e}");
-                    MatrixRtcFfiError::InvalidInput(e.to_string())
-                })
-        };
-
-        if result.is_ok() {
-            log::info!("manager: leave succeeded");
-        }
-        // The dialect stays registered: the room is still attached in its
-        // mode, and a rejoin in it renders the same way. Detaching clears it.
-
-        result
+        // the leave below cancels it. A beat already in flight is harmless:
+        // once the leave has taken the membership machine it is a no-op.
+        self.stop_heartbeat();
+        self.call
+            .leave(params.into_core())
+            .await
+            .inspect_err(|error| log::warn!("call: leave failed: {error}"))?;
+        log::info!("call: leave succeeded");
+        Ok(())
     }
 }
 
-impl RtcSessionManagerHandle {
-    /// The session-wide to-device subscription, started once.
-    async fn ensure_session_feeder(&self) -> Result<(), MatrixRtcFfiError> {
-        let mut slot = self.session_feeder.lock().await;
-        if slot.is_some() {
-            return Ok(());
-        }
-        let (feeder, run) =
-            SessionFeeder::start(self.backend.clone(), self.inner.clone(), self.modes.clone())
-                .await?;
-        *slot = Some((feeder, AbortOnDrop(runtime::runtime().spawn(run.run()))));
-        log::info!("manager: to-device subscription started");
-        Ok(())
-    }
+/// Owns the task that drives one call's keep-alive. Dropping it stops the
+/// task; so does the call ending, or being dropped.
+struct HeartbeatDriver {
+    _stop: tokio::sync::mpsc::Sender<()>,
+}
 
-    /// Starts (or replaces) the keep-alive driver for one session.
-    fn start_heartbeat(&self, room_id: String, slot_id: String) {
-        self.start_heartbeat_every(room_id, slot_id, HEARTBEAT_INTERVAL);
-    }
-
-    /// [`Self::start_heartbeat`] with the interval spelled out, so a test can
-    /// beat faster than a session ships with.
-    fn start_heartbeat_every(&self, room_id: String, slot_id: String, interval: Duration) {
-        let (stop, stop_rx) = tokio::sync::mpsc::channel(1);
-        let manager = Arc::downgrade(&self.inner);
-        let key = (room_id.clone(), slot_id.clone());
-
+impl HeartbeatDriver {
+    fn start(call: &Arc<call::RtcCall<FfiBackend>>, interval: Duration) -> Self {
+        let (stop, mut stopped) = tokio::sync::mpsc::channel::<()>(1);
+        let call = Arc::downgrade(call);
         // On `runtime()` rather than a thread of its own: the body is a sleep
-        // and an await on a mutex, and `tokio::time::sleep` needs a timer to
-        // fire at all. Detached — it stops when the `stop` sender below is
-        // dropped, or when the manager behind its `Weak` goes away.
-        runtime::runtime().spawn(run_heartbeat(manager, room_id, slot_id, interval, stop_rx));
-
-        log::info!(
-            "manager: keep-alive driver started for [{}/{}] every {interval:?}",
-            key.0,
-            key.1,
-        );
-        // Replaces any previous driver for this session; dropping the old
-        // sender stops its task.
-        match lock_mutex(&self.heartbeats) {
-            Ok(mut drivers) => {
-                drivers.insert(key, HeartbeatDriver { _stop: stop });
-            }
-            Err(error) => log::error!("manager: could not register keep-alive: {error}"),
-        }
-    }
-
-    /// Stops the keep-alive driver for one session, if any.
-    fn stop_heartbeat(&self, room_id: &str, slot_id: &str) {
-        let key = (room_id.to_owned(), slot_id.to_owned());
-        match lock_mutex(&self.heartbeats) {
-            Ok(mut drivers) => {
-                if drivers.remove(&key).is_some() {
-                    log::debug!("manager: keep-alive driver stopped for [{room_id}/{slot_id}]");
+        // and an await, and `tokio::time::sleep` needs a timer to fire at all.
+        runtime::runtime().spawn(async move {
+            loop {
+                tokio::select! {
+                    // The driver was dropped (leave, or the call object died),
+                    // so a stop takes effect at once.
+                    _ = stopped.recv() => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                let Some(call) = call.upgrade() else {
+                    break;
+                };
+                if !call.heartbeat().await {
+                    log::debug!(
+                        "call: [{}] no longer joined; keep-alive done",
+                        call.slot_id()
+                    );
+                    break;
                 }
             }
-            Err(error) => log::error!("manager: could not stop the keep-alive: {error}"),
-        }
+        });
+        Self { _stop: stop }
     }
+}
 
-    /// The generation `room_id` was attached for, or `Off`.
-    ///
-    /// `pub(crate)` for the media layer, which derives its SFU identity and picks
-    /// its token endpoint from this rather than from a second host-supplied
-    /// value — the two disagreeing is not an error but a silence.
-    #[cfg(feature = "media")]
-    pub(crate) fn element_call_compat_for(
-        &self,
-        room_id: &str,
-    ) -> matrix_rtc_bridge::compat::ElementCallCompat {
-        self.modes.mode(room_id)
-    }
+struct SubscriptionState {
+    receiver: watch::Receiver<Vec<CoreJoinedMembership>>,
+    initial_pending: bool,
+}
 
-    /// The host's backend, for the media layer's token exchange.
-    #[cfg(feature = "media")]
-    pub(crate) fn backend(&self) -> Arc<dyn CoreBackend> {
-        self.backend.clone()
+#[derive(uniffi::Object)]
+pub struct MembershipSnapshotSubscription {
+    state: Mutex<SubscriptionState>,
+}
+
+impl MembershipSnapshotSubscription {
+    fn new(receiver: watch::Receiver<Vec<CoreJoinedMembership>>) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(SubscriptionState {
+                receiver,
+                initial_pending: true,
+            }),
+        })
     }
 }
 
@@ -944,7 +784,7 @@ mod tests {
     use super::*;
     use crate::backend::test_support::{Carrier, MockHost};
     use crate::backend::{FfiEventEncryption, FfiEventIn};
-    use matrix_rtc_bridge::compat::STATE_MEMBER_EVENT_TYPE;
+    use matrix_rtc_call::compat::STATE_MEMBER_EVENT_TYPE;
 
     const ROOM: &str = "!room:example.org";
     const SLOT: &str = "m.call#ROOM";
@@ -1005,22 +845,22 @@ mod tests {
         }
     }
 
-    /// Seeds the room's gating subjects and `sticky`, then attaches.
-    async fn attach(
-        manager: &RtcSessionManagerHandle,
+    /// Seeds the room's gating subjects and `sticky`, then opens the room.
+    async fn open(
+        client: &RtcClient,
         mock: &MockHost,
         compat: Option<FfiElementCallCompat>,
         encrypted: bool,
         slots: Vec<FfiEventIn>,
         sticky: Vec<FfiEventIn>,
-    ) {
-        let attach = manager.attach_room(
+    ) -> Arc<RtcRoom> {
+        let open = client.room(
             ROOM.to_owned(),
-            FfiAttachOptions {
+            FfiRoomOptions {
                 element_call_compat: compat,
             },
         );
-        tokio::pin!(attach);
+        tokio::pin!(open);
         // The mock stores the sink inside `subscribe_room`; deliver the current
         // sets once it exists, the way a host does on subscribe.
         let seed = async {
@@ -1049,13 +889,17 @@ mod tests {
                 sink.on_state_events(STATE_MEMBER_EVENT_TYPE.to_owned(), Vec::new());
             }
         };
-        let (result, ()) = tokio::join!(attach, seed);
-        result.expect("attach");
+        let (result, ()) = tokio::join!(open, seed);
+        result.expect("open")
+    }
+
+    /// [`open`] with an open slot and nobody in it.
+    async fn open_call_room(client: &RtcClient, mock: &MockHost) -> Arc<RtcRoom> {
+        open(client, mock, None, false, vec![open_slot(None)], Vec::new()).await
     }
 
     fn join_params() -> FfiJoinSessionParams {
         FfiJoinSessionParams {
-            room_id: ROOM.to_owned(),
             slot_id: SLOT.to_owned(),
             application: "m.call".to_owned(),
             transport: Some(FfiTransportConfig {
@@ -1073,6 +917,17 @@ mod tests {
         }
     }
 
+    fn no_reason() -> FfiLeaveSessionParams {
+        FfiLeaveSessionParams { leave_reason: None }
+    }
+
+    fn beats(mock: &MockHost) -> usize {
+        mock.sent_types()
+            .into_iter()
+            .filter(|sent| sent == "restart_delayed_event")
+            .count()
+    }
+
     async fn wait_until(mut condition: impl AsyncFnMut() -> bool) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         while !condition().await {
@@ -1085,36 +940,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_reports_no_session_when_not_joined() {
-        let manager = RtcSessionManagerHandle::new(MockHost::new());
-        assert!(
-            !manager
-                .heartbeat(ROOM.to_owned(), SLOT.to_owned())
-                .await
-                .expect("the call itself should succeed"),
-        );
-    }
-
-    #[test]
-    fn stopping_an_unknown_heartbeat_is_harmless() {
-        let manager = RtcSessionManagerHandle::new(MockHost::new());
-        manager.stop_heartbeat(ROOM, SLOT);
-        assert!(lock_mutex(&manager.heartbeats).unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_room_must_be_attached_before_joining() {
-        let manager = RtcSessionManagerHandle::new(MockHost::new());
-        let result = manager.join(join_params()).await;
-        assert!(matches!(result, Err(MatrixRtcFfiError::Attachment(_))));
-    }
-
-    #[tokio::test]
-    async fn attaching_subscribes_in_the_mode_and_seeds_the_roster() {
+    async fn a_left_call_has_nothing_to_keep_alive() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.join_call(join_params()).await.expect("join");
+        assert!(call.heartbeat().await);
+
+        call.leave(no_reason()).await.expect("leave");
+        assert!(!call.is_live());
+        assert!(!call.heartbeat().await);
+        assert!(matches!(
+            call.leave(no_reason()).await,
+            Err(MatrixRtcFfiError::CallOver(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_shut_down_room_refuses_further_calls() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        room.shutdown().await;
+        assert!(matches!(
+            room.join_call(join_params()).await,
+            Err(MatrixRtcFfiError::Attachment(_))
+        ));
+        room.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opening_subscribes_in_the_mode_and_seeds_the_roster() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
             &mock,
             None,
             false,
@@ -1133,11 +993,10 @@ mod tests {
         );
         assert!(mock.to_device_sink.lock().unwrap().is_some());
 
-        let subscription = manager
-            .subscribe_membership_snapshots(ROOM.to_owned(), SLOT.to_owned())
+        let subscription = room
+            .subscribe_membership_snapshots(SLOT.to_owned())
             .await
-            .unwrap()
-            .expect("the member event should have created the session");
+            .unwrap();
         let joined = subscription.next_snapshot().unwrap().unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].sender, "@bob:example.org");
@@ -1158,98 +1017,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attaching_twice_is_an_error_and_detaching_ends_the_subscription() {
+    async fn opening_twice_is_an_error_and_shutting_down_ends_every_subscription() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
 
-        let again = manager
-            .attach_room(ROOM.to_owned(), FfiAttachOptions::default())
+        let again = client
+            .room(ROOM.to_owned(), FfiRoomOptions::default())
             .await;
         assert!(matches!(again, Err(MatrixRtcFfiError::Attachment(_))));
-
-        // The refused attach subscribed to nothing: the room and to-device.
+        // The refused open subscribed to nothing: the room and to-device.
         assert_eq!(mock.live_subscriptions(), 2);
 
-        manager.detach_room(ROOM.to_owned()).await.unwrap();
-        assert_eq!(mock.live_subscriptions(), 1, "only to-device is left");
-        // Delivered after detach: not applied.
-        mock.room_sink(ROOM).on_sticky_events(vec![member_event(
-            "@bob:example.org",
-            "BOBDEV",
-            "bob-a",
-            "$m1",
-        )]);
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        room.shutdown().await;
         assert_eq!(
-            manager
-                .member_count(ROOM.to_owned(), SLOT.to_owned())
-                .await
-                .unwrap(),
-            None
+            mock.live_subscriptions(),
+            0,
+            "the last room took the to-device subscription with it"
         );
     }
 
     #[tokio::test]
-    async fn dropping_the_handle_ends_every_subscription() {
+    async fn dropping_the_room_ends_every_subscription() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
         assert_eq!(mock.live_subscriptions(), 2);
 
-        drop(manager);
+        drop(room);
         assert_eq!(mock.live_subscriptions(), 0);
     }
 
     #[tokio::test]
-    async fn an_attach_still_seeding_refuses_a_second_and_cancelling_it_frees_the_room() {
+    async fn an_open_still_seeding_refuses_a_second_and_cancelling_it_frees_the_room() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
+        let client = RtcClient::new(mock.clone());
         {
-            let first = manager.attach_room(ROOM.to_owned(), FfiAttachOptions::default());
+            let first = client.room(ROOM.to_owned(), FfiRoomOptions::default());
             tokio::pin!(first);
             // Subscribed, never seeded.
             tokio::select! {
-                _ = &mut first => panic!("an unseeded attach must not resolve"),
+                _ = &mut first => panic!("an unseeded open must not resolve"),
                 _ = async {
                     while mock.subjects(ROOM).is_none() {
                         tokio::time::sleep(Duration::from_millis(2)).await;
                     }
                 } => {}
             }
-            let second = manager
-                .attach_room(ROOM.to_owned(), FfiAttachOptions::default())
+            let second = client
+                .room(ROOM.to_owned(), FfiRoomOptions::default())
                 .await;
             assert!(matches!(second, Err(MatrixRtcFfiError::Attachment(_))));
         }
-        // The first attach was dropped (its caller cancelled it): its room
-        // subscription ended and the room is free again.
-        assert_eq!(mock.live_subscriptions(), 1, "only to-device is left");
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
+        // The first open was dropped (its caller cancelled it): its room
+        // subscription ended, the room is free again, and with no room left
+        // the to-device subscription went too.
+        assert_eq!(mock.live_subscriptions(), 0);
+        let _room = open_call_room(&client, &mock).await;
         assert_eq!(mock.live_subscriptions(), 2);
     }
 
@@ -1258,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn membership_from_every_generation_lands_in_one_roster() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
+        let client = RtcClient::new(mock.clone());
 
         let spec = member_event("@alice:example.org", "ALICEDEV", "alice-a", "$a");
         // No `membership`, no `transports` — that generation states neither.
@@ -1284,7 +1108,7 @@ mod tests {
             sender: "@carl:example.org".to_owned(),
             event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
             state_key: Some("_@carl:example.org_CARLDEV_m.call".to_owned()),
-            origin_server_ts: matrix_rtc_bridge::compat::element_call_state::now_ms(),
+            origin_server_ts: matrix_rtc_call::compat::element_call_state::now_ms(),
             content_json: serde_json::json!({
                 "application": "m.call",
                 "call_id": "",
@@ -1297,8 +1121,8 @@ mod tests {
             encryption: cleartext(),
         };
 
-        attach(
-            &manager,
+        let room = open(
+            &client,
             &mock,
             Some(FfiElementCallCompat::StateEvents),
             false,
@@ -1308,20 +1132,12 @@ mod tests {
         .await;
         mock.room_sink(ROOM)
             .on_state_events(STATE_MEMBER_EVENT_TYPE.to_owned(), vec![pre_sticky]);
-        wait_until(async || {
-            manager
-                .member_count(ROOM.to_owned(), SLOT.to_owned())
-                .await
-                .unwrap()
-                == Some(3)
-        })
-        .await;
+        wait_until(async || room.member_count(SLOT.to_owned()).await.unwrap() == 3).await;
 
-        let subscription = manager
-            .subscribe_membership_snapshots(ROOM.to_owned(), SLOT.to_owned())
+        let subscription = room
+            .subscribe_membership_snapshots(SLOT.to_owned())
             .await
-            .unwrap()
-            .expect("the member events should have created the session");
+            .unwrap();
         let mut joined = subscription.next_snapshot().unwrap().unwrap();
         joined.sort_by(|a, b| a.sender.cmp(&b.sender));
         assert_eq!(
@@ -1346,31 +1162,16 @@ mod tests {
         let mock = MockHost::new();
         *mock.transports_json.lock().unwrap() =
             serde_json::json!([{ "type": "livekit", "livekit_service_url": SFU }]).to_string();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
 
-        let first = manager
-            .join(FfiJoinSessionParams {
+        let first = room
+            .join_call(FfiJoinSessionParams {
                 transport: None,
                 ..join_params()
             })
             .await
             .expect("first join");
-        assert_eq!(
-            manager
-                .own_member_id(ROOM.to_owned(), SLOT.to_owned())
-                .await
-                .unwrap(),
-            Some(first.clone()),
-        );
         let membership = mock
             .sends()
             .into_iter()
@@ -1386,25 +1187,34 @@ mod tests {
             &serde_json::json!(SFU),
         );
 
-        manager
-            .leave(
-                ROOM.to_owned(),
-                SLOT.to_owned(),
-                FfiLeaveSessionParams { leave_reason: None },
-            )
-            .await
-            .expect("leave");
-        let second = manager.join(join_params()).await.expect("rejoin");
-        assert_ne!(first, second, "a rejoin must not reuse the member id");
+        first.leave(no_reason()).await.expect("leave");
+        let second = room.join_call(join_params()).await.expect("rejoin");
+        assert_ne!(
+            first.member_id(),
+            second.member_id(),
+            "a rejoin must not reuse the member id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_call_in_a_joined_slot_is_refused() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let _call = room.join_call(join_params()).await.expect("join");
+        assert!(matches!(
+            room.join_call(join_params()).await,
+            Err(MatrixRtcFfiError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test]
     async fn a_join_into_a_room_with_no_open_slot_is_refused() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(&manager, &mock, None, false, Vec::new(), Vec::new()).await;
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
 
-        let result = manager.join(join_params()).await;
+        let result = room.join_call(join_params()).await;
         assert!(result.is_err(), "no open slot, no join");
         assert!(mock.sends().is_empty(), "nothing should have been sent");
     }
@@ -1412,26 +1222,16 @@ mod tests {
     #[tokio::test]
     async fn the_keep_alive_driver_restarts_the_delayed_leave() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
 
-        manager.join(join_params()).await.expect("join");
-        manager.start_heartbeat_every(ROOM.to_owned(), SLOT.to_owned(), Duration::from_millis(50));
+        let _call = room
+            .join_call_every(join_params(), Duration::from_millis(50))
+            .await
+            .expect("join");
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        let beats = mock
-            .sent_types()
-            .into_iter()
-            .filter(|sent| sent == "restart_delayed_event")
-            .count();
+        let beats = beats(&mock);
         assert!(
             beats >= 2,
             "saw {beats} beats over 300ms at a 50ms interval"
@@ -1441,60 +1241,54 @@ mod tests {
     #[tokio::test]
     async fn leaving_stops_the_keep_alive_driver() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
 
-        manager.join(join_params()).await.expect("join");
-        manager.start_heartbeat_every(ROOM.to_owned(), SLOT.to_owned(), Duration::from_millis(50));
+        let call = room
+            .join_call_every(join_params(), Duration::from_millis(50))
+            .await
+            .expect("join");
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        manager
-            .leave(
-                ROOM.to_owned(),
-                SLOT.to_owned(),
-                FfiLeaveSessionParams { leave_reason: None },
-            )
-            .await
-            .expect("leave");
-        let beats = |mock: &MockHost| {
-            mock.sent_types()
-                .into_iter()
-                .filter(|sent| sent == "restart_delayed_event")
-                .count()
-        };
+        call.leave(no_reason()).await.expect("leave");
         let after_leave = beats(&mock);
         tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(
-            beats(&mock),
-            after_leave,
-            "no beat once the session has left"
+        assert_eq!(beats(&mock), after_leave, "no beat once the call has left");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_call_stops_its_keep_alive_without_leaving() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let call = room
+            .join_call_every(join_params(), Duration::from_millis(50))
+            .await
+            .expect("join");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        drop(call);
+        let after_drop = beats(&mock);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(beats(&mock), after_drop, "no beat once the call is dropped");
+        assert!(
+            !mock
+                .sent_types()
+                .iter()
+                .any(|sent| sent == "cancel_delayed_event"),
+            "dropping sends no leave"
         );
     }
 
     #[tokio::test]
-    async fn detaching_leaves_the_joined_session() {
+    async fn shutting_down_leaves_the_joined_call() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
-        manager.join(join_params()).await.expect("join");
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.join_call(join_params()).await.expect("join");
 
-        manager.detach_room(ROOM.to_owned()).await.unwrap();
+        room.shutdown().await;
         assert!(
             mock.sent_types()
                 .iter()
@@ -1502,17 +1296,17 @@ mod tests {
             "the leave cancels the delayed leave: {:?}",
             mock.sent_types()
         );
-        assert!(lock_mutex(&manager.heartbeats).unwrap().is_empty());
+        assert!(!call.is_live());
     }
 
-    /// Driven through the handle an FFI host holds: the rejoin must distribute
-    /// a key to the incumbent even though no sticky event moved.
+    /// Driven through the objects an FFI host holds: the rejoin must
+    /// distribute a key to the incumbent even though no sticky event moved.
     #[tokio::test]
     async fn a_rejoin_distributes_keys_without_new_sticky_events() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
             &mock,
             None,
             true,
@@ -1521,7 +1315,7 @@ mod tests {
         )
         .await;
 
-        manager.join(join_params()).await.expect("first join");
+        let first = room.join_call(join_params()).await.expect("first join");
         mock.room_sink(ROOM).on_sticky_events(vec![member_event(
             "@bob:example.org",
             "BOBDEV",
@@ -1530,43 +1324,32 @@ mod tests {
         )]);
         wait_until(async || !mock.to_device_for("@bob:example.org", "BOBDEV").is_empty()).await;
 
-        manager
-            .leave(
-                ROOM.to_owned(),
-                SLOT.to_owned(),
-                FfiLeaveSessionParams { leave_reason: None },
-            )
-            .await
-            .expect("leave");
+        first.leave(no_reason()).await.expect("leave");
         mock.clear_to_device();
 
-        let second = manager.join(join_params()).await.expect("rejoin");
+        let second = room.join_call(join_params()).await.expect("rejoin");
         let sent = mock.to_device_for("@bob:example.org", "BOBDEV");
         assert!(!sent.is_empty(), "the second call distributed no key");
         assert_eq!(
             sent[0].pointer("/member_id").and_then(|v| v.as_str()),
-            Some(second.as_str()),
+            Some(second.member_id().as_str()),
         );
     }
 
     #[tokio::test]
     async fn opening_and_closing_a_slot_publishes_the_state_a_peer_reads() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
 
-        manager
-            .open_slot(
-                ROOM.to_owned(),
-                SLOT.to_owned(),
-                "m.call".to_owned(),
-                Some(FfiSlotEncryption::PerMember),
-            )
-            .await
-            .expect("open");
-        manager
-            .close_slot(ROOM.to_owned(), SLOT.to_owned())
-            .await
-            .expect("close");
+        room.open_slot(
+            SLOT.to_owned(),
+            "m.call".to_owned(),
+            Some(FfiSlotEncryption::PerMember),
+        )
+        .await
+        .expect("open");
+        room.close_slot(SLOT.to_owned()).await.expect("close");
 
         let sends = mock.sends();
         assert_eq!(sends.len(), 2);
@@ -1589,14 +1372,10 @@ mod tests {
     #[tokio::test]
     async fn a_slot_id_that_contradicts_its_application_is_refused() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        let result = manager
-            .open_slot(
-                ROOM.to_owned(),
-                SLOT.to_owned(),
-                "m.something.else".to_owned(),
-                None,
-            )
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
+        let result = room
+            .open_slot(SLOT.to_owned(), "m.something.else".to_owned(), None)
             .await;
         assert!(result.is_err());
         assert!(mock.sends().is_empty());
@@ -1604,15 +1383,16 @@ mod tests {
 
     // --- Element Call compatibility ------------------------------------------
     //
-    // The dialects are tested in `matrix_rtc_bridge::compat`. Tested here: the
-    // mode chosen at attach reaches every send, the two of the join included.
+    // The dialects are tested in `matrix_rtc_call::compat`. Tested here: the
+    // mode chosen when the room opens reaches every send, the two of the join
+    // included.
 
     #[tokio::test]
     async fn a_sticky_compat_join_is_readable_by_both_generations() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
             &mock,
             Some(FfiElementCallCompat::StickyEvents),
             false,
@@ -1621,7 +1401,7 @@ mod tests {
         )
         .await;
 
-        let member_id = manager.join(join_params()).await.expect("join");
+        let call = room.join_call(join_params()).await.expect("join");
         let membership = mock
             .sends()
             .into_iter()
@@ -1630,7 +1410,7 @@ mod tests {
         assert_eq!(membership.event_type, "org.matrix.msc4143.rtc.member");
         assert_eq!(
             membership.content.pointer("/member/id").unwrap(),
-            &serde_json::json!(member_id),
+            &serde_json::json!(call.member_id()),
         );
         assert_eq!(
             membership.content.pointer("/member/user_id").unwrap(),
@@ -1652,10 +1432,10 @@ mod tests {
     #[tokio::test]
     async fn a_pre_sticky_join_publishes_room_state() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
+        let client = RtcClient::new(mock.clone());
         // No slot state is asked for in this mode: that generation has none.
-        attach(
-            &manager,
+        let room = open(
+            &client,
             &mock,
             Some(FfiElementCallCompat::StateEvents),
             false,
@@ -1668,13 +1448,14 @@ mod tests {
             vec![STATE_MEMBER_EVENT_TYPE.to_owned()]
         );
 
-        let member_id = manager
-            .join(FfiJoinSessionParams {
+        let call = room
+            .join_call(FfiJoinSessionParams {
                 keep_alive_timeout_ms: Some(30_000),
                 ..join_params()
             })
             .await
             .expect("join");
+        let member_id = call.member_id();
         assert_eq!(member_id, "@alice:example.org:DEVICE");
 
         let sends = mock.sends();
@@ -1705,9 +1486,9 @@ mod tests {
         let mock = MockHost::new();
         mock.refuse_delayed
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
             &mock,
             Some(FfiElementCallCompat::StateEvents),
             false,
@@ -1716,8 +1497,7 @@ mod tests {
         )
         .await;
 
-        manager
-            .join(join_params())
+        room.join_call(join_params())
             .await
             .expect("a refused delayed leave must not fail the join");
         let sends = mock.sends();
@@ -1739,14 +1519,14 @@ mod tests {
         );
     }
 
-    /// A mode is per attachment: a later spec-current attach of the same room
+    /// A mode is per room object: a later spec-current open of the same room
     /// must not inherit the dialect a previous one installed.
     #[tokio::test]
-    async fn detaching_forgets_the_dialect() {
+    async fn shutting_down_forgets_the_dialect() {
         let mock = MockHost::new();
-        let manager = RtcSessionManagerHandle::new(mock.clone());
-        attach(
-            &manager,
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
             &mock,
             Some(FfiElementCallCompat::StateEvents),
             false,
@@ -1754,8 +1534,8 @@ mod tests {
             Vec::new(),
         )
         .await;
-        manager.join(join_params()).await.expect("join");
-        manager.detach_room(ROOM.to_owned()).await.unwrap();
+        let _call = room.join_call(join_params()).await.expect("join");
+        room.shutdown().await;
         assert!(
             mock.sends()
                 .iter()
@@ -1764,16 +1544,8 @@ mod tests {
             "the leave emptied our state membership",
         );
 
-        attach(
-            &manager,
-            &mock,
-            None,
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
-        manager.join(join_params()).await.expect("rejoin");
+        let room = open_call_room(&client, &mock).await;
+        let _call = room.join_call(join_params()).await.expect("rejoin");
         assert!(
             mock.sends()
                 .iter()
@@ -1783,7 +1555,7 @@ mod tests {
         );
     }
 
-    /// A panic inside one handle method must not disable the handle forever.
+    /// A panic inside one method must not disable an object forever.
     #[test]
     fn a_poisoned_lock_is_recovered_rather_than_propagated() {
         let mutex = Mutex::new(0_u32);

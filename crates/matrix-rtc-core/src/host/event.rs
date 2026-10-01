@@ -136,7 +136,7 @@ pub struct RawStickyEvent {
 /// Content DTO extracted from a sticky Matrix event (MSC4143 compliant).
 ///
 /// `Deserialize` lets host SDK layers parse an `m.rtc.member` event's `content`
-/// object straight into this DTO (see `matrix-rtc-bridge`'s `sdk`).
+/// object straight into this DTO (see `matrix-rtc-matrix-sdk`'s `sdk`).
 /// Only `slot_id` and `sticky_key` are required; a leave event carries just
 /// those plus `member` and `leave_reason`, so the rest default.
 pub struct RawStickyEventContent {

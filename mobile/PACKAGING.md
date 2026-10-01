@@ -287,10 +287,10 @@ Benign build noise with `MEDIA=1`: uniffi-bindgen warns about a missing
 **Host app responsibilities with media** (see the module docs in
 `crates/matrix-rtc-ffi/src/media/mod.rs` for the full flow):
 
-- Attach the room and join the slot through the manager first, then call
-  `connectMediaSession(manager, config)`.
+- Open the room and join the slot first (`client.room(..)`,
+  `room.joinCall(..)`), then call `connectMediaSession(call, config)`.
 - Media keys and the OpenID token (asked for peers' foci too) go through
-  the same `MatrixBackend` you built the manager with — there is nothing
+  the same `MatrixBackend` you built the client with — there is nothing
   extra to implement. Keys that arrive before `connectMediaSession` are
   replayed into the transport on attach, so the order of "join, receive
   keys, connect media" does not matter.
