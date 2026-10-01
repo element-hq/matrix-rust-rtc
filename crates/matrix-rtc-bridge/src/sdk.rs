@@ -30,7 +30,6 @@ use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateA
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, delayed_state_event, update_delayed_event,
 };
-use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
 use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
 use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::events::relation::RelationType;
@@ -651,16 +650,18 @@ impl MatrixBackend for SdkBackend {
         })
     }
 
-    /// An empty array when the homeserver lacks the endpoint: that is "none
-    /// advertised", and the join's own choice (if any) decides.
+    /// Through the SDK's discovery: cached, with a bounded request, and
+    /// falling back to the well-known `rtc_foci` when the homeserver lacks the
+    /// endpoint. Nothing discovered is an empty array ("none advertised"); a
+    /// failed request stays an error rather than reading as "none".
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
-        match self.client.send(rtc_transports::Request::new()).await {
-            Ok(response) => serde_json::to_value(response.rtc_transports).map_err(backend_error),
-            Err(error) => {
-                log::info!("transports endpoint unavailable ({error}); advertising none");
-                Ok(Value::Array(Vec::new()))
-            }
-        }
+        let transports = self
+            .client
+            .discover_rtc_transports()
+            .await
+            .map_err(backend_error)?
+            .unwrap_or_default();
+        serde_json::to_value(transports).map_err(backend_error)
     }
 }
 

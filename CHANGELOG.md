@@ -29,6 +29,7 @@ log only.
 - `RtcSessionManager::backend()`, and a core `testing` feature exposing `MockBackend`, whose sinks a test delivers sets into.
 - Reactions, the raised hand and the `/relations` backfill on every host (FFI, wasm, `Call`), since the feeder does the work once.
 - `matrix_rtc_bridge::transports::choose`: the library's transport choice from the homeserver's `GET /rtc/transports`.
+- `SdkBackend` discovers transports through matrix-sdk's cached `discover_rtc_transports`, falling back to the well-known `rtc_foci`; a failed request is an error rather than "none advertised".
 - A member event carrying both `msc4354_sticky_key` and `sticky_key` (as seen on the wire) now parses; it was dropped as a duplicate field.
 
 ## v0.4.0-rc.1 - 2026-09-25
