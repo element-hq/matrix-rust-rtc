@@ -28,11 +28,11 @@
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use matrix_rtc_bridge::compat::{DialectBackend, ElementCallCompat, ingest};
-use matrix_rtc_bridge::feeder::{
+use matrix_rtc_call::compat::{DialectBackend, ElementCallCompat, ingest};
+use matrix_rtc_call::feeder::{
     AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, ToDeviceFeeder,
 };
-use matrix_rtc_bridge::transports;
+use matrix_rtc_call::transports;
 use matrix_rtc_call::{
     CallJoinParams, CallSessionManager, Mentions, NotificationType, NotifyConfig,
 };

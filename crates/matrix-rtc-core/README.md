@@ -15,14 +15,14 @@ It does four things:
 - **Slots.** It resolves `m.rtc.slot` state, and opens and closes slots.
 
 The core does no I/O. It sends through the host-implemented `MatrixBackend`, and it is fed —
-by the feeder in `matrix-rtc-bridge`, which subscribes through that same backend — the room's
+by the feeder in `matrix-rtc-call`, which subscribes through that same backend — the room's
 state and membership as `RawStickyEvent`s, slot and room state, and decrypted key messages. It
 spawns no tasks and arms no timers: the host calls `heartbeat` periodically while joined.
 
 ## Quick start: join a slot and follow its memberships
 
 The core is **fed**, not polled: it spawns nothing and never reads from the backend itself. The
-feeder in `matrix-rtc-bridge` does that — it subscribes through the backend to what the room needs,
+feeder in `matrix-rtc-call` does that — it subscribes through the backend to what the room needs,
 applies the room's current state in the right order (encryption and slots and members before the
 first membership), translates the member events and keeps the manager current. So the entry point
 is the feeder, over the core manager:
@@ -31,8 +31,8 @@ is the feeder, over the core manager:
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use matrix_rtc_bridge::{AttachOptions, RoomFeeder, RoomModes, ToDeviceFeeder};
-use matrix_rtc_bridge::compat::DialectBackend;
+use matrix_rtc_call::{AttachOptions, RoomFeeder, RoomModes, ToDeviceFeeder};
+use matrix_rtc_call::compat::DialectBackend;
 use matrix_rtc_core::{
     JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, MatrixBackend,
     RtcSessionManager, RtcTransport,

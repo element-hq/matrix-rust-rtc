@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use matrix_rtc_call::CallSessionManager;
+use crate::CallSessionManager;
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{EventEncryption, EventIn, ToDeviceMessageIn};
 use serde_json::json;

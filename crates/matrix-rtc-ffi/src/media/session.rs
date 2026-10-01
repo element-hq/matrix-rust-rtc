@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
-use matrix_rtc_bridge::compat::ElementCallCompat;
+use matrix_rtc_call::compat::ElementCallCompat;
 use matrix_rtc_livekit::{
     LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
     identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,

@@ -19,11 +19,11 @@
 //! - bridging `matrix-rtc-core`'s media keys into LiveKit frame encryption
 //!   ([`keys`]).
 //!
-//! Everything Matrix-side — feeding the core from a `matrix_sdk::Client`, and
-//! translating the pre-2026 Element Call wire dialects — belongs to
-//! [`matrix_rtc_bridge`] instead, which knows nothing about LiveKit. With the
-//! `matrix-sdk` feature, [`call::Call`] composes that bridge with this
-//! transport into a join/leave facade — start there.
+//! Everything Matrix-side belongs elsewhere and knows nothing about LiveKit:
+//! [`matrix_rtc_bridge`] is the `matrix_sdk::Client` backend, and
+//! [`matrix_rtc_call`] feeds the core from it and translates the pre-2026
+//! Element Call wire dialects. With the `matrix-sdk` feature, [`call::Call`]
+//! composes them with this transport into a join/leave facade — start there.
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
@@ -47,10 +47,10 @@ pub mod call;
 
 // Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite.
 // Scaffolding with a delete-by date; nothing else should depend on it. Lives in
-// `matrix-rtc-bridge` (it is pure Matrix wire translation, with no LiveKit in
+// `matrix-rtc-call` (it is pure Matrix wire translation, with no LiveKit in
 // it), and is re-exported because `CallOptions::element_call_compat` names
 // `ElementCallCompat` in this crate's own public API.
-pub use matrix_rtc_bridge::compat;
+pub use matrix_rtc_call::compat;
 
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,

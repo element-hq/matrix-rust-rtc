@@ -10,7 +10,8 @@ log only.
 
 ### Breaking
 
-- One `MatrixBackend` trait (`matrix-rtc-core`) replaces `RtcCommandSender` and every inbound method on the managers and bindings (`set_current_sticky_state`/`set_current_membership`, `on_room_slots_received`, `on_room_members_received`, `on_room_encryption_received`, `receive_encryption_key`/`receive_legacy_encryption_key`, `on_room_timeline_events`, `on_event_redacted`, `on_relations_received`). A host implements the trait — the sends, a per-room subscription delivering the room's complete current sets, a to-device subscription, `/relations`, the OpenID token and `GET /rtc/transports` — and calls `attach_room`/`detach_room`; the bridge's feeder (`matrix_rtc_bridge::feeder`) does the feeding, including the pre-2026 compatibility funnels, for every host. Gone with it: `CommandSenderCallback`, `OpenIdTokenProvider`, `OpenIdTokenSource`, `SdkCommandSender`, `run_membership_bridge`, `discover_livekit_transport`, and the typed inbound records (`StickyEvent`, `SlotEvent`, `FfiTimelineEvent`, `FfiReceivedEncryptionKey`, `RawMemberEvent`, …).
+- `compat`, `feeder` and `transports` move from `matrix-rtc-bridge` to `matrix-rtc-call`; the bridge is now only `SdkBackend`.
+- One `MatrixBackend` trait (`matrix-rtc-core`) replaces `RtcCommandSender` and every inbound method on the managers and bindings (`set_current_sticky_state`/`set_current_membership`, `on_room_slots_received`, `on_room_members_received`, `on_room_encryption_received`, `receive_encryption_key`/`receive_legacy_encryption_key`, `on_room_timeline_events`, `on_event_redacted`, `on_relations_received`). A host implements the trait — the sends, a per-room subscription delivering the room's complete current sets, a to-device subscription, `/relations`, the OpenID token and `GET /rtc/transports` — and calls `attach_room`/`detach_room`; the feeder (`matrix_rtc_call::feeder`) does the feeding, including the pre-2026 compatibility funnels, for every host. Gone with it: `CommandSenderCallback`, `OpenIdTokenProvider`, `OpenIdTokenSource`, `SdkCommandSender`, `run_membership_bridge`, `discover_livekit_transport`, and the typed inbound records (`StickyEvent`, `SlotEvent`, `FfiTimelineEvent`, `FfiReceivedEncryptionKey`, `RawMemberEvent`, …).
 - `send_delayed_event` takes an optional state key; `send_delayed_state_event` is folded into it.
 - The compatibility mode is given when a room is attached, not on `join`; the FFI and wasm join params no longer take `user_id`/`device_id` (the backend knows them) and their `transport` is optional — the library picks from `rtc_transports()` when it is absent.
 - `Call::join` takes `CallOptions::livekit_transport` as an override instead of `livekit_service_url_fallback`; `connect_media_session` no longer takes a token provider.
@@ -19,7 +20,7 @@ log only.
 - `CallMembershipEvent` is renamed `RtcMembershipEvent`, and `try_into_call_membership_event` is renamed `try_into_membership_event`.
 - `JoinSessionParams.application` and `JoinedMembership.application` are the whole MSC4143 `ApplicationInfo`, and the wasm roster serializes it as an object.
 - `RtcSessionManager::join`, `RtcSession::join` and `CallSessionManager::join` return the event id of the membership they sent.
-- The bridge's feeder feeds any `ApplicationIntake`, subscribing to the event types it names.
+- The feeder feeds any `ApplicationIntake`, subscribing to the event types it names.
 - `WasmRtcSession`, the bare single-session wasm API, is removed; `WasmRtcSessionManager` over a `MatrixBackendHost` is the one entry point, and its `join` rings through `CallSessionManager`.
 
 ### Added
@@ -28,7 +29,7 @@ log only.
 - `ApplicationIntake` and `RelationsRequest`, how a host feeds an application beyond membership.
 - `RtcSessionManager::backend()`, and a core `testing` feature exposing `MockBackend`, whose sinks a test delivers sets into.
 - Reactions, the raised hand and the `/relations` backfill on every host (FFI, wasm, `Call`), since the feeder does the work once.
-- `matrix_rtc_bridge::transports::choose`: the library's transport choice from the homeserver's `GET /rtc/transports`.
+- `matrix_rtc_call::transports::choose`: the library's transport choice from the homeserver's `GET /rtc/transports`.
 - `SdkBackend` discovers transports through matrix-sdk's cached `discover_rtc_transports`, falling back to the well-known `rtc_foci`; a failed request is an error rather than "none advertised".
 - A member event carrying both `msc4354_sticky_key` and `sticky_key` (as seen on the wire) now parses; it was dropped as a duplicate field.
 

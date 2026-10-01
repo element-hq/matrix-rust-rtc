@@ -16,12 +16,12 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::watch;
 
-use matrix_rtc_bridge::compat::DialectBackend;
-use matrix_rtc_bridge::feeder::{
+use matrix_rtc_call::CallSessionManager;
+use matrix_rtc_call::compat::DialectBackend;
+use matrix_rtc_call::feeder::{
     AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, ToDeviceFeeder,
 };
-use matrix_rtc_bridge::transports;
-use matrix_rtc_call::CallSessionManager;
+use matrix_rtc_call::transports;
 use matrix_rtc_core::{
     JoinedMembership as CoreJoinedMembership, MatrixBackend as CoreBackend, RtcSessionManager,
 };
@@ -857,7 +857,7 @@ impl RtcSessionManagerHandle {
     pub(crate) fn element_call_compat_for(
         &self,
         room_id: &str,
-    ) -> matrix_rtc_bridge::compat::ElementCallCompat {
+    ) -> matrix_rtc_call::compat::ElementCallCompat {
         self.modes.mode(room_id)
     }
 
@@ -944,7 +944,7 @@ mod tests {
     use super::*;
     use crate::backend::test_support::{Carrier, MockHost};
     use crate::backend::{FfiEventEncryption, FfiEventIn};
-    use matrix_rtc_bridge::compat::STATE_MEMBER_EVENT_TYPE;
+    use matrix_rtc_call::compat::STATE_MEMBER_EVENT_TYPE;
 
     const ROOM: &str = "!room:example.org";
     const SLOT: &str = "m.call#ROOM";
@@ -1284,7 +1284,7 @@ mod tests {
             sender: "@carl:example.org".to_owned(),
             event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
             state_key: Some("_@carl:example.org_CARLDEV_m.call".to_owned()),
-            origin_server_ts: matrix_rtc_bridge::compat::element_call_state::now_ms(),
+            origin_server_ts: matrix_rtc_call::compat::element_call_state::now_ms(),
             content_json: serde_json::json!({
                 "application": "m.call",
                 "call_id": "",
@@ -1604,7 +1604,7 @@ mod tests {
 
     // --- Element Call compatibility ------------------------------------------
     //
-    // The dialects are tested in `matrix_rtc_bridge::compat`. Tested here: the
+    // The dialects are tested in `matrix_rtc_call::compat`. Tested here: the
     // mode chosen at attach reaches every send, the two of the join included.
 
     #[tokio::test]

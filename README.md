@@ -114,12 +114,13 @@ for a runnable two-client example against the local backend.
   high-level `Call::join` facade. Native-only (pulls in `libwebrtc`).
 - `crates/matrix-rtc-core`: single-session machine plus room-scoped session
   manager and MSC4143/MSC4354 event conversion boundary.
-- `crates/matrix-rtc-bridge`: the Matrix side — the feeder that subscribes
-  through a host's `MatrixBackend` and feeds the core, the dialect wrapper and
-  `compat` for pre-2026 Element Call wire formats, and `SdkBackend` over
-  matrix-rust-sdk (behind the `matrix-sdk` feature). **No LiveKit**; nothing but
-  `SdkBackend` needs a Matrix SDK, so the rest tests in seconds against no git
-  dependencies.
+- `crates/matrix-rtc-call`: the call application — reactions, raised hand,
+  MSC4075 ringing — plus the feeder that subscribes through a host's
+  `MatrixBackend` and feeds the core, the dialect wrapper and `compat` for
+  pre-2026 Element Call wire formats, and the transport choice. No Matrix SDK,
+  so it tests in seconds against no git dependencies.
+- `crates/matrix-rtc-bridge`: `SdkBackend`, the `MatrixBackend` over
+  matrix-rust-sdk (behind the `matrix-sdk` feature). **No LiveKit**.
 - `crates/matrix-rtc-ffi`: UniFFI-based Kotlin/Swift bindings — the
   room-scoped manager API always, plus the media layer behind the `media`
   cargo feature (default off, keeps the slim artifact libwebrtc-free).

@@ -5,7 +5,7 @@
 
 //! Pre-2026 Element Call interoperability, exposed to FFI hosts.
 //!
-//! The translation lives in [`matrix_rtc_bridge::compat`] and is applied by the
+//! The translation lives in [`matrix_rtc_call::compat`] and is applied by the
 //! library's feeder and dialect wrapper; nothing here re-implements a dialect.
 //! A host chooses the mode once, when it attaches the room
 //! ([`FfiAttachOptions::element_call_compat`](crate::FfiAttachOptions::element_call_compat)),
@@ -17,8 +17,8 @@
 //! how an inbound media key is bound, the SFU participant identity and the
 //! token endpoint. Those must agree or the call connects and nothing decrypts.
 
-use matrix_rtc_bridge::compat::ingest;
-use matrix_rtc_bridge::compat::{ElementCallCompat, OutboundDialect};
+use matrix_rtc_call::compat::ingest;
+use matrix_rtc_call::compat::{ElementCallCompat, OutboundDialect};
 
 /// Which MatrixRTC generation a session speaks, for interoperating with Element
 /// Call builds that predate the 2026 MSC4143 rewrite.
@@ -30,7 +30,7 @@ use matrix_rtc_bridge::compat::{ElementCallCompat, OutboundDialect};
 /// our token. Those must agree or the call connects and nothing decrypts.
 ///
 /// Scaffolding, and meant to be deleted once Element Call catches up. See
-/// [`matrix_rtc_bridge::compat`].
+/// [`matrix_rtc_call::compat`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiElementCallCompat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_sys::{Function, Reflect};
-use matrix_rtc_bridge::compat::ElementCallCompat;
+use matrix_rtc_call::compat::ElementCallCompat;
 use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{

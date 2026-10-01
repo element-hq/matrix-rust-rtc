@@ -16,6 +16,8 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The Element Call dialect constants the SDK subscriptions are keyed on.
+matrix-rtc-call = { path = "../matrix-rtc-call", optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
@@ -73,11 +75,8 @@ web-time = "1"
 # `StickyEvents` need. Their `encryption_info().sender_device` is the only
 # source for a member event's sending device now that MSC4143 has dropped
 # `member.claimed_device_id`. See `sdk::snapshot`.
-matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "matrix-sdk/unstable-msc4354"]
+matrix-sdk = ["dep:matrix-rtc-call", "dep:matrix-sdk", "dep:matrix-sdk-base", "matrix-sdk/unstable-msc4354"]
 
 [dev-dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
-# The feeder tests drive a real call layer, so reactions and relations are
-# exercised end to end.
-matrix-rtc-call = { path = "../matrix-rtc-call" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

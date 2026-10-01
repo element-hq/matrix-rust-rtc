@@ -2702,6 +2702,7 @@ dependencies = [
 name = "matrix-rtc-call"
 version = "0.4.0-rc.1"
 dependencies = [
+ "async-trait",
  "log",
  "matrix-rtc-core",
  "serde",
@@ -2740,7 +2741,6 @@ dependencies = [
  "futures",
  "jni 0.21.1",
  "log",
- "matrix-rtc-bridge",
  "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit",
@@ -2785,7 +2785,7 @@ name = "matrix-rtc-livekit-proto"
 version = "0.4.0-rc.1"
 dependencies = [
  "base64 0.22.1",
- "matrix-rtc-bridge",
+ "matrix-rtc-call",
  "matrix-rtc-core",
  "serde",
  "serde_json",
@@ -2820,7 +2820,6 @@ dependencies = [
  "futures",
  "js-sys",
  "log",
- "matrix-rtc-bridge",
  "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit-proto",

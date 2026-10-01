@@ -5,14 +5,14 @@
 
 //! Pre-2026 Element Call interoperability, exposed to web hosts.
 //!
-//! The translation lives in [`matrix_rtc_bridge::compat`] and is applied by
+//! The translation lives in [`matrix_rtc_call::compat`] and is applied by
 //! the library's feeder and dialect wrapper; nothing here re-implements a
 //! dialect. A page chooses the mode once, when it attaches the room
 //! (`attachRoom`'s `element_call_compat`), and delivers the same raw events in
 //! every mode. This module owns only the mode-string vocabulary
 //! (`"off" | "sticky_events" | "state_events"`).
 
-use matrix_rtc_bridge::compat::ElementCallCompat;
+use matrix_rtc_call::compat::ElementCallCompat;
 use wasm_bindgen::JsError;
 
 /// The page's mode vocabulary, shared by `attachRoom` and `connectMedia` so

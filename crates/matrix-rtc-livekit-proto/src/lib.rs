@@ -20,7 +20,7 @@ pub mod token;
 
 pub use token::{MemberClaims, SfuToken, TokenServiceError};
 
-use matrix_rtc_bridge::compat::{ElementCallCompat, element_call_state};
+use matrix_rtc_call::compat::{ElementCallCompat, element_call_state};
 
 /// The participant-identity derivation a MatrixRTC generation's authorisation
 /// service uses.

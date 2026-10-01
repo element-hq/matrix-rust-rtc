@@ -6,10 +6,30 @@
 //! The call application over `matrix-rtc-core`, which is application-agnostic:
 //! Element Call's reactions and raised hand ([`reactions`]), MSC4075 ringing
 //! ([`notification`]), and the host-facing [`CallSessionManager`].
+//!
+//! It also holds how a host's `MatrixBackend` reaches the call, none of which
+//! needs a Matrix SDK: [`compat`], translation to and from the pre-2026
+//! dialects Element Call still speaks, with [`DialectBackend`], the backend
+//! wrapper that renders sends in a room's dialect; [`feeder`], which subscribes,
+//! seeds, orders and funnels a room into the manager; and [`transports`], which
+//! transport a join publishes on.
 
+pub mod compat;
+pub mod feeder;
 mod manager;
 pub mod notification;
 pub mod reactions;
+pub mod transports;
+
+pub use compat::{
+    DialectBackend, ElementCallCompat, ElementCallDialect, ElementCallStateDialect,
+    LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent, MemberEventRoute, OutboundDialect,
+    STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
+};
+pub use feeder::{
+    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomFeederRun, RoomModes,
+    RoomReservation, ToDeviceFeeder, ToDeviceFeederRun,
+};
 
 pub use manager::{CallJoinParams, CallSessionManager};
 pub use notification::{

@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use matrix_rtc_bridge::OpenIdToken;
+use matrix_rtc_core::OpenIdToken;
 
 /// Contents of the `member` field of the `m.rtc.member` event, identifying the
 /// joining membership to the authorisation service.

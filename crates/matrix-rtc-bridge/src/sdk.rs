@@ -47,7 +47,7 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 
-use crate::compat::STATE_MEMBER_EVENT_TYPE;
+use matrix_rtc_call::compat::STATE_MEMBER_EVENT_TYPE;
 
 // The sticky duration for `m.rtc.member` comes from the core
 // (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
@@ -1009,7 +1009,7 @@ mod tests {
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 
     use super::*;
-    use crate::compat::element_call_state;
+    use matrix_rtc_call::compat::element_call_state;
 
     fn wanted() -> Vec<String> {
         vec![

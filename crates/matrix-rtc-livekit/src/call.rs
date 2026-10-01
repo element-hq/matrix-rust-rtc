@@ -44,12 +44,13 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
-use matrix_rtc_bridge::compat::ingest::outbound_dialect;
-use matrix_rtc_bridge::compat::{self, DialectBackend, ElementCallCompat};
-use matrix_rtc_bridge::feeder::{
+use matrix_rtc_bridge::SdkBackend;
+use matrix_rtc_call::compat::ingest::outbound_dialect;
+use matrix_rtc_call::compat::{self, DialectBackend, ElementCallCompat};
+use matrix_rtc_call::feeder::{
     AttachOptions, RoomAttachment, RoomFeeder, RoomModes, ToDeviceFeeder,
 };
-use matrix_rtc_bridge::{SdkBackend, transports};
+use matrix_rtc_call::transports;
 use matrix_rtc_call::{
     CallJoinParams, CallSessionManager, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
 };
