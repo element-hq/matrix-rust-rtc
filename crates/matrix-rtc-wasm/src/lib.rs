@@ -1395,7 +1395,10 @@ struct WasmStickyEventContent {
     msc4354_sticky_key: Option<String>,
     #[serde(default)]
     sticky_key: Option<String>,
-    application: Option<WasmApplication>,
+    /// The whole object: the core reads only `type`, the rest is the
+    /// application's and must reach the snapshot untouched.
+    #[serde(default)]
+    application: matrix_rtc_core::ApplicationInfo,
     member: Option<WasmMember>,
     #[serde(default)]
     transports: Option<WasmTransports>,
@@ -1424,12 +1427,6 @@ struct WasmRawRtcTransport {
     transport_type: String,
     #[serde(flatten)]
     extra_fields: std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WasmApplication {
-    #[serde(rename = "type")]
-    kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1484,10 +1481,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     .msc4354_sticky_key
                     .or(value.content.sticky_key)
                     .unwrap_or_default(),
-                application: matrix_rtc_core::ApplicationInfo {
-                    application_type: value.content.application.map(|app| app.kind),
-                    extra: std::collections::BTreeMap::new(),
-                },
+                application: value.content.application,
                 member,
                 transports: value
                     .content
@@ -1864,6 +1858,34 @@ mod tests {
                 .is_err(),
             "an encrypted key without its decrypted sender must be refused"
         );
+    }
+
+    /// A peer's whole `application` object reaches the snapshot: the binding
+    /// must not keep only its `type` on the way in.
+    #[wasm_bindgen_test]
+    async fn a_snapshot_carries_the_peers_application_properties() {
+        let events = serde_json::json!([{
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "type": "m.rtc.member",
+            "content": {
+                "slot_id": "m.call#ROOM",
+                "sticky_key": "alice-device-a",
+                "application": { "type": "m.call", "m.call.intent": "video" },
+                "member": { "id": "alice-device-a", "membership": "join" },
+            },
+        }])
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+
+        let mut session = WasmRtcSession::new();
+        session.set_current_sticky_state(events).await.unwrap();
+
+        let mut subscription = session.subscribe_membership_snapshots();
+        let parsed: Vec<Value> =
+            serde_wasm_bindgen::from_value(subscription.next_snapshot().unwrap()).unwrap();
+        assert_eq!(parsed[0]["application"]["type"], "m.call");
+        assert_eq!(parsed[0]["application"]["m.call.intent"], "video");
     }
 
     #[wasm_bindgen_test]
