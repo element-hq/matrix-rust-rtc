@@ -31,7 +31,7 @@ use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, delayed_state_event, update_delayed_event,
 };
 use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
-use matrix_sdk::ruma::api::client::state::get_state_events;
+use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
 use matrix_sdk::ruma::api::error::ErrorKind;
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::{
@@ -464,11 +464,21 @@ impl MatrixBackend for SdkBackend {
         content: Value,
     ) -> Result<String, CommandError> {
         let room = self.room(&room_id)?;
-        // Normalised through ruma, which registers `m.rtc.slot` as an alias of
-        // the MSC4143 id and stringifies back to whichever it treats as primary.
-        let event_type = StateEventType::from(event_type).to_string();
-        let response = room
-            .send_state_event_raw(&event_type, &state_key, &content)
+        // Bounded by `rtc_request_config`: the pre-sticky membership comes
+        // through here, as time-critical as the sticky one. The type is
+        // normalised through ruma, which registers `m.rtc.slot` as
+        // an alias of the MSC4143 id.
+        let raw = serde_json::value::to_raw_value(&content).map_err(command_error)?;
+        let request = send_state_event::v3::Request::new_raw(
+            room.room_id().to_owned(),
+            StateEventType::from(event_type),
+            state_key,
+            Raw::<AnyStateEventContent>::from_json(raw),
+        );
+        let response = self
+            .client
+            .send(request)
+            .with_request_config(rtc_request_config())
             .await
             .map_err(command_error)?;
         Ok(response.event_id.to_string())
