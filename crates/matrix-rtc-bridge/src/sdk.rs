@@ -20,8 +20,10 @@ use matrix_rtc_core::{
     ToDeviceSink,
 };
 use matrix_sdk::deserialized_responses::{
-    EncryptionInfo, RawAnySyncOrStrippedState, VerificationLevel, VerificationState,
+    AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, RawAnySyncOrStrippedState, VerificationLevel,
+    VerificationState,
 };
+use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::room::{IncludeRelations, RelationsOptions};
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
@@ -167,6 +169,72 @@ fn event_encryption(info: Option<&EncryptionInfo>) -> EventEncryption {
     EventEncryption::Encrypted {
         sender_device_id: info.sender_device.as_ref().map(|d| d.to_string()),
         sender_cross_signed: Some(cross_signed),
+    }
+}
+
+/// Whether the SDK's verdict on the sending device is still provisional: the
+/// device was not in the store, or it was (an Olm message carries its own
+/// device keys) but the sender's cross-signing identity was not downloaded
+/// yet, so "unsigned" may only mean "not checked yet".
+async fn sender_trust_pending(client: &Client, info: &EncryptionInfo) -> bool {
+    match info.verification_state {
+        VerificationState::Unverified(VerificationLevel::None(
+            DeviceLinkProblem::MissingDevice,
+        )) => true,
+        VerificationState::Unverified(VerificationLevel::UnsignedDevice) => client
+            .encryption()
+            .get_user_identity(&info.sender)
+            .await
+            .ok()
+            .flatten()
+            .is_none(),
+        _ => false,
+    }
+}
+
+/// [`event_encryption`] for a device looked up after the fact.
+fn device_encryption(device: &Device) -> EventEncryption {
+    EventEncryption::Encrypted {
+        sender_device_id: Some(device.device_id().to_string()),
+        sender_cross_signed: Some(device.is_verified() || device.is_cross_signed_by_owner()),
+    }
+}
+
+/// The decryption information of a to-device message whose sender trust was
+/// pending ([`sender_trust_pending`]), after querying the sender's keys.
+///
+/// A peer who joins a call right after joining the room sends its media key
+/// before our client has queried its keys; reported as-is, the library reads
+/// that as "not cross-signed" and refuses the key for good. One keys query
+/// for the sender settles it; a failed query reports the message as the SDK
+/// did.
+async fn resolve_to_device_encryption(client: &Client, info: &EncryptionInfo) -> EventEncryption {
+    let AlgorithmInfo::OlmV1Curve25519AesSha2 {
+        curve25519_public_key_base64: sender_key,
+    } = &info.algorithm_info
+    else {
+        return event_encryption(Some(info));
+    };
+    let encryption = client.encryption();
+    if let Err(error) = encryption.request_user_identity(&info.sender).await {
+        log::warn!(
+            "could not query {}'s keys for a to-device message from them ({error}); reporting \
+             it as decrypted",
+            info.sender,
+        );
+        return event_encryption(Some(info));
+    }
+    match encryption.get_user_devices(&info.sender).await {
+        Ok(devices) => devices
+            .devices()
+            .find(|device| {
+                device
+                    .curve25519_key()
+                    .is_some_and(|key| key.to_base64() == *sender_key)
+            })
+            .map(|device| device_encryption(&device))
+            .unwrap_or_else(|| event_encryption(Some(info))),
+        Err(_) => event_encryption(Some(info)),
     }
 }
 
@@ -461,10 +529,12 @@ impl MatrixBackend for SdkBackend {
         // for the legacy key type, and a typed handler silently never fires
         // when the content does not match its model.
         let event_types = Arc::new(event_types);
+        let client = self.client.clone();
         let handle = self.client.add_event_handler(
             move |event: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
                 let sink = sink.clone();
                 let event_types = event_types.clone();
+                let client = client.clone();
                 async move {
                     let Some(event_type) = event.get_field::<String>("type").ok().flatten() else {
                         return;
@@ -484,12 +554,30 @@ impl MatrixBackend for SdkBackend {
                         );
                         return;
                     };
-                    sink.on_to_device_message(ToDeviceMessageIn {
-                        sender,
-                        event_type,
-                        content,
-                        encryption: event_encryption(encryption_info.as_ref()),
-                    });
+                    log::debug!(
+                        "to-device {event_type} from {sender}: {:?}",
+                        encryption_info
+                            .as_ref()
+                            .map(|info| (&info.verification_state, &info.sender_device))
+                    );
+                    let deliver = move |encryption| {
+                        sink.on_to_device_message(ToDeviceMessageIn {
+                            sender,
+                            event_type,
+                            content,
+                            encryption,
+                        })
+                    };
+                    match encryption_info {
+                        // A keys query inside the handler would stall the sync
+                        // loop; resolve it on the side.
+                        Some(info) if sender_trust_pending(&client, &info).await => {
+                            tokio::spawn(async move {
+                                deliver(resolve_to_device_encryption(&client, &info).await)
+                            });
+                        }
+                        info => deliver(event_encryption(info.as_ref())),
+                    }
                 }
             },
         );
