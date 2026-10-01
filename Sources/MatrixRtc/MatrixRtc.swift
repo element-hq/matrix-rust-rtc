@@ -8756,7 +8756,7 @@ public enum FfiBackendError: Swift.Error {
 
     
     
-    case Failed(errcode: String?, status: UInt16?, message: String
+    case Failed(errcode: String?, status: UInt16?, reason: String
     )
 }
 
@@ -8777,7 +8777,7 @@ public struct FfiConverterTypeFfiBackendError: FfiConverterRustBuffer {
         case 1: return .Failed(
             errcode: try FfiConverterOptionString.read(from: &buf), 
             status: try FfiConverterOptionUInt16.read(from: &buf), 
-            message: try FfiConverterString.read(from: &buf)
+            reason: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -8791,11 +8791,11 @@ public struct FfiConverterTypeFfiBackendError: FfiConverterRustBuffer {
 
         
         
-        case let .Failed(errcode,status,message):
+        case let .Failed(errcode,status,reason):
             writeInt(&buf, Int32(1))
             FfiConverterOptionString.write(errcode, into: &buf)
             FfiConverterOptionUInt16.write(status, into: &buf)
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         }
     }

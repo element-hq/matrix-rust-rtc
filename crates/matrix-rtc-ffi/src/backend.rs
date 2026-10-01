@@ -23,11 +23,13 @@ use serde_json::Value;
 /// delayed-event refusal, for one); the host does not.
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum FfiBackendError {
-    #[error("{message}")]
+    // `reason`, not `message`: Kotlin's generated exception already has a
+    // `message` property, and a field of that name fails to compile.
+    #[error("{reason}")]
     Failed {
         errcode: Option<String>,
         status: Option<u16>,
-        message: String,
+        reason: String,
     },
 }
 
@@ -37,8 +39,8 @@ impl FfiBackendError {
             Self::Failed {
                 errcode,
                 status,
-                message,
-            } => (errcode, status, message),
+                reason,
+            } => (errcode, status, reason),
         }
     }
 
@@ -790,7 +792,7 @@ pub(crate) mod test_support {
                 .then(|| FfiBackendError::Failed {
                     errcode: Some("M_FORBIDDEN".to_owned()),
                     status: Some(403),
-                    message: "Sending delayed events has been disallowed".to_owned(),
+                    reason: "Sending delayed events has been disallowed".to_owned(),
                 })
         }
     }
