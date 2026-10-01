@@ -110,6 +110,9 @@ export async function createMatrixSession({
   return { client, userId: login.user_id, deviceId: login.device_id, password: pass };
 }
 
+/** How long a room subject whose read failed waits before reading again. */
+export const READ_RETRY_MS = 5000;
+
 /**
  * The `MatrixBackendHost` the manager takes: `new WasmRtcSessionManager(host)`.
  */
@@ -192,52 +195,63 @@ export class MatrixHost {
   // --- reads -------------------------------------------------------------
 
   /**
-   * Deliver the room's subjects into `sink`: the current sets now (as soon as
-   * they are read), then again on every change, coalesced per tick. Timeline
-   * events and redactions go as they arrive. Synchronous by contract: the
-   * listeners are registered here, the deliveries happen from them.
+   * Deliver the room's subjects into `sink`: each subject's complete current
+   * set on subscribe (encryption, state, members, sticky, in that order), then
+   * again whenever that subject changes, coalesced per tick. Timeline events
+   * and redactions go as they arrive. Synchronous by contract: the listeners
+   * are registered here, the deliveries happen from them.
    */
   subscribeRoom(roomId, subjects, sink) {
     const room = this.client.getRoom(roomId);
     if (!room) throw new Error(`not joined to ${roomId}`);
     const detachers = [];
-    let pending = false;
     let cancelled = false;
 
-    const feed = async () => {
-      if (cancelled) return;
-      sink.onEncryption(Boolean(room.currentState.getStateEvents('m.room.encryption', '')));
-      for (const type of subjects.state_event_types) {
-        const events = room.currentState.getStateEvents(type);
-        sink.onStateEvents(type, await Promise.all(events.map((ev) => this.eventIn(ev))));
-      }
-      sink.onJoinedMembers(room.getJoinedMembers().map((member) => member.userId));
-      sink.onStickyEvents(await this.stickySnapshot(room));
-    };
-    const scheduleFeed = () => {
-      if (pending) return;
-      pending = true;
-      queueMicrotask(() => {
-        pending = false;
-        feed().catch((error) => this.log(`feed failed: ${error}`));
-      });
-    };
+    const subject = this.roomSubject(() => cancelled, detachers);
+    const encryption = subject(
+      'encryption',
+      () => Boolean(room.currentState.getStateEvents('m.room.encryption', '')),
+      (encrypted) => sink.onEncryption(encrypted),
+    );
+    const state = new Map(
+      subjects.state_event_types.map((type) => [
+        type,
+        subject(
+          `${type} state`,
+          () => this.stateEventsIn(room.currentState.getStateEvents(type)),
+          (events) => sink.onStateEvents(type, events),
+        ),
+      ]),
+    );
+    const members = subject(
+      'joined members',
+      () => room.getJoinedMembers().map((member) => member.userId),
+      (userIds) => sink.onJoinedMembers(userIds),
+    );
+    const sticky = subject(
+      'sticky events',
+      () => this.stickySnapshot(room),
+      (events) => sink.onStickyEvents(events),
+    );
 
-    room.on(this.sdk.RoomStickyEventsEvent.Update, scheduleFeed);
+    room.on(this.sdk.RoomStickyEventsEvent.Update, sticky.schedule);
     // State listeners on the CLIENT, not the room: the room-level re-emit is
     // unreliable (it re-arms only when the RoomState instance is swapped, and
     // MSC4222 `state_after` sync churns those), while the client-level one is
     // what js-sdk's own MatrixRTCSessionManager trusts.
     const onStateEvent = (event) => {
-      if (event.getRoomId() === roomId) scheduleFeed();
+      if (event.getRoomId() !== roomId) return;
+      const type = event.getType();
+      if (type === 'm.room.encryption') encryption.schedule();
+      state.get(type)?.schedule();
     };
     const onMembers = (_event, _state, member) => {
-      if (member.roomId === roomId) scheduleFeed();
+      if (member.roomId === roomId) members.schedule();
     };
     this.client.on(this.sdk.RoomStateEvent.Events, onStateEvent);
     this.client.on(this.sdk.RoomStateEvent.Members, onMembers);
     detachers.push(() => {
-      room.off(this.sdk.RoomStickyEventsEvent.Update, scheduleFeed);
+      room.off(this.sdk.RoomStickyEventsEvent.Update, sticky.schedule);
       this.client.off(this.sdk.RoomStateEvent.Events, onStateEvent);
       this.client.off(this.sdk.RoomStateEvent.Members, onMembers);
     });
@@ -275,12 +289,64 @@ export class MatrixHost {
       });
     }
 
-    scheduleFeed();
+    encryption.run();
+    for (const type of state.values()) type.run();
+    members.run();
+    sticky.run();
     return {
       cancel: () => {
         cancelled = true;
         for (const detach of detachers.splice(0)) detach();
       },
+    };
+  }
+
+  /**
+   * One subject of a room subscription: `read` its current set, `deliver` it.
+   * A synchronous read is delivered at once. An asynchronous one (the sticky
+   * set decrypts) is delivered only if no later read has started, so a slow
+   * read never lands over a newer set; a failed one is retried after
+   * `READ_RETRY_MS` unless a later read superseded it. `schedule` coalesces
+   * the changes of one tick into one read.
+   */
+  roomSubject(isCancelled, detachers) {
+    return (name, read, deliver) => {
+      let generation = 0;
+      let queued = false;
+      let retry;
+      const run = () => {
+        if (isCancelled()) return;
+        clearTimeout(retry);
+        const mine = ++generation;
+        const current = () => !isCancelled() && mine === generation;
+        const fail = (error) => {
+          if (!current()) return;
+          this.log(`${name} read failed: ${error}; retrying`);
+          retry = setTimeout(run, READ_RETRY_MS);
+        };
+        let result;
+        try {
+          result = read();
+        } catch (error) {
+          fail(error);
+          return;
+        }
+        if (result instanceof Promise) {
+          result.then((value) => current() && deliver(value), fail);
+        } else {
+          deliver(result);
+        }
+      };
+      const schedule = () => {
+        if (queued) return;
+        queued = true;
+        queueMicrotask(() => {
+          queued = false;
+          run();
+        });
+      };
+      detachers.push(() => clearTimeout(retry));
+      return { run, schedule };
     };
   }
 
@@ -342,6 +408,10 @@ export class MatrixHost {
 
   /** One event as the manager takes it: content verbatim, decryption info as reported. */
   async eventIn(event) {
+    return this.eventShape(event, await this.eventEncryption(event));
+  }
+
+  eventShape(event, encryption) {
     return {
       event_id: event.getId(),
       sender: event.getSender(),
@@ -349,8 +419,19 @@ export class MatrixHost {
       state_key: event.getStateKey?.() ?? undefined,
       origin_server_ts: event.getTs(),
       content: event.getContent(),
-      encryption: await this.eventEncryption(event),
+      encryption,
     };
+  }
+
+  /**
+   * State events in the `EventIn` shape: synchronously when all are cleartext
+   * (room state in practice), so a state set is delivered the moment it changes.
+   */
+  stateEventsIn(events) {
+    if (events.some((event) => event.isEncrypted?.())) {
+      return Promise.all(events.map((event) => this.eventIn(event)));
+    }
+    return events.map((event) => this.eventShape(event, { kind: 'cleartext' }));
   }
 
   /** What js-sdk reports: encrypted or not, and the attributed device. */
