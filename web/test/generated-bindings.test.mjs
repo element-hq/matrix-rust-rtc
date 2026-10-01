@@ -20,8 +20,8 @@ describe('generated bindings', () => {
     const mod = await import(browserBindingUrl.href);
 
     expect(mod).toBeDefined();
-    expect(typeof mod.WasmRtcSession).toBe('function');
     expect(typeof mod.WasmRtcSessionManager).toBe('function');
-    expect(typeof mod.WasmMembershipSnapshotSubscription).toBe('function');
+    expect(typeof mod.WasmRoomSink).toBe('function');
+    expect(typeof mod.WasmToDeviceSink).toBe('function');
   });
 });

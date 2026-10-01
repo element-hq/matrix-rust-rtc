@@ -5,8 +5,9 @@ SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 Please see LICENSE in the repository root for full details.
 */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { existsSync } from 'node:fs';
+import { mockBackendHost, openSlotEvent } from './mock-backend-host.mjs';
 
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
@@ -14,6 +15,7 @@ const ROOM_ID = '!test:example.org';
 const SLOT_ID = 'm.call#TEST';
 const USER_ID = '@alice:example.org';
 const DEVICE_ID = 'device123';
+const SFU = 'https://example.com/livekit/jwt';
 
 // Helper function to get values from wasm-bindgen serialized content (Map, string, or object)
 function getContentValue(content, key) {
@@ -27,261 +29,151 @@ function getContentValue(content, key) {
   }
 }
 
-// Create a mock Matrix client
-function createMockMatrixClient() {
-  const stickyEventsSent = [];
-  const delayedEventsSent = [];
-  const cancelledEvents = [];
-  const stateEventsSent = [];
+const joinParams = {
+  room_id: ROOM_ID,
+  slot_id: SLOT_ID,
+  application: 'm.call',
+  transport: { type: 'livekit', livekit_service_url: SFU },
+};
 
-  const client = {
-    // WASM now expects these methods to return Promises
-    // Resolves the way matrix-js-sdk's sendEvent does. The SDK reads the event
-    // id out of it to relate an MSC4075 call notification to the membership
-    // that justifies it, and treats a response without one as a failed send.
-    sendStickyEvent: vi.fn((roomId, eventType, content) => {
-      const eventId = `$sticky-event-${stickyEventsSent.length}`;
-      stickyEventsSent.push({ roomId, eventType, content, eventId });
-      return Promise.resolve({ event_id: eventId });
-    }),
-    sendDelayedEvent: vi.fn((roomId, eventType, content, delayMs) => {
-      const eventId = `delayed-event-${delayedEventsSent.length}`;
-      delayedEventsSent.push({ roomId, eventType, content, delayMs, eventId });
-      return Promise.resolve(eventId);
-    }),
-    cancelDelayedEvent: vi.fn((roomId, eventId) => {
-      cancelledEvents.push({ roomId, eventId });
-      return Promise.resolve();
-    }),
-    // Used for m.rtc.slot, the only MatrixRTC event that lives in room state.
-    sendStateEvent: vi.fn((roomId, eventType, stateKey, content) => {
-      const eventId = `$state-event-${stateEventsSent.length}`;
-      stateEventsSent.push({ roomId, eventType, stateKey, content, eventId });
-      return Promise.resolve({ event_id: eventId });
-    }),
-    // Expose internal state for assertions
-    _getStickyEvents: () => stickyEventsSent,
-    _getDelayedEvents: () => delayedEventsSent,
-    _getCancelledEvents: () => cancelledEvents,
-    _getStateEvents: () => stateEventsSent,
-    _clear: () => {
-      stickyEventsSent.length = 0;
-      delayedEventsSent.length = 0;
-      cancelledEvents.length = 0;
-      stateEventsSent.length = 0;
-    }
-  };
-
-  return client;
-}
-
-describe('WASM bindings with mock client', () => {
+describe('WASM bindings with a mock backend host', () => {
   let bindings;
-  let mockClient;
+  let host;
 
   beforeEach(async () => {
     if (!existsSync(nodeBindingUrl)) {
       // Skip all tests if bindings haven't been built
       return;
     }
-
-    // Import the bindings
     bindings = await import(nodeBindingUrl.href);
-
-    // Create a fresh mock client for each test
-    mockClient = createMockMatrixClient();
-  });
-
-  describe('JsCommandSender', () => {
-    it('can be created with a client object', () => {
-      const sender = new bindings.JsCommandSender(mockClient);
-      expect(sender).toBeDefined();
+    host = mockBackendHost({
+      userId: USER_ID,
+      deviceId: DEVICE_ID,
+      slots: [openSlotEvent(SLOT_ID)],
+      transports: [{ type: 'livekit', livekit_service_url: SFU }],
     });
   });
 
   describe('WasmRtcSessionManager', () => {
-    it('can setup command sender with mock client', () => {
-      const manager = new bindings.WasmRtcSessionManager();
-      
-      expect(manager.has_command_sender()).toBe(false);
-      manager.setup_command_sender(mockClient);
-      expect(manager.has_command_sender()).toBe(true);
+    it('attaches a room and subscribes to what it needs', async () => {
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await manager.attachRoom(ROOM_ID, undefined);
+
+      const subjects = host._subjects(ROOM_ID);
+      expect(subjects.sticky_events).toBe(true);
+      expect(subjects.joined_members).toBe(true);
+      expect(subjects.encryption).toBe(true);
+      expect(subjects.state_event_types).toEqual(['m.rtc.slot', 'org.matrix.msc4143.rtc.slot']);
+      expect(host._toDevice()).not.toBeNull();
+
+      await expect(manager.attachRoom(ROOM_ID, undefined)).rejects.toThrow(/already attached/);
     });
 
-    it('join() with valid params schedules events', async () => {
-      const manager = new bindings.WasmRtcSessionManager();
-      manager.setup_command_sender(mockClient);
+    it('join() without a transport takes the advertised one and sends the membership', async () => {
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await manager.attachRoom(ROOM_ID, undefined);
+      host._clear();
 
-      // Clear any previous events
-      mockClient._clear();
+      const { transport, ...withoutTransport } = joinParams;
+      void transport;
+      const memberId = await manager.join(withoutTransport);
+      expect(memberId).toBeTruthy();
+      expect(await manager.ownMemberId(ROOM_ID, SLOT_ID)).toBe(memberId);
 
-      const joinParams = {
-        user_id: USER_ID,
-        device_id: DEVICE_ID,
-        room_id: ROOM_ID,
-        slot_id: SLOT_ID,
-        application: 'm.call',
-        transport: {
-          type: 'livekit',
-          livekit_service_url: 'https://example.com/livekit/jwt',
-        },
-      };
-
-      // Join the session
-      await manager.join(joinParams);
-
-      // Wait for the mock callbacks to fire
-      await new Promise(resolve => setTimeout(resolve, 50));
-
-      // Verify that events were sent
-      const stickyEvents = mockClient._getStickyEvents();
+      const stickyEvents = host._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
       expect(stickyEvents[0].roomId).toBe(ROOM_ID);
+      // The wire spelling: peers do not match on `m.rtc.member`.
       expect(stickyEvents[0].eventType).toBe('org.matrix.msc4143.rtc.member');
 
-      // Check the content
       const content = stickyEvents[0].content;
       expect(getContentValue(content, 'slot_id')).toBe(SLOT_ID);
       // member.id must be unique per join, so it must not be derived from the
       // (stable) user and device IDs.
       const stickyKey = getContentValue(content, 'msc4354_sticky_key');
-      expect(stickyKey).toBeTruthy();
+      expect(stickyKey).toBe(memberId);
       expect(stickyKey).not.toBe(`${USER_ID}-${DEVICE_ID}`);
       expect(getContentValue(getContentValue(content, 'member'), 'membership')).toBe('join');
+      // The transport came from the backend.
+      const transports = getContentValue(content, 'transports');
+      expect(getContentValue(getContentValue(transports, 'published')[0], 'livekit_service_url')).toBe(SFU);
 
-      // Verify delayed event was scheduled for keep-alive
-      const delayedEvents = mockClient._getDelayedEvents();
+      // The dead man's switch, armed by the join.
+      const delayedEvents = host._getDelayedEvents();
       expect(delayedEvents.length).toBe(1);
-      expect(delayedEvents[0].roomId).toBe(ROOM_ID);
       expect(delayedEvents[0].eventType).toBe('org.matrix.msc4143.rtc.member');
-
-      // Check delayed event content
-      const delayedContent = delayedEvents[0].content;
-      // The homeserver fires this on our behalf when heartbeats stop, so it must
-      // be distinguishable from a user-initiated leave.
-      const leaveReason = getContentValue(delayedContent, 'leave_reason');
-      expect(leaveReason).toBeDefined();
+      expect(delayedEvents[0].stateKey).toBeNull();
+      const leaveReason = getContentValue(delayedEvents[0].content, 'leave_reason');
       expect(getContentValue(leaveReason, 'code')).toBe('delayed_leave');
     });
 
     it('leave() with a leave reason works', async () => {
-      const manager = new bindings.WasmRtcSessionManager();
-      manager.setup_command_sender(mockClient);
-
-      // Clear any previous events
-      mockClient._clear();
-
-      // First join the session
-      const joinParams = {
-        user_id: USER_ID,
-        device_id: DEVICE_ID,
-        room_id: ROOM_ID,
-        slot_id: SLOT_ID,
-        application: 'm.call',
-        transport: {
-          type: 'livekit',
-          livekit_service_url: 'https://example.com/livekit/jwt',
-        },
-      };
-
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await manager.attachRoom(ROOM_ID, undefined);
       await manager.join(joinParams);
+      host._clear();
 
-      // Wait for the join callbacks to fire
-      await new Promise(resolve => setTimeout(resolve, 50));
-
-      // Clear the events from join
-      mockClient._clear();
-
-      // Now leave
-      const leaveParams = {
+      await manager.leave(ROOM_ID, SLOT_ID, {
         leave_reason: { code: 'leave', reason: 'user hung up' },
-      };
+      });
 
-      await manager.leave(ROOM_ID, SLOT_ID, leaveParams);
-
-      // Wait for the mock callbacks to fire
-      await new Promise(resolve => setTimeout(resolve, 50));
-
-      // Leave should send a sticky event with the leave reason
-      const stickyEvents = mockClient._getStickyEvents();
+      const stickyEvents = host._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
-      expect(stickyEvents[0].eventType).toBe('org.matrix.msc4143.rtc.member');
-
-      // Check the content
       const content = stickyEvents[0].content;
       const leaveReason = getContentValue(content, 'leave_reason');
-      expect(leaveReason).toBeDefined();
       expect(getContentValue(leaveReason, 'code')).toBe('leave');
       expect(getContentValue(leaveReason, 'reason')).toBe('user hung up');
       expect(getContentValue(getContentValue(content, 'member'), 'membership')).toBe('leave');
 
-      // Should also cancel the delayed event
-      const cancelledEvents = mockClient._getCancelledEvents();
+      const cancelledEvents = host._getCancelledEvents();
       expect(cancelledEvents.length).toBe(1);
-      expect(cancelledEvents[0].roomId).toBe(ROOM_ID);
-      expect(cancelledEvents[0].eventId).toBe('delayed-event-0');
-    });
-  });
-
-  describe('WasmRtcSession', () => {
-    it('can setup command sender with mock client', () => {
-      const session = new bindings.WasmRtcSession();
-      
-      expect(session.has_command_sender()).toBe(false);
-      session.setup_command_sender(mockClient);
-      expect(session.has_command_sender()).toBe(true);
+      expect(cancelledEvents[0].delayId).toBe('delayed-event-0');
     });
 
-    it('join() with valid params works', async () => {
-      const session = new bindings.WasmRtcSession();
-      session.setup_command_sender(mockClient);
+    it('detachRoom() leaves a joined session and ends the subscription', async () => {
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await manager.attachRoom(ROOM_ID, undefined);
+      await manager.join(joinParams);
+      host._clear();
 
-      // Clear any previous events
-      mockClient._clear();
+      await manager.detachRoom(ROOM_ID);
+      expect(host._getCancelledEvents().length).toBe(1);
+      expect(host._sink(ROOM_ID)).toBeUndefined();
+      // A no-op the second time.
+      await manager.detachRoom(ROOM_ID);
+    });
 
-      const joinParams = {
-        user_id: USER_ID,
-        device_id: DEVICE_ID,
-        room_id: ROOM_ID,
-        slot_id: SLOT_ID,
-        application: 'm.call',
-        transport: {
-          type: 'livekit',
-          livekit_service_url: 'https://example.com/livekit/jwt',
-        },
-      };
+    it('join() into a room with no open slot is refused', async () => {
+      const closed = mockBackendHost({ userId: USER_ID, deviceId: DEVICE_ID, slots: [] });
+      const manager = new bindings.WasmRtcSessionManager(closed);
+      await manager.attachRoom(ROOM_ID, undefined);
+      await expect(manager.join(joinParams)).rejects.toThrow(/not open/);
+      expect(closed._getStickyEvents().length).toBe(0);
+    });
 
-      await session.join(joinParams);
+    it('a sticky_events room mirrors the legacy fields on the membership', async () => {
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await manager.attachRoom(ROOM_ID, { element_call_compat: 'sticky_events' });
+      await manager.join(joinParams);
 
-      // Wait for the mock callbacks to fire
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-      const stickyEvents = mockClient._getStickyEvents();
-      expect(stickyEvents.length).toBe(1);
-
-      // Check the content
-      const content = stickyEvents[0].content;
-      expect(getContentValue(content, 'slot_id')).toBe(SLOT_ID);
+      const content = host._getStickyEvents()[0].content;
+      expect(getContentValue(getContentValue(content, 'member'), 'user_id')).toBe(USER_ID);
+      expect(getContentValue(getContentValue(content, 'member'), 'device_id')).toBe(DEVICE_ID);
+      expect(getContentValue(content, 'rtc_transports')).toBeDefined();
     });
   });
 
   describe('Error handling', () => {
+    it('join before attach throws', async () => {
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await expect(manager.join(joinParams)).rejects.toThrow(/not attached/);
+    });
+
     it('join with missing required params throws', async () => {
-      const manager = new bindings.WasmRtcSessionManager();
-      manager.setup_command_sender(mockClient);
-
-      // Missing user_id
-      const invalidParams = {
-        device_id: DEVICE_ID,
-        room_id: ROOM_ID,
-        slot_id: SLOT_ID,
-        application: 'm.call',
-        transport: {
-          type: 'livekit',
-          livekit_service_url: 'https://example.com/livekit/jwt',
-        },
-      };
-
+      const manager = new bindings.WasmRtcSessionManager(host);
+      await manager.attachRoom(ROOM_ID, undefined);
+      const { room_id, ...invalidParams } = joinParams;
+      void room_id;
       await expect(manager.join(invalidParams)).rejects.toThrow(/invalid join params/);
     });
   });

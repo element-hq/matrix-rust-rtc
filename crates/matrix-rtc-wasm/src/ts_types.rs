@@ -23,13 +23,69 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_TYPES: &'static str = r#"
-/** The `matrix-js-sdk`-shaped client object `setup_command_sender` dispatches on. */
-export interface MatrixClientHost {
-    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room joined in `state_events` mode, so a host without sticky support may reject it there. */
+/** What the client reports about how an event or to-device message arrived. */
+export type EventEncryptionIn =
+    | { kind: "cleartext" }
+    /** `sender_cross_signed` stays absent when the client cannot say; never infer it. */
+    | { kind: "encrypted"; sender_device_id?: string; sender_cross_signed?: boolean };
+
+/** A room event as the client handed it over, content verbatim; the library parses it. */
+export interface EventIn {
+    event_id: string;
+    sender: string;
+    event_type: string;
+    /** Set for state events. */
+    state_key?: string;
+    origin_server_ts?: number;
+    content: Record<string, unknown>;
+    encryption: EventEncryptionIn;
+}
+
+/** A decrypted to-device message as the client handed it over. */
+export interface ToDeviceMessageIn {
+    sender: string;
+    event_type: string;
+    content: Record<string, unknown>;
+    encryption: EventEncryptionIn;
+}
+
+/** What the library wants delivered for one room (`subscribeRoom`). */
+export interface RoomSubjects {
+    sticky_events: boolean;
+    /** Stable and unstable spellings both listed; deliver either. */
+    state_event_types: string[];
+    joined_members: boolean;
+    encryption: boolean;
+    /** Message-like types to forward as they arrive, redactions included. */
+    timeline_event_types: string[];
+}
+
+/** What a `subscribeRoom` / `subscribeToDevice` call returns. */
+export interface BackendSubscription {
+    cancel(): void;
+}
+
+/** `attachRoom`'s options. */
+export interface AttachOptionsIn {
+    element_call_compat?: ElementCallCompatMode;
+}
+
+/**
+ * The page's Matrix backend: the one object `WasmRtcSessionManager` takes.
+ * Sends take the event type already in its wire spelling. The read half
+ * delivers into the sink classes (`WasmRoomSink`, `WasmToDeviceSink`): for
+ * sticky events, state events and joined members every call carries the
+ * room's complete current set, the first one on subscribe; an empty set
+ * means none.
+ */
+export interface MatrixBackendHost {
+    ownUserId(): string;
+    ownDeviceId(): string;
+    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room attached in `state_events` mode, so a host without sticky support may reject it there. */
     sendStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, durationMs: number): Promise<{ event_id: string } | { eventId: string } | string>;
     sendStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
-    /** MSC4140 delayed send; resolves with the bare delay id. */
-    sendDelayedEvent(roomId: string, eventType: string, content: Record<string, unknown>, delayMs: number): Promise<string>;
+    /** MSC4140 delayed send — a delayed STATE event when `stateKey` is set; resolves with the bare delay id. A rejection carrying `errcode` lets the library tell a homeserver without delayed events apart. */
+    sendDelayedEvent(roomId: string, eventType: string, stateKey: string | null, content: Record<string, unknown>, delayMs: number): Promise<string>;
     /** MSC4140 `restart` — never cancel+resend. */
     restartDelayedEvent(roomId: string, delayId: string): Promise<unknown>;
     cancelDelayedEvent(roomId: string, delayId: string): Promise<unknown>;
@@ -39,8 +95,14 @@ export interface MatrixClientHost {
     sendRoomEvent(roomId: string, eventType: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
     /** Redact one of our own events (lowering a raised hand). */
     redactEvent(roomId: string, eventId: string, reason?: string): Promise<unknown>;
-    /** Pre-sticky compat only: the delayed leave as a delayed STATE event. */
-    sendDelayedStateEvent?(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>, delayMs: number): Promise<string>;
+    /** Synchronous: register listeners, deliver the current sets (now or soon), return the handle. */
+    subscribeRoom(roomId: string, subjects: RoomSubjects, sink: WasmRoomSink): BackendSubscription;
+    subscribeToDevice(eventTypes: string[], sink: WasmToDeviceSink): BackendSubscription;
+    /** `GET /rooms/{room}/relations/{event}/{relType}/{eventType}`, decrypted. */
+    relations(roomId: string, eventId: string, relType: string, eventType: string): Promise<EventIn[]>;
+    getOpenIdToken(): Promise<{ access_token: string; token_type: string; matrix_server_name: string; expires_in: number }>;
+    /** The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`; `[]` when the endpoint is missing. */
+    rtcTransports(): Promise<unknown[]>;
 }
 
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
@@ -117,7 +179,6 @@ export interface StabilityConfigIn {
 
 /** The object driving livekit-js for `connectMedia`. */
 export interface MediaDelegate {
-    getOpenIdToken(): Promise<{ access_token: string; token_type: string; matrix_server_name: string; expires_in: number }>;
     /** POST `body` as JSON to `url`; resolve with the HTTP status and raw response text. */
     fetchJson(url: string, body: Record<string, unknown>): Promise<{ status: number; body: string }>;
     /** Connect a livekit-js Room and register the RoomEvent translation onto `sink`. */
@@ -136,13 +197,14 @@ export interface MediaDelegate {
 
 /** `join`'s parameters. */
 export interface JoinParamsIn {
-    user_id: string;
-    device_id: string;
+    /** The room must be attached first. */
     room_id: string;
     slot_id: string;
     application: string;
-    /** The transport to publish on; omit to join receive-only. */
-    transport?: { type: string; [key: string]: unknown };
+    /** Omit to take the first LiveKit transport the homeserver advertises (`rtcTransports`). */
+    transport?: { type: string; livekit_service_url?: string; [key: string]: unknown };
+    /** Join without publishing; `can_subscribe` then lists what this member can receive on. */
+    receive_only?: boolean;
     can_subscribe?: string[];
     keep_alive_timeout_ms?: number;
     sticky_duration_ms?: number;
@@ -165,70 +227,6 @@ export interface LeaveParamsIn {
     leave_reason?: { code: string; reason?: string };
 }
 
-/** One sticky event for the TYPED ingestion (`set_current_sticky_state`). */
-export interface StickyEventIn {
-    room_id: string;
-    /** The event's id; reactions and the raised hand relate to it. Supply it. */
-    event_id?: string;
-    sender: string;
-    /** From decryption metadata, not the payload. */
-    sender_device_id?: string;
-    /** Omit if unknown — not the same as `false`. */
-    was_encrypted?: boolean;
-    type: string;
-    content: {
-        slot_id: string;
-        msc4354_sticky_key?: string;
-        sticky_key?: string;
-        application?: { type: string; [key: string]: unknown };
-        member?: { id: string; membership?: string };
-        transports?: { published?: { type: string; [key: string]: unknown }[]; can_subscribe?: string[] };
-        leave_reason?: { code?: string; reason?: string };
-    };
-}
-
-/** One raw member event for the compat funnel (`setCurrentMembership`) — content verbatim. */
-export interface RawMemberEventIn {
-    /** The event's id; reactions and the raised hand relate to it. Supply it. */
-    event_id?: string;
-    sender: string;
-    sender_device_id?: string;
-    was_encrypted?: boolean;
-    type: string;
-    content: Record<string, unknown>;
-}
-
-/** One pre-MSC4354 `org.matrix.msc3401.call.member` room-state event. */
-export interface LegacyStateMemberEventIn {
-    /** The event's id; reactions and the raised hand relate to it. Supply it. */
-    event_id?: string;
-    sender: string;
-    state_key: string;
-    /** Load-bearing: the expiry base for a content with no `created_ts`. */
-    origin_server_ts: number;
-    content: Record<string, unknown>;
-}
-
-/** One message-like room event for the reactions intake (`onRoomTimelineEvents`, `onRelationsReceived`). */
-export interface TimelineEventIn {
-    room_id?: string;
-    event_id: string;
-    sender: string;
-    /** From decryption metadata, not the payload. */
-    sender_device_id?: string;
-    was_encrypted?: boolean;
-    /** `io.element.call.reaction` or `m.reaction`; anything else is ignored. */
-    type: string;
-    origin_server_ts: number;
-    content: Record<string, unknown>;
-}
-
-/** A membership event whose annotations the host should fetch (`pendingRelationLookups`). */
-export interface RelationLookup {
-    member_id: string;
-    membership_event_id: string;
-}
-
 /** A member whose hand is up (`raisedHands`). */
 export interface RaisedHand {
     member_id: string;
@@ -246,39 +244,10 @@ export interface ReactionKind {
     sound: string | null;
 }
 
-/** One `m.rtc.slot` state event (`on_room_slots_received`). */
-export interface SlotEventIn {
-    slot_id: string;
-    content: Record<string, unknown>;
-}
-
 /** MSC4143 `content.encryption` of an `m.rtc.slot` (`openSlot`). */
 export interface SlotEncryptionIn {
     type: string;
     [key: string]: unknown;
-}
-
-/** A decrypted spec-current media-key to-device message (`receiveEncryptionKey`). */
-export interface ReceivedKeyIn {
-    room_id: string;
-    member_id: string;
-    key_b64: string;
-    key_index: number;
-    was_encrypted: boolean;
-    /** Required when `was_encrypted`; from Olm decryption metadata. */
-    sender_user_id?: string;
-    sender_device_id?: string;
-    /** MSC4153: keys from devices that are not cross-signed are discarded. */
-    sender_is_cross_signed?: boolean;
-}
-
-/** A decrypted legacy `io.element.call.encryption_keys` message, content raw. */
-export interface LegacyKeyIn {
-    sender: string;
-    content: Record<string, unknown>;
-    was_encrypted: boolean;
-    sender_device_id?: string;
-    sender_is_cross_signed?: boolean;
 }
 
 /** One entry of the sink's `activeSpeakers` payload. */
@@ -288,26 +257,4 @@ export interface SpeakerIn {
     level?: number;
 }
 
-/** A projected membership, as snapshot subscriptions return them. */
-export interface MembershipSnapshot {
-    room_id: string;
-    slot_id: string;
-    sender: string;
-    origin: "unknown" | "cleartext"
-        | { encrypted: { sender_device_id: string | null } }
-        | { claimed: { device_id: string } };
-    sticky_key: string;
-    member_id: string;
-    /** Id of the member's latest membership event; moves on every sticky refresh. */
-    membership_event_id: string | null;
-    membership_ts: number | null;
-    /** `content.application`: its `type` plus any application-defined properties. */
-    application: { type: string; [key: string]: unknown };
-    /** Externally tagged: the core's typed transports, not the wire shape. */
-    transports: (
-        | { LiveKit: { livekit_service_url: string } }
-        | { Unsupported: { transport_type: string; extra_fields: Record<string, unknown> } }
-    )[];
-    can_subscribe: string[];
-}
 "#;

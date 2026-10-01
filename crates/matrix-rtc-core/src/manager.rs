@@ -353,6 +353,15 @@ impl<T: MatrixBackend + 'static> RtcSessionManager<T> {
             .map(str::to_owned)
     }
 
+    /// The slots of `room_id` this manager is currently joined to.
+    pub fn joined_slots(&self, room_id: &str) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|(key, session)| key.room_id == room_id && session.own_member_id().is_some())
+            .map(|(key, _)| key.slot_id.clone())
+            .collect()
+    }
+
     /// The event id of our current membership event in one `(room_id,
     /// slot_id)` session, or `None` if there is no such session or it has not
     /// joined.

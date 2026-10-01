@@ -13,6 +13,7 @@ Please see LICENSE in the repository root for full details.
 
 import { describe, it, expect } from 'vitest';
 import { existsSync } from 'node:fs';
+import { mockBackendHost, openSlotEvent, memberEventIn } from './mock-backend-host.mjs';
 
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
@@ -22,38 +23,6 @@ const USER_ID = '@me:example.org';
 const DEVICE_ID = 'MYDEVICE';
 const OWN_FOCUS = 'https://rtc.example.org/livekit/jwt';
 const PEER_FOCUS = 'https://rtc.othersite.org/livekit/jwt';
-
-function mockMatrixClient() {
-  let counter = 0;
-  return {
-    sendStickyEvent: () => Promise.resolve({ event_id: `$sticky-${counter++}` }),
-    sendDelayedEvent: () => Promise.resolve(`delay-${counter++}`),
-    restartDelayedEvent: () => Promise.resolve(),
-    cancelDelayedEvent: () => Promise.resolve(),
-    sendStateEvent: () => Promise.resolve({ event_id: `$state-${counter++}` }),
-  };
-}
-
-function memberEvent({ sender, deviceId, memberId, focus }) {
-  return {
-    room_id: ROOM_ID,
-    sender,
-    sender_device_id: deviceId,
-    was_encrypted: true,
-    type: 'm.rtc.member',
-    content: {
-      slot_id: SLOT_ID,
-      // The wire spelling (MSC4354 unstable id), as real events carry it.
-      msc4354_sticky_key: memberId,
-      application: { type: 'm.call' },
-      member: { id: memberId, membership: 'join' },
-      transports: {
-        published: [{ type: 'livekit', livekit_service_url: focus }],
-        can_subscribe: ['livekit'],
-      },
-    },
-  };
-}
 
 // Stands in for the livekit-js half: resolves token fetches with a canned SFU
 // token, records connects and hands their sinks back to the test, and counts
@@ -70,13 +39,6 @@ function fakeDelegate() {
     closed: 0,
   };
   const delegate = {
-    getOpenIdToken: () =>
-      Promise.resolve({
-        access_token: 'opaque',
-        token_type: 'Bearer',
-        matrix_server_name: 'example.org',
-        expires_in: 3600,
-      }),
     fetchJson: (url, body) => {
       log.tokenRequests.push({ url, body });
       return Promise.resolve({
@@ -128,31 +90,37 @@ describe('web media roster over a fake transport delegate', () => {
       return;
     }
     const bindings = await import(nodeBindingUrl);
-    const manager = new bindings.WasmRtcSessionManager();
-    manager.setup_command_sender(mockMatrixClient());
+    const host = mockBackendHost({
+      userId: USER_ID,
+      deviceId: DEVICE_ID,
+      slots: [openSlotEvent(SLOT_ID)],
+      members: [USER_ID, '@peer:example.org', '@far:othersite.org'],
+    });
+    const manager = new bindings.WasmRtcSessionManager(host);
+    await manager.attachRoom(ROOM_ID, undefined);
 
-    // Join, then feed the sticky state back as a server would echo it:
+    // Join, then deliver the sticky state as a server would echo it:
     // ourselves, plus one peer on our focus and one on a second focus.
     const memberId = await manager.join({
-      user_id: USER_ID,
-      device_id: DEVICE_ID,
       room_id: ROOM_ID,
       slot_id: SLOT_ID,
       application: 'm.call',
       transport: { type: 'livekit', livekit_service_url: OWN_FOCUS },
     });
-    await manager.set_current_sticky_state(ROOM_ID, [
-      memberEvent({ sender: USER_ID, deviceId: DEVICE_ID, memberId, focus: OWN_FOCUS }),
-      memberEvent({
+    host._sink(ROOM_ID).onStickyEvents([
+      memberEventIn({ sender: USER_ID, deviceId: DEVICE_ID, memberId, slotId: SLOT_ID, focus: OWN_FOCUS }),
+      memberEventIn({
         sender: '@peer:example.org',
         deviceId: 'PEERDEVICE',
         memberId: 'peer-member-1',
+        slotId: SLOT_ID,
         focus: OWN_FOCUS,
       }),
-      memberEvent({
+      memberEventIn({
         sender: '@far:othersite.org',
         deviceId: 'FARDEVICE',
         memberId: 'far-member-1',
+        slotId: SLOT_ID,
         focus: PEER_FOCUS,
       }),
     ]);

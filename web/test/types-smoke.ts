@@ -15,31 +15,79 @@ Please see LICENSE in the repository root for full details.
  */
 
 import type {
+  AttachOptionsIn,
+  BackendSubscription,
+  EventIn,
   JoinParamsIn,
-  MatrixClientHost,
+  MatrixBackendHost,
   MediaDelegate,
-  MembershipSnapshot,
+  RoomSubjects,
   RtcCallEvent,
   RtcParticipant,
   WasmMediaSession,
+  WasmRoomSink,
   WasmRtcSessionManager,
+  WasmToDeviceSink,
 } from '../pkg/browser/matrix_rtc_wasm';
+
+export function host(client: {
+  userId: string;
+  deviceId: string;
+  send(): Promise<{ event_id: string }>;
+}): MatrixBackendHost {
+  return {
+    ownUserId: () => client.userId,
+    ownDeviceId: () => client.deviceId,
+    sendStickyEvent: () => client.send(),
+    sendStateEvent: () => client.send(),
+    sendDelayedEvent: (_room, _type, stateKey: string | null) => Promise.resolve(stateKey ?? 'delay'),
+    restartDelayedEvent: () => Promise.resolve(),
+    cancelDelayedEvent: () => Promise.resolve(),
+    sendToDeviceMessage: () => Promise.resolve(),
+    sendRoomEvent: () => client.send(),
+    redactEvent: () => Promise.resolve(),
+    subscribeRoom: (_roomId: string, subjects: RoomSubjects, sink: WasmRoomSink): BackendSubscription => {
+      const slot: EventIn = {
+        event_id: '$slot',
+        sender: '@admin:hs',
+        event_type: 'm.rtc.slot',
+        state_key: 'm.call#ROOM',
+        content: { status: 'open' },
+        encryption: { kind: 'cleartext' },
+      };
+      if (subjects.encryption) sink.onEncryption(false);
+      sink.onStateEvents(subjects.state_event_types[0], [slot]);
+      sink.onJoinedMembers([client.userId]);
+      sink.onStickyEvents([]);
+      return { cancel: () => {} };
+    },
+    subscribeToDevice: (_types: string[], sink: WasmToDeviceSink): BackendSubscription => {
+      sink.onToDeviceMessage({
+        sender: '@a:hs',
+        event_type: 'm.rtc.encryption_key',
+        content: {},
+        encryption: { kind: 'encrypted', sender_device_id: 'DEV', sender_cross_signed: true },
+      });
+      return { cancel: () => {} };
+    },
+    relations: () => Promise.resolve([]),
+    getOpenIdToken: () =>
+      Promise.resolve({ access_token: 't', token_type: 'Bearer', matrix_server_name: 'hs', expires_in: 1 }),
+    rtcTransports: () => Promise.resolve([{ type: 'livekit', livekit_service_url: 'https://sfu' }]),
+  };
+}
 
 export async function smoke(
   manager: WasmRtcSessionManager,
-  host: MatrixClientHost,
   delegate: MediaDelegate,
 ): Promise<void> {
-  manager.setup_command_sender(host);
+  const options: AttachOptionsIn = { element_call_compat: 'sticky_events' };
+  await manager.attachRoom('!r:hs', options);
 
   const params: JoinParamsIn = {
-    user_id: '@a:hs',
-    device_id: 'DEV',
     room_id: '!r:hs',
     slot_id: 'm.call#ROOM',
     application: 'm.call',
-    transport: { type: 'livekit', livekit_service_url: 'https://sfu' },
-    element_call_compat: 'sticky_events',
   };
   const memberId: string = await manager.join(params);
 
@@ -77,23 +125,5 @@ export async function smoke(
   void handle;
   void memberId;
 
-  await manager.receiveEncryptionKey({
-    room_id: '!r:hs',
-    member_id: memberId,
-    key_b64: 'AAAA',
-    key_index: 0,
-    was_encrypted: true,
-    sender_user_id: '@a:hs',
-    sender_device_id: 'DEV',
-    sender_is_cross_signed: true,
-  });
-
-  await manager.setCurrentMembership(
-    '!r:hs',
-    [{ sender: '@a:hs', type: 'm.rtc.member', content: {} }],
-    [{ sender: '@a:hs', state_key: '_a_DEV', origin_server_ts: 1, content: {} }],
-  );
-
-  const snapshots: MembershipSnapshot[] | null = null;
-  void snapshots;
+  await manager.detachRoom('!r:hs');
 }
