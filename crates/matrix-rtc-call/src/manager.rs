@@ -17,10 +17,7 @@ use matrix_rtc_core::{
 };
 use tokio::sync::{broadcast, watch};
 
-use crate::notification::{
-    NOTIFICATION_EVENT_TYPE, NotifyConfig, build_notification_content,
-    notification_sticky_duration_ms,
-};
+use crate::notification::{NotifyConfig, notify_session_started};
 use crate::reactions::{
     ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, Clock, REACTION_EVENT_TYPE, RaisedHand,
     ReactionError, ReactionsConfig, ReactionsState, ReceivedReaction, RelationLookup,
@@ -210,13 +207,14 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
             .ok_or_else(|| CommandError::from_message("no command sender configured"))
     }
 
-    /// The core join, then the notification if we started the call.
-    pub async fn join(&mut self, params: CallJoinParams) -> Result<(), JoinError> {
+    /// The core join, then the notification if we started the call. Returns
+    /// the core join's membership event id.
+    pub async fn join(&mut self, params: CallJoinParams) -> Result<String, JoinError> {
         let reactions = params.reactions();
         let CallJoinParams { rtc, notify, .. } = params;
         let (room_id, slot_id) = (rtc.room_id.clone(), rtc.slot_id.clone());
 
-        self.rtc.join(rtc.clone()).await?;
+        let member_event_id = self.rtc.join(rtc.clone()).await?;
 
         self.with_state(&room_id, &slot_id, |state| {
             state.reactions.configure(reactions);
@@ -227,9 +225,10 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         });
 
         if let Some(notify) = &notify {
-            self.notify_session_started(notify, &rtc).await;
+            self.notify_session_started(notify, &rtc, &member_event_id)
+                .await;
         }
-        Ok(())
+        Ok(member_event_id)
     }
 
     /// Lowers our hand first, while the membership it annotates still stands.
@@ -275,107 +274,30 @@ impl<T: RtcCommandSender + 'static> CallSessionManager<T> {
         joined
     }
 
-    /// Whether a roster entry is this device's own participation — the current
-    /// one or an earlier one that is still sticky.
-    ///
-    /// A candidate whose sending device the host did not report counts as ours
-    /// when the *user* matches. See [`Self::notify_session_started`] for why
-    /// erring that way is the right trade here — it is the opposite of the rule
-    /// the core applies to drop a superseded participation of ours from the
-    /// roster, which leaves such a candidate in rather than dropping a genuine
-    /// peer.
-    fn is_own_participation(member: &JoinedMembership, params: &JoinSessionParams) -> bool {
-        member.sender == params.user_id
-            && member
-                .origin
-                .sender_device_id()
-                .is_none_or(|device_id| device_id == params.device_id)
-    }
-
-    /// Sends the MSC4075 notification that summons the room to this session.
-    ///
-    /// Called at the tail of [`Self::join`], where the roster has just been
-    /// republished. Never fails the join: the user is in the call whether or
-    /// not anyone else was told about it.
-    async fn notify_session_started(&self, notify: &NotifyConfig, params: &JoinSessionParams) {
-        let tag = format!("{}/{}/{}", params.room_id, params.slot_id, params.device_id);
-
-        // MSC4075 leaves who sends the notification open, but every joiner
-        // sending one would ring the room once per participant. Only the member
-        // who *starts* the session does — matching what Element Call does.
-        //
-        // The question is whether anyone *else* is here, so our own
-        // participations have to come out of the count first. Both kinds occur:
-        // the host feeds the room's whole sticky map, which contains our own
-        // membership as soon as the homeserver echoes it back, and a session
-        // outlives `leave()` keeping the previous call's membership as a
-        // candidate. Counting either concludes that somebody else started the
-        // call and stays silent — the caller hits "call" and no phone rings.
-        //
-        // The core already drops the stale ones from the roster, but only where
-        // the sending device is known, and an unencrypted room reports none. So
-        // a membership from our own user with no device attributed is treated
-        // as ours here too. That is a *wider* rule than the roster's on
-        // purpose: it can only misfire on another device of our own user in an
-        // unencrypted room, where the cost is one extra ring — against a silent
-        // failure to ring at all, which is the bug this replaced.
+    /// Sends the MSC4075 notification that summons the room to this session;
+    /// see [`notify_session_started`] for when it is suppressed.
+    async fn notify_session_started(
+        &self,
+        notify: &NotifyConfig,
+        params: &JoinSessionParams,
+        member_event_id: &str,
+    ) {
+        let Ok(command_sender) = self.command_sender() else {
+            return;
+        };
         let members = self
             .rtc
             .subscribe_membership_snapshots(&params.room_id, &params.slot_id)
             .map(|snapshots| snapshots.borrow().clone())
             .unwrap_or_default();
-        let others = members
-            .iter()
-            .filter(|member| !Self::is_own_participation(member, params))
-            .count();
-        if others > 0 {
-            log::info!(
-                "[{tag}] not notifying: {others} member(s) were already in the session, so \
-                 somebody else started it",
-            );
-            return;
-        }
-
-        // MSC4075 ties the notification to the membership that justifies it.
-        let Some(member_event_id) = self
-            .rtc
-            .own_membership_event_id(&params.room_id, &params.slot_id)
-        else {
-            log::warn!("[{tag}] not notifying: our membership event id is unknown");
-            return;
-        };
-        let Ok(command_sender) = self.command_sender() else {
-            return;
-        };
-
-        let content = build_notification_content(
+        notify_session_started(
+            command_sender.as_ref(),
             notify,
-            params.application.application_type().unwrap_or_default(),
-            &params.user_id,
-            &params.device_id,
-            &member_event_id,
-            crate::now_ms(),
-        );
-
-        log::info!(
-            "[{tag}] notifying the room: {}",
-            notify.notification_type.as_str(),
-        );
-
-        if let Err(error) = command_sender
-            .send_sticky_event(
-                params.room_id.clone(),
-                NOTIFICATION_EVENT_TYPE.to_owned(),
-                content,
-                notification_sticky_duration_ms(notify.lifetime_ms()),
-            )
-            .await
-        {
-            log::warn!(
-                "[{tag}] the session-started notification was not sent ({error:?}); the call \
-                 itself is unaffected",
-            );
-        }
+            params,
+            &members,
+            member_event_id,
+        )
+        .await;
     }
 
     // ---- Reactions and raised hands (see `crate::reactions`) ----

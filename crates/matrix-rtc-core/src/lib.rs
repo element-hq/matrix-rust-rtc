@@ -162,7 +162,7 @@ mod tests {
     async fn join_as(
         manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
         member_id: &str,
-    ) {
+    ) -> String {
         let mut params = JoinSessionParams::new(
             "@alice:example.org".to_owned(),
             "ALICEDEV".to_owned(),
@@ -174,7 +174,7 @@ mod tests {
             }),
         );
         params.membership_id = Some(member_id.to_owned());
-        manager.join(params).await.expect("join should succeed");
+        manager.join(params).await.expect("join should succeed")
     }
 
     /// Feeds the current sticky state containing one peer, the way a host does.
@@ -372,6 +372,22 @@ mod tests {
         assert!(
             !member_ids.iter().any(|id| id == "alice-a"),
             "our superseded participation is still joined: {member_ids:?}"
+        );
+    }
+
+    /// A join hands back the event id of the membership it sent, so an
+    /// application can relate its own events to it without asking again.
+    #[tokio::test]
+    async fn a_join_returns_its_membership_event_id() {
+        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
+        let mut manager = encrypted_call_manager(sender.clone()).await;
+
+        let event_id = join_as(&mut manager, "alice-a").await;
+
+        assert!(!event_id.is_empty());
+        assert_eq!(
+            manager.own_membership_event_id(ROOM_ID, "m.call#ROOM"),
+            Some(event_id)
         );
     }
 

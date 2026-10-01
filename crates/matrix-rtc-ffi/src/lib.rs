@@ -885,7 +885,7 @@ impl RtcSessionManagerHandle {
             self.start_heartbeat(room_id, slot_id);
         }
 
-        result.map(|()| member_id)
+        result.map(|_| member_id)
     }
 
     /// Our `member.id` in one session, or `None` if there is no such session or

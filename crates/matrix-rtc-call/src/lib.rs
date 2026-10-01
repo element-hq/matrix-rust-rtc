@@ -15,6 +15,7 @@ pub use manager::{CallJoinParams, CallSessionManager};
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,
+    notify_session_started,
 };
 pub use reactions::{
     ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, DEFAULT_REACTION_ACTIVE_MS, GENERIC_SOUND,

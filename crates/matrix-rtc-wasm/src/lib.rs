@@ -318,11 +318,11 @@ impl WasmRtcSessionManager {
             .map_err(|err| JsError::new(&err.to_string()));
 
         match &result {
-            Ok(()) => log::info!("manager: join succeeded as {member_id}"),
+            Ok(_) => log::info!("manager: join succeeded as {member_id}"),
             Err(_) => log::warn!("manager: join failed"),
         }
 
-        result.map(|()| member_id)
+        result.map(|_| member_id)
     }
 
     /// Our `member.id` in one session, or `undefined` if there is no such
@@ -1286,19 +1286,29 @@ impl WasmRtcSession {
             notify,
             ..
         } = params.into_core()?;
-        if notify.is_some() {
-            log::warn!(
-                "WasmRtcSession::join: `notify` ignored; use WasmRtcSessionManager to start a call"
-            );
-        }
         let member_id = matrix_rtc_core::generate_member_id();
         core_params.membership_id = Some(member_id.clone());
 
-        self.inner
-            .join(core_params)
+        let member_event_id = self
+            .inner
+            .join(core_params.clone())
             .await
-            .map(|()| member_id)
-            .map_err(|err| JsError::new(&err.to_string()))
+            .map_err(|err| JsError::new(&err.to_string()))?;
+
+        // This session is a bare core one, so the call's ring is sent here
+        // rather than by `CallSessionManager::join`.
+        if let (Some(notify), Some(command_sender)) = (&notify, &self.command_sender) {
+            let members = self.inner.subscribe_membership_snapshots().borrow().clone();
+            matrix_rtc_call::notify_session_started(
+                command_sender.as_ref(),
+                notify,
+                &core_params,
+                &members,
+                &member_event_id,
+            )
+            .await;
+        }
+        Ok(member_id)
     }
 
     /// Our `member.id` for the current join, or `undefined` while not joined.
@@ -1927,6 +1937,62 @@ mod tests {
         assert_eq!(
             js_sys::Reflect::get(&application, &"m.call.intent".into()).unwrap(),
             "video"
+        );
+    }
+
+    /// Starting a call through the single-session API still rings the room, as
+    /// it did before the call features left the core.
+    #[wasm_bindgen_test]
+    async fn a_single_session_join_with_notify_rings_the_room() {
+        let client = js_sys::Object::new();
+        let set = |name: &str, args: &str, body: &str| {
+            let function = js_sys::Function::new_with_args(args, body);
+            js_sys::Reflect::set(&client, &JsValue::from_str(name), &function).unwrap();
+        };
+        set(
+            "sendStickyEvent",
+            "roomId,eventType,content,durationMs",
+            "(globalThis.__singleSessionSent ??= []).push(eventType); \
+             return Promise.resolve({ event_id: '$sticky' });",
+        );
+        set(
+            "sendDelayedEvent",
+            "roomId,eventType,content,delayMs",
+            "return Promise.resolve('delay-id');",
+        );
+        set(
+            "restartDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+        set(
+            "cancelDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+
+        let params = serde_json::json!({
+            "user_id": "@alice:example.org",
+            "device_id": "DEVICEID",
+            "room_id": "!room:example.org",
+            "slot_id": "m.call#ROOM",
+            "application": "m.call",
+            "notify": { "notification_type": "ring" },
+        })
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+
+        let mut session = WasmRtcSession::new();
+        session.setup_command_sender(client.into());
+        session.join(params).await.expect("join should succeed");
+
+        let sent = js_sys::Reflect::get(&js_sys::global(), &"__singleSessionSent".into()).unwrap();
+        let sent: Vec<String> = serde_wasm_bindgen::from_value(sent).unwrap();
+        // Either spelling: the host writes the unstable wire type.
+        assert!(
+            sent.iter()
+                .any(|event_type| event_type.ends_with("rtc.notification")),
+            "no notification among the sent sticky events: {sent:?}"
         );
     }
 

@@ -353,9 +353,10 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if the join completed successfully.
+    /// Returns the event id of the membership event this join sent, which an
+    /// application relates its own events to (a call's MSC4075 notification).
     /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
-    pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
+    pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
         params.validate().map_err(|missing| {
             log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
             JoinError::MissingParameter(missing)
@@ -414,7 +415,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         );
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        machine.join(transports).await?;
+        let membership_event_id = machine.join(transports).await?;
 
         // Store the machine
         self.own_membership_machine = Some(machine);
@@ -511,7 +512,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             if manage_media_keys { "managed" } else { "off" },
         );
 
-        Ok(())
+        Ok(membership_event_id)
     }
 
     /// Leaves this RTC session.

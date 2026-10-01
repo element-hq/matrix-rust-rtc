@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::TryRecvError;
 
 use super::*;
-use crate::notification::DEFAULT_RING_LIFETIME_MS;
+use crate::notification::{DEFAULT_RING_LIFETIME_MS, NOTIFICATION_EVENT_TYPE};
 use crate::reactions::ReactionSound;
 
 const ROOM: &str = "!room:example.org";

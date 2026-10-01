@@ -116,9 +116,10 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if the join completed successfully.
+    /// Returns the event id of the membership event this join sent; see
+    /// [`RtcSession::join`].
     /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
-    pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
+    pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
         let command_sender = self
             .command_sender
             .as_ref()
