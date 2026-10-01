@@ -125,11 +125,12 @@ Promise. With matrix-js-sdk (v42+):
 | `getOpenIdToken()` | `getOpenIdToken()` | the token object |
 | `rtcTransports()` | `GET /_matrix/client/v1/rtc/transports`; `[]` on 404 | the `rtc_transports` array |
 
-`subscribeRoom` is where the room reaches Rust. `subjects` says what the
-attached mode needs (`encryption`, `state_event_types`, `joined_members`,
-`sticky_events`, `timeline_event_types`); deliver each as the room's
-**complete current set**, once as soon as you subscribe and again on every
-change (the first set may be the one at subscription time, not a later one):
+`subscribeRoom` is where the room reaches Rust. Every subscription wants the
+room's encryption state, its joined members and its sticky events; `subjects`
+adds what the attached mode needs on top (`state_event_types`,
+`timeline_event_types`). Deliver each as the room's **complete current set**,
+once as soon as you subscribe and again on every change (the first set may be
+the one at subscription time, not a later one):
 
 ```js
 sink.onEncryption(isEncrypted);

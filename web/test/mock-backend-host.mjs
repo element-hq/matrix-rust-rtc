@@ -93,13 +93,13 @@ export function mockBackendHost({
     subscribeRoom: (roomId, subjects, sink) => {
       rooms.set(roomId, { subjects, sink });
       // The current sets, the way a host delivers them on subscribe.
-      if (subjects.encryption) sink.onEncryption(encrypted);
+      sink.onEncryption(encrypted);
       for (const type of subjects.state_event_types) {
         if (type === 'm.rtc.slot') sink.onStateEvents(type, slots);
         if (type === 'org.matrix.msc3401.call.member') sink.onStateEvents(type, []);
       }
-      if (subjects.joined_members) sink.onJoinedMembers(members);
-      if (subjects.sticky_events) sink.onStickyEvents(sticky);
+      sink.onJoinedMembers(members);
+      sink.onStickyEvents(sticky);
       return { cancel: () => rooms.delete(roomId) };
     },
     subscribeToDevice: (eventTypes, sink) => {

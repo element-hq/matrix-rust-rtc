@@ -7020,13 +7020,10 @@ public func FfiConverterTypeFfiReceiveStats_lower(_ value: FfiReceiveStats) -> R
  * What the library wants delivered for one room; see [`MatrixBackend::subscribe_room`].
  */
 public struct FfiRoomSubjects {
-    public var stickyEvents: Bool
     /**
      * Stable and unstable spellings both listed; deliver either.
      */
     public var stateEventTypes: [String]
-    public var joinedMembers: Bool
-    public var encryption: Bool
     /**
      * Message-like types to forward as they arrive, redactions included.
      */
@@ -7034,17 +7031,14 @@ public struct FfiRoomSubjects {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(stickyEvents: Bool, 
+    public init(
         /**
          * Stable and unstable spellings both listed; deliver either.
-         */stateEventTypes: [String], joinedMembers: Bool, encryption: Bool, 
+         */stateEventTypes: [String], 
         /**
          * Message-like types to forward as they arrive, redactions included.
          */timelineEventTypes: [String]) {
-        self.stickyEvents = stickyEvents
         self.stateEventTypes = stateEventTypes
-        self.joinedMembers = joinedMembers
-        self.encryption = encryption
         self.timelineEventTypes = timelineEventTypes
     }
 }
@@ -7056,16 +7050,7 @@ extension FfiRoomSubjects: Sendable {}
 
 extension FfiRoomSubjects: Equatable, Hashable {
     public static func ==(lhs: FfiRoomSubjects, rhs: FfiRoomSubjects) -> Bool {
-        if lhs.stickyEvents != rhs.stickyEvents {
-            return false
-        }
         if lhs.stateEventTypes != rhs.stateEventTypes {
-            return false
-        }
-        if lhs.joinedMembers != rhs.joinedMembers {
-            return false
-        }
-        if lhs.encryption != rhs.encryption {
             return false
         }
         if lhs.timelineEventTypes != rhs.timelineEventTypes {
@@ -7075,10 +7060,7 @@ extension FfiRoomSubjects: Equatable, Hashable {
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(stickyEvents)
         hasher.combine(stateEventTypes)
-        hasher.combine(joinedMembers)
-        hasher.combine(encryption)
         hasher.combine(timelineEventTypes)
     }
 }
@@ -7092,19 +7074,13 @@ public struct FfiConverterTypeFfiRoomSubjects: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRoomSubjects {
         return
             try FfiRoomSubjects(
-                stickyEvents: FfiConverterBool.read(from: &buf), 
                 stateEventTypes: FfiConverterSequenceString.read(from: &buf), 
-                joinedMembers: FfiConverterBool.read(from: &buf), 
-                encryption: FfiConverterBool.read(from: &buf), 
                 timelineEventTypes: FfiConverterSequenceString.read(from: &buf)
         )
     }
 
     public static func write(_ value: FfiRoomSubjects, into buf: inout [UInt8]) {
-        FfiConverterBool.write(value.stickyEvents, into: &buf)
         FfiConverterSequenceString.write(value.stateEventTypes, into: &buf)
-        FfiConverterBool.write(value.joinedMembers, into: &buf)
-        FfiConverterBool.write(value.encryption, into: &buf)
         FfiConverterSequenceString.write(value.timelineEventTypes, into: &buf)
     }
 }

@@ -55,7 +55,7 @@ export function host(client: {
         content: { status: 'open' },
         encryption: { kind: 'cleartext' },
       };
-      if (subjects.encryption) sink.onEncryption(false);
+      sink.onEncryption(false);
       sink.onStateEvents(subjects.state_event_types[0], [slot]);
       sink.onJoinedMembers([client.userId]);
       sink.onStickyEvents([]);

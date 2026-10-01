@@ -1126,7 +1126,6 @@ mod tests {
         .await;
 
         let subjects = mock.subjects(ROOM).unwrap();
-        assert!(subjects.sticky_events && subjects.joined_members && subjects.encryption);
         assert_eq!(
             subjects.state_event_types,
             vec![

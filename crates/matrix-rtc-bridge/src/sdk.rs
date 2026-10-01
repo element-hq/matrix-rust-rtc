@@ -641,13 +641,11 @@ async fn emit_room_subjects(
     let room_id = room.room_id().to_string();
     let mut all_read = true;
 
-    if subjects.encryption {
-        match room.latest_encryption_state().await {
-            Ok(state) => sink.on_encryption(state.is_encrypted()),
-            Err(error) => {
-                log::warn!("[{room_id}] failed to read room encryption state: {error}");
-                all_read = false;
-            }
+    match room.latest_encryption_state().await {
+        Ok(state) => sink.on_encryption(state.is_encrypted()),
+        Err(error) => {
+            log::warn!("[{room_id}] failed to read room encryption state: {error}");
+            all_read = false;
         }
     }
 
@@ -664,24 +662,20 @@ async fn emit_room_subjects(
         }
     }
 
-    if subjects.joined_members {
-        match room.members(RoomMemberships::JOIN).await {
-            Ok(members) => sink.on_joined_members(
-                members
-                    .into_iter()
-                    .map(|member| member.user_id().to_string())
-                    .collect(),
-            ),
-            Err(error) => {
-                log::warn!("[{room_id}] failed to read room members: {error}");
-                all_read = false;
-            }
+    match room.members(RoomMemberships::JOIN).await {
+        Ok(members) => sink.on_joined_members(
+            members
+                .into_iter()
+                .map(|member| member.user_id().to_string())
+                .collect(),
+        ),
+        Err(error) => {
+            log::warn!("[{room_id}] failed to read room members: {error}");
+            all_read = false;
         }
     }
 
-    if subjects.sticky_events {
-        sink.on_sticky_events(sticky_snapshot(room));
-    }
+    sink.on_sticky_events(sticky_snapshot(room));
 
     all_read
 }

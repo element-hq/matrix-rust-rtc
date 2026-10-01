@@ -51,11 +51,8 @@ export interface ToDeviceMessageIn {
 
 /** What the library wants delivered for one room (`subscribeRoom`). */
 export interface RoomSubjects {
-    sticky_events: boolean;
     /** Stable and unstable spellings both listed; deliver either. */
     state_event_types: string[];
-    joined_members: boolean;
-    encryption: boolean;
     /** Message-like types to forward as they arrive, redactions included. */
     timeline_event_types: string[];
 }

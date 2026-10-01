@@ -124,7 +124,6 @@ fn member_event(sender: &str, member_id: &str, event_id: &str) -> EventIn {
 async fn attach_subscribes_to_what_the_mode_needs() {
     let harness = Harness::attach(ElementCallCompat::Off).await;
     let subjects = &harness.mock.room_subscription(ROOM).unwrap().subjects;
-    assert!(subjects.sticky_events && subjects.joined_members && subjects.encryption);
     assert_eq!(subjects.state_event_types, SLOT_EVENT_TYPES);
     assert_eq!(
         subjects.timeline_event_types,

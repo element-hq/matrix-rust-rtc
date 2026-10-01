@@ -60,9 +60,6 @@ describe('WASM bindings with a mock backend host', () => {
       await manager.attachRoom(ROOM_ID, undefined);
 
       const subjects = host._subjects(ROOM_ID);
-      expect(subjects.sticky_events).toBe(true);
-      expect(subjects.joined_members).toBe(true);
-      expect(subjects.encryption).toBe(true);
       expect(subjects.state_event_types).toEqual(['m.rtc.slot', 'org.matrix.msc4143.rtc.slot']);
       expect(host._toDevice()).not.toBeNull();
 

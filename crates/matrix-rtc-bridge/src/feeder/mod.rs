@@ -89,10 +89,7 @@ pub fn subjects_for(mode: ElementCallCompat, timeline_event_types: Vec<String>) 
         SLOT_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect()
     };
     RoomSubjects {
-        sticky_events: true,
         state_event_types,
-        joined_members: true,
-        encryption: true,
         timeline_event_types,
     }
 }

@@ -193,15 +193,14 @@ pub struct ToDeviceMessageIn {
     pub encryption: EventEncryption,
 }
 
-/// What the library wants delivered for one room.
+/// What the library wants delivered for one room, beyond the three subjects
+/// every subscription carries: sticky events, joined members and whether the
+/// room is encrypted.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomSubjects {
-    pub sticky_events: bool,
     /// State event types, stable and unstable spellings both listed; a host
     /// may deliver either.
     pub state_event_types: Vec<String>,
-    pub joined_members: bool,
-    pub encryption: bool,
     /// Message-like event types to forward as they arrive, redactions included.
     pub timeline_event_types: Vec<String>,
 }

@@ -141,11 +141,8 @@ fn events_into_core(events: Vec<FfiEventIn>) -> Vec<EventIn> {
 /// What the library wants delivered for one room; see [`MatrixBackend::subscribe_room`].
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FfiRoomSubjects {
-    pub sticky_events: bool,
     /// Stable and unstable spellings both listed; deliver either.
     pub state_event_types: Vec<String>,
-    pub joined_members: bool,
-    pub encryption: bool,
     /// Message-like types to forward as they arrive, redactions included.
     pub timeline_event_types: Vec<String>,
 }
@@ -153,10 +150,7 @@ pub struct FfiRoomSubjects {
 impl From<RoomSubjects> for FfiRoomSubjects {
     fn from(value: RoomSubjects) -> Self {
         Self {
-            sticky_events: value.sticky_events,
             state_event_types: value.state_event_types,
-            joined_members: value.joined_members,
-            encryption: value.encryption,
             timeline_event_types: value.timeline_event_types,
         }
     }

@@ -209,9 +209,7 @@ export class MatrixHost {
 
     const feed = async () => {
       if (cancelled) return;
-      if (subjects.encryption) {
-        sink.onEncryption(Boolean(room.currentState.getStateEvents('m.room.encryption', '')));
-      }
+      sink.onEncryption(Boolean(room.currentState.getStateEvents('m.room.encryption', '')));
       // One set per subject: the two slot spellings are one subject, so they
       // go together under the first requested spelling rather than as two
       // sets that would replace each other.
@@ -225,12 +223,8 @@ export class MatrixHost {
         const events = room.currentState.getStateEvents(type);
         sink.onStateEvents(type, await Promise.all(events.map((ev) => this.eventIn(ev))));
       }
-      if (subjects.joined_members) {
-        sink.onJoinedMembers(room.getJoinedMembers().map((member) => member.userId));
-      }
-      if (subjects.sticky_events) {
-        sink.onStickyEvents(await this.stickySnapshot(room));
-      }
+      sink.onJoinedMembers(room.getJoinedMembers().map((member) => member.userId));
+      sink.onStickyEvents(await this.stickySnapshot(room));
     };
     const scheduleFeed = () => {
       if (pending) return;
