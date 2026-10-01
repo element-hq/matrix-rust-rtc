@@ -6,13 +6,11 @@
 //! Join functionality for RTC sessions.
 //!
 //! This module provides the data structures and parameters needed for joining
-//! an RTC session, including user information, transport configuration, and
-//! call intent.
+//! an RTC session, including user information, the application and transport
+//! configuration.
 
 use crate::encryption::types::EncryptionConfig;
-use crate::notification::NotifyConfig;
-use crate::reactions::ReactionsConfig;
-use crate::session::{LeaveCode, LeaveReason};
+use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
 /// Default keep-alive timeout in milliseconds (30 seconds).
@@ -100,7 +98,8 @@ pub enum TransportIntent {
 /// Parameters for joining an RTC session.
 ///
 /// Contains all the information needed to construct and send a membership event
-/// to join a call, including user identification, transport details, and call intent.
+/// to join a session, including user identification, the application and
+/// transport details.
 #[derive(Clone, Debug)]
 pub struct JoinSessionParams {
     /// The Matrix user ID of the user joining the session (e.g., "@alice:example.org").
@@ -124,8 +123,9 @@ pub struct JoinSessionParams {
     /// The slot ID for the session (e.g., "m.call#ROOM").
     pub slot_id: String,
 
-    /// The application type, usually "m.call".
-    pub application: String,
+    /// `content.application` to publish. A `String` or `&str` converts into a
+    /// type-only one.
+    pub application: ApplicationInfo,
 
     /// What this member does with transports.
     pub transport: TransportIntent,
@@ -156,21 +156,6 @@ pub struct JoinSessionParams {
     ///
     /// If not provided, defaults to `EncryptionConfig::default()`.
     pub encryption_config: Option<EncryptionConfig>,
-
-    /// Ask for an MSC4075 notification to be sent with this join.
-    ///
-    /// `None` — the default — joins quietly, which is what joining a call
-    /// someone else started does. Set it only when the user is *starting* the
-    /// call: the notification is still suppressed if somebody is already in the
-    /// session, but the intent to summon anyone at all is the application's to
-    /// state.
-    pub notify: Option<NotifyConfig>,
-
-    /// How this session handles Element Call reactions and the raised hand.
-    ///
-    /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
-    /// Element Call's three-second window. See [`crate::reactions`].
-    pub reactions: Option<ReactionsConfig>,
 }
 
 impl JoinSessionParams {
@@ -182,7 +167,7 @@ impl JoinSessionParams {
         device_id: String,
         room_id: String,
         slot_id: String,
-        application: String,
+        application: impl Into<ApplicationInfo>,
         transport: RtcTransport,
     ) -> Self {
         Self {
@@ -191,14 +176,12 @@ impl JoinSessionParams {
             membership_id: None,
             room_id,
             slot_id,
-            application,
+            application: application.into(),
             transport: TransportIntent::Publish(transport),
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
-            notify: None,
-            reactions: None,
         }
     }
 
@@ -208,7 +191,7 @@ impl JoinSessionParams {
         device_id: String,
         room_id: String,
         slot_id: String,
-        application: String,
+        application: impl Into<ApplicationInfo>,
         transport: TransportIntent,
     ) -> Self {
         Self {
@@ -217,14 +200,12 @@ impl JoinSessionParams {
             membership_id: None,
             room_id,
             slot_id,
-            application,
+            application: application.into(),
             transport,
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
-            notify: None,
-            reactions: None,
         }
     }
 
@@ -277,11 +258,6 @@ impl JoinSessionParams {
             .min(MAX_STICKY_DURATION_MS)
     }
 
-    /// The reactions configuration to use: the configured one or the default.
-    pub fn reactions(&self) -> ReactionsConfig {
-        self.reactions.clone().unwrap_or_default()
-    }
-
     /// Gets the encryption configuration to use.
     ///
     /// Returns the configured config or the default.
@@ -306,7 +282,7 @@ impl JoinSessionParams {
         if self.slot_id.is_empty() {
             return Err("slot_id is required");
         }
-        if self.application.is_empty() {
+        if self.application.application_type().is_none() {
             return Err("application is required");
         }
         Ok(())

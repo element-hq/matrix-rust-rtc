@@ -2698,6 +2698,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-rtc-call"
+version = "0.4.0-rc.1"
+dependencies = [
+ "log",
+ "matrix-rtc-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "unicode-segmentation",
+ "web-time",
+]
+
+[[package]]
 name = "matrix-rtc-core"
 version = "0.4.0-rc.1"
 dependencies = [
@@ -2712,7 +2726,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "unicode-segmentation",
  "web-time",
 ]
 
@@ -2727,6 +2740,7 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "matrix-rtc-bridge",
+ "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit",
  "matrix-rtc-media",
@@ -2750,6 +2764,7 @@ dependencies = [
  "livekit",
  "log",
  "matrix-rtc-bridge",
+ "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit-proto",
  "matrix-rtc-media",
@@ -2786,6 +2801,7 @@ dependencies = [
  "futures-util",
  "gloo-timers 0.3.0",
  "log",
+ "matrix-rtc-call",
  "matrix-rtc-core",
  "thiserror 2.0.21",
  "tokio",
@@ -2804,6 +2820,7 @@ dependencies = [
  "js-sys",
  "log",
  "matrix-rtc-bridge",
+ "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-rtc-livekit-proto",
  "matrix-rtc-media",

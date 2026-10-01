@@ -11,18 +11,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::watch;
 
-use crate::commands::RtcCommandSender;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::event::{EventConversionError, RawStickyEvent};
+use crate::host::commands::RtcCommandSender;
+use crate::host::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
-use crate::reactions::{
-    RaisedHand, RawTimelineEvent, ReactionError, ReceivedReaction, RelationLookup,
-};
-use crate::session::{CallMembershipEvent, JoinedMembership, RtcSession};
+use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
+use crate::session::{JoinedMembership, RtcMembershipEvent, RtcSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
@@ -45,6 +43,7 @@ pub struct RtcSessionManager<T: RtcCommandSender> {
     room_members: HashMap<String, HashSet<String>>,
     /// Room encryption per room, for rooms where the host reports it.
     room_encryption: HashMap<String, RoomEncryption>,
+    membership_listeners: MembershipListeners,
 }
 
 impl<T: RtcCommandSender + 'static> Default for RtcSessionManager<T> {
@@ -65,6 +64,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             rooms_with_slot_state: HashSet::new(),
             room_members: HashMap::new(),
             room_encryption: HashMap::new(),
+            membership_listeners: MembershipListeners::default(),
         }
     }
 
@@ -77,12 +77,27 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             rooms_with_slot_state: HashSet::new(),
             room_members: HashMap::new(),
             room_encryption: HashMap::new(),
+            membership_listeners: MembershipListeners::default(),
         }
     }
 
     /// Sets the command sender for this manager.
     pub fn set_command_sender(&mut self, command_sender: Arc<T>) {
         self.command_sender = Some(command_sender);
+    }
+
+    /// For applications, which send through the same host sender as the core.
+    pub fn command_sender(&self) -> Option<&Arc<T>> {
+        self.command_sender.as_ref()
+    }
+
+    /// Replays every existing session's joined memberships to it first. Listeners
+    /// cannot be removed.
+    pub fn add_membership_listener(&mut self, listener: Arc<dyn MembershipListener>) {
+        for (key, session) in &self.sessions {
+            listener.on_memberships(&key.room_id, &key.slot_id, session.members());
+        }
+        self.membership_listeners.add(listener);
     }
 
     /// Returns true if this manager has a command sender configured.
@@ -101,9 +116,10 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if the join completed successfully.
+    /// Returns the event id of the membership event this join sent; see
+    /// [`RtcSession::join`].
     /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
-    pub async fn join(&mut self, params: JoinSessionParams) -> Result<(), JoinError> {
+    pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
         let command_sender = self
             .command_sender
             .as_ref()
@@ -138,7 +154,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     /// The session is **kept**, not removed: it is keyed by `(room_id, slot_id)`
     /// and stays usable for a later join in the same process. See
     /// [`RtcSession::leave`] for why, and for what it does and does not clear —
-    /// a rejoin therefore starts with the previous call's roster in place, which
+    /// a rejoin therefore starts with the previous call's joined memberships in place, which
     /// [`RtcSession::join`] accounts for.
     ///
     /// # Arguments
@@ -192,7 +208,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     ///
     /// # One call, at most one key rotation
     ///
-    /// Everything the state says is applied before the roster is republished, so
+    /// Everything the state says is applied before the joined memberships are republished, so
     /// a change of any size costs at most one rotation — three people hanging up
     /// together mint one key between them, not three. Key rotation has no
     /// debounce of its own and cannot have one (the core owns no timer), so this
@@ -209,7 +225,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         room_id: &str,
         events: impl IntoIterator<Item = RawStickyEvent>,
     ) -> Result<(), EventConversionError> {
-        let mut batches: HashMap<SessionKey, Vec<CallMembershipEvent>> = HashMap::new();
+        let mut batches: HashMap<SessionKey, Vec<RtcMembershipEvent>> = HashMap::new();
 
         for event in events {
             if event.room_id != room_id {
@@ -221,8 +237,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
             };
 
             let slot_id = match &event {
-                CallMembershipEvent::Joined(joined) => joined.slot_id.clone(),
-                CallMembershipEvent::Left(left) => left.slot_id.clone(),
+                RtcMembershipEvent::Joined(joined) => joined.slot_id.clone(),
+                RtcMembershipEvent::Left(left) => left.slot_id.clone(),
             };
 
             let key = SessionKey::new(room_id.to_owned(), slot_id);
@@ -332,134 +348,6 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         self.sessions
             .get(&key)
             .and_then(|session| session.own_membership_event_id())
-    }
-
-    // ---- Reactions and raised hands (see `crate::reactions`) ----
-    //
-    // Inbound reactions are routed by *room*: a reaction relates to a
-    // membership event and names no slot, so every session of the room is
-    // offered each event and keeps the ones that relate to its own members.
-
-    /// Applies message-like room events — `io.element.call.reaction` and
-    /// `m.reaction` — to every session of `room_id`. Other event types are
-    /// ignored, so a host may forward without filtering.
-    pub fn on_room_timeline_events(&mut self, room_id: &str, events: &[RawTimelineEvent]) {
-        for session in self.sessions_in_room_mut(room_id) {
-            for event in events {
-                session.on_timeline_event(event);
-            }
-        }
-    }
-
-    /// Lowers whichever hand the redacted `event_id` raised, in every session
-    /// of `room_id`.
-    pub fn on_event_redacted(&mut self, room_id: &str, event_id: &str) {
-        for session in self.sessions_in_room_mut(room_id) {
-            session.on_event_redacted(event_id);
-        }
-    }
-
-    /// Feeds the annotations of one membership event back, as fetched in
-    /// answer to [`Self::pending_relation_lookups`].
-    pub fn on_relations_received(
-        &mut self,
-        room_id: &str,
-        target_event_id: &str,
-        events: &[RawTimelineEvent],
-    ) {
-        for session in self.sessions_in_room_mut(room_id) {
-            session.on_relations_received(target_event_id, events);
-        }
-    }
-
-    /// Membership events in `room_id` whose annotations have not been fetched
-    /// yet, across its sessions. See
-    /// [`RtcSession::pending_relation_lookups`].
-    pub fn pending_relation_lookups(&self, room_id: &str) -> Vec<RelationLookup> {
-        let mut seen = HashSet::new();
-        self.sessions
-            .iter()
-            .filter(|(key, _)| key.room_id == room_id)
-            .flat_map(|(_, session)| session.pending_relation_lookups())
-            .filter(|lookup| seen.insert(lookup.membership_event_id.clone()))
-            .collect()
-    }
-
-    /// Sends an emoji reaction from one `(room_id, slot_id)` session. See
-    /// [`RtcSession::send_reaction`].
-    pub async fn send_reaction(
-        &mut self,
-        room_id: &str,
-        slot_id: &str,
-        emoji: &str,
-        name: &str,
-    ) -> Result<String, ReactionError> {
-        self.session_for_reactions(room_id, slot_id)?
-            .send_reaction(emoji, name)
-            .await
-    }
-
-    /// Raises our hand in one `(room_id, slot_id)` session. See
-    /// [`RtcSession::raise_hand`].
-    pub async fn raise_hand(&mut self, room_id: &str, slot_id: &str) -> Result<(), ReactionError> {
-        self.session_for_reactions(room_id, slot_id)?
-            .raise_hand()
-            .await
-    }
-
-    /// Lowers our hand in one `(room_id, slot_id)` session. See
-    /// [`RtcSession::lower_hand`].
-    pub async fn lower_hand(&mut self, room_id: &str, slot_id: &str) -> Result<(), ReactionError> {
-        self.session_for_reactions(room_id, slot_id)?
-            .lower_hand()
-            .await
-    }
-
-    /// The raised hands of one `(room_id, slot_id)` session, oldest first, or
-    /// `None` if there is no such session.
-    pub fn raised_hands(&self, room_id: &str, slot_id: &str) -> Option<Vec<RaisedHand>> {
-        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
-        self.sessions.get(&key).map(RtcSession::raised_hands)
-    }
-
-    /// Subscribes to the raised hands of one `(room_id, slot_id)` session, or
-    /// `None` if there is no such session.
-    pub fn subscribe_raised_hands(
-        &self,
-        room_id: &str,
-        slot_id: &str,
-    ) -> Option<watch::Receiver<Vec<RaisedHand>>> {
-        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
-        self.sessions
-            .get(&key)
-            .map(RtcSession::subscribe_raised_hands)
-    }
-
-    /// Subscribes to the emoji reactions of one `(room_id, slot_id)` session,
-    /// or `None` if there is no such session.
-    pub fn subscribe_reactions(
-        &self,
-        room_id: &str,
-        slot_id: &str,
-    ) -> Option<broadcast::Receiver<ReceivedReaction>> {
-        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
-        self.sessions.get(&key).map(RtcSession::subscribe_reactions)
-    }
-
-    fn session_for_reactions(
-        &mut self,
-        room_id: &str,
-        slot_id: &str,
-    ) -> Result<&mut RtcSession<T>, ReactionError> {
-        let key = SessionKey::new(room_id.to_owned(), slot_id.to_owned());
-        self.sessions.get_mut(&key).ok_or(ReactionError::NoSession)
-    }
-
-    fn sessions_in_room_mut(&mut self, room_id: &str) -> impl Iterator<Item = &mut RtcSession<T>> {
-        self.sessions
-            .iter_mut()
-            .filter(move |(key, _)| key.room_id == room_id)
-            .map(|(_, session)| session)
     }
 
     /// Re-signals every key one session already holds to its signal handler.
@@ -768,8 +656,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
 
     /// Everything the manager and its sessions believe, as JSON.
     ///
-    /// Meant to be attached to a bug report or dumped to the log when a roster
-    /// looks wrong: it answers "which sessions exist, what room state do they
+    /// Meant to be attached to a bug report or dumped to the log when the joined
+    /// memberships look wrong: it answers "which sessions exist, what room state do they
     /// have, and why is each candidate in or out" in one shot. Contains no key
     /// material.
     pub fn debug_snapshot(&self) -> serde_json::Value {
@@ -829,6 +717,11 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
         let room_members = self.room_members.get(&key.room_id).cloned();
         let command_sender = self.command_sender.clone();
         let log_tag = key.to_string();
+        let membership_scope = MembershipScope {
+            room_id: key.room_id.clone(),
+            slot_id: key.slot_id.clone(),
+            listeners: self.membership_listeners.clone(),
+        };
 
         self.sessions.entry(key).or_insert_with(|| {
             log::info!(
@@ -846,6 +739,7 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
                 None => RtcSession::new(),
             };
             session.set_log_tag(log_tag);
+            session.set_membership_scope(membership_scope);
             if let Some(slot) = slot {
                 session.seed_slot_state(slot);
             }
@@ -860,8 +754,8 @@ impl<T: RtcCommandSender + 'static> RtcSessionManager<T> {
     fn try_convert_membership_event(
         &self,
         event: RawStickyEvent,
-    ) -> Result<Option<CallMembershipEvent>, EventConversionError> {
-        match event.try_into_call_membership_event() {
+    ) -> Result<Option<RtcMembershipEvent>, EventConversionError> {
+        match event.try_into_membership_event() {
             Ok(event) => Ok(Some(event)),
             // Not an RTC member event at all — the host feeds us its whole
             // sticky map, so this is routine.
@@ -889,9 +783,9 @@ impl SessionKey {
 /// `slot_id xN` per session, for the one-line routing summary.
 ///
 /// Which slots a room's sticky events landed in is the first thing to check
-/// when a roster looks wrong: a typo in `slot_id` silently creates a second,
+/// when the joined memberships look wrong: a typo in `slot_id` silently creates a second,
 /// empty session rather than failing.
-fn describe_batches(batches: &HashMap<SessionKey, Vec<CallMembershipEvent>>) -> String {
+fn describe_batches(batches: &HashMap<SessionKey, Vec<RtcMembershipEvent>>) -> String {
     if batches.is_empty() {
         return "none".to_owned();
     }

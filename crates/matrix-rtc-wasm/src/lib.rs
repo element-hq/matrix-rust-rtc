@@ -25,11 +25,13 @@
 #![cfg(target_arch = "wasm32")]
 
 use matrix_rtc_bridge::compat::{ElementCallCompat, ingest};
+use matrix_rtc_call::{
+    CallJoinParams, CallSessionManager, Mentions, NotificationType, NotifyConfig,
+};
 use matrix_rtc_core::{
     EncryptionConfig, EventConversionError, JoinSessionParams, JoinedMembership, KeyOrigin,
-    LeaveSessionParams, Mentions, NotificationType, NotifyConfig, RawRtcTransport, RawSlotEvent,
-    RawStickyEvent, ReceivedEncryptionKey, RtcSession, RtcSessionManager, RtcTransport,
-    SlotEncryption,
+    LeaveSessionParams, RawRtcTransport, RawSlotEvent, RawStickyEvent, ReceivedEncryptionKey,
+    RtcSession, RtcSessionManager, RtcTransport, SlotEncryption,
 };
 
 mod commands;
@@ -46,9 +48,9 @@ use tokio::sync::watch;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
-/// WebAssembly-facing wrapper around `RtcSessionManager`.
+/// WebAssembly-facing wrapper around the call layer's `CallSessionManager`.
 pub struct WasmRtcSessionManager {
-    inner: RtcSessionManager<JsCommandSender>,
+    inner: CallSessionManager<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
     command_sender: Option<Arc<JsCommandSender>>,
     /// The Element Call compat mode each room was joined in, installed by
@@ -65,7 +67,7 @@ impl WasmRtcSessionManager {
     /// Creates an empty session manager instance for JS consumers.
     pub fn new() -> Self {
         Self {
-            inner: RtcSessionManager::new(),
+            inner: CallSessionManager::new(RtcSessionManager::new()),
             command_sender: None,
             element_call_compat: std::collections::HashMap::new(),
         }
@@ -288,7 +290,7 @@ impl WasmRtcSessionManager {
         // Not always a fresh id: see `ingest::member_id` for the one generation
         // where a fresh one makes us mark ourselves departed on our own join.
         let member_id = ingest::member_id(mode, &user_id, &device_id);
-        core_params.membership_id = Some(member_id.clone());
+        core_params.rtc.membership_id = Some(member_id.clone());
 
         // Before the join, not after: the join itself sends the membership
         // (and arms the delayed leave), so a dialect registered afterwards
@@ -316,11 +318,11 @@ impl WasmRtcSessionManager {
             .map_err(|err| JsError::new(&err.to_string()));
 
         match &result {
-            Ok(()) => log::info!("manager: join succeeded as {member_id}"),
+            Ok(_) => log::info!("manager: join succeeded as {member_id}"),
             Err(_) => log::warn!("manager: join failed"),
         }
 
-        result.map(|()| member_id)
+        result.map(|_| member_id)
     }
 
     /// Our `member.id` in one session, or `undefined` if there is no such
@@ -812,7 +814,7 @@ pub fn reaction_catalog() -> Result<JsValue, JsError> {
         emoji: &'static str,
         sound: Option<&'static str>,
     }
-    let catalogue: Vec<Kind> = matrix_rtc_core::KNOWN_REACTIONS
+    let catalogue: Vec<Kind> = matrix_rtc_call::KNOWN_REACTIONS
         .iter()
         .map(|kind| Kind {
             name: kind.name,
@@ -828,7 +830,7 @@ pub fn reaction_catalog() -> Result<JsValue, JsError> {
 /// one.
 #[wasm_bindgen(js_name = reactionSoundFor)]
 pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_core::sound_for(&name)
+    matrix_rtc_call::sound_for(&name)
         .asset_name()
         .map(str::to_owned)
 }
@@ -971,12 +973,12 @@ fn default_true() -> bool {
 }
 
 fn default_reaction_window_ms() -> u64 {
-    matrix_rtc_core::DEFAULT_REACTION_ACTIVE_MS
+    matrix_rtc_call::DEFAULT_REACTION_ACTIVE_MS
 }
 
-impl From<WasmReactionsConfig> for matrix_rtc_core::ReactionsConfig {
+impl From<WasmReactionsConfig> for matrix_rtc_call::ReactionsConfig {
     fn from(value: WasmReactionsConfig) -> Self {
-        matrix_rtc_core::ReactionsConfig {
+        matrix_rtc_call::ReactionsConfig {
             enabled: value.enabled,
             active_window_ms: value.active_window_ms,
             send_cooldown_ms: value.send_cooldown_ms,
@@ -1079,10 +1081,10 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
 }
 
 impl WasmJoinSessionParams {
-    pub fn into_core(self) -> Result<JoinSessionParams, JsError> {
+    pub fn into_core(self) -> Result<CallJoinParams, JsError> {
         let transport = self.transport.map(|t| t.into_core()).transpose()?;
         let encryption_config = self.encryption_config.map(Into::into);
-        Ok(JoinSessionParams {
+        let rtc = JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
             // Filled in by the join entry points, which generate a fresh id per
@@ -1093,7 +1095,7 @@ impl WasmJoinSessionParams {
             membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
-            application: self.application,
+            application: self.application.into(),
             transport: match transport {
                 Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport),
                 None => matrix_rtc_core::TransportIntent::ReceiveOnly {
@@ -1103,9 +1105,12 @@ impl WasmJoinSessionParams {
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
             degraded_lifetime_ms: self.degraded_lifetime_ms,
-            reactions: self.reactions.map(Into::into),
             encryption_config,
+        };
+        Ok(CallJoinParams {
+            rtc,
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
+            reactions: self.reactions.map(Into::into),
         })
     }
 }
@@ -1186,7 +1191,7 @@ impl WasmLeaveSessionParams {
 }
 
 #[wasm_bindgen]
-/// WebAssembly-facing single-session API.
+/// WebAssembly-facing single-session API: MatrixRTC only, no call features.
 pub struct WasmRtcSession {
     inner: RtcSession<JsCommandSender>,
     /// Command sender for sending events to Matrix rooms
@@ -1240,7 +1245,7 @@ impl WasmRtcSession {
         let mut membership_events = Vec::new();
         for event in input.into_iter() {
             let event = RawStickyEvent::from(event);
-            match event.try_into_call_membership_event() {
+            match event.try_into_membership_event() {
                 Ok(event) => membership_events.push(event),
                 Err(EventConversionError::UnsupportedEventType { .. }) => continue,
                 Err(err) => return Err(JsError::new(&err.to_string())),
@@ -1276,15 +1281,34 @@ impl WasmRtcSession {
         let params: WasmJoinSessionParams = serde_wasm_bindgen::from_value(params)
             .map_err(|err| JsError::new(&format!("invalid join params: {err}")))?;
 
-        let mut core_params = params.into_core()?;
+        let CallJoinParams {
+            rtc: mut core_params,
+            notify,
+            ..
+        } = params.into_core()?;
         let member_id = matrix_rtc_core::generate_member_id();
         core_params.membership_id = Some(member_id.clone());
 
-        self.inner
-            .join(core_params)
+        let member_event_id = self
+            .inner
+            .join(core_params.clone())
             .await
-            .map(|()| member_id)
-            .map_err(|err| JsError::new(&err.to_string()))
+            .map_err(|err| JsError::new(&err.to_string()))?;
+
+        // This session is a bare core one, so the call's ring is sent here
+        // rather than by `CallSessionManager::join`.
+        if let (Some(notify), Some(command_sender)) = (&notify, &self.command_sender) {
+            let members = self.inner.subscribe_membership_snapshots().borrow().clone();
+            matrix_rtc_call::notify_session_started(
+                command_sender.as_ref(),
+                notify,
+                &core_params,
+                &members,
+                &member_event_id,
+            )
+            .await;
+        }
+        Ok(member_id)
     }
 
     /// Our `member.id` for the current join, or `undefined` while not joined.
@@ -1336,16 +1360,23 @@ impl WasmMembershipSnapshotSubscription {
     pub fn next_snapshot(&mut self) -> Result<JsValue, JsError> {
         if self.initial_pending {
             self.initial_pending = false;
-            return serde_wasm_bindgen::to_value(&self.inner.borrow().clone())
-                .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}")));
+            return snapshot_to_js(&self.inner.borrow());
         }
 
         match self.inner.has_changed() {
-            Ok(true) => serde_wasm_bindgen::to_value(&self.inner.borrow_and_update().clone())
-                .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}"))),
+            Ok(true) => snapshot_to_js(&self.inner.borrow_and_update()),
             Ok(false) | Err(_) => Ok(JsValue::NULL),
         }
     }
+}
+
+/// Plain JS objects, not ES `Map`s: the default serializer turns serde maps —
+/// `application`'s flattened properties, a transport's `extra_fields` — into
+/// `Map`s, which the TS types do not describe and `JSON.stringify` empties.
+fn snapshot_to_js(snapshot: &[JoinedMembership]) -> Result<JsValue, JsError> {
+    snapshot
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1381,7 +1412,10 @@ struct WasmStickyEventContent {
     msc4354_sticky_key: Option<String>,
     #[serde(default)]
     sticky_key: Option<String>,
-    application: Option<WasmApplication>,
+    /// The whole object: the core reads only `type`, the rest is the
+    /// application's and must reach the snapshot untouched.
+    #[serde(default)]
+    application: matrix_rtc_core::ApplicationInfo,
     member: Option<WasmMember>,
     #[serde(default)]
     transports: Option<WasmTransports>,
@@ -1410,12 +1444,6 @@ struct WasmRawRtcTransport {
     transport_type: String,
     #[serde(flatten)]
     extra_fields: std::collections::BTreeMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WasmApplication {
-    #[serde(rename = "type")]
-    kind: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1470,10 +1498,7 @@ impl From<WasmStickyEvent> for RawStickyEvent {
                     .msc4354_sticky_key
                     .or(value.content.sticky_key)
                     .unwrap_or_default(),
-                application: matrix_rtc_core::ApplicationInfo {
-                    application_type: value.content.application.map(|app| app.kind),
-                    extra: std::collections::BTreeMap::new(),
-                },
+                application: value.content.application,
                 member,
                 transports: value
                     .content
@@ -1849,6 +1874,125 @@ mod tests {
                 .await
                 .is_err(),
             "an encrypted key without its decrypted sender must be refused"
+        );
+    }
+
+    /// A peer's whole `application` object reaches the snapshot: the binding
+    /// must not keep only its `type` on the way in.
+    #[wasm_bindgen_test]
+    async fn a_snapshot_carries_the_peers_application_properties() {
+        let events = serde_json::json!([{
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "type": "m.rtc.member",
+            "content": {
+                "slot_id": "m.call#ROOM",
+                "sticky_key": "alice-device-a",
+                "application": { "type": "m.call", "m.call.intent": "video" },
+                "member": { "id": "alice-device-a", "membership": "join" },
+            },
+        }])
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+
+        let mut session = WasmRtcSession::new();
+        session.set_current_sticky_state(events).await.unwrap();
+
+        let mut subscription = session.subscribe_membership_snapshots();
+        let parsed: Vec<Value> =
+            serde_wasm_bindgen::from_value(subscription.next_snapshot().unwrap()).unwrap();
+        assert_eq!(parsed[0]["application"]["type"], "m.call");
+        assert_eq!(parsed[0]["application"]["m.call.intent"], "video");
+    }
+
+    /// What JS reads off a snapshot: `application` must be a plain object, not
+    /// an ES `Map` (whose `.type` is `undefined` and which `JSON.stringify`s to
+    /// `{}`). Read through `Reflect`, since `from_value` accepts both shapes.
+    #[wasm_bindgen_test]
+    async fn a_snapshot_reaches_js_as_plain_objects() {
+        let events = serde_json::json!([{
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "type": "m.rtc.member",
+            "content": {
+                "slot_id": "m.call#ROOM",
+                "sticky_key": "alice-device-a",
+                "application": { "type": "m.call", "m.call.intent": "video" },
+                "member": { "id": "alice-device-a", "membership": "join" },
+            },
+        }])
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+
+        let mut session = WasmRtcSession::new();
+        session.set_current_sticky_state(events).await.unwrap();
+
+        let snapshot = session
+            .subscribe_membership_snapshots()
+            .next_snapshot()
+            .unwrap();
+        let member = js_sys::Array::from(&snapshot).get(0);
+        let application = js_sys::Reflect::get(&member, &"application".into()).unwrap();
+        assert!(!application.is_instance_of::<js_sys::Map>());
+        assert_eq!(
+            js_sys::Reflect::get(&application, &"m.call.intent".into()).unwrap(),
+            "video"
+        );
+    }
+
+    /// Starting a call through the single-session API still rings the room, as
+    /// it did before the call features left the core.
+    #[wasm_bindgen_test]
+    async fn a_single_session_join_with_notify_rings_the_room() {
+        let client = js_sys::Object::new();
+        let set = |name: &str, args: &str, body: &str| {
+            let function = js_sys::Function::new_with_args(args, body);
+            js_sys::Reflect::set(&client, &JsValue::from_str(name), &function).unwrap();
+        };
+        set(
+            "sendStickyEvent",
+            "roomId,eventType,content,durationMs",
+            "(globalThis.__singleSessionSent ??= []).push(eventType); \
+             return Promise.resolve({ event_id: '$sticky' });",
+        );
+        set(
+            "sendDelayedEvent",
+            "roomId,eventType,content,delayMs",
+            "return Promise.resolve('delay-id');",
+        );
+        set(
+            "restartDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+        set(
+            "cancelDelayedEvent",
+            "roomId,delayId",
+            "return Promise.resolve();",
+        );
+
+        let params = serde_json::json!({
+            "user_id": "@alice:example.org",
+            "device_id": "DEVICEID",
+            "room_id": "!room:example.org",
+            "slot_id": "m.call#ROOM",
+            "application": "m.call",
+            "notify": { "notification_type": "ring" },
+        })
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+
+        let mut session = WasmRtcSession::new();
+        session.setup_command_sender(client.into());
+        session.join(params).await.expect("join should succeed");
+
+        let sent = js_sys::Reflect::get(&js_sys::global(), &"__singleSessionSent".into()).unwrap();
+        let sent: Vec<String> = serde_wasm_bindgen::from_value(sent).unwrap();
+        // Either spelling: the host writes the unstable wire type.
+        assert!(
+            sent.iter()
+                .any(|event_type| event_type.ends_with("rtc.notification")),
+            "no notification among the sent sticky events: {sent:?}"
         );
     }
 

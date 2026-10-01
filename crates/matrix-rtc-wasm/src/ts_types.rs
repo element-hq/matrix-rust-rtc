@@ -301,7 +301,8 @@ export interface MembershipSnapshot {
     /** Id of the member's latest membership event; moves on every sticky refresh. */
     membership_event_id: string | null;
     membership_ts: number | null;
-    application: string | null;
+    /** `content.application`: its `type` plus any application-defined properties. */
+    application: { type: string; [key: string]: unknown };
     /** Externally tagged: the core's typed transports, not the wire shape. */
     transports: (
         | { LiveKit: { livekit_service_url: string } }
