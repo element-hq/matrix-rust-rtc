@@ -8,14 +8,12 @@ package org.matrix.rtc
 import com.sun.jna.CallbackThreadInitializer
 
 /**
- * Media build: pin the callback interfaces that only the `media` feature's
- * bindings generate.
+ * Media build: nothing media-only to pin today.
  *
- * `OpenIdTokenProvider` is declared in `crates/matrix-rtc-ffi/src/media/`, so
- * uniffi emits no `uniffiCallbackInterfaceOpenIdTokenProvider` for the slim
- * artifact and naming it from shared code fails that build. The slim twin of
- * this file is a no-op; see [MatrixRtc.initialize] for why any of it happens.
+ * The host's `MatrixBackend` (tokens included) is part of the slim surface and
+ * is pinned by [MatrixRtc.initialize]. The variant split stays so a callback
+ * interface the `media` feature alone generates can be pinned here without
+ * naming it from shared code, which would fail the slim build.
  */
-internal fun pinMediaCallbackThreads(initializer: CallbackThreadInitializer) {
-    pinVTableCallbacks(uniffiCallbackInterfaceOpenIdTokenProvider.vtable, initializer)
-}
+@Suppress("UNUSED_PARAMETER")
+internal fun pinMediaCallbackThreads(initializer: CallbackThreadInitializer) = Unit

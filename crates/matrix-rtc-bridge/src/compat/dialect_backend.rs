@@ -291,3 +291,184 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         self.inner.rtc_transports().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use matrix_rtc_core::testing::MockBackend;
+    use matrix_rtc_core::{KEY_MESSAGE_TYPE, ToDeviceRecipient};
+    use serde_json::json;
+
+    use super::*;
+    use crate::compat::ElementCallCompat;
+    use crate::compat::ingest::outbound_dialect;
+
+    fn backend() -> (Arc<MockBackend>, DialectBackend<MockBackend>) {
+        let mock = Arc::new(MockBackend::new());
+        (mock.clone(), DialectBackend::new(mock))
+    }
+
+    fn dialect(compat: ElementCallCompat, room_id: &str) -> OutboundDialect {
+        outbound_dialect(
+            compat,
+            "@alice:example.org",
+            "DEVICE",
+            room_id,
+            "m.call#ROOM",
+        )
+    }
+
+    #[tokio::test]
+    async fn every_outbound_type_reaches_the_backend_in_its_wire_spelling() {
+        let (mock, backend) = backend();
+        backend
+            .send_sticky_event(
+                "!room:example.org".to_owned(),
+                "m.rtc.member".to_owned(),
+                json!({ "slot_id": "m.call#ROOM" }),
+                90_000,
+            )
+            .await
+            .unwrap();
+        backend
+            .send_state_event(
+                "!room:example.org".to_owned(),
+                matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+                "m.call#ROOM".to_owned(),
+                json!({ "status": "open" }),
+            )
+            .await
+            .unwrap();
+        backend
+            .send_to_device_message(
+                vec![ToDeviceRecipient::new("@bob:example.org", "BOBDEV")],
+                KEY_MESSAGE_TYPE.to_owned(),
+                json!({ "room_id": "!room:example.org" }),
+            )
+            .await
+            .unwrap();
+
+        let (_, event_type, _, duration) = mock.last_sticky_event().unwrap();
+        assert_eq!(event_type, "org.matrix.msc4143.rtc.member");
+        assert_eq!(
+            duration, 90_000,
+            "the sticky lifetime reaches the backend unchanged"
+        );
+        assert_eq!(
+            mock.state_events.lock().unwrap()[0].1,
+            "org.matrix.msc4143.rtc.slot"
+        );
+        assert_eq!(
+            mock.last_to_device_message().unwrap().2,
+            "org.matrix.msc4143.rtc.encryption_key"
+        );
+    }
+
+    /// The pre-sticky wire has no sticky map, so in that mode the notification
+    /// is an ordinary room event; in every other mode it stays sticky.
+    #[tokio::test]
+    async fn a_notification_goes_out_as_a_room_event_in_the_state_dialect() {
+        let (mock, backend) = backend();
+        backend.set_dialect(
+            "!legacy:example.org",
+            dialect(ElementCallCompat::StateEvents, "!legacy:example.org"),
+        );
+        let notification = json!({
+            "application": { "type": "m.call", "notification_type": "ring" },
+            "m.mentions": { "user_ids": [], "room": true },
+        });
+
+        for room_id in ["!legacy:example.org", "!modern:example.org"] {
+            backend
+                .send_sticky_event(
+                    room_id.to_owned(),
+                    "m.rtc.notification".to_owned(),
+                    notification.clone(),
+                    30_000,
+                )
+                .await
+                .unwrap();
+        }
+
+        let room_events = mock.room_events.lock().unwrap();
+        let sticky_events = mock.sticky_events.lock().unwrap();
+        assert_eq!(room_events.len(), 1);
+        assert_eq!(room_events[0].0, "!legacy:example.org");
+        assert_eq!(room_events[0].1, "org.matrix.msc4075.rtc.notification");
+        assert_eq!(sticky_events.len(), 1);
+        assert_eq!(sticky_events[0].0, "!modern:example.org");
+        assert_eq!(sticky_events[0].1, "org.matrix.msc4075.rtc.notification");
+    }
+
+    /// A to-device message names its room only inside the content, so that is
+    /// what decides the dialect — for that room alone.
+    #[tokio::test]
+    async fn a_media_key_takes_the_dialect_of_its_own_room() {
+        let (mock, backend) = backend();
+        backend.set_dialect(
+            "!legacy:example.org",
+            dialect(ElementCallCompat::StickyEvents, "!legacy:example.org"),
+        );
+        let key = |room_id: &str| {
+            json!({
+                "room_id": room_id,
+                "member_id": "MEMBER",
+                "media_key": { "index": 0, "key": "AAAA" },
+            })
+        };
+        let recipients = vec![ToDeviceRecipient::new("@bob:example.org", "BOBDEV")];
+
+        for room_id in ["!legacy:example.org", "!modern:example.org"] {
+            backend
+                .send_to_device_message(
+                    recipients.clone(),
+                    KEY_MESSAGE_TYPE.to_owned(),
+                    key(room_id),
+                )
+                .await
+                .unwrap();
+        }
+
+        let types: Vec<String> = mock
+            .to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, message_type, _)| message_type.clone())
+            .collect();
+        assert_eq!(
+            types,
+            [
+                "io.element.call.encryption_keys",
+                "org.matrix.msc4143.rtc.encryption_key",
+            ]
+        );
+    }
+
+    /// The pre-sticky delayed leave is a delayed state event: the wrapper
+    /// routes it, so a backend only ever sends what it is told.
+    #[tokio::test]
+    async fn a_pre_sticky_delayed_leave_is_a_delayed_state_event() {
+        let (mock, backend) = backend();
+        backend.set_dialect(
+            "!legacy:example.org",
+            dialect(ElementCallCompat::StateEvents, "!legacy:example.org"),
+        );
+        backend
+            .send_delayed_event(
+                "!legacy:example.org".to_owned(),
+                "m.rtc.member".to_owned(),
+                None,
+                json!({ "slot_id": "m.call#ROOM", "msc4354_sticky_key": "k", "member": { "membership": "leave" } }),
+                30_000,
+            )
+            .await
+            .unwrap();
+        let (_, event_type, state_key, content, _) = mock.last_delayed_event().unwrap();
+        assert_eq!(event_type, "org.matrix.msc3401.call.member");
+        assert_eq!(
+            state_key.as_deref(),
+            Some("_@alice:example.org_DEVICE_m.call")
+        );
+        assert_eq!(content, json!({}));
+    }
+}
