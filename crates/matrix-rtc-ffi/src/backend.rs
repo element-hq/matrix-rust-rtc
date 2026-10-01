@@ -59,6 +59,20 @@ impl FfiBackendError {
     }
 }
 
+/// What uniffi lifts when the host throws something other than an
+/// `FfiBackendError` (a Kotlin `IOException`, a Swift error of another type).
+/// Without it uniffi panics, and a panic in a room's feed task silently stops
+/// that room being fed; as an error it is one failed call like any other.
+impl From<uniffi::UnexpectedUniFFICallbackError> for FfiBackendError {
+    fn from(error: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Failed {
+            errcode: None,
+            status: None,
+            reason: format!("the host threw an unexpected error: {}", error.reason),
+        }
+    }
+}
+
 /// What the client reports about how an event arrived. `encrypted: false`
 /// means cleartext; the other two fields then mean nothing. Report only what
 /// the client says — a cross-signing status it cannot give stays `null`.
@@ -972,5 +986,28 @@ pub(crate) mod test_support {
         async fn rtc_transports(&self) -> Result<String, FfiBackendError> {
             Ok(self.transports_json.lock().unwrap().clone())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use uniffi::{LiftReturn, UnexpectedUniFFICallbackError};
+
+    use super::*;
+
+    /// The path uniffi takes when a host method throws an exception the
+    /// interface does not declare.
+    #[test]
+    fn an_unexpected_host_exception_is_an_error_not_a_panic() {
+        let lifted = <Result<String, FfiBackendError> as LiftReturn<crate::UniFfiTag>>::handle_callback_unexpected_error(
+            UnexpectedUniFFICallbackError::new("java.io.IOException: boom"),
+        );
+        let FfiBackendError::Failed {
+            errcode,
+            status,
+            reason,
+        } = lifted.expect_err("an error");
+        assert_eq!((errcode, status), (None, None));
+        assert!(reason.contains("java.io.IOException: boom"), "{reason}");
     }
 }
