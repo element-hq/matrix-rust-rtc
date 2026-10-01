@@ -1350,16 +1350,23 @@ impl WasmMembershipSnapshotSubscription {
     pub fn next_snapshot(&mut self) -> Result<JsValue, JsError> {
         if self.initial_pending {
             self.initial_pending = false;
-            return serde_wasm_bindgen::to_value(&self.inner.borrow().clone())
-                .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}")));
+            return snapshot_to_js(&self.inner.borrow());
         }
 
         match self.inner.has_changed() {
-            Ok(true) => serde_wasm_bindgen::to_value(&self.inner.borrow_and_update().clone())
-                .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}"))),
+            Ok(true) => snapshot_to_js(&self.inner.borrow_and_update()),
             Ok(false) | Err(_) => Ok(JsValue::NULL),
         }
     }
+}
+
+/// Plain JS objects, not ES `Map`s: the default serializer turns serde maps —
+/// `application`'s flattened properties, a transport's `extra_fields` — into
+/// `Map`s, which the TS types do not describe and `JSON.stringify` empties.
+fn snapshot_to_js(snapshot: &[JoinedMembership]) -> Result<JsValue, JsError> {
+    snapshot
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|err| JsError::new(&format!("failed to serialize snapshot: {err}")))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1886,6 +1893,41 @@ mod tests {
             serde_wasm_bindgen::from_value(subscription.next_snapshot().unwrap()).unwrap();
         assert_eq!(parsed[0]["application"]["type"], "m.call");
         assert_eq!(parsed[0]["application"]["m.call.intent"], "video");
+    }
+
+    /// What JS reads off a snapshot: `application` must be a plain object, not
+    /// an ES `Map` (whose `.type` is `undefined` and which `JSON.stringify`s to
+    /// `{}`). Read through `Reflect`, since `from_value` accepts both shapes.
+    #[wasm_bindgen_test]
+    async fn a_snapshot_reaches_js_as_plain_objects() {
+        let events = serde_json::json!([{
+            "room_id": "!room:example.org",
+            "sender": "@alice:example.org",
+            "type": "m.rtc.member",
+            "content": {
+                "slot_id": "m.call#ROOM",
+                "sticky_key": "alice-device-a",
+                "application": { "type": "m.call", "m.call.intent": "video" },
+                "member": { "id": "alice-device-a", "membership": "join" },
+            },
+        }])
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .unwrap();
+
+        let mut session = WasmRtcSession::new();
+        session.set_current_sticky_state(events).await.unwrap();
+
+        let snapshot = session
+            .subscribe_membership_snapshots()
+            .next_snapshot()
+            .unwrap();
+        let member = js_sys::Array::from(&snapshot).get(0);
+        let application = js_sys::Reflect::get(&member, &"application".into()).unwrap();
+        assert!(!application.is_instance_of::<js_sys::Map>());
+        assert_eq!(
+            js_sys::Reflect::get(&application, &"m.call.intent".into()).unwrap(),
+            "video"
+        );
     }
 
     #[wasm_bindgen_test]
