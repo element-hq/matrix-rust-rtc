@@ -17,7 +17,7 @@ knows what a LiveKit SFU is.
 | Feature | Effect |
 | --- | --- |
 | *(default)* | Nothing: the crate is empty without the SDK. |
-| `matrix-sdk` | `sdk`. Depends on upstream matrix-rust-sdk (rev in the workspace manifest) with its `unstable-msc4354` feature, for the MSC4354 sticky carrier, and on `matrix-rtc-call` for the dialect constants its subscriptions are keyed on. |
+| `matrix-sdk` | `sdk`. Depends on upstream matrix-rust-sdk (rev in the workspace manifest) with its `unstable-msc4354` feature, for the MSC4354 sticky carrier. |
 
 ## Testing
 

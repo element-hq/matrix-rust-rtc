@@ -47,8 +47,6 @@ use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
 
-use matrix_rtc_call::compat::STATE_MEMBER_EVENT_TYPE;
-
 // The sticky duration for `m.rtc.member` comes from the core
 // (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
 // half that interval to stay in the map.
@@ -748,22 +746,21 @@ async fn emit_room_subjects(
         }
     }
 
-    if subjects
-        .state_event_types
-        .iter()
-        .any(|event_type| event_type == STATE_MEMBER_EVENT_TYPE)
-    {
-        sink.on_state_events(
-            STATE_MEMBER_EVENT_TYPE.to_owned(),
-            legacy_state_snapshot(room).await,
-        );
+    // A type the SDK store already holds is read from it; one fetch answers
+    // every other requested type, each delivered under its own type: the
+    // library tells the spellings apart, not us.
+    for event_type in &subjects.state_event_types {
+        if held_by_store(event_type) {
+            sink.on_state_events(
+                event_type.clone(),
+                store_state_snapshot(room, event_type).await,
+            );
+        }
     }
-    // One fetch answers every other requested type, each delivered under its
-    // own type: the library tells the spellings apart, not us.
     let fetched: Vec<&String> = subjects
         .state_event_types
         .iter()
-        .filter(|event_type| *event_type != STATE_MEMBER_EVENT_TYPE)
+        .filter(|event_type| !held_by_store(event_type))
         .collect();
     if !fetched.is_empty() {
         match state_snapshot(room, &fetched).await {
@@ -892,19 +889,25 @@ async fn state_snapshot(room: &Room, event_types: &[&String]) -> Option<Vec<Even
     Some(events)
 }
 
-/// The room's `org.matrix.msc3401.call.member` state, raw, from the SDK store
-/// (that type is in sliding sync's default `required_state`). Stripped state
+/// Whether the SDK store keeps `event_type` current on its own, so it is read
+/// from there rather than fetched: `m.call.member` (the pre-sticky Element
+/// Call membership) is in sliding sync's default `required_state`.
+fn held_by_store(event_type: &str) -> bool {
+    StateEventType::from(event_type) == StateEventType::CallMember
+}
+
+/// The room's state of `event_type`, raw, from the SDK store. Stripped state
 /// belongs to a room we are only invited to and carries no `origin_server_ts`,
-/// so it is skipped. Temporary; see [`crate::compat`].
-async fn legacy_state_snapshot(room: &Room) -> Vec<EventIn> {
+/// so it is skipped.
+async fn store_state_snapshot(room: &Room, event_type: &str) -> Vec<EventIn> {
     let room_id = room.room_id().to_string();
-    let raw = match room.get_state_events(StateEventType::CallMember).await {
+    let raw = match room
+        .get_state_events(StateEventType::from(event_type))
+        .await
+    {
         Ok(raw) => raw,
         Err(error) => {
-            log::warn!(
-                "[{room_id}] could not read {STATE_MEMBER_EVENT_TYPE} state: {error}. Members of \
-                 a pre-sticky Element Call session will not appear.",
-            );
+            log::warn!("[{room_id}] could not read {event_type} state: {error}");
             return Vec::new();
         }
     };
@@ -916,7 +919,7 @@ async fn legacy_state_snapshot(room: &Room) -> Vec<EventIn> {
             Some(EventIn {
                 event_id: raw.get_field("event_id").ok().flatten()?,
                 sender: raw.get_field("sender").ok().flatten()?,
-                event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+                event_type: event_type.to_owned(),
                 state_key: raw.get_field("state_key").ok().flatten(),
                 origin_server_ts: raw.get_field("origin_server_ts").ok().flatten()?,
                 content: raw.get_field("content").ok().flatten()?,
@@ -1003,13 +1006,9 @@ fn register_timeline_receiver(
 
 #[cfg(test)]
 mod tests {
-    use matrix_rtc_core::{
-        EventOrigin, RawStickyEvent, RawStickyEventContent, RtcMembershipEvent, RtcTransport,
-    };
     use matrix_sdk::ruma::events::AnySyncTimelineEvent;
 
     use super::*;
-    use matrix_rtc_call::compat::element_call_state;
 
     fn wanted() -> Vec<String> {
         vec![
@@ -1108,75 +1107,5 @@ mod tests {
             }"#,
         );
         assert!(timeline_ingest_from_raw(&hand, None, &[]).is_none());
-    }
-
-    /// A join as observed from Element Call on the JS SDK, pre-sticky.
-    const EC_STATE_JOIN: &str = r#"{
-        "application": "m.call",
-        "call_id": "",
-        "scope": "m.room",
-        "device_id": "V5cP8FErcB",
-        "membershipID": "@alice:example.io:V5cP8FErcB",
-        "expires": 14400000,
-        "m.call.intent": "video",
-        "focus_active": { "type": "livekit", "focus_selection": "multi_sfu" },
-        "foci_preferred": [
-            {
-                "type": "livekit",
-                "livekit_alias": "!room:example.io",
-                "livekit_service_url": "https://mrtc.example.io/livekit/jwt"
-            }
-        ]
-    }"#;
-
-    /// The seam `compat::element_call_state` cannot test itself: that what it
-    /// emits parses as a core type and projects to a *joined* member.
-    #[test]
-    fn a_translated_pre_sticky_membership_is_a_joined_core_membership() {
-        let now = element_call_state::now_ms();
-        let events = [element_call_state::StateMemberEvent {
-            event_id: None,
-            sender: "@alice:example.io".to_owned(),
-            state_key: "_@alice:example.io_V5cP8FErcB_m.call".to_owned(),
-            origin_server_ts: now,
-            content: serde_json::from_str(EC_STATE_JOIN).expect("valid json"),
-        }];
-
-        let mut translated = element_call_state::translate_state_memberships(&events, now);
-        assert_eq!(translated.len(), 1, "a live join must survive translation");
-        let membership = translated.pop().unwrap();
-
-        let content: RawStickyEventContent = serde_json::from_value(membership.content)
-            .expect("the translation must produce parseable MSC4143 content");
-        let event = RawStickyEvent {
-            room_id: "!room:example.io".to_owned(),
-            event_id: membership.event_id,
-            sender: membership.sender,
-            origin: EventOrigin::claimed(membership.claimed_device_id),
-            event_type: "m.rtc.member".to_owned(),
-            content,
-        };
-
-        let joined = match event
-            .try_into_membership_event()
-            .expect("converts to a membership event")
-        {
-            RtcMembershipEvent::Joined(joined) => joined,
-            RtcMembershipEvent::Left(_) => panic!("a join must not project as a leave"),
-        };
-
-        assert_eq!(joined.slot_id, "m.call#ROOM");
-        assert_eq!(joined.sender, "@alice:example.io");
-        assert_eq!(joined.member_id, "@alice:example.io:V5cP8FErcB");
-        assert_eq!(joined.sticky_key, joined.member_id);
-        assert_eq!(joined.application.application_type(), Some("m.call"));
-        assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
-        assert_eq!(joined.origin.sender_device_id(), Some("V5cP8FErcB"));
-        assert_eq!(joined.origin.was_encrypted(), None);
-        assert!(matches!(
-            joined.transports.first(),
-            Some(RtcTransport::LiveKit(livekit))
-                if livekit.livekit_service_url == "https://mrtc.example.io/livekit/jwt"
-        ));
     }
 }

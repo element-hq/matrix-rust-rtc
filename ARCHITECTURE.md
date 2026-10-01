@@ -243,10 +243,10 @@ Membership is always applied as a complete set: a member whose event is absent f
     and to nobody else. The core still sees only MSC4143: the state events are
     translated into synthetic sticky memberships in the feeder, and the slot
     condition is left unenforced because that generation has no slot concept.
-  - Three things refuse to be JSON and so live outside `compat` as one `match`
-    each: the ruma request type (`sdk`), and — in `matrix-rtc-livekit`, because
-    both are MSC4195 rather than Matrix concerns — the token endpoint and the
-    identity derivation.
+  - Two things refuse to be JSON and so live outside `compat` as one `match`
+    each, in `matrix-rtc-livekit` because both are MSC4195 rather than Matrix
+    concerns: the token endpoint and the identity derivation. The backend knows
+    no dialect: it delivers whatever state types the feeder asks for.
 
 ## `crates/matrix-rtc-bridge`
 
@@ -257,8 +257,10 @@ Membership is always applied as a complete set: a member whose event is absent f
   `MatrixBackend` over a `matrix_sdk::Client` — Client-Server requests for the
   sends, and for the reads one task per room subscription that re-emits the
   complete sets on sticky-store and room-state wakes. It reads MSC4354 sticky
-  events (the SDK's `unstable-msc4354`) and, when asked for the type,
-  `org.matrix.msc3401.call.member` room state as well.
+  events (the SDK's `unstable-msc4354`) and the state types the feeder asks
+  for: from the SDK store for a type sliding sync keeps there (the pre-sticky
+  `m.call.member`, which it recognises through ruma), and from one `/state`
+  fetch for the rest. Depends on the core alone.
 
 ## `crates/matrix-rtc-media`
 

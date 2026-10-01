@@ -636,6 +636,10 @@ impl ElementCallStateDialect {
 
 #[cfg(test)]
 mod tests {
+    use matrix_rtc_core::{
+        EventOrigin, RawStickyEvent, RawStickyEventContent, RtcMembershipEvent, RtcTransport,
+    };
+
     use super::*;
 
     /// A join as observed from Element Call on the JS SDK, pre-sticky.
@@ -1226,5 +1230,75 @@ mod tests {
 
         let legacy = dialect().member_content(&spec, None);
         assert_eq!(legacy["foci_preferred"], json!([]));
+    }
+
+    /// A join as observed from Element Call on the JS SDK, pre-sticky.
+    const EC_STATE_JOIN: &str = r#"{
+        "application": "m.call",
+        "call_id": "",
+        "scope": "m.room",
+        "device_id": "V5cP8FErcB",
+        "membershipID": "@alice:example.io:V5cP8FErcB",
+        "expires": 14400000,
+        "m.call.intent": "video",
+        "focus_active": { "type": "livekit", "focus_selection": "multi_sfu" },
+        "foci_preferred": [
+            {
+                "type": "livekit",
+                "livekit_alias": "!room:example.io",
+                "livekit_service_url": "https://mrtc.example.io/livekit/jwt"
+            }
+        ]
+    }"#;
+
+    /// What this module emits parses as a core type and projects to a *joined*
+    /// member.
+    #[test]
+    fn a_translated_pre_sticky_membership_is_a_joined_core_membership() {
+        let now = now_ms();
+        let events = [StateMemberEvent {
+            event_id: None,
+            sender: "@alice:example.io".to_owned(),
+            state_key: "_@alice:example.io_V5cP8FErcB_m.call".to_owned(),
+            origin_server_ts: now,
+            content: serde_json::from_str(EC_STATE_JOIN).expect("valid json"),
+        }];
+
+        let mut translated = translate_state_memberships(&events, now);
+        assert_eq!(translated.len(), 1, "a live join must survive translation");
+        let membership = translated.pop().unwrap();
+
+        let content: RawStickyEventContent = serde_json::from_value(membership.content)
+            .expect("the translation must produce parseable MSC4143 content");
+        let event = RawStickyEvent {
+            room_id: "!room:example.io".to_owned(),
+            event_id: membership.event_id,
+            sender: membership.sender,
+            origin: EventOrigin::claimed(membership.claimed_device_id),
+            event_type: "m.rtc.member".to_owned(),
+            content,
+        };
+
+        let joined = match event
+            .try_into_membership_event()
+            .expect("converts to a membership event")
+        {
+            RtcMembershipEvent::Joined(joined) => joined,
+            RtcMembershipEvent::Left(_) => panic!("a join must not project as a leave"),
+        };
+
+        assert_eq!(joined.slot_id, "m.call#ROOM");
+        assert_eq!(joined.sender, "@alice:example.io");
+        assert_eq!(joined.member_id, "@alice:example.io:V5cP8FErcB");
+        assert_eq!(joined.sticky_key, joined.member_id);
+        assert_eq!(joined.application.application_type(), Some("m.call"));
+        assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
+        assert_eq!(joined.origin.sender_device_id(), Some("V5cP8FErcB"));
+        assert_eq!(joined.origin.was_encrypted(), None);
+        assert!(matches!(
+            joined.transports.first(),
+            Some(RtcTransport::LiveKit(livekit))
+                if livekit.livekit_service_url == "https://mrtc.example.io/livekit/jwt"
+        ));
     }
 }

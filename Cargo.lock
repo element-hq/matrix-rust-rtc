@@ -2687,7 +2687,6 @@ version = "0.4.0-rc.1"
 dependencies = [
  "async-trait",
  "log",
- "matrix-rtc-call",
  "matrix-rtc-core",
  "matrix-sdk",
  "matrix-sdk-base",
