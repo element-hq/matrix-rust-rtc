@@ -64,14 +64,8 @@ export class WebPeerApp {
     this.userId = session.userId;
     this.deviceId = session.deviceId;
 
-    this.manager = new bindings.WasmRtcSessionManager();
-    this.host = new MatrixHost({
-      sdk,
-      client: this.client,
-      managerOps: this.managerOps,
-      log: this.log,
-    });
-    this.manager.setup_command_sender(this.host.commandSender());
+    this.host = new MatrixHost({ sdk, client: this.client, log: this.log });
+    this.manager = new bindings.WasmRtcSessionManager(this.host);
 
     this.emit({ event: 'ready', user_id: this.userId, device_id: this.deviceId });
     return { userId: this.userId, deviceId: this.deviceId };
@@ -142,21 +136,22 @@ export class WebPeerApp {
     this.compat = compat;
     this.log(`joining ${roomId} / ${slotId} on focus ${focusUrl}`);
 
-    // Feed before joining: the manager must know the room's encryption state
-    // (it decides how the membership counts) before it publishes ours.
-    await this.host.attachRoom(this.manager, roomId, {
-      readsStateMembership: compat === 'state_events',
-    });
+    // Attach before joining: the manager subscribes to the room through the
+    // host and applies its current state (encryption, slots, members,
+    // membership) before publishing ours.
+    await this.managerOps.enqueue(() =>
+      this.manager.attachRoom(roomId, {
+        element_call_compat: compat === 'off' ? undefined : compat,
+      }),
+    );
 
     const memberId = await this.managerOps.enqueue(() =>
       this.manager.join({
-        user_id: this.userId,
-        device_id: this.deviceId,
         room_id: roomId,
         slot_id: slotId,
         application: 'm.call',
+        // The demo pins the focus it discovered; omit to take the homeserver's.
         transport: { type: 'livekit', livekit_service_url: focusUrl },
-        element_call_compat: compat === 'off' ? undefined : compat,
       }),
     );
     this.memberId = memberId;
@@ -166,7 +161,6 @@ export class WebPeerApp {
       bindings,
       livekit,
       managerOps: this.managerOps,
-      getOpenIdToken: () => this.client.getOpenIdToken(),
       roomOptions: { e2ee: { worker: new E2EEWorker() } },
     });
     this.call.onParticipants = (roster) => this.onRoster(roster);
@@ -231,7 +225,7 @@ export class WebPeerApp {
     }
     if (this.roomId) {
       await this.managerOps.enqueue(() => this.manager.leave(this.roomId, this.slotId, {}));
-      this.host.detach();
+      await this.managerOps.enqueue(() => this.manager.detachRoom(this.roomId));
     }
     this.emit({ event: 'left' });
   }

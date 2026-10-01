@@ -23,7 +23,7 @@
 //!
 //! [`CallJoinParams::notify`]: crate::CallJoinParams::notify
 
-use matrix_rtc_core::{JoinSessionParams, JoinedMembership, RtcCommandSender};
+use matrix_rtc_core::{JoinSessionParams, JoinedMembership, MatrixBackend};
 use serde_json::{Map, Value, json};
 
 /// Event type for MatrixRTC notifications (MSC4075).
@@ -252,8 +252,8 @@ fn is_own_participation(member: &JoinedMembership, params: &JoinSessionParams) -
 /// [`crate::CallSessionManager::join`] calls it; a host driving a bare core
 /// session calls it itself. Never fails the join: the user is in the call
 /// whether or not anyone else was told about it.
-pub async fn notify_session_started<T: RtcCommandSender + ?Sized>(
-    command_sender: &T,
+pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
+    backend: &T,
     notify: &NotifyConfig,
     params: &JoinSessionParams,
     members: &[JoinedMembership],
@@ -306,7 +306,7 @@ pub async fn notify_session_started<T: RtcCommandSender + ?Sized>(
         notify.notification_type.as_str(),
     );
 
-    if let Err(error) = command_sender
+    if let Err(error) = backend
         .send_sticky_event(
             params.room_id.clone(),
             NOTIFICATION_EVENT_TYPE.to_owned(),

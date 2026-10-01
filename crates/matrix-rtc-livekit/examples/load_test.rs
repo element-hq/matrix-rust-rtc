@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, open_slot};
 use matrix_rtc_media::{
@@ -599,7 +599,9 @@ impl Fleet {
                 CallOptions {
                     slot_id: args.slot_id.clone(),
                     application: args.application.clone(),
-                    livekit_service_url_fallback: Some(args.livekit_url.clone()),
+                    livekit_transport: Some(LiveKitTransport {
+                        livekit_service_url: args.livekit_url.clone(),
+                    }),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
                     element_call_compat: args.element_call_compat.into(),

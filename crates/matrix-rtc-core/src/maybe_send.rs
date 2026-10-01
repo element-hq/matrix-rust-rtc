@@ -5,7 +5,7 @@
 
 //! Thread-safety bounds that hold off `wasm32` and vanish on it.
 //!
-//! The host-facing traits in this crate ([`RtcCommandSender`],
+//! The host-facing traits in this crate ([`MatrixBackend`],
 //! [`EncryptionKeySignalHandler`]) are implemented on native by types uniffi
 //! moves between threads, and on `wasm32` by types holding a `JsValue`, which is
 //! `!Send`, `!Sync`, and cannot be made otherwise. So a `Send + Sync` supertrait
@@ -15,7 +15,7 @@
 //! matrix-rust-sdk solves the same problem with `SendOutsideWasm` /
 //! `SyncOutsideWasm` in `matrix-sdk-common`.
 //!
-//! [`RtcCommandSender`]: crate::RtcCommandSender
+//! [`MatrixBackend`]: crate::MatrixBackend
 //! [`EncryptionKeySignalHandler`]: crate::EncryptionKeySignalHandler
 
 /// `Send + Sync` off `wasm32`, and no constraint at all on it.

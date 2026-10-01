@@ -83,7 +83,7 @@ What lets an application sit on the core without the core knowing it:
   joined memberships, since the core spawns nothing to await the watch.
 - **`host/`**: `send_room_event`, `redact_event` and `RawTimelineEvent` exist for
   applications; the core uses none of them.
-- **`ApplicationIntake`**: how the matrix-sdk bridge feeds an application
+- **`ApplicationIntake`**: how the bridge's feeder feeds an application
   timeline events and relations without knowing which application it is.
 
 ## Who drives the call
@@ -93,10 +93,24 @@ place it could go — it is because there are **two**, and neither is on a defau
 dependency path. `matrix-sdk` enters the workspace only through the `matrix-sdk`
 feature of `matrix-rtc-bridge` and `matrix-rtc-livekit`, which is off by default.
 
-`RtcCommandSender` (defined in `matrix-rtc-core`) is the seam that makes both
-topologies work: `FfiCommandSender` (a host callback) and
-`matrix_rtc_bridge::SdkCommandSender` (a real `matrix_sdk::Client`) are two
-implementations of one trait, and the core cannot tell them apart.
+`MatrixBackend` (defined in `matrix-rtc-core`) is the seam that makes both
+topologies work. It is the library's one view of a Matrix client, in both
+directions: the sends (sticky, state, delayed and plain room events, redactions,
+Olm-encrypted to-device messages) and the reads (a per-room subscription that
+delivers the room's *complete current* sticky set, the state events of the
+requested types, its joined members and its encryption flag — first on
+subscribe, again on every change — plus to-device messages, `/relations`, the
+OpenID token and `GET /rtc/transports`). The host's app (through the FFI or
+wasm trait) and `matrix_rtc_bridge::SdkBackend` (a real `matrix_sdk::Client`)
+are two implementations, and the core cannot tell them apart.
+
+The core does nothing with the read half itself — it spawns no tasks. The
+**feeder** in `matrix-rtc-bridge` (`RoomFeeder`, `SessionFeeder`) subscribes
+through the backend, orders what arrives (encryption and slots and members
+before the first membership, so nobody is briefly joined to a closed slot),
+derives `EventOrigin`/`KeyOrigin` from the decryption facts the client
+reported, applies the pre-2026 compatibility funnels for the mode the room was
+attached in, and feeds `CallSessionManager`. One copy, for every host.
 
 ### Host-driven — production mobile and web
 
@@ -108,8 +122,8 @@ consumer, not a dependency:
 │ host app and its own Matrix client                     │
 │ matrix-rust-sdk (mobile) / matrix-js-sdk (web)         │
 └────────────────────────────────────────────────────────┘
-        │ outbound commands      ▲ inbound events
-        │ CommandSenderCallback  │ stickies + keys
+        │ sends                  ▲ subscriptions
+        │ MatrixBackend (trait)  │ RoomSink / ToDeviceSink
         ▼                        │
 ┌────────────────────────────────────────────────────────┐
 │ matrix-rtc-ffi   /   matrix-rtc-wasm                   │
@@ -117,7 +131,7 @@ consumer, not a dependency:
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-core  (+ media / livekit under "media")
+   matrix-rtc-bridge feeder ──▶ matrix-rtc-core  (+ media / livekit under "media")
 ```
 
 The bindings carry no Matrix SDK at all — not even transitively, and not even
@@ -140,38 +154,38 @@ below**. This is the topology of the e2e call test, `join_and_record`,
                               ▼
 ┌────────────────────────────────────────────────────────┐
 │ matrix_rtc_livekit::call::Call                         │
-│ matrix_rtc_bridge::SdkCommandSender ──▶ matrix_sdk     │
+│ matrix_rtc_bridge::SdkBackend ──▶ matrix_sdk           │
 │ both behind feature "matrix-sdk", off by default       │
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-core
+   matrix-rtc-bridge feeder ──▶ matrix-rtc-core
 ```
 
-### The consequence worth knowing
+### What the two topologies share
 
-**`call::Call` exists only in the Rust-driven topology.** It is gated on
-`matrix-sdk`, the FFI does not enable that feature, so the FFI cannot use
-`Call::join` and hand-rolls the equivalent wiring in `src/media/session.rs` plus
-`RtcSessionManagerHandle`. The workspace therefore has two implementations of
-"join a slot and attach media" — a facade that compiles for only half its
-consumers.
-
-That is what makes extracting `Call::join`'s transport-agnostic half into
-`matrix-rtc-bridge` worthwhile rather than cosmetic: that half needs an
-`RtcCommandSender`, not a `Client`, so it would serve both topologies and let the
-two implementations converge.
+`call::Call` still exists only in the Rust-driven topology — it owns a
+`matrix_sdk::Client`, so it is gated on `matrix-sdk`. But the wiring under it
+is no longer its own: `Call::join`, the FFI's `RtcSessionManagerHandle` and the
+wasm `WasmRtcSessionManager` all do the same three things — wrap the backend in
+`DialectBackend`, start the `SessionFeeder`, attach rooms through `RoomFeeder`
+— and then join. What differs between them is only where the backend comes
+from and how the feeder's run loop is spawned (`tokio::spawn`, the FFI runtime,
+`spawn_local`).
 
 ## High-level data flow
 
 This is the host-driven topology above, in detail.
 
-1. A Matrix client receives a sticky event (`MSC4354`) for MatrixRTC membership (`MSC4143`).
-2. Platform binding converts the incoming shape into a core input event.
-3. `RtcSessionManager` ingests a room-scoped initial sticky snapshot or incremental sticky update.
+1. The host attaches a room (`attach_room` / `attachRoom`), naming its compatibility mode.
+2. The feeder asks the backend to `subscribe_room` for what that mode needs; the host's client
+   delivers the current sets into the `RoomSink` and keeps delivering them as they change.
+3. The feeder applies encryption, slot state and joined members first, then translates the
+   sticky (or, pre-sticky, state) member events — content verbatim plus the client's decryption
+   facts — into `RawStickyEvent`s and hands the whole set to `RtcSessionManager`.
 4. The manager groups events by `(room_id, slot_id)` and forwards each batch once to a single-session `RtcSession`.
 
-At this stage there is no persistence, network transport, or encryption key distribution logic yet.
+Membership is always applied as a complete set: a member whose event is absent from the set has left.
 
 ## Crate boundaries
 
@@ -182,7 +196,9 @@ At this stage there is no persistence, network transport, or encryption key dist
 - `RtcSessionManager` owns `RtcSession`s keyed by `(room_id, slot_id)`.
 - `ApplicationInfo` carries the whole `application` object both ways; the core
   reads only `type`.
-- `testing::MockCommandSender` under the `testing` feature.
+- `MatrixBackend`, the host's contract (`host/backend.rs`), with the `EventIn`
+  / `ToDeviceMessageIn` carriers the read half delivers; `testing::MockBackend`
+  under the `testing` feature.
 
 ## `crates/matrix-rtc-call`
 
@@ -197,19 +213,23 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 - The Matrix side of the stack, and deliberately transport-free — nothing in it
   knows what a LiveKit SFU is, so a second transport reuses it unchanged.
-- `sdk` (behind the **`matrix-sdk` feature**): `SdkCommandSender` implements the
-  core's `RtcCommandSender`, turning outbound commands (join/leave sticky events,
-  the dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key`
-  to-device messages) into Client-Server requests; `run_membership_bridge` feeds
-  the room's live membership, and the timeline events and relations it asks
-  for, into an `ApplicationIntake`. It reads MSC4354
-  sticky events (the SDK's `unstable-msc4354`) and, in the pre-sticky
-  `ElementCallCompat::StateEvents` mode, `org.matrix.msc3401.call.member` room
-  state as well.
-- `OpenIdTokenSource` (always available): the host's route to a Matrix OpenID
-  token, which a transport exchanges for its own credentials. The trait is
-  unconditional so a transport can name it; the `matrix_sdk::Client` impl sits
-  behind the feature.
+- `feeder` (always available): `RoomFeeder::attach` subscribes a room through
+  the backend and runs the routing described under "Who drives the call";
+  `SessionFeeder` does the same for to-device keys. `RoomAttachment::seeded`
+  resolves once the room's current state has been applied, which is what the
+  bindings' `attach_room` awaits.
+- `compat::dialect_backend::DialectBackend` (always available): the one
+  `MatrixBackend` wrapper that applies the outbound half of a room's dialect
+  (member-event routing, legacy key type, pre-sticky leave) before delegating.
+  Every binding wraps its backend in it; nothing else rewrites outbound JSON.
+- `transports::choose`: the library's transport choice (first LiveKit entry of
+  the backend's `rtc_transports()`, unless the join names one).
+- `sdk` (behind the **`matrix-sdk` feature**): `SdkBackend` implements
+  `MatrixBackend` over a `matrix_sdk::Client` — Client-Server requests for the
+  sends, and for the reads one task per room subscription that re-emits the
+  complete sets on sticky-store and room-state wakes. It reads MSC4354 sticky
+  events (the SDK's `unstable-msc4354`) and, when asked for the type,
+  `org.matrix.msc3401.call.member` room state as well.
 - `compat` (always available): interop with MatrixRTC implementations that predate
   the 2026 MSC4143 rewrite — today only Element Call on the JS SDK, the sole other
   implementation available to test against. Pure JSON translation with no Matrix
@@ -229,8 +249,8 @@ At this stage there is no persistence, network transport, or encryption key dist
     participant identity, and the pre-MSC4195 `/sfu/get` token endpoint. Opt-in in
     both directions, and not additive — such a call is visible to that generation
     and to nobody else. The core still sees only MSC4143: the state events are
-    translated into synthetic sticky memberships in `sdk`, and the slot condition
-    is left unenforced because that generation has no slot concept.
+    translated into synthetic sticky memberships in the feeder, and the slot
+    condition is left unenforced because that generation has no slot concept.
   - Three things refuse to be JSON and so live outside `compat` as one `match`
     each: the ruma request type (`sdk`), and — in `matrix-rtc-livekit`, because
     both are MSC4195 rather than Matrix concerns — the token endpoint and the
@@ -291,12 +311,12 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 ## `crates/matrix-rtc-wasm`
 
-- Exposes `WasmRtcSessionManager` to JavaScript.
-- Accepts `JsValue` payloads for snapshots and updates and deserializes via `serde-wasm-bindgen`.
-- Maps JSON fields to core sticky event DTOs.
+- Exposes `WasmRtcSessionManager` to JavaScript, constructed over the page's
+  `MatrixBackendHost` (`backend.rs`: `JsBackend` adapts the JS object to the
+  core trait; `WasmRoomSink`/`WasmToDeviceSink` are the sinks the host pushes
+  into). `attachRoom`/`detachRoom` run the bridge feeder on `spawn_local`.
 - Host-driven hooks the page must call: `heartbeat` on an interval while
-  joined (`HEARTBEAT_INTERVAL_MS`), `receiveEncryptionKey` per decrypted
-  key to-device message, `flushDueKeyRotation` when told a switch
+  joined (`HEARTBEAT_INTERVAL_MS`), `flushDueKeyRotation` when told a switch
   completed; plus `openSlot`/`closeSlot`.
 - `media/`: `connectMedia` attaches media to a joined slot — the shared
   `CallEngine` (roster + multi-focus pool) over `JsMediaTransport`, a JS
@@ -315,6 +335,10 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Browser-first JavaScript packaging around `crates/matrix-rtc-wasm`.
 - Uses `wasm-pack` to generate browser and Node.js runtime bundles into ignored `pkg/` subdirectories.
 - Keeps generated JavaScript/WASM artifacts out of git while providing a small JS test surface.
+- `src/matrix-js-sdk-host.mjs` (export `./matrix-js-sdk-host`): `MatrixHost`,
+  the `MatrixBackendHost` over matrix-js-sdk — sends, the per-room
+  subscription (complete sets on subscribe and on every change, decrypted,
+  with megolm sender attribution) and to-device keys with their Olm metadata.
 - `src/matrix-rtc-call.mjs` (export `./call`): the `MatrixRtcCall` wrapper —
   implements the media delegate over `livekit-client` (optional peer
   dependency, injected), drives the heartbeat, and joins roster entries to
@@ -325,11 +349,12 @@ At this stage there is no persistence, network transport, or encryption key dist
 - Exposes UniFFI objects and records for Swift/Kotlin consumers.
 - Keeps FFI DTOs local to the crate and converts them into core DTOs.
 - Preserves session subscription semantics through a polling subscription object.
-- Signalling extras for media hosts (always available): `transports` flow
-  through both directions (`transports_json` passthrough on inbound sticky
-  events; typed `FfiRtcTransport` on membership records) and decrypted
-  `m.rtc.encryption_key` to-device messages are fed in via
-  `RtcSessionManagerHandle::receive_encryption_key`.
+- The host implements the `MatrixBackend` foreign trait (`backend.rs`) and
+  constructs `RtcSessionManagerHandle` over it; `attach_room(room_id, options)`
+  subscribes through it and resolves once the room's current state is applied,
+  `detach_room` leaves and unsubscribes. Inbound events reach the library only
+  through the `RoomSink`/`ToDeviceSink` objects the subscriptions hand the host
+  — there are no feed methods on the handle.
 - Behind the **`media` cargo feature** (default off — pulls the LiveKit
   client and libwebrtc, ~8–15 MB per ABI): `src/media/` exposes the
   transport-agnostic media model to mobile. The host joins the slot through
@@ -339,9 +364,8 @@ At this stage there is no persistence, network transport, or encryption key dist
   pull → Kotlin `Flow` / Swift `AsyncStream`), the participant roster,
   `set_constraints`, frame streams (audio frames by value; video frames as
   objects with safe copies *and* zero-copy plane pointers), and local
-  publications the host pushes captured PCM/I420 into. OpenID tokens come
-  from a host-implemented `OpenIdTokenProvider` (async foreign trait);
-  outbound keys ride the existing `CommandSenderCallback`. All media work
+  publications the host pushes captured PCM/I420 into. OpenID tokens and
+  outbound keys go through the same `MatrixBackend`. All media work
   runs on a dedicated multithreaded tokio runtime — the manager's `?Send`
   futures never touch it. Android gets a `JNI_OnLoad` that initialises
   libwebrtc.
@@ -355,8 +379,8 @@ At this stage there is no persistence, network transport, or encryption key dist
   hash derivations (`identity`), drives a LiveKit `Room` (`session`), and bridges
   core media keys into LiveKit per-participant frame encryption (`keys`,
   `MediaKeyBridge` → `KeyProvider`, HKDF mode, GCM frames).
-- Obtains the Matrix OpenID token via `matrix-rtc-bridge`'s `OpenIdTokenSource`
-  trait, so the crate is not hard-wired to a particular Matrix SDK. `MemberClaims`
+- Obtains the Matrix OpenID token via the core's `MatrixBackend::openid_token`,
+  so the crate is not hard-wired to a particular Matrix SDK. `MemberClaims`
   stays here: those are the `/get_token` request body's claims, which no
   homeserver ever sees.
 - Implements `matrix-rtc-media`'s transport traits in `transport_impl`
@@ -365,20 +389,18 @@ At this stage there is no persistence, network transport, or encryption key dist
   translation, and `NativeAudioStream` → owned PCM frame streams behind
   `RemoteTrackHandle`.
 - Behind `matrix-sdk` it ships `call` — a `Call::join`/`Call::leave` facade that
-  composes `matrix-rtc-bridge`'s signalling with this transport: membership, key
-  exchange, transport discovery, the E2EE SFU connection, and a `CallEngine` in
-  one handle (the crate README's quick start; also what the e2e test drives).
+  composes `matrix-rtc-bridge`'s signalling (`SdkBackend` + the feeder) with
+  this transport: membership, key exchange, the library's transport choice, the
+  E2EE SFU connection, and a `CallEngine` in one handle (the crate README's
+  quick start; also what the e2e test drives).
   `Call::subscribe_call_events`/`Call::participants` are the transport-agnostic
   surface; the raw `Call::events`/`Call::session` accessors remain during the
-  transition. `Call::join` is currently the only place the Matrix and media
-  halves are interleaved — extracting its transport-agnostic half into the bridge
-  is a known follow-up.
+  transition.
 - Selects the pre-2026 compatibility mode per call via
   `CallOptions::element_call_compat`, and owns the two parts of it that refuse to
   be JSON and so cannot live in `matrix-rtc-bridge`'s `compat`: the token endpoint
   (`TokenEndpoint`, `token`/`lib`) and the participant-identity derivation
-  (`identity_mapper`, which hashes per MSC4195 — a LiveKit document). Also
-  `call::register_legacy_key_receiver`, for that generation's to-device key type.
+  (`identity_mapper`, which hashes per MSC4195 — a LiveKit document).
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
 
 ## Spec alignment
@@ -529,19 +551,19 @@ protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven by
   has not seen (`pending_relation_lookups`), the host answers each with
   `rel_type=m.annotation`, `event_type=m.reaction` (`on_relations_received`), and
   only hands are taken from the answer — an hour-old applause is not replayed.
-  The matrix-sdk bridge and the `matrix-js-sdk` host module do this on every
-  tick; an FFI host does it itself, one request per new membership event id.
+  The feeder does this for every host after each membership apply, one
+  `MatrixBackend::relations` request per new membership event id.
 - **Inbound needed a new intake.** The core only ever saw sticky, slot and
   to-device traffic. `CallSessionManager::on_room_timeline_events` and
   `on_event_redacted` route by *room* — a reaction names no slot — to every
-  session of the room, each keeping what relates to its own members. The matrix-sdk
-  bridge feeds them from a room event handler (`register_timeline_receiver` →
-  `run_timeline_bridge`, the same `Send`-handler-to-`spawn_local`-pump shape as
-  media keys); the web host from `RoomEvent.Timeline`, `MatrixEventEvent.Decrypted`
-  and `RoomEvent.Redaction`.
-- **Outbound needed two commands.** `RtcCommandSender::send_room_event` (a plain
+  session of the room, each keeping what relates to its own members. They arrive
+  through the room subscription's `on_timeline_events`/`on_redaction`, which the
+  feeder subscribes to for the application's `timeline_event_types`
+  (`SdkBackend` from a room event handler; the web host from `RoomEvent.Timeline`,
+  `MatrixEventEvent.Decrypted` and `RoomEvent.Redaction`).
+- **Outbound needed two sends.** `MatrixBackend::send_room_event` (a plain
   message-like send, encrypted by the client SDK in an encrypted room) and
-  `redact_event`, mirrored on the uniffi callback and the JS host object.
+  `redact_event`.
 
 The media layer merges the result onto the roster: `Participant.hand_raised_at_ms`
 plus `CallEvent::HandRaised` / `HandLowered` / `Reaction`, so a UI can order
@@ -604,19 +626,20 @@ an encrypted room. That and the sending device are one value,
 decryption metadata — a cleartext event cannot carry a sending device, and the
 type makes that unrepresentable. `EventOrigin::Unknown` is distinct from
 `Cleartext`: it means the host did not report, so the rule is skipped rather
-than failed. The flat `sender_device_id` / `was_encrypted` pair survives only in
-the wasm and FFI wire records, which converge into the enum at the boundary.
+than failed. A host never builds an `EventOrigin`: it reports what its client
+can honestly say — `EventEncryption::{Cleartext, Encrypted { sender_device_id,
+sender_cross_signed }}` on each `EventIn` — and the feeder derives the origin
+(and, for keys, `KeyOrigin`) from it.
 
 ### Transports and who chooses them
 
-Transport discovery is deliberately **not** in the core. Which transport to
-publish on is an application decision: the app calls
-`GET /_matrix/client/v1/rtc/transports` itself and passes the result into
-`join`. The core has no HTTP of its own, and adding a fetch would have meant
-every host implementing one whose result it then handed back to itself.
-The `e2e_call` integration test (`crates/matrix-rtc-livekit/tests/e2e_call/`)
-shows the pattern, using ruma's `api::client::rtc::transports` endpoint and
-falling back to a configured URL where the homeserver has not implemented it.
+The core has no HTTP of its own; `GET /_matrix/client/v1/rtc/transports` is
+the backend's `rtc_transports()`, returned raw. The **library** then chooses
+(`matrix_rtc_bridge::transports::choose`): the first LiveKit entry the
+homeserver advertises, unless the join names a transport — kept as an override
+for tests, debugging and pinning a specific focus. A homeserver without the
+endpoint reports `[]`, and a join with no override then fails with a clear
+message rather than guessing.
 
 What the core does model is the *intent*, via `TransportIntent`:
 
@@ -630,25 +653,22 @@ What the core does model is the *intent*, via `TransportIntent`:
 
 Still outstanding:
 
-1. **Prompt reaction to slot changes** — the Matrix bridge re-reads room state
-   on sticky-event ticks, so a slot closing in an otherwise idle room is noticed
-   late. A room-state subscription would fix it.
-2. **Mid-session renegotiation** — a slot that changes its encryption mechanism
+1. **Mid-session renegotiation** — a slot that changes its encryption mechanism
    while a session is live keeps the mechanism negotiated at join.
-3. **Slot state comes from a server fetch, not the store** — sliding sync only
-   delivers state types listed in `required_state`, and the SDK's room-list
-   defaults do not include the MSC4143 slot type, so the local store reports
-   every room as slotless (which the core reads as "slot closed, everyone
-   left"). The bridge therefore fetches `GET /rooms/{id}/state` on each tick
-   and skips the update when the fetch fails. The real fix is adding the slot
-   type to the SDK's sliding sync `required_state`, then reverting
-   `slot_snapshot` to the state store.
-4. **A unified `CallEvent` stream on the `Call` facade** — landed as
+2. **Slot state comes from a server fetch, not the store** (`SdkBackend`) —
+   sliding sync only delivers state types listed in `required_state`, and the
+   SDK's room-list defaults do not include the MSC4143 slot type, so the local
+   store reports every room as slotless (which the core reads as "slot closed,
+   everyone left"). The backend therefore fetches `GET /rooms/{id}/state` on
+   each wake and skips the set when the fetch fails. The real fix is adding the
+   slot type to the SDK's sliding sync `required_state`, then reading the state
+   store.
+3. **A unified `CallEvent` stream on the `Call` facade** — landed as
    `matrix-rtc-media::CallEvent` via `Call::subscribe_call_events` (peer
    joined/left, stream started/stopped, key imported, connection health,
    ended-with-reason). Remaining: migrate the e2e test and examples off the
    raw `Call::events`/`Call::session` accessors and delete them, and surface
-   slot-close (item 1) as `CallEvent::Ended`.
+   slot-close as `CallEvent::Ended`.
 
 ## Logging
 

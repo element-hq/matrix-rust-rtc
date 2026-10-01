@@ -112,7 +112,8 @@ object MatrixRtc {
         // covered without another edit here.
         for (vtable in arrayOf(
             uniffiCallbackInterfaceRtcLogSink.vtable,
-            uniffiCallbackInterfaceCommandSenderCallback.vtable,
+            uniffiCallbackInterfaceMatrixBackend.vtable,
+            uniffiCallbackInterfaceBackendSubscription.vtable,
         )) {
             pinVTableCallbacks(vtable, initializer)
         }

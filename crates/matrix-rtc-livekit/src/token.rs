@@ -10,7 +10,7 @@
 //! module only POSTs what that one builds. Obtaining the OpenID token itself is
 //! a Client-Server API concern and belongs to [`matrix_rtc_bridge`]: the host
 //! supplies one through
-//! [`OpenIdTokenSource`](matrix_rtc_bridge::OpenIdTokenSource), so nothing here
+//! [`MatrixBackend`](matrix_rtc_core::MatrixBackend), so nothing here
 //! is wired to a particular Matrix SDK.
 //!
 //! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195

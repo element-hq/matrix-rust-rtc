@@ -6,7 +6,7 @@
 //! The browser LiveKit transport: `matrix-rtc-media`'s transport traits over a
 //! JS delegate driving livekit-js.
 //!
-//! The division of labour mirrors [`JsCommandSender`](crate::JsCommandSender):
+//! The division of labour mirrors [`JsBackend`](crate::backend::JsBackend):
 //! Rust owns the protocol — token request building and response decoding
 //! (`matrix-rtc-livekit-proto`), identity derivation, connection keying, and
 //! the engine's pool/backoff policy — while JS owns the IO: the OpenID token
@@ -18,8 +18,6 @@
 //!
 //! The delegate object must implement:
 //!
-//! - `getOpenIdToken() -> Promise<{access_token, token_type,
-//!   matrix_server_name, expires_in}>`
 //! - `fetchJson(url, body) -> Promise<{status, body}>` — POST `body` (a plain
 //!   object) as JSON to `url`, resolving with the HTTP status and the raw
 //!   response text
@@ -37,8 +35,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
-use matrix_rtc_bridge::OpenIdToken;
-use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
+use matrix_rtc_core::{JoinedMembership, MatrixBackend, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_livekit_proto::token::{get_token_request, legacy_token_request, parse_sfu_token};
 use matrix_rtc_livekit_proto::{SfuToken, TokenEndpoint};
 use matrix_rtc_media::keys::FrameKeyRing;
@@ -288,6 +285,8 @@ struct ConnectRequest<'a> {
 /// `matrix-rtc-media`'s transport over the JS delegate.
 pub(crate) struct JsMediaTransport {
     delegate: JsValue,
+    /// The page's Matrix backend, which answers the OpenID token requests.
+    backend: Arc<dyn MatrixBackend>,
     identity_mapper: RtcIdentityMapper,
     token_endpoint: TokenEndpoint,
 }
@@ -295,17 +294,19 @@ pub(crate) struct JsMediaTransport {
 impl JsMediaTransport {
     pub(crate) fn new(
         delegate: JsValue,
+        backend: Arc<dyn MatrixBackend>,
         identity_mapper: RtcIdentityMapper,
         token_endpoint: TokenEndpoint,
     ) -> Self {
         Self {
             delegate,
+            backend,
             identity_mapper,
             token_endpoint,
         }
     }
 
-    /// Obtain a fresh OpenID token from the delegate and exchange it for an
+    /// Obtain a fresh OpenID token from the backend and exchange it for an
     /// SFU JWT: Rust builds the request and decodes the response
     /// (`matrix-rtc-livekit-proto`), the delegate performs the fetch.
     async fn acquire_token(
@@ -313,10 +314,11 @@ impl JsMediaTransport {
         livekit_service_url: &str,
         ctx: &ConnectionContext,
     ) -> Result<SfuToken, TransportError> {
-        let openid = call_delegate(&self.delegate, "getOpenIdToken", &[]).await?;
-        let openid: OpenIdToken = serde_wasm_bindgen::from_value(openid).map_err(|error| {
-            TransportError::Connect(format!("getOpenIdToken resolved to a non-token: {error}"))
-        })?;
+        let openid = self
+            .backend
+            .openid_token()
+            .await
+            .map_err(|error| TransportError::Connect(format!("openid token: {error}")))?;
 
         let (url, body) = match self.token_endpoint {
             TokenEndpoint::Msc4195 => get_token_request(

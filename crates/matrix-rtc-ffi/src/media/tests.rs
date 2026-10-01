@@ -8,133 +8,17 @@
 //! Rust here). Run with `cargo test -p matrix-rtc-ffi --features media` —
 //! they need the libwebrtc build, but no SFU and no homeserver.
 
-use std::sync::Arc;
-
-use crate::commands::{
-    CommandSenderCallback, CommandSenderError, FfiToDeviceDelivery, FfiToDeviceRecipient,
-    FfiTransportConfig,
-};
-use crate::{FfiJoinSessionParams, RtcSessionManagerHandle};
+use crate::backend::test_support::MockHost;
+use crate::backend::{FfiEventEncryption, FfiEventIn};
+use crate::params::FfiTransportConfig;
+use crate::{FfiAttachOptions, FfiJoinSessionParams, RtcSessionManagerHandle};
 
 use super::session::{MediaSessionConfig, connect_media_session};
 use super::types::{
-    FfiLocalState, FfiMediaConstraints, FfiOpenIdToken, FfiStreamKind, FfiStreamRef, FfiTileId,
-    FfiTileRoster, FfiVideoDetail, OpenIdTokenProvider, zip_stream_stats,
+    FfiLocalState, FfiMediaConstraints, FfiStreamKind, FfiStreamRef, FfiTileId, FfiTileRoster,
+    FfiVideoDetail, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
-
-/// A host command sender that accepts everything (the signalling side is not
-/// under test here).
-struct NoopCommands;
-
-#[async_trait::async_trait]
-impl CommandSenderCallback for NoopCommands {
-    async fn send_sticky_event(
-        &self,
-        _room_id: String,
-        _event_type: String,
-        _content_json: String,
-        _duration_ms: u64,
-    ) -> Result<String, CommandSenderError> {
-        Ok("$sticky-event-1".to_owned())
-    }
-
-    async fn send_delayed_event(
-        &self,
-        _room_id: String,
-        _event_type: String,
-        _content_json: String,
-        _delay_ms: u64,
-    ) -> Result<String, CommandSenderError> {
-        Ok("delayed-event-1".to_owned())
-    }
-
-    async fn send_state_event(
-        &self,
-        _room_id: String,
-        _event_type: String,
-        _state_key: String,
-        _content_json: String,
-    ) -> Result<String, CommandSenderError> {
-        Ok("$state-event-1".to_owned())
-    }
-
-    async fn send_delayed_state_event(
-        &self,
-        _room_id: String,
-        _event_type: String,
-        _state_key: String,
-        _content_json: String,
-        _delay_ms: u64,
-    ) -> Result<String, CommandSenderError> {
-        Ok("delayed-state-event-1".to_owned())
-    }
-
-    async fn send_room_event(
-        &self,
-        _room_id: String,
-        _event_type: String,
-        _content_json: String,
-    ) -> Result<String, CommandSenderError> {
-        Ok("$room-event-1".to_owned())
-    }
-
-    async fn redact_event(
-        &self,
-        _room_id: String,
-        _event_id: String,
-        _reason: Option<String>,
-    ) -> Result<(), CommandSenderError> {
-        Ok(())
-    }
-
-    async fn restart_delayed_event(
-        &self,
-        _room_id: String,
-        _delay_id: String,
-    ) -> Result<(), CommandSenderError> {
-        Ok(())
-    }
-
-    async fn cancel_delayed_event(
-        &self,
-        _room_id: String,
-        _delay_id: String,
-    ) -> Result<(), CommandSenderError> {
-        Ok(())
-    }
-
-    async fn send_to_device_message(
-        &self,
-        recipients: Vec<FfiToDeviceRecipient>,
-        _message_type: String,
-        _content_json: String,
-    ) -> Result<Vec<FfiToDeviceDelivery>, CommandSenderError> {
-        Ok(recipients
-            .into_iter()
-            .map(|r| FfiToDeviceDelivery {
-                user_id: r.user_id,
-                device_id: r.device_id,
-                error: None,
-            })
-            .collect())
-    }
-}
-
-/// A Rust-side implementation of the foreign token provider.
-struct DummyTokens;
-
-#[async_trait::async_trait]
-impl OpenIdTokenProvider for DummyTokens {
-    async fn get_open_id_token(&self) -> Result<FfiOpenIdToken, MediaFfiError> {
-        Ok(FfiOpenIdToken {
-            access_token: "token".to_owned(),
-            token_type: "Bearer".to_owned(),
-            matrix_server_name: "example.org".to_owned(),
-            expires_in_secs: 3600,
-        })
-    }
-}
 
 /// TCP port 9 (discard) is reliably closed on dev machines: connections are
 /// refused immediately, keeping the failure path fast.
@@ -153,12 +37,8 @@ fn config() -> MediaSessionConfig {
 
 #[test]
 fn connect_requires_a_joined_slot() {
-    let manager = RtcSessionManagerHandle::new();
-    let result = runtime().block_on(connect_media_session(
-        manager,
-        config(),
-        Arc::new(DummyTokens),
-    ));
+    let manager = RtcSessionManagerHandle::new(MockHost::new());
+    let result = runtime().block_on(connect_media_session(manager, config()));
     assert!(
         matches!(result, Err(MediaFfiError::NotJoined(_))),
         "connecting media on an unjoined slot must fail with NotJoined",
@@ -167,16 +47,42 @@ fn connect_requires_a_joined_slot() {
 
 #[test]
 fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
-    let manager = RtcSessionManagerHandle::new();
+    let mock = MockHost::new();
+    let manager = RtcSessionManagerHandle::new(mock.clone());
     runtime().block_on(async {
-        manager
-            .set_command_sender(Arc::new(NoopCommands))
-            .await
-            .unwrap();
+        // Attach, delivering the current sets the way a host does on subscribe.
+        let attach =
+            manager.attach_room("!room:example.org".to_owned(), FfiAttachOptions::default());
+        tokio::pin!(attach);
+        let seed = async {
+            while mock.subjects("!room:example.org").is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let sink = mock.room_sink("!room:example.org");
+            sink.on_encryption(false);
+            sink.on_state_events(
+                matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+                vec![FfiEventIn {
+                    event_id: "$slot".to_owned(),
+                    sender: "@admin:example.org".to_owned(),
+                    event_type: matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+                    state_key: Some("m.call#ROOM".to_owned()),
+                    origin_server_ts: 1,
+                    content_json: r#"{"status":"open","application":{"type":"m.call"}}"#.to_owned(),
+                    encryption: FfiEventEncryption {
+                        encrypted: false,
+                        sender_device_id: None,
+                        sender_cross_signed: None,
+                    },
+                }],
+            );
+            sink.on_joined_members(vec!["@alice:example.org".to_owned()]);
+            sink.on_sticky_events(Vec::new());
+        };
+        let (attached, ()) = tokio::join!(attach, seed);
+        attached.unwrap();
         manager
             .join(FfiJoinSessionParams {
-                user_id: "@alice:example.org".to_owned(),
-                device_id: "DEVICE".to_owned(),
                 room_id: "!room:example.org".to_owned(),
                 slot_id: "m.call#ROOM".to_owned(),
                 application: "m.call".to_owned(),
@@ -184,12 +90,12 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
                     r#type: "livekit".to_owned(),
                     livekit_service_url: Some(DEAD_SFU_URL.to_owned()),
                 }),
+                receive_only: false,
                 can_subscribe: Vec::new(),
                 keep_alive_timeout_ms: None,
                 sticky_duration_ms: None,
                 degraded_lifetime_ms: None,
                 encryption_config: None,
-                element_call_compat: None,
                 notify: None,
                 reactions: None,
             })
@@ -198,14 +104,9 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
     });
 
     // Everything up to the SFU works — key bridge registration, engine
-    // startup, and the (Rust-implemented) foreign token provider call — and
-    // the dead endpoint surfaces as a clean Transport error, not a hang or
-    // a panic.
-    let result = runtime().block_on(connect_media_session(
-        manager,
-        config(),
-        Arc::new(DummyTokens),
-    ));
+    // startup, and the (Rust-implemented) backend's token call — and the dead
+    // endpoint surfaces as a clean Transport error, not a hang or a panic.
+    let result = runtime().block_on(connect_media_session(manager, config()));
     assert!(
         matches!(result, Err(MediaFfiError::Transport(_))),
         "expected a Transport error from the dead SFU endpoint, got {:?}",

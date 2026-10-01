@@ -6,10 +6,10 @@
 //! High-level "join a call" facade over the whole stack.
 //!
 //! [`Call::join`] wires together everything a MatrixRTC participant needs —
-//! the [`RtcSessionManager`] with an SDK-backed command sender, the sticky
-//! membership bridge, MSC4143 media-key signalling in both directions, the
-//! MSC4195 token exchange, and an E2EE-enabled SFU connection driven through
-//! the transport-agnostic [`matrix_rtc_media`] layer. [`Call::leave`] tears
+//! the manager over a [`SdkBackend`], the feeder that subscribes to the room
+//! and to media keys, the MSC4195 token exchange, and an E2EE-enabled SFU
+//! connection driven through the transport-agnostic [`matrix_rtc_media`]
+//! layer. [`Call::leave`] tears
 //! all of it down in the right order.
 //!
 //! Consume the call through the unified stream
@@ -21,7 +21,7 @@
 //!
 //! # Runtime requirements
 //!
-//! The core's command sender is `?Send`, so the futures driving the session
+//! The backend's futures are `?Send`, so the futures driving the session
 //! are `!Send`: **[`Call::join`] must be called from within a
 //! [`tokio::task::LocalSet`]** (it uses `spawn_local` internally) and panics
 //! outside one. See `examples/join_and_record.rs` for the runtime skeleton.
@@ -29,8 +29,8 @@
 //! # Preconditions
 //!
 //! - the client is logged in and syncing (e.g. `matrix_sdk_ui::sync_service::SyncService`
-//!   is running — it enables the sticky-events extension the membership
-//!   bridge relies on);
+//!   is running — it enables the sticky-events extension the feeder relies
+//!   on);
 //! - the user has joined `room`;
 //! - the slot is open (an `m.rtc.slot` state event; see [`open_slot`]) —
 //!   MSC4143 counts nobody as joined against a closed slot.
@@ -39,32 +39,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use livekit::RoomEvent;
-use matrix_sdk::deserialized_responses::{EncryptionInfo, VerificationLevel, VerificationState};
-use matrix_sdk::event_handler::EventHandlerDropGuard;
-use matrix_sdk::ruma::api::client::rtc::RtcTransport as RumaRtcTransport;
-use matrix_sdk::ruma::api::client::rtc::transports::v1 as rtc_transports;
-use matrix_sdk::ruma::events::AnyToDeviceEvent;
-use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::{Client, Room};
-use serde::Deserialize;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::sync::{Mutex, broadcast, watch};
 use tokio::task::JoinHandle;
 
-use matrix_rtc_bridge::compat::{
-    self, ElementCallCompat, ElementCallDialect, ElementCallStateDialect, OutboundDialect,
+use matrix_rtc_bridge::compat::ingest::outbound_dialect;
+use matrix_rtc_bridge::compat::{self, DialectBackend, ElementCallCompat};
+use matrix_rtc_bridge::feeder::{
+    AttachOptions, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
 };
-use matrix_rtc_bridge::{
-    SdkCommandSender, TimelineIngest, register_timeline_receiver, run_membership_bridge,
-    run_timeline_bridge,
-};
+use matrix_rtc_bridge::{SdkBackend, transports};
 use matrix_rtc_call::{
     CallJoinParams, CallSessionManager, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
 };
 use matrix_rtc_core::{
-    ApplicationIntake, EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin,
-    LiveKitTransport, ReceivedEncryptionKey, RtcSessionManager, RtcTransport, SlotEncryption,
-    generate_member_id,
+    EncryptionConfig, JoinSessionParams, LiveKitTransport, MatrixBackend, RtcSessionManager,
+    RtcTransport, SlotEncryption, TransportIntent, generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
@@ -78,7 +69,7 @@ use crate::{
     MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 
-type Manager = Arc<Mutex<CallSessionManager<SdkCommandSender>>>;
+type Manager = Arc<Mutex<CallSessionManager<DialectBackend<SdkBackend>>>>;
 
 /// Errors produced when joining, operating, or leaving a [`Call`].
 #[derive(Debug, thiserror::Error)]
@@ -118,10 +109,10 @@ pub struct CallOptions {
     pub slot_id: String,
     /// MatrixRTC application of the slot.
     pub application: String,
-    /// LiveKit authorisation service URL to use when the homeserver does not
-    /// advertise a LiveKit transport (MSC4143 `GET /rtc/transports`). Joining
-    /// fails if discovery yields nothing and no fallback is set.
-    pub livekit_service_url_fallback: Option<String>,
+    /// The LiveKit transport to publish on, overriding the homeserver's
+    /// advertised transports (MSC4143 `GET /rtc/transports`). `None` takes the
+    /// first LiveKit one advertised; joining fails if there is none.
+    pub livekit_transport: Option<LiveKitTransport>,
     /// Override for the core's media-key policy. `None` keeps the core's
     /// default, which requires key senders to be cross-signed (MSC4153) —
     /// only relax this for test setups whose users have no cross-signing.
@@ -212,7 +203,7 @@ impl Default for CallOptions {
         Self {
             slot_id: "m.call#ROOM".to_owned(),
             application: "m.call".to_owned(),
-            livekit_service_url_fallback: None,
+            livekit_transport: None,
             encryption_config: None,
             heartbeat_interval: Duration::from_secs(15),
             sticky_duration_ms: None,
@@ -237,17 +228,6 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// A media encryption key extracted from a peer's decrypted
-/// `m.rtc.encryption_key` to-device message, carried from the (`Send`) event
-/// handler to the (`!Send`) key pump over an mpsc channel.
-struct ReceivedKey {
-    origin: KeyOrigin,
-    room_id: String,
-    member_id: String,
-    key_index: u8,
-    key_b64: String,
-}
-
 /// A joined MatrixRTC call: live membership signalling plus an E2EE SFU
 /// connection.
 ///
@@ -266,13 +246,11 @@ pub struct Call {
     room_id: String,
     slot_id: String,
     heartbeat: AbortOnDrop,
-    key_pump: AbortOnDrop,
     rotation_pump: AbortOnDrop,
-    _sticky_bridge: AbortOnDrop,
-    _timeline_bridge: AbortOnDrop,
-    _key_handler: EventHandlerDropGuard,
-    _legacy_key_handler: EventHandlerDropGuard,
-    _timeline_handler: EventHandlerDropGuard,
+    attachment: RoomAttachment,
+    session_feeder: SessionFeeder,
+    _room_feed: AbortOnDrop,
+    _session_feed: AbortOnDrop,
 }
 
 impl Call {
@@ -298,64 +276,64 @@ impl Call {
             .to_string();
         let room_id = room.room_id().to_string();
 
-        // The manager plus the bridge feeding it peer memberships.
-        let dialect = match options.element_call_compat {
-            ElementCallCompat::Off => OutboundDialect::None,
-            ElementCallCompat::StickyEvents => {
-                log::warn!(
-                    "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
-                     go out as {} and will not reach spec-current peers",
-                    options.slot_id,
-                    compat::LEGACY_KEY_EVENT_TYPE,
-                );
-                OutboundDialect::Sticky(ElementCallDialect::new(
-                    user_id.clone(),
-                    device_id.clone(),
-                    options.slot_id.clone(),
-                ))
-            }
-            ElementCallCompat::StateEvents => {
-                log::warn!(
-                    "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
-                     membership goes out as {} room state, our SFU identity is the plain \
-                     {{user}}:{{device}} string, and the token comes from /sfu/get. Nothing about \
-                     this call is visible to a spec-current peer.",
-                    options.slot_id,
-                    compat::STATE_MEMBER_EVENT_TYPE,
-                );
-                OutboundDialect::State(ElementCallStateDialect::new(
-                    user_id.clone(),
-                    device_id.clone(),
-                    room_id.clone(),
-                    options.slot_id.clone(),
-                ))
-            }
-        };
-        let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_command_sender(
-            Arc::new(SdkCommandSender::with_compat(client.clone(), dialect)),
-        )));
-        let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_membership_bridge(
-            room.clone(),
-            manager.clone(),
-            options.element_call_compat.reads_state_membership(),
+        // The backend, wrapped so every send renders in the room's dialect,
+        // and the manager over it.
+        let backend = Arc::new(DialectBackend::new(Arc::new(SdkBackend::new(
+            client.clone(),
+        ))));
+        match options.element_call_compat {
+            ElementCallCompat::Off => {}
+            ElementCallCompat::StickyEvents => log::warn!(
+                "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
+                 go out as {} and will not reach spec-current peers",
+                options.slot_id,
+                compat::LEGACY_KEY_EVENT_TYPE,
+            ),
+            ElementCallCompat::StateEvents => log::warn!(
+                "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
+                 membership goes out as {} room state, our SFU identity is the plain \
+                 {{user}}:{{device}} string, and the token comes from /sfu/get. Nothing about \
+                 this call is visible to a spec-current peer.",
+                options.slot_id,
+                compat::STATE_MEMBER_EVENT_TYPE,
+            ),
+        }
+        backend.set_dialect(
+            &room_id,
+            outbound_dialect(
+                options.element_call_compat,
+                &user_id,
+                &device_id,
+                &room_id,
+                &options.slot_id,
+            ),
+        );
+        let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
+            backend.clone(),
         )));
 
-        // Reactions and raised hands are ordinary room events, which the sticky
-        // bridge does not see. Same shape as the key path below: a `Send` sync
-        // handler forwards over a channel to a `spawn_local` pump that drives
-        // the `!Send` manager.
-        let (timeline_tx, timeline_rx) = unbounded_channel::<TimelineIngest>();
-        let timeline_types = manager.lock().await.timeline_event_types();
-        let timeline_handler = client.event_handler_drop_guard(register_timeline_receiver(
-            room,
-            timeline_tx,
-            timeline_types,
-        ));
-        let timeline_bridge = AbortOnDrop(tokio::task::spawn_local(run_timeline_bridge(
-            room_id.clone(),
+        // Media keys of both generations, then the room: the feeder subscribes
+        // to what the mode needs, seeds room state before membership and
+        // funnels the dialects. Both run on this `LocalSet`.
+        let modes = RoomModes::default();
+        let (session_feeder, session_run) =
+            SessionFeeder::start(backend.clone(), manager.clone(), modes.clone())
+                .await
+                .map_err(signalling_error)?;
+        let session_feed = AbortOnDrop(tokio::task::spawn_local(session_run.run()));
+        let (attachment, room_run) = RoomFeeder::attach(
+            backend.clone(),
             manager.clone(),
-            timeline_rx,
-        )));
+            modes,
+            room_id.clone(),
+            AttachOptions {
+                element_call_compat: options.element_call_compat,
+            },
+        )
+        .await
+        .map_err(signalling_error)?;
+        let room_feed = AbortOnDrop(tokio::task::spawn_local(room_run.run()));
+        attachment.seeded().await;
 
         // Frame encryption: a single shared KeyProvider handle feeds both the
         // LiveKit room (which encrypts our frames and decrypts peers') and the
@@ -363,24 +341,6 @@ impl Call {
         // per-participant HKDF mode.
         let provider = msc4195_key_provider();
         let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
-
-        // Receive path: peers distribute their media keys as Olm-encrypted
-        // `m.rtc.encryption_key` to-device messages. The SDK decrypts and
-        // dispatches them to a handler that must stay `Send`; forward the key
-        // bytes over a channel to a `spawn_local` pump that drives the `!Send`
-        // manager. The drop guard unregisters the handler with the `Call`.
-        let (key_tx, key_rx) = unbounded_channel::<ReceivedKey>();
-        let handler = register_key_receiver(&client, key_tx.clone());
-        let key_handler = client.event_handler_drop_guard(handler);
-        // Peers that predate the 2026 rewrite send their keys under a different
-        // type entirely, which ruma has no typed event for. Always registered:
-        // reading the legacy dialect costs a string comparison and cannot
-        // affect a spec-current call.
-        let legacy_key_handler = client.event_handler_drop_guard(register_legacy_key_receiver(
-            &client,
-            key_tx,
-            options.element_call_compat,
-        ));
 
         // MSC4143 requires a fresh `member.id` on every join, so this must not
         // be derived from the (stable) user and device IDs.
@@ -394,11 +354,6 @@ impl Call {
         // `JoinCondition::SupersededOwnParticipation`, which drops a candidate
         // from our own device whose member id is not the one we joined with. We
         // would mark ourselves departed on our own join.
-        //
-        // The cost is inherent to that generation rather than to this choice: a
-        // rejoin reuses the id, so the core cannot tell a stale participation from
-        // the current one, and two slots joined from one device would collide.
-        // That generation's SFU identity has no session component at all.
         let identity_mapper = identity_mapper(options.element_call_compat);
         let membership_id = match options.element_call_compat {
             ElementCallCompat::StateEvents => {
@@ -414,9 +369,21 @@ impl Call {
             options.slot_id,
         );
 
-        let livekit =
-            discover_livekit_transport(&client, options.livekit_service_url_fallback.as_deref())
-                .await?;
+        // The transport: the join's own choice, else the first LiveKit one the
+        // homeserver advertises.
+        let chosen = options
+            .livekit_transport
+            .clone()
+            .map(|transport| TransportIntent::Publish(RtcTransport::LiveKit(transport)));
+        let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
+            transports::resolve(&*backend, chosen)
+                .await
+                .map_err(signalling_error)?
+        else {
+            return Err(CallError::Signalling(
+                "the chosen transport is not a LiveKit one".into(),
+            ));
+        };
         log::info!(
             "[{room_id}/{}] join: focus is {}",
             options.slot_id,
@@ -480,8 +447,6 @@ impl Call {
             (memberships, raised_hands, reactions)
         };
 
-        let key_pump = AbortOnDrop(spawn_key_pump(manager.clone(), key_rx));
-
         // Rotations the core coalesced into a key's `delayBeforeUse` window fall
         // due the moment that window closes, and the bridge's scheduled
         // installation is the only thing that knows when that is. Route it back:
@@ -517,8 +482,9 @@ impl Call {
             Some(http) => http,
             None => reqwest::Client::new(),
         };
+        let token_backend: Arc<dyn MatrixBackend> = backend.clone();
         let transport = Arc::new(
-            LiveKitMediaTransport::new(http, Arc::new(client.clone()), provider)
+            LiveKitMediaTransport::new(http, token_backend, provider)
                 .with_auto_subscribe(options.auto_subscribe)
                 // The same mapper the core got, so our own identity, the peers'
                 // and the key ring's all agree.
@@ -613,6 +579,8 @@ impl Call {
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
                 drop(heartbeat);
+                attachment.detach();
+                session_feeder.stop();
                 if let Err(leave_error) = manager
                     .lock()
                     .await
@@ -666,13 +634,11 @@ impl Call {
             room_id,
             slot_id: options.slot_id,
             heartbeat,
-            key_pump,
             rotation_pump,
-            _sticky_bridge: sticky_bridge,
-            _timeline_bridge: timeline_bridge,
-            _key_handler: key_handler,
-            _legacy_key_handler: legacy_key_handler,
-            _timeline_handler: timeline_handler,
+            attachment,
+            session_feeder,
+            _room_feed: room_feed,
+            _session_feed: session_feed,
         })
     }
 
@@ -863,14 +829,14 @@ impl Call {
             engine,
             connection,
             heartbeat,
-            key_pump,
             rotation_pump,
+            attachment,
+            session_feeder,
             room_id,
             slot_id,
             ..
         } = self;
         drop(heartbeat);
-        drop(key_pump);
         // Nothing left to rotate for once we are leaving, and the core drops its
         // encryption manager as part of the leave below.
         drop(rotation_pump);
@@ -883,6 +849,10 @@ impl Call {
             .leave(room_id.clone(), slot_id, Default::default())
             .await
             .map_err(signalling_error);
+        // After the leave, whose cancel of the delayed event still goes through
+        // the backend; the feeders are not needed for that.
+        attachment.detach();
+        session_feeder.stop();
         log::debug!(
             "[{room_id}] leave: matrix leave {}; shutting down the media engine",
             if leave_result.is_ok() {
@@ -914,7 +884,7 @@ pub async fn open_slot(
     application: &str,
     encryption: Option<SlotEncryption>,
 ) -> Result<(), CallError> {
-    RtcSessionManager::with_command_sender(Arc::new(SdkCommandSender::new(client.clone())))
+    RtcSessionManager::with_backend(Arc::new(SdkBackend::new(client.clone())))
         .open_slot(
             room_id.to_owned(),
             slot_id.to_owned(),
@@ -925,235 +895,6 @@ pub async fn open_slot(
         .map_err(signalling_error)
 }
 
-/// Ask the homeserver which RTC transports it offers, and take the first
-/// LiveKit one (MSC4143 returns them in descending order of preference).
-///
-/// Falls back to `fallback_url` when the homeserver does not implement the
-/// endpoint or advertises no LiveKit transport; errors if there is no
-/// fallback either.
-pub async fn discover_livekit_transport(
-    client: &Client,
-    fallback_url: Option<&str>,
-) -> Result<LiveKitTransport, CallError> {
-    match client.send(rtc_transports::Request::new()).await {
-        Ok(response) => {
-            for transport in response.rtc_transports {
-                if let RumaRtcTransport::LiveKit(livekit) = transport {
-                    log::info!(
-                        "homeserver offers a livekit transport at {}",
-                        livekit.service_url
-                    );
-                    return Ok(LiveKitTransport {
-                        livekit_service_url: livekit.service_url,
-                    });
-                }
-            }
-            log::info!("homeserver advertises no livekit transport; using the fallback URL");
-        }
-        Err(error) => {
-            log::info!("transports endpoint unavailable ({error}); using the fallback URL");
-        }
-    }
-
-    fallback_url
-        .map(|url| LiveKitTransport {
-            livekit_service_url: url.to_owned(),
-        })
-        .ok_or_else(|| {
-            CallError::Signalling(
-                "the homeserver advertises no livekit transport and no fallback URL is configured"
-                    .into(),
-            )
-        })
-}
-
-/// The content of an `m.rtc.encryption_key` to-device message, as the 2026
-/// MSC4143 rewrite shapes it and as `matrix-rtc-core` puts it on the wire.
-///
-/// Our own type rather than ruma's: upstream ruma has no event for the rewrite
-/// (its `rtc` module stops at notification and decline), and the core does not
-/// depend on ruma. `format` is not read — the key is always base64.
-#[derive(Deserialize)]
-struct KeyMessageContent {
-    room_id: String,
-    member_id: String,
-    media_key: MediaKey,
-}
-
-#[derive(Deserialize)]
-struct MediaKey {
-    index: u8,
-    key: String,
-}
-
-/// Register a to-device handler that forwards decrypted
-/// `m.rtc.encryption_key` events to the key pump.
-///
-/// Raw rather than typed, like [`register_legacy_key_receiver`] and for the same
-/// reasons: ruma has no typed event for this content, and a typed handler
-/// silently never fires when the content does not match ruma's model. The type
-/// is filtered here, under both the stable and the MSC4143 unstable id, and a
-/// content that will not parse is logged instead of vanishing.
-///
-/// The handler is `Send` (it only moves owned key data into a channel), which
-/// `add_event_handler` requires; the `!Send` work happens in the pump.
-fn register_key_receiver(
-    client: &Client,
-    key_tx: UnboundedSender<ReceivedKey>,
-) -> matrix_sdk::event_handler::EventHandlerHandle {
-    client.add_event_handler(
-        move |event: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
-            let key_tx = key_tx.clone();
-            async move {
-                let event_type = event.get_field::<String>("type").ok().flatten();
-                if !matches!(
-                    event_type.as_deref(),
-                    Some("m.rtc.encryption_key" | KEY_MESSAGE_TYPE)
-                ) {
-                    return;
-                }
-                let content = match event.get_field::<KeyMessageContent>("content") {
-                    Ok(Some(content)) => content,
-                    Ok(None) => {
-                        log::warn!("ignoring an m.rtc.encryption_key to-device with no content");
-                        return;
-                    }
-                    Err(error) => {
-                        log::warn!(
-                            "ignoring an unparseable m.rtc.encryption_key to-device: {error}"
-                        );
-                        return;
-                    }
-                };
-                let _ = key_tx.send(ReceivedKey {
-                    origin: key_origin(encryption_info.as_ref()),
-                    room_id: content.room_id,
-                    member_id: content.member_id,
-                    key_index: content.media_key.index,
-                    key_b64: content.media_key.key,
-                });
-            }
-        },
-    )
-}
-
-/// Register a to-device handler for media keys from peers that predate the 2026
-/// MSC4143 rewrite (`io.element.call.encryption_keys`).
-///
-/// Takes the event raw rather than typed, for two reasons: ruma has no typed
-/// event for the legacy type at all, and a typed handler silently never fires
-/// when the content does not match ruma's model — a failure mode this crate has
-/// already been bitten by once. The type is filtered here instead, so a
-/// `Raw<AnyToDeviceEvent>` handler (which matches every to-device event) only
-/// ever acts on the one type it is for.
-///
-/// Feeds the same channel as [`register_key_receiver`]; the core neither knows
-/// nor cares which dialect a key arrived in. See [`crate::compat`].
-fn register_legacy_key_receiver(
-    client: &Client,
-    key_tx: UnboundedSender<ReceivedKey>,
-    compat: ElementCallCompat,
-) -> matrix_sdk::event_handler::EventHandlerHandle {
-    client.add_event_handler(
-        move |event: Raw<AnyToDeviceEvent>, encryption_info: Option<EncryptionInfo>| {
-            let key_tx = key_tx.clone();
-            async move {
-                if event.get_field::<String>("type").ok().flatten().as_deref()
-                    != Some(compat::LEGACY_KEY_EVENT_TYPE)
-                {
-                    return;
-                }
-
-                let content = match event.get_field::<serde_json::Value>("content") {
-                    Ok(Some(content)) => content,
-                    _ => {
-                        log::warn!(
-                            "ignoring a {} to-device message with no content object",
-                            compat::LEGACY_KEY_EVENT_TYPE,
-                        );
-                        return;
-                    }
-                };
-
-                // The sender is needed for the pre-sticky generation, whose key
-                // messages carry no `member` object at all and are bound to
-                // `{sender}:{content.device_id}` instead. Homeserver-stamped, so
-                // it is the one identity in the event worth trusting anyway.
-                let sender = match event.get_field::<String>("sender") {
-                    Ok(Some(sender)) => sender,
-                    _ => {
-                        log::warn!(
-                            "ignoring a {} to-device message with no sender",
-                            compat::LEGACY_KEY_EVENT_TYPE,
-                        );
-                        return;
-                    }
-                };
-
-                let Some(key) = compat::element_call::parse_key_message(&sender, &content) else {
-                    log::warn!(
-                        "ignoring a {} to-device message from {sender} missing a required field; \
-                         that peer's media will not decrypt",
-                        compat::LEGACY_KEY_EVENT_TYPE,
-                    );
-                    return;
-                };
-
-                let origin = key_origin(encryption_info.as_ref());
-
-                // In the pre-sticky generation the `member.id` a key message
-                // carries is Element Call's own per-session UUID, and it appears
-                // in *no* field of the membership state event — so binding the
-                // key by it can never match anything, and the key sits buffered
-                // while that peer's media stays undecryptable. Observed exactly
-                // that: `key index 0 for member ef8adf45-… / No matching RTC
-                // membership … buffering`.
-                //
-                // Everything in that generation is keyed on `{user}:{device}` —
-                // the SFU identity, our translated `member_id`, and the
-                // `membershipID` — so bind on that instead. The device comes
-                // from the Olm decryption where possible, so both halves are
-                // authenticated rather than self-asserted.
-                let member_id = match compat {
-                    ElementCallCompat::StateEvents => {
-                        let device_id = match &origin {
-                            KeyOrigin::Encrypted {
-                                sender_device_id, ..
-                            } => sender_device_id.clone(),
-                            KeyOrigin::Cleartext => None,
-                        }
-                        .or_else(|| compat::element_call::claimed_key_device_id(&content));
-                        match device_id {
-                            Some(device_id) => compat::element_call_state::participant_identity(
-                                &sender, &device_id,
-                            ),
-                            None => {
-                                log::warn!(
-                                    "ignoring a {} to-device message from {sender}: no device to \
-                                     bind it to, so it could not be matched to a membership",
-                                    compat::LEGACY_KEY_EVENT_TYPE,
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    _ => key.member_id,
-                };
-
-                let _ = key_tx.send(ReceivedKey {
-                    origin,
-                    room_id: key.room_id,
-                    member_id,
-                    key_index: key.key_index,
-                    key_b64: key.key_b64,
-                });
-            }
-        },
-    )
-}
-
-/// Drain received peer keys into the (`!Send`) manager. Runs until the
-/// channel closes or the task is aborted.
 /// Perform a coalesced key rotation at the instant it falls due.
 ///
 /// Two things wake this up, because neither alone is enough:
@@ -1228,27 +969,6 @@ fn matrix_rtc_now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn spawn_key_pump(manager: Manager, mut key_rx: UnboundedReceiver<ReceivedKey>) -> JoinHandle<()> {
-    tokio::task::spawn_local(async move {
-        while let Some(received) = key_rx.recv().await {
-            if let Err(error) = manager
-                .lock()
-                .await
-                .receive_encryption_key(ReceivedEncryptionKey {
-                    origin: received.origin,
-                    room_id: received.room_id,
-                    member_id: received.member_id,
-                    key_b64: received.key_b64,
-                    key_index: received.key_index,
-                })
-                .await
-            {
-                log::warn!("failed to ingest received media key: {error}");
-            }
-        }
-    })
-}
-
 /// Keep pushing the dead man's switch delayed leave back while joined.
 fn spawn_heartbeat(
     manager: Manager,
@@ -1263,32 +983,4 @@ fn spawn_heartbeat(
             manager.lock().await.heartbeat(&room_id, &slot_id).await;
         }
     })
-}
-
-/// Translate the SDK's decryption metadata into the core's [`KeyOrigin`].
-///
-/// `None` means the to-device message arrived unencrypted, which MSC4143 says
-/// to discard — the core makes that call, this just reports it faithfully.
-fn key_origin(info: Option<&EncryptionInfo>) -> KeyOrigin {
-    let Some(info) = info else {
-        return KeyOrigin::Cleartext;
-    };
-
-    // MSC4153 asks whether the sending device is cross-signed, not whether we
-    // trust its owner: an unverified *identity* still signs its own devices.
-    // States that leave the device unattributable count as not cross-signed.
-    let sender_is_cross_signed = !matches!(
-        info.verification_state,
-        VerificationState::Unverified(
-            VerificationLevel::UnsignedDevice
-                | VerificationLevel::None(_)
-                | VerificationLevel::MismatchedSender
-        )
-    );
-
-    KeyOrigin::Encrypted {
-        sender_user_id: info.sender.to_string(),
-        sender_device_id: info.sender_device.as_ref().map(|d| d.to_string()),
-        sender_is_cross_signed,
-    }
 }

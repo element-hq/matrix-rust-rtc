@@ -11,6 +11,7 @@ Please see LICENSE in the repository root for full details.
 
 import { describe, it, expect } from 'vitest';
 import { existsSync } from 'node:fs';
+import { mockBackendHost, openSlotEvent, memberEventIn } from './mock-backend-host.mjs';
 import { MatrixRtcCall } from '../src/matrix-rtc-call.mjs';
 
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
@@ -89,40 +90,6 @@ function fakeLivekit() {
   };
 }
 
-// --- fixtures shared with media-roster.test.mjs ---------------------------
-
-function mockMatrixClient() {
-  let counter = 0;
-  return {
-    sendStickyEvent: () => Promise.resolve({ event_id: `$sticky-${counter++}` }),
-    sendDelayedEvent: () => Promise.resolve(`delay-${counter++}`),
-    restartDelayedEvent: () => Promise.resolve(),
-    cancelDelayedEvent: () => Promise.resolve(),
-    sendStateEvent: () => Promise.resolve({ event_id: `$state-${counter++}` }),
-  };
-}
-
-function memberEvent({ sender, deviceId, memberId }) {
-  return {
-    room_id: ROOM_ID,
-    sender,
-    sender_device_id: deviceId,
-    was_encrypted: true,
-    type: 'm.rtc.member',
-    content: {
-      slot_id: SLOT_ID,
-      // The wire spelling (MSC4354 unstable id), as real events carry it.
-      msc4354_sticky_key: memberId,
-      application: { type: 'm.call' },
-      member: { id: memberId, membership: 'join' },
-      transports: {
-        published: [{ type: 'livekit', livekit_service_url: OWN_FOCUS }],
-        can_subscribe: ['livekit'],
-      },
-    },
-  };
-}
-
 async function waitFor(probe, description, attempts = 100) {
   for (let i = 0; i < attempts; i++) {
     const value = probe();
@@ -139,23 +106,30 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
       return;
     }
     const bindings = await import(nodeBindingUrl);
-    const manager = new bindings.WasmRtcSessionManager();
-    manager.setup_command_sender(mockMatrixClient());
+    const host = mockBackendHost({
+      userId: USER_ID,
+      deviceId: DEVICE_ID,
+      slots: [openSlotEvent(SLOT_ID)],
+      members: [USER_ID, '@peer:example.org'],
+    });
+    const manager = new bindings.WasmRtcSessionManager(host);
+    await manager.attachRoom(ROOM_ID, undefined);
 
     const memberId = await manager.join({
-      user_id: USER_ID,
-      device_id: DEVICE_ID,
       room_id: ROOM_ID,
       slot_id: SLOT_ID,
       application: 'm.call',
       transport: { type: 'livekit', livekit_service_url: OWN_FOCUS },
     });
-    await manager.set_current_sticky_state(ROOM_ID, [
-      memberEvent({ sender: USER_ID, deviceId: DEVICE_ID, memberId }),
-      memberEvent({
+    // The sticky set as the server echoes it: ourselves plus one peer.
+    host._sink(ROOM_ID).onStickyEvents([
+      memberEventIn({ sender: USER_ID, deviceId: DEVICE_ID, memberId, slotId: SLOT_ID, focus: OWN_FOCUS }),
+      memberEventIn({
         sender: '@peer:example.org',
         deviceId: 'PEERDEVICE',
         memberId: 'peer-member-1',
+        slotId: SLOT_ID,
+        focus: OWN_FOCUS,
       }),
     ]);
 
@@ -165,13 +139,6 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
       manager,
       bindings,
       livekit,
-      getOpenIdToken: () =>
-        Promise.resolve({
-          access_token: 'opaque',
-          token_type: 'Bearer',
-          matrix_server_name: 'example.org',
-          expires_in: 3600,
-        }),
       fetchJson: () =>
         Promise.resolve({
           status: 200,

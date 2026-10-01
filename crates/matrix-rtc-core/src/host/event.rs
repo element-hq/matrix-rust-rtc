@@ -132,6 +132,7 @@ pub struct RawStickyEvent {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 /// Content DTO extracted from a sticky Matrix event (MSC4143 compliant).
 ///
 /// `Deserialize` lets host SDK layers parse an `m.rtc.member` event's `content`
@@ -143,10 +144,11 @@ pub struct RawStickyEventContent {
     pub slot_id: String,
     /// Sticky-map key associated with this membership; equal to `member.id`.
     ///
-    /// Sent under the unstable MSC4354 name, and accepted under either. The
-    /// stable spelling is what MSC4354 lands as, and matrix-rust-sdk already
-    /// reads both — being stricter than the SDK here means a peer that has moved
-    /// to `sticky_key` fails to deserialize, and the member event is then dropped
+    /// Sent under the unstable MSC4354 name, and accepted under either, or
+    /// both when they agree (events seen on the wire carry both). The stable
+    /// spelling is what MSC4354 lands as, and matrix-rust-sdk already reads
+    /// both — being stricter than the SDK here means a peer that has moved to
+    /// `sticky_key` fails to deserialize, and the member event is then dropped
     /// whole: that participant simply never appears in the call.
     #[serde(rename = "msc4354_sticky_key", alias = "sticky_key")]
     pub sticky_key: String,
@@ -172,6 +174,38 @@ pub struct RawStickyEventContent {
     /// [`JoinedMembership::membership_ts`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_ts: Option<u64>,
+}
+
+impl Serialize for RawStickyEventContent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // The derived (inherent) serializer: `remote = "Self"` leaves the
+        // trait impls to us so the deserializer can tolerate both key spellings.
+        RawStickyEventContent::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawStickyEventContent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        // The alias would make a content carrying both spellings a duplicate
+        // field; keep the one the derive reads when they agree.
+        if let Some(object) = value.as_object_mut()
+            && let Some(stable) = object.get("sticky_key").cloned()
+        {
+            match object.get("msc4354_sticky_key") {
+                Some(unstable) if *unstable != stable => {
+                    return Err(serde::de::Error::custom(
+                        "msc4354_sticky_key and sticky_key disagree",
+                    ));
+                }
+                Some(_) => {
+                    object.remove("sticky_key");
+                }
+                None => {}
+            }
+        }
+        RawStickyEventContent::deserialize(value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -529,6 +563,29 @@ mod tests {
             "",
         );
         assert!(matches!(parse(&json), RtcMembershipEvent::Left(_)));
+    }
+
+    /// Events on the wire have been seen with both spellings of the sticky key.
+    #[test]
+    fn sticky_key_accepted_under_either_or_both_spellings() {
+        let both = r#"{ "slot_id": "m.call#ROOM",
+                        "member": { "id": "abc", "membership": "join" },
+                        "msc4354_sticky_key": "abc", "sticky_key": "abc" }"#;
+        let content: RawStickyEventContent = serde_json::from_str(both).unwrap();
+        assert_eq!(content.sticky_key, "abc");
+
+        let stable = r#"{ "slot_id": "m.call#ROOM", "sticky_key": "abc" }"#;
+        let content: RawStickyEventContent = serde_json::from_str(stable).unwrap();
+        assert_eq!(content.sticky_key, "abc");
+
+        let disagree = r#"{ "slot_id": "m.call#ROOM",
+                            "msc4354_sticky_key": "abc", "sticky_key": "xyz" }"#;
+        assert!(serde_json::from_str::<RawStickyEventContent>(disagree).is_err());
+
+        // Serialisation still writes the unstable spelling only.
+        let json = serde_json::to_value(&content).unwrap();
+        assert_eq!(json["msc4354_sticky_key"], "abc");
+        assert!(json.get("sticky_key").is_none());
     }
 
     #[test]

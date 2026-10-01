@@ -22,10 +22,9 @@ thiserror.workspace = true
 async-trait.workspace = true
 log.workspace = true
 
-# Only the `matrix-sdk` half needs an async runtime (the bridge's `Mutex` and the
-# sticky-event broadcast receiver). `compat` is pure JSON and must stay free of
-# it, which is what keeps `cargo test -p matrix-rtc-bridge` a seconds-long build.
-tokio = { workspace = true, optional = true }
+# `sync` only, like the core: the feeder's channels and the manager's mutex.
+# No runtime — the binding spawns the feeder's future.
+tokio = { workspace = true }
 
 # Upstream matrix-rust-sdk (rev in the workspace manifest). Keeps its default
 # features (e2e-encryption, sqlite, rustls-aws-lc-rs,
@@ -74,7 +73,11 @@ web-time = "1"
 # `StickyEvents` need. Their `encryption_info().sender_device` is the only
 # source for a member event's sending device now that MSC4143 has dropped
 # `member.claimed_device_id`. See `sdk::snapshot`.
-matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "dep:tokio", "matrix-sdk/unstable-msc4354"]
+matrix-sdk = ["dep:matrix-sdk", "dep:matrix-sdk-base", "matrix-sdk/unstable-msc4354"]
 
 [dev-dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+# The feeder tests drive a real call layer, so reactions and relations are
+# exercised end to end.
+matrix-rtc-call = { path = "../matrix-rtc-call" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

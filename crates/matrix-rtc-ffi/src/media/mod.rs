@@ -12,8 +12,9 @@
 //! The shape mirrors the native `Call` facade, adapted to an FFI host that
 //! owns its own Matrix stack:
 //!
-//! 1. The host drives the [`RtcSessionManagerHandle`](crate::RtcSessionManagerHandle)
-//!    exactly as before (sticky events in, commands out) and `join`s the slot.
+//! 1. The host attaches the room on the
+//!    [`RtcSessionManagerHandle`](crate::RtcSessionManagerHandle) and `join`s
+//!    the slot; the library feeds itself from the host's backend.
 //! 2. [`connect_media_session`] then attaches media: it wires the E2EE key
 //!    bridge into the core, starts the transport-agnostic `CallEngine`
 //!    (which opens connections to every peer's focus — MSC4195 multi-SFU),
@@ -26,11 +27,9 @@
 //!    participant roster, per-stream constraints, frame streams
 //!    (audio by value; video as objects with both safe copies and zero-copy
 //!    plane pointers), and local publications it pushes captured frames into.
-//! 4. Keys: outbound distribution already flows through the host's
-//!    [`CommandSenderCallback`](crate::CommandSenderCallback)
-//!    (`sendToDeviceMessage`); inbound, the host feeds decrypted
-//!    `m.rtc.encryption_key` to-device messages to
-//!    [`RtcSessionManagerHandle::receive_encryption_key`](crate::RtcSessionManagerHandle::receive_encryption_key).
+//! 4. Keys flow through the host's [`MatrixBackend`](crate::MatrixBackend) in
+//!    both directions (`sendToDeviceMessage`, the to-device subscription); the
+//!    OpenID token for the SFU exchange comes from the same backend.
 //!
 //! Everything media runs on a dedicated multithreaded tokio runtime
 //! ([`runtime`]); the manager's `?Send` futures never touch it.
@@ -52,9 +51,9 @@ pub use frames::{
 pub use session::{MediaSession, MediaSessionConfig, connect_media_session};
 pub use types::{
     FfiAudioSourceConfig, FfiCallEvent, FfiEndedReason, FfiFrameEncryptionDiagnostic,
-    FfiFrameEncryptionState, FfiKeyRejection, FfiMediaConstraints, FfiOpenIdToken, FfiParticipant,
+    FfiFrameEncryptionState, FfiKeyRejection, FfiMediaConstraints, FfiParticipant,
     FfiPublishOptions, FfiQualityLimit, FfiReceiveStats, FfiStreamKind, FfiStreamState,
-    FfiVideoDetail, FfiVideoSourceConfig, OpenIdTokenProvider,
+    FfiVideoDetail, FfiVideoSourceConfig,
 };
 
 /// Errors produced by the media layer of the FFI.

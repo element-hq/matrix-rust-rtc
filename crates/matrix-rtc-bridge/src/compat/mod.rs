@@ -69,36 +69,33 @@
 //!
 //! In this crate:
 //!
-//! 1. `sdk::snapshot` — normalises inbound `m.rtc.member` content.
-//! 2. `sdk::SdkCommandSender` — routes and rewrites outbound events.
-//! 3. `sdk::element_call_state_snapshot` — reads inbound state membership.
-//! 4. `sdk::run_membership_bridge` — the room-state wake source a state-carried
-//!    membership needs.
+//! 1. `feeder` — the inbound half for every host: normalises `m.rtc.member`
+//!    content (`ingest`), reads state-carried membership in `StateEvents`, and
+//!    parses legacy to-device keys, all from the mode the room was attached in.
+//! 2. `dialect_backend::DialectBackend` — the outbound half for every host:
+//!    routes and rewrites the sends of the one `MatrixBackend` wrapper the
+//!    bindings and the `Call` facade all use.
 //!
 //! In `matrix-rtc-livekit`:
 //!
-//! 5. `call::register_legacy_key_receiver` — ingests legacy to-device keys.
-//! 6. `call::Call::join` — mode selection and the member id.
-//! 7. `identity_mapper` — the participant-identity derivation (see above).
-//! 8. `transport_impl` + `token` — `/sfu/get`.
+//! 3. `call::Call::join` — mode selection and the member id.
+//! 4. `identity_mapper` — the participant-identity derivation (see above).
+//! 5. `transport_impl` + `token` — `/sfu/get`.
 //!
-//! In `matrix-rtc-ffi`, which reaches the same dialects from a host that owns its
-//! own Matrix stack (see that crate's `compat` module):
+//! In `matrix-rtc-ffi` and `matrix-rtc-wasm`, which reach the same dialects from
+//! a host that owns its own Matrix stack:
 //!
-//! 9. `compat` — the FFI-shaped mode, the raw-JSON ingestion, and the two
-//!    identifiers the mode changes.
-//! 10. `commands::FfiCommandSender` — routes and rewrites outbound events, per
-//!     room.
-//! 11. `RtcSessionManagerHandle::{join, leave, set_current_membership,
-//!     receive_legacy_encryption_key}` — mode selection, and both inbound halves.
-//! 12. `media::session` — the identity derivation and token endpoint again.
+//! 6. `compat` — the binding-shaped mode vocabulary, given at `attach_room`.
+//! 7. `media::session` — the identity derivation and token endpoint again.
 
 use serde_json::Value;
 
+pub mod dialect_backend;
 pub mod element_call;
 pub mod element_call_state;
 pub mod ingest;
 
+pub use dialect_backend::DialectBackend;
 pub use element_call::{
     ElementCallDialect, LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent,
 };

@@ -50,7 +50,7 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use matrix_rtc_core::{
     CommandError, EncryptionConfig, EncryptionKeySignalHandler, EncryptionManager, EventOrigin,
-    JoinedMembership, KeyMaterialSignal, KeyOrigin, ReceivedEncryptionKey, RtcCommandSender,
+    JoinedMembership, KeyMaterialSignal, KeyOrigin, MatrixBackend, ReceivedEncryptionKey,
     ToDeviceDelivery, ToDeviceRecipient,
 };
 use serde_json::Value;
@@ -233,14 +233,22 @@ impl Bus {
     }
 }
 
-/// The command sender one participant is given.
+/// The backend one participant is given.
 struct PeerSender {
     bus: Arc<Bus>,
     own_member_id: String,
 }
 
 #[async_trait]
-impl RtcCommandSender for PeerSender {
+impl MatrixBackend for PeerSender {
+    fn own_user_id(&self) -> String {
+        "@peer:example.org".to_owned()
+    }
+
+    fn own_device_id(&self) -> String {
+        "DEVICE".to_owned()
+    }
+
     async fn send_sticky_event(
         &self,
         _room_id: String,
@@ -255,6 +263,7 @@ impl RtcCommandSender for PeerSender {
         &self,
         _room_id: String,
         _event_type: String,
+        _state_key: Option<String>,
         _content: Value,
         _delay_ms: u64,
     ) -> Result<String, CommandError> {

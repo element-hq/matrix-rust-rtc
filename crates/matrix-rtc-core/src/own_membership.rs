@@ -63,7 +63,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::CommandError;
-use crate::host::commands::RtcCommandSender;
+use crate::host::backend::MatrixBackend;
 use crate::host::event::RawStickyEventContent;
 use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::{MemberTransports, RtcTransport};
@@ -214,12 +214,12 @@ impl Default for MembershipTimings {
 ///
 /// This machine is responsible for:
 /// - Managing our membership state (joined/left)
-/// - Sending join/leave events via the command sender
+/// - Sending join/leave events via the backend
 /// - Managing the keep-alive delayed event lifecycle
 /// - Storing and retrieving the delayed event ID from callbacks
-pub struct OwnMembershipMachine<T: RtcCommandSender> {
-    /// Reference to the command sender for sending events.
-    command_sender: Arc<T>,
+pub struct OwnMembershipMachine<T: MatrixBackend> {
+    /// Reference to the backend for sending events.
+    backend: Arc<T>,
     /// Room ID for the session.
     room_id: String,
     /// Slot ID for the session.
@@ -272,12 +272,12 @@ struct SentSticky {
     sent_at_ms: u64,
 }
 
-impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
+impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// Creates a new own membership machine.
     ///
     /// # Arguments
     ///
-    /// * `command_sender` - The command sender for sending events
+    /// * `backend` - The backend for sending events
     /// * `room_id` - The room ID for the session
     /// * `slot_id` - The slot ID for the session
     /// * `sticky_key` - Our `member.id`, which doubles as the sticky key
@@ -285,7 +285,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
     ///   application-defined properties
     /// * `timings` - The three lifetimes the membership runs on
     pub fn new(
-        command_sender: Arc<T>,
+        backend: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,
@@ -298,7 +298,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             degraded_lifetime_ms,
         } = timings;
         Self {
-            command_sender,
+            backend,
             room_id,
             slot_id,
             sticky_key,
@@ -317,14 +317,14 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
     /// Creates a new own membership machine with the default keep-alive timeout.
     pub fn with_default_timeout(
-        command_sender: Arc<T>,
+        backend: Arc<T>,
         room_id: String,
         slot_id: String,
         sticky_key: String,
         application: impl Into<ApplicationInfo>,
     ) -> Self {
         Self::new(
-            command_sender,
+            backend,
             room_id,
             slot_id,
             sticky_key,
@@ -446,10 +446,11 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         // Schedule the delayed leave (Step 1 of dead man's switch)
         // This returns the event_id on success
         match self
-            .command_sender
+            .backend
             .send_delayed_event(
                 room_id.clone(),
                 "m.rtc.member".to_string(),
+                None,
                 delayed_content,
                 keep_alive_timeout_ms,
             )
@@ -496,7 +497,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Send the join event (Step 2 of dead man's switch)
         let event_id = self
-            .command_sender
+            .backend
             .send_sticky_event(
                 room_id.clone(),
                 "m.rtc.member".to_string(),
@@ -620,7 +621,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         log::info!("[{}] Sending leave membership event", room_id);
 
         // Send leave event
-        self.command_sender
+        self.backend
             .send_sticky_event(
                 room_id.clone(),
                 "m.rtc.member".to_string(),
@@ -646,7 +647,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
             // anyway. Failing the whole leave here would leave the machine
             // stuck in `Leaving` after a successful leave.
             match self
-                .command_sender
+                .backend
                 .cancel_delayed_event(room_id.clone(), event_id.clone())
                 .await
             {
@@ -725,7 +726,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         };
 
         match self
-            .command_sender
+            .backend
             .restart_delayed_event(room_id.clone(), event_id.clone())
             .await
         {
@@ -842,7 +843,7 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
         );
 
         match self
-            .command_sender
+            .backend
             .send_sticky_event(
                 room_id.clone(),
                 "m.rtc.member".to_string(),
@@ -900,10 +901,11 @@ impl<T: RtcCommandSender + 'static> OwnMembershipMachine<T> {
 
         // Schedule the delayed event and await its completion
         let delayed_event_id = self
-            .command_sender
+            .backend
             .send_delayed_event(
                 room_id.clone(),
                 "m.rtc.member".to_string(),
+                None,
                 delayed_content,
                 keep_alive_timeout_ms,
             )
@@ -931,9 +933,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use crate::host::commands::{
-        MockCommandSender, NoopCommandSender, ToDeviceDelivery, ToDeviceRecipient,
-    };
+    use crate::host::backend::{MockBackend, NoopBackend, ToDeviceDelivery, ToDeviceRecipient};
     use crate::transport::RawRtcTransport;
 
     const APPLICATION_TYPE: &str = "m.call";
@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn test_machine_starts_not_joined() {
         let machine = OwnMembershipMachine::with_default_timeout(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn test_machine_room_id() {
         let machine = OwnMembershipMachine::with_default_timeout(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
@@ -968,7 +968,7 @@ mod tests {
     #[test]
     fn test_machine_slot_id() {
         let machine = OwnMembershipMachine::with_default_timeout(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn test_machine_sticky_key() {
         let machine = OwnMembershipMachine::with_default_timeout(
-            Arc::new(NoopCommandSender),
+            Arc::new(NoopBackend),
             "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "alice-device-a".to_string(),
@@ -993,7 +993,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_machine_join_schedules_delayed_leave() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
@@ -1012,7 +1012,7 @@ mod tests {
         assert_eq!(delayed_events.len(), 1);
 
         // The first delayed event should be the leave (dead man's switch)
-        let (room_id, event_type, content, _delay) = &delayed_events[0];
+        let (room_id, event_type, _state_key, content, _delay) = &delayed_events[0];
         assert_eq!(room_id, "!room:example.org");
         assert_eq!(event_type, "m.rtc.member");
 
@@ -1035,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_machine_join_sends_join_event() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
@@ -1065,7 +1065,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_machine_join_with_transport() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
@@ -1109,7 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_machine_leave_sends_leave_event() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
@@ -1150,7 +1150,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_machine_heartbeat_restarts_delayed_leave() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
@@ -1254,9 +1254,7 @@ mod tests {
         assert!(machine.delayed_event_id().is_some());
     }
 
-    fn test_machine(
-        mock_sender: Arc<MockCommandSender>,
-    ) -> OwnMembershipMachine<MockCommandSender> {
+    fn test_machine(mock_sender: Arc<MockBackend>) -> OwnMembershipMachine<MockBackend> {
         OwnMembershipMachine::with_default_timeout(
             mock_sender,
             "!room:example.org".to_string(),
@@ -1269,9 +1267,9 @@ mod tests {
     /// A machine whose sticky entry lives `sticky_duration_ms`, so a test can
     /// make the refresh due (or not) without waiting on a clock.
     fn test_machine_with_sticky_duration(
-        mock_sender: Arc<MockCommandSender>,
+        mock_sender: Arc<MockBackend>,
         sticky_duration_ms: u64,
-    ) -> OwnMembershipMachine<MockCommandSender> {
+    ) -> OwnMembershipMachine<MockBackend> {
         OwnMembershipMachine::new(
             mock_sender,
             "!room:example.org".to_string(),
@@ -1297,7 +1295,15 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-    impl RtcCommandSender for CancelFailsSender {
+    impl MatrixBackend for CancelFailsSender {
+        fn own_user_id(&self) -> String {
+            "@alice:example.org".to_owned()
+        }
+
+        fn own_device_id(&self) -> String {
+            "DEVICE".to_owned()
+        }
+
         async fn send_sticky_event(
             &self,
             _room_id: String,
@@ -1316,6 +1322,7 @@ mod tests {
             &self,
             _room_id: String,
             _event_type: String,
+            _state_key: Option<String>,
             _content: Value,
             _delay_ms: u64,
         ) -> Result<String, CommandError> {
@@ -1417,7 +1424,15 @@ mod tests {
 
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-    impl RtcCommandSender for NoDelayedEventsSender {
+    impl MatrixBackend for NoDelayedEventsSender {
+        fn own_user_id(&self) -> String {
+            "@alice:example.org".to_owned()
+        }
+
+        fn own_device_id(&self) -> String {
+            "DEVICE".to_owned()
+        }
+
         async fn send_sticky_event(
             &self,
             _room_id: String,
@@ -1436,6 +1451,7 @@ mod tests {
             &self,
             _room_id: String,
             _event_type: String,
+            _state_key: Option<String>,
             _content: Value,
             _delay_ms: u64,
         ) -> Result<String, CommandError> {
@@ -1740,7 +1756,7 @@ mod tests {
     /// running past its lifetime must re-announce the membership.
     #[tokio::test]
     async fn heartbeat_refreshes_the_sticky_membership_once_half_expired() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         // A zero lifetime is always at least half expired.
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
         machine
@@ -1760,7 +1776,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_leaves_a_fresh_sticky_membership_alone() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 60 * 60 * 1000);
         machine
             .join(MemberTransports::default())
@@ -1778,7 +1794,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_refreshes_nothing_before_a_join() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
 
         machine.heartbeat().await;
@@ -1791,7 +1807,7 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_stops_refreshing_the_sticky_after_leaving() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
         machine
             .join(MemberTransports::default())
@@ -1872,7 +1888,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_join_and_delayed_leave_use_unstable_sticky_key() {
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         test_machine(mock_sender.clone())
             .join(MemberTransports::default())
             .await
@@ -1895,7 +1911,7 @@ mod tests {
             Some("join")
         );
 
-        let (_, _, delayed_content, _) = &mock_sender.delayed_events.lock().unwrap()[0];
+        let (_, _, _, delayed_content, _) = &mock_sender.delayed_events.lock().unwrap()[0];
         assert_eq!(
             delayed_content
                 .get("msc4354_sticky_key")
@@ -1909,7 +1925,7 @@ mod tests {
     async fn test_leave_uses_unstable_sticky_key_and_round_trips() {
         use crate::host::event::RawStickyEventContent;
 
-        let mock_sender = Arc::new(MockCommandSender::new());
+        let mock_sender = Arc::new(MockBackend::new());
         test_machine(mock_sender.clone())
             .leave(Some(LeaveReason::with_reason(
                 LeaveCode::Leave,
