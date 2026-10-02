@@ -601,7 +601,12 @@ impl WasmJoinSessionParams {
     /// join.
     fn into_call(self) -> Result<CallJoinOptions, JsError> {
         let transport = self.transport_intent()?;
-        let mut join = JoinOptions::new(self.slot_id, self.application);
+        // The binding names the whole slot id; the room checks it belongs to
+        // the application.
+        let mut join = JoinOptions {
+            slot_id: self.slot_id,
+            ..JoinOptions::application(self.application)
+        };
         join.transport = transport;
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;

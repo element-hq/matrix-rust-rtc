@@ -338,7 +338,10 @@ impl LiveKitCall {
         // join, except in the pre-sticky generation; see
         // `compat::ingest::member_id`) and renders our sends in the room's
         // dialect.
-        let mut join = JoinOptions::new(options.slot_id.clone(), options.application.clone());
+        let mut join = JoinOptions {
+            slot_id: options.slot_id.clone(),
+            ..JoinOptions::application(options.application.clone())
+        };
         join.transport = Some(TransportIntent::Publish(RtcTransport::LiveKit(
             livekit.clone(),
         )));

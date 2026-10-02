@@ -33,16 +33,16 @@ first membership), in the room's membership format:
 use std::sync::Arc;
 
 use matrix_rtc_core::{
-    BaseRtcClient, JoinSessionParams, LeaveSessionParams, MatrixBackend, RoomOptions,
+    BaseRtcClient, JoinSessionParams, LeaveSessionParams, LiveKitTransport, MatrixBackend,
+    RoomOptions, RtcTransport,
 };
 
 const ROOM: &str = "!room:example.org";
-const SLOT: &str = "org.example.board#ROOM";
+const SLOT: &str = "org.example.board#planning";
 
 async fn run(
     // The host's Matrix client, behind the one trait the library knows.
     backend: Arc<impl MatrixBackend + 'static>,
-    params: JoinSessionParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One per backend; creating it does no I/O.
     let client = BaseRtcClient::new(backend);
@@ -60,8 +60,18 @@ async fn run(
         }
     });
 
-    // The joined slot keeps itself alive until it leaves.
-    room.join(params).await?;
+    // Who joins is the backend's account. The transport is the application's
+    // choice (`matrix-rtc-call` takes the homeserver's first LiveKit one).
+    // Without `.slot`, the application's room-wide slot,
+    // `org.example.board#ROOM`; other setters override one default each
+    // (`.keep_alive_interval_ms(..)`, `.member_id(..)`, …). The joined slot
+    // keeps itself alive until it leaves.
+    let join = JoinSessionParams::application("org.example.board")
+        .slot("planning")
+        .transport(RtcTransport::LiveKit(LiveKitTransport {
+            livekit_service_url: "https://sfu.example.org".to_owned(),
+        }));
+    room.join(join).await?;
 
     room.leave(SLOT, LeaveSessionParams::new()).await?;
     Ok(())

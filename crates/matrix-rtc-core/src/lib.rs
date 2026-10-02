@@ -49,7 +49,7 @@ pub use host::event::{
 };
 pub use join::{
     DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS, JoinSessionParams,
-    LeaveSessionParams, TransportIntent, generate_member_id,
+    LeaveSessionParams, ROOM_SLOT_NAME, TransportIntent, generate_member_id,
 };
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
@@ -171,19 +171,23 @@ mod tests {
 
     /// Joins as alice under an explicit `member_id`, so a leave/rejoin pair can
     /// be told apart in the assertions.
+    /// The account these tests join as: the backend's, as every join's is.
+    fn alice_backend() -> Arc<crate::host::backend::MockBackend> {
+        let mut backend = crate::host::backend::MockBackend::new();
+        backend.user_id = "@alice:example.org".to_owned();
+        backend.device_id = "ALICEDEV".to_owned();
+        Arc::new(backend)
+    }
+
     async fn join_as(
         room: &mut BaseRtcRoom<crate::host::backend::MockBackend>,
         member_id: &str,
     ) -> String {
-        let mut params = JoinSessionParams::new(
-            "@alice:example.org".to_owned(),
-            "ALICEDEV".to_owned(),
-            "m.call#ROOM".to_owned(),
-            "m.call".to_owned(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com/jwt".to_owned(),
-            }),
-        );
+            },
+        ));
         params.membership_id = Some(member_id.to_owned());
         room.join(params).await.expect("join should succeed")
     }
@@ -293,7 +297,7 @@ mod tests {
     /// four.
     #[tokio::test]
     async fn a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
 
         // First call: bob arrives after we joined, so the joined memberships change while we
@@ -344,7 +348,7 @@ mod tests {
     /// receive stream for and to expect a key from.
     #[tokio::test]
     async fn a_rejoin_does_not_advertise_the_previous_participation() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
 
         join_as(&mut room, "alice-a").await;
@@ -368,7 +372,7 @@ mod tests {
     /// application can relate its own events to it without asking again.
     #[tokio::test]
     async fn a_join_returns_its_membership_event_id() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
 
         let event_id = join_as(&mut room, "alice-a").await;
@@ -381,19 +385,15 @@ mod tests {
     /// replace the live participation without leaving it.
     #[tokio::test]
     async fn joining_a_joined_slot_is_refused() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
 
-        let mut params = JoinSessionParams::new(
-            "@alice:example.org".to_owned(),
-            "ALICEDEV".to_owned(),
-            "m.call#ROOM".to_owned(),
-            "m.call".to_owned(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com/jwt".to_owned(),
-            }),
-        );
+            },
+        ));
         params.membership_id = Some("alice-b".to_owned());
 
         assert!(matches!(
@@ -412,7 +412,7 @@ mod tests {
     /// future "just drop the session on leave" refactor has to argue with a test.
     #[tokio::test]
     async fn a_left_session_still_publishes_the_peer_memberships() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
 
         join_as(&mut room, "alice-a").await;
@@ -830,7 +830,7 @@ mod tests {
     /// to-device traffic to the other member.
     #[tokio::test]
     async fn slot_encryption_turns_key_distribution_on() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
         room.on_encryption_received(true).await;
@@ -855,7 +855,7 @@ mod tests {
     /// keys are distributed there however the client is configured.
     #[tokio::test]
     async fn absent_slot_encryption_turns_key_distribution_off() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
         room.on_encryption_received(false).await;
@@ -877,15 +877,11 @@ mod tests {
         room: &mut BaseRtcRoom<crate::host::backend::MockBackend>,
         local_manage_media_keys: bool,
     ) {
-        let mut params = JoinSessionParams::new(
-            "@alice:example.org".to_owned(),
-            "ALICEDEV".to_owned(),
-            "m.call#ROOM".to_owned(),
-            "m.call".to_owned(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com/jwt".to_owned(),
-            }),
-        );
+            },
+        ));
         params.membership_id = Some("alice-a".to_owned());
         params.encryption_config = Some(EncryptionConfig {
             manage_media_keys: local_manage_media_keys,
@@ -905,18 +901,13 @@ mod tests {
     /// nothing is a legitimate choice rather than a broken join.
     #[tokio::test]
     async fn a_receive_only_member_joins_and_publishes_nothing() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
-        let params = JoinSessionParams::with_transport_intent(
-            "@recorder:example.org".to_owned(),
-            "RECORDERDEV".to_owned(),
-            "m.call#ROOM".to_owned(),
-            "m.call".to_owned(),
-            TransportIntent::ReceiveOnly {
+        let params =
+            JoinSessionParams::application("m.call").transport(TransportIntent::ReceiveOnly {
                 can_subscribe: vec!["livekit".to_owned()],
-            },
-        );
+            });
         room.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
@@ -943,18 +934,13 @@ mod tests {
     /// rather than emitted empty.
     #[tokio::test]
     async fn a_receive_only_member_with_no_cue_omits_transports() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
-        let params = JoinSessionParams::with_transport_intent(
-            "@recorder:example.org".to_owned(),
-            "RECORDERDEV".to_owned(),
-            "m.call#ROOM".to_owned(),
-            "m.call".to_owned(),
-            TransportIntent::ReceiveOnly {
+        let params =
+            JoinSessionParams::application("m.call").transport(TransportIntent::ReceiveOnly {
                 can_subscribe: Vec::new(),
-            },
-        );
+            });
         room.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
@@ -966,18 +952,14 @@ mod tests {
     /// declares it can receive on that type too.
     #[tokio::test]
     async fn a_publishing_member_advertises_its_transport() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
-        let params = JoinSessionParams::new(
-            "@alice:example.org".to_owned(),
-            "ALICEDEV".to_owned(),
-            "m.call#ROOM".to_owned(),
-            "m.call".to_owned(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://sfu.example.com/jwt".to_owned(),
-            }),
-        );
+            },
+        ));
         room.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
@@ -1116,7 +1098,7 @@ mod tests {
     /// The core keeps a join alive by itself: nobody ticks it.
     #[tokio::test(start_paused = true)]
     async fn a_joined_slot_keeps_itself_alive_until_it_leaves() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
         assert_eq!(
@@ -1137,7 +1119,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dropping_the_room_stops_its_upkeep() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
 
@@ -1149,7 +1131,7 @@ mod tests {
     /// What lets an owner that drops a join without leaving stop its upkeep.
     #[tokio::test(start_paused = true)]
     async fn aborting_the_upkeep_handle_stops_it_and_sends_no_leave() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         let mut room = encrypted_call_room(sender.clone()).await;
         join_as(&mut room, "alice-a").await;
 
@@ -1165,7 +1147,7 @@ mod tests {
     /// Without a runtime the join still succeeds; the host ticks it instead.
     #[test]
     fn a_join_off_a_runtime_has_no_upkeep() {
-        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let sender = alice_backend();
         futures::executor::block_on(async {
             let mut room = encrypted_call_room(sender.clone()).await;
             join_as(&mut room, "alice-a").await;

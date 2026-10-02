@@ -29,6 +29,12 @@ one slot — and `join_call(CallJoinOptions)` an `RtcCall`, which is an `RtcSess
 plus reactions, the raised hand and the ring. Room-scoped reads (`slot_state`,
 `member_count`, `observe`) and `open_slot`/`close_slot` need no join.
 
+Both name the slot, not its id: `CallJoinOptions::new()` joins the room-wide
+call `m.call#ROOM`, `.slot("standup")` joins `m.call#standup`, and
+`JoinOptions::application("org.example.board").slot("planning")` composes
+`org.example.board#planning`. The transport is the homeserver's first LiveKit
+one unless `.transport(..)` names one.
+
 Ending things: `session.leave()` leaves; `room.close()` leaves every slot joined
 through it, then unsubscribes. Dropping a session or a room sends no leave — the
 membership expires through its delayed leave, and joining the slot again leaves
@@ -46,7 +52,7 @@ learns of a ring through its own SDK or push path.
 | **`room_state`** | `CallRoomState`, the call layer over one core `BaseRtcRoom`: reactions per joined slot, the ring at join. |
 | **`reactions`** | Element Call's emoji reactions and raised hand: the wire format, the send cooldown, and the per-session state the call keeps. |
 | **`notification`** | MSC4075 ringing: who notifies, and the notification content. |
-| **`transports`** | `choose(rtc_transports, override)`: the library's transport pick — the join's override, else the first LiveKit entry the homeserver advertises. |
+| **`transports`** | `choose(rtc_transports, override)`: the library's transport pick — the join's override, else the first LiveKit entry the homeserver advertises. The core's join takes the result; it chooses none itself. |
 
 ## Testing
 

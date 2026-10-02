@@ -8,9 +8,10 @@
 //! ([`notification`]), and the host-facing [`RtcClient`] → [`RtcRoom`] →
 //! [`RtcSession`] / [`RtcCall`].
 //!
-//! It also holds [`transports`], which transport a join publishes on. Opening
-//! a room, its feeds and the pre-2026 membership formats are the core's
-//! (`matrix_rtc_core::compat`).
+//! It also holds [`transports`], which transport a join publishes on: the
+//! homeserver's first advertised LiveKit one unless the join names one.
+//! Opening a room, its feeds and the pre-2026 membership formats
+//! (`matrix_rtc_core::compat`) are the core's.
 
 mod client;
 #[cfg(test)]

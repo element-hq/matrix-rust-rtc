@@ -72,26 +72,25 @@ async fn open(
     room
 }
 
-fn join_params(mock: &MockBackend) -> JoinSessionParams {
-    JoinSessionParams::new(
-        mock.user_id.clone(),
-        mock.device_id.clone(),
-        SLOT.to_owned(),
-        "m.call",
-        RtcTransport::LiveKit(LiveKitTransport {
-            livekit_service_url: "https://sfu.example.org".to_owned(),
-        }),
-    )
+fn mock() -> Arc<MockBackend> {
+    Arc::new(MockBackend::new())
+}
+
+/// Who joins is the backend's account; the transport is the host's choice.
+fn join_params() -> JoinSessionParams {
+    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(LiveKitTransport {
+        livekit_service_url: "https://sfu.example.org".to_owned(),
+    }))
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_room_feeds_itself_and_a_join_keeps_itself_alive() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
     assert_eq!(room.observe(SLOT).await.borrow().len(), 1);
 
-    room.join(join_params(&mock)).await.expect("join");
+    room.join(join_params()).await.expect("join");
     assert_eq!(room.state().lock().await.joined_slots(), vec![SLOT]);
     tokio::time::sleep(
         Duration::from_millis(crate::DEFAULT_KEEP_ALIVE_INTERVAL_MS * 2) + Duration::from_millis(1),
@@ -106,7 +105,7 @@ async fn a_room_feeds_itself_and_a_join_keeps_itself_alive() {
 
 #[tokio::test]
 async fn a_second_handle_for_an_open_room_is_refused() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
 
@@ -121,7 +120,7 @@ async fn a_second_handle_for_an_open_room_is_refused() {
 
 #[tokio::test]
 async fn an_opening_that_fails_leaves_nothing_behind() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     *mock.room_subscription_error.lock().unwrap() =
         Some(BackendError::not_implemented("subscribe_room"));
@@ -139,7 +138,7 @@ async fn an_opening_that_fails_leaves_nothing_behind() {
 
 #[tokio::test]
 async fn the_to_device_subscription_stops_with_the_last_room() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
     let other = open(&client, &mock, OTHER_ROOM).await;
@@ -154,7 +153,7 @@ async fn the_to_device_subscription_stops_with_the_last_room() {
 
 #[tokio::test]
 async fn a_media_key_for_a_room_that_is_not_open_is_dropped() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let _room = open(&client, &mock, ROOM).await;
 
@@ -236,14 +235,14 @@ async fn open_in(
 
 #[tokio::test]
 async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
     let subjects = mock.room_subscription(ROOM).unwrap().subjects.clone();
     assert_eq!(subjects.state_event_types, vec![STATE_MEMBER_EVENT_TYPE]);
     assert_eq!(room.observe(SLOT).await.borrow().len(), 1);
 
-    let member_id = room.join(join_params(&mock)).await.expect("join");
+    let member_id = room.join(join_params()).await.expect("join");
     assert_eq!(
         room.state().lock().await.own_member_id(SLOT),
         Some(format!("{}:{}", mock.user_id, mock.device_id)),
@@ -262,10 +261,10 @@ async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() 
 
 #[tokio::test]
 async fn a_sticky_2025_join_carries_the_legacy_fields() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
-    room.join(join_params(&mock)).await.expect("join");
+    room.join(join_params()).await.expect("join");
 
     let sticky = mock.sticky_events.lock().unwrap();
     let (_, _, content, _) = sticky.last().expect("a membership");
@@ -275,10 +274,10 @@ async fn a_sticky_2025_join_carries_the_legacy_fields() {
 
 #[tokio::test]
 async fn dropping_the_room_forgets_its_dialect() {
-    let mock = Arc::new(MockBackend::new());
+    let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
     let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
-    room.join(join_params(&mock)).await.expect("join");
+    room.join(join_params()).await.expect("join");
     assert!(matches!(
         client.backend().dialect(ROOM),
         OutboundDialect::Sticky(_)
@@ -289,4 +288,25 @@ async fn dropping_the_room_forgets_its_dialect() {
         client.backend().dialect(ROOM),
         OutboundDialect::None
     ));
+}
+
+#[tokio::test]
+async fn a_join_without_a_transport_is_refused_and_publishes_nothing() {
+    let mock = mock();
+    *mock.transports.lock().unwrap() =
+        Ok(json!([{ "type": "livekit", "livekit_service_url": "https://advertised.example.org" }]));
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+
+    let refused = room.join(JoinSessionParams::application("m.call")).await;
+    assert!(matches!(
+        refused,
+        Err(JoinError::MissingParameter("transport is required"))
+    ));
+    assert!(mock.sticky_events.lock().unwrap().is_empty());
+    assert_eq!(
+        mock.transports_requests.load(Ordering::SeqCst),
+        0,
+        "choosing a transport is the application's, not the core's"
+    );
 }

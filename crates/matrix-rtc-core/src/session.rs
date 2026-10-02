@@ -334,7 +334,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     ///
     /// # Arguments
     ///
-    /// * `params` - The join parameters including user info, transport, etc.
+    /// * `params` - The slot, the application, the transport, and any
+    ///   overrides; the user and device are the backend's.
     ///
     /// # Returns
     ///
@@ -357,6 +358,12 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         })?;
 
         let membership_id = params.membership_id();
+        let user_id = backend.own_user_id();
+        let device_id = backend.own_device_id();
+        let transport = params
+            .transport
+            .clone()
+            .expect("validate() refuses a join without a transport");
 
         // Check if already joined with this membership
         if self
@@ -369,14 +376,11 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         log::info!(
-            "[{}] joining as {membership_id} ({}/{}, transport {:?})",
+            "[{}] joining as {membership_id} ({user_id}/{device_id}, transport {transport:?})",
             self.log_tag,
-            params.user_id,
-            params.device_id,
-            params.transport,
         );
 
-        let transports = match &params.transport {
+        let transports = match &transport {
             TransportIntent::Publish(transport) => MemberTransports::publishing(
                 serde_json::from_value(transport_to_json(transport))
                     .expect("a transport always serializes to an object with a type"),
@@ -386,7 +390,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 can_subscribe: can_subscribe.clone(),
             },
         };
-        let keep_alive_interval = Duration::from_millis(params.keep_alive_interval_ms());
+        let keep_alive_interval = Duration::from_millis(params.effective_keep_alive_interval_ms());
         let machine = OwnMembershipMachine::new(
             backend.clone(),
             self.room_id.clone(),
@@ -394,9 +398,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             membership_id.clone(),
             params.application.clone(),
             MembershipTimings {
-                keep_alive_timeout_ms: params.keep_alive_timeout_ms(),
-                sticky_duration_ms: params.sticky_duration_ms(),
-                degraded_lifetime_ms: params.degraded_lifetime_ms(),
+                keep_alive_timeout_ms: params.effective_keep_alive_timeout_ms(),
+                sticky_duration_ms: params.effective_sticky_duration_ms(),
+                degraded_lifetime_ms: params.effective_degraded_lifetime_ms(),
             },
         );
 
@@ -406,8 +410,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // Store the machine
         self.own_membership_machine = Some(Arc::new(machine));
         self.own_participation = Some(OwnParticipation {
-            user_id: params.user_id.clone(),
-            device_id: params.device_id.clone(),
+            user_id: user_id.clone(),
+            device_id: device_id.clone(),
             member_id: membership_id.clone(),
         });
 
@@ -418,7 +422,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // an identical prefix, and the interleaving cannot be untangled even in
         // principle: "membership changed" from one device sits next to
         // "candidate added" from another, and any conclusion drawn is a guess.
-        self.log_tag = format!("{}/{}", self.log_tag, params.device_id);
+        self.log_tag = format!("{}/{device_id}", self.log_tag);
 
         // Create the encryption manager
         // We need a closure that can access self.members
@@ -429,7 +433,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             move || members_tx.borrow().clone()
         };
 
-        let mut encryption_config = params.encryption_config();
+        let mut encryption_config = params.effective_encryption_config();
         if let Some(negotiated) = self.negotiated_encryption() {
             // The slot decides whether RTC data is encrypted; the local flag only
             // applies where no slot state has been supplied to negotiate from.
@@ -438,8 +442,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         let mut encryption_manager = EncryptionManager::new(
             backend.clone(),
-            params.user_id.clone(),
-            params.device_id.clone(),
+            user_id,
+            device_id,
             membership_id.clone(),
             self.room_id.clone(),
             self.slot_id.clone(),

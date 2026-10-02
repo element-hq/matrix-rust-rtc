@@ -287,7 +287,12 @@ impl FfiJoinSessionParams {
         self,
     ) -> Result<matrix_rtc_call::CallJoinOptions, matrix_rtc_core::CommandError> {
         let transport = self.transport_intent()?;
-        let mut join = matrix_rtc_call::JoinOptions::new(self.slot_id, self.application);
+        // The binding names the whole slot id; the room checks it belongs to
+        // the application.
+        let mut join = matrix_rtc_call::JoinOptions {
+            slot_id: self.slot_id,
+            ..matrix_rtc_call::JoinOptions::application(self.application)
+        };
         join.transport = transport;
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;

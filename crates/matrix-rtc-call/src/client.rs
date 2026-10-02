@@ -26,8 +26,8 @@ use std::time::Duration;
 use matrix_rtc_core::{
     ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveError, LeaveSessionParams, MatrixBackend, OpenError, RtcIdentityMapper, SlotEncryption,
-    SlotState, TransportIntent,
+    LeaveError, LeaveSessionParams, MatrixBackend, OpenError, ROOM_SLOT_NAME, RtcIdentityMapper,
+    SlotEncryption, SlotState, TransportIntent,
     executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -96,10 +96,13 @@ pub struct JoinOptions {
 }
 
 impl JoinOptions {
-    pub fn new(slot_id: impl Into<String>, application: impl Into<ApplicationInfo>) -> Self {
+    /// Joins `application`'s room-wide slot, `{application}#ROOM`, with
+    /// everything else defaulted; each setter overrides one default.
+    pub fn application(application: impl Into<ApplicationInfo>) -> Self {
+        let application = application.into();
         Self {
-            slot_id: slot_id.into(),
-            application: application.into(),
+            slot_id: slot_id_of(&application, ROOM_SLOT_NAME),
+            application,
             transport: None,
             encryption_config: None,
             keep_alive_timeout_ms: None,
@@ -108,6 +111,52 @@ impl JoinOptions {
             degraded_lifetime_ms: None,
         }
     }
+
+    /// Joins the application's slot named `name`: `{application}#{name}`.
+    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
+        self.slot_id = slot_id_of(&self.application, name.as_ref());
+        self
+    }
+
+    /// Publishes on (or only receives from) `transport` instead of the
+    /// homeserver's first advertised LiveKit transport.
+    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
+        self.transport = Some(transport.into());
+        self
+    }
+
+    pub fn encryption_config(mut self, config: EncryptionConfig) -> Self {
+        self.encryption_config = Some(config);
+        self
+    }
+
+    pub fn keep_alive_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.keep_alive_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    pub fn keep_alive_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.keep_alive_interval_ms = Some(interval_ms);
+        self
+    }
+
+    pub fn sticky_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.sticky_duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn degraded_lifetime_ms(mut self, lifetime_ms: u64) -> Self {
+        self.degraded_lifetime_ms = Some(lifetime_ms);
+        self
+    }
+}
+
+/// `{application}#{name}`, MSC4143's slot id.
+fn slot_id_of(application: &ApplicationInfo, name: &str) -> String {
+    format!(
+        "{}#{name}",
+        application.application_type().unwrap_or_default()
+    )
 }
 
 /// A join into a call slot: the generic join plus what a call adds.
@@ -122,15 +171,48 @@ pub struct CallJoinOptions {
 }
 
 impl CallJoinOptions {
-    /// A quiet `m.call` join with default reactions.
-    pub fn new(slot_id: impl Into<String>) -> Self {
+    /// A quiet join of the room-wide call, `m.call#ROOM`, with default
+    /// reactions.
+    pub fn new() -> Self {
         Self {
-            join: JoinOptions::new(slot_id, "m.call"),
+            join: JoinOptions::application(CALL_APPLICATION),
             notify: None,
             reactions: None,
         }
     }
+
+    /// Joins the call slot named `name`: `m.call#{name}`.
+    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
+        self.join = self.join.slot(name);
+        self
+    }
+
+    /// See [`JoinOptions::transport`].
+    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
+        self.join = self.join.transport(transport);
+        self
+    }
+
+    /// Rings the room when we start the call.
+    pub fn notify(mut self, notify: NotifyConfig) -> Self {
+        self.notify = Some(notify);
+        self
+    }
+
+    pub fn reactions(mut self, reactions: ReactionsConfig) -> Self {
+        self.reactions = Some(reactions);
+        self
+    }
 }
+
+impl Default for CallJoinOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The MSC4143 application type of a call.
+const CALL_APPLICATION: &str = "m.call";
 
 /// How long the raised hand waits before retrying a failed re-annotation.
 const RETRY: Duration = Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS);
@@ -396,12 +478,10 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
 
         let mut params = JoinSessionParams {
-            user_id: self.backend.own_user_id(),
-            device_id: self.backend.own_device_id(),
             membership_id: None,
             slot_id,
             application,
-            transport,
+            transport: Some(transport),
             keep_alive_timeout_ms,
             keep_alive_interval_ms,
             sticky_duration_ms,

@@ -210,13 +210,13 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         let slot_id = rtc.slot_id.clone();
 
         let member_event_id = self.rtc.join(rtc.clone()).await?;
+        // The join succeeded, so the room has a backend.
+        let user_id = self.backend()?.own_user_id();
 
         self.with_state(&slot_id, |state| {
             state.reactions.configure(reactions);
             state.reactions.reset_own();
-            state.own = Some(OwnCall {
-                user_id: rtc.user_id.clone(),
-            });
+            state.own = Some(OwnCall { user_id });
         });
 
         if let Some(notify) = &notify {

@@ -275,17 +275,20 @@ impl<B: MatrixBackend + 'static, M> BaseRtcRoomHandle<B, M> {
     /// afterwards would let the two events that announce us go out in the
     /// current format.
     pub fn prepare_join(&self, params: &mut JoinSessionParams) {
+        let backend = &self.client.backend;
+        let user_id = backend.own_user_id();
+        let device_id = backend.own_device_id();
         // Not always a fresh id: see `compat::ingest::member_id` for the one
         // format where a fresh one makes us mark ourselves departed.
         params
             .membership_id
-            .get_or_insert_with(|| member_id(self.format, &params.user_id, &params.device_id));
-        self.client.backend.set_dialect(
+            .get_or_insert_with(|| member_id(self.format, &user_id, &device_id));
+        backend.set_dialect(
             &self.room_id,
             outbound_dialect(
                 self.format,
-                &params.user_id,
-                &params.device_id,
+                &user_id,
+                &device_id,
                 &self.room_id,
                 &params.slot_id,
             ),

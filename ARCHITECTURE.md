@@ -226,6 +226,8 @@ Membership is always applied as a complete set: a member whose event is absent f
   and runs their feeds; `BaseRtcRoomHandle::seeded` resolves once the room's
   current state has been applied.
 
+- A join names its slot, application and transport; who joins is the
+  backend's account. Choosing the transport is the application's.
 - `BaseRtcClient` wraps the backend in `compat::dialect_backend::DialectBackend`,
   the one `MatrixBackend` wrapper that applies the outbound half of a room's
   format (member-event routing, legacy key type, pre-sticky leave) before
@@ -276,7 +278,8 @@ Membership is always applied as a complete set: a member whose event is absent f
   resolves once the room's current state has been applied, which is what the
   bindings' `room` awaits.
 - `transports::choose`: the library's transport choice (first LiveKit entry of
-  the backend's `rtc_transports()`, unless the join names one).
+  the backend's `rtc_transports()`, unless the join names one), asked before
+  the room's lock is taken and handed to the core's join.
 
 ## `crates/matrix-rtc-matrix-sdk`
 

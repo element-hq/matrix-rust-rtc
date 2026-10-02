@@ -236,12 +236,12 @@ pub fn build_notification_content(
 /// the core applies to drop a superseded participation of ours from the
 /// roster, which leaves such a candidate in rather than dropping a genuine
 /// peer.
-fn is_own_participation(member: &JoinedMembership, params: &JoinSessionParams) -> bool {
-    member.sender == params.user_id
+fn is_own_participation(member: &JoinedMembership, user_id: &str, own_device_id: &str) -> bool {
+    member.sender == user_id
         && member
             .origin
             .sender_device_id()
-            .is_none_or(|device_id| device_id == params.device_id)
+            .is_none_or(|device_id| device_id == own_device_id)
 }
 
 /// Sends the MSC4075 notification that summons the room to this session.
@@ -260,7 +260,9 @@ pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
     members: &[JoinedMembership],
     member_event_id: &str,
 ) {
-    let tag = format!("{room_id}/{}/{}", params.slot_id, params.device_id);
+    let user_id = backend.own_user_id();
+    let device_id = backend.own_device_id();
+    let tag = format!("{room_id}/{}/{device_id}", params.slot_id);
 
     // MSC4075 leaves who sends the notification open, but every joiner
     // sending one would ring the room once per participant. Only the member
@@ -283,7 +285,7 @@ pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
     // failure to ring at all, which is the bug this replaced.
     let others = members
         .iter()
-        .filter(|member| !is_own_participation(member, params))
+        .filter(|member| !is_own_participation(member, &user_id, &device_id))
         .count();
     if others > 0 {
         log::info!(
@@ -296,8 +298,8 @@ pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
     let content = build_notification_content(
         notify,
         params.application.application_type().unwrap_or_default(),
-        &params.user_id,
-        &params.device_id,
+        &user_id,
+        &device_id,
         member_event_id,
         crate::now_ms(),
     );
