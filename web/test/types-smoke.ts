@@ -83,7 +83,7 @@ export async function smoke(
   client: WasmRtcClient,
   delegate: MediaDelegate,
 ): Promise<void> {
-  const options: RoomOptionsIn = { element_call_compat: 'sticky_events' };
+  const options: RoomOptionsIn = { format: 'sticky_2025' };
   const room: WasmRtcRoom = await client.room('!r:hs', options);
 
   const params: JoinParamsIn = {

@@ -20,12 +20,12 @@ pub mod token;
 
 pub use token::{MemberClaims, SfuToken, TokenServiceError};
 
-use matrix_rtc_call::compat::{ElementCallCompat, element_call_state};
+use matrix_rtc_core::compat::{MembershipFormat, room_state};
 
 /// The participant-identity derivation a MatrixRTC generation's authorisation
 /// service uses.
 ///
-/// One of the two things `matrix_rtc_call::compat` deliberately cannot own — the
+/// One of the two things `matrix_rtc_core::compat` deliberately cannot own — the
 /// other being [`TokenEndpoint`] — because the modern derivation hashes per
 /// MSC4195, which is a LiveKit document rather than a Matrix wire format. The
 /// `compat` module decides *which generation*; this decides *what that means
@@ -42,18 +42,18 @@ use matrix_rtc_call::compat::{ElementCallCompat, element_call_state};
 /// This is deliberately a plain Rust closure even on the web:
 /// `RtcIdentityMapper` is `Send + Sync`, which a JS-backed function can never
 /// be, and the derivation is a hash with no reason to cross the boundary.
-pub fn identity_mapper(compat: ElementCallCompat) -> matrix_rtc_core::RtcIdentityMapper {
+pub fn identity_mapper(compat: MembershipFormat) -> matrix_rtc_core::RtcIdentityMapper {
     use std::sync::Arc;
 
     match compat {
-        ElementCallCompat::Off | ElementCallCompat::StickyEvents => {
+        MembershipFormat::Current | MembershipFormat::Sticky2025 => {
             Arc::new(identity::pseudonymous_identity)
         }
         // That generation's authorisation service issues the unhashed
         // `{user}:{device}` string, and has no session component at all.
-        ElementCallCompat::StateEvents => {
+        MembershipFormat::RoomState => {
             Arc::new(|user_id: &str, device_id: &str, _member_id: &str| {
-                element_call_state::participant_identity(user_id, device_id)
+                room_state::participant_identity(user_id, device_id)
             })
         }
     }
@@ -66,7 +66,7 @@ pub enum TokenEndpoint {
     #[default]
     Msc4195,
     /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
-    /// Temporary; see `matrix_rtc_call::compat`.
+    /// Temporary; see `matrix_rtc_core::compat`.
     LegacyElementCall,
 }
 

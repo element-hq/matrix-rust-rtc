@@ -42,12 +42,13 @@ use matrix_sdk::{Client, Room};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{broadcast, watch};
 
-use matrix_rtc_call::compat::{self, ElementCallCompat};
 use matrix_rtc_call::transports;
 use matrix_rtc_call::{
     CallJoinOptions, JoinOptions, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
-    RoomOptions, RtcCall, RtcClient, RtcError, RtcRoom,
+    RtcCall, RtcClient, RtcError, RtcRoom,
 };
+use matrix_rtc_core::RoomOptions;
+use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{
     BaseRtcRoom, EncryptionConfig, LiveKitTransport, MatrixBackend, RtcTransport, SlotEncryption,
     TransportIntent,
@@ -161,7 +162,7 @@ pub struct LiveKitCallOptions {
     /// with Element Call builds that have not caught up with the 2026 MSC4143
     /// rewrite.
     ///
-    /// [`ElementCallCompat::StickyEvents`] keeps a join MSC4143-valid — the
+    /// [`MembershipFormat::Sticky2025`] keeps a join MSC4143-valid — the
     /// legacy fields ride alongside. A leave and a media key cannot: a leave
     /// becomes the legacy bare-sticky-key content (that generation has no
     /// `membership` field, and a padded spec leave would read to it as still
@@ -170,7 +171,7 @@ pub struct LiveKitCallOptions {
     /// mode therefore exchanges keys with legacy peers and not with spec-current
     /// ones.
     ///
-    /// [`ElementCallCompat::StateEvents`] goes further and is not additive at
+    /// [`MembershipFormat::RoomState`] goes further and is not additive at
     /// all: the membership moves to `org.matrix.msc3401.call.member` room state,
     /// the SFU participant identity becomes the plain `{user}:{device}` string,
     /// and the token comes from the pre-MSC4195 `/sfu/get` endpoint. Nothing
@@ -178,7 +179,7 @@ pub struct LiveKitCallOptions {
     ///
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
     /// [`crate::compat`], and delete all of it once Element Call catches up.
-    pub element_call_compat: ElementCallCompat,
+    pub format: MembershipFormat,
     /// Ask for an MSC4075 notification to be sent with this join, so other
     /// devices in the room ring or show an incoming call.
     ///
@@ -214,7 +215,7 @@ impl Default for LiveKitCallOptions {
             degraded_lifetime_ms: None,
             http: None,
             auto_subscribe: true,
-            element_call_compat: ElementCallCompat::default(),
+            format: MembershipFormat::default(),
             notify: None,
             reactions: None,
             stability: StabilityConfig::default(),
@@ -271,15 +272,15 @@ impl LiveKitCall {
             .to_string();
         let room_id = room.room_id().to_string();
 
-        match options.element_call_compat {
-            ElementCallCompat::Off => {}
-            ElementCallCompat::StickyEvents => log::warn!(
+        match options.format {
+            MembershipFormat::Current => {}
+            MembershipFormat::Sticky2025 => log::warn!(
                 "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
                  go out as {} and will not reach spec-current peers",
                 options.slot_id,
                 compat::LEGACY_KEY_EVENT_TYPE,
             ),
-            ElementCallCompat::StateEvents => log::warn!(
+            MembershipFormat::RoomState => log::warn!(
                 "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
                  membership goes out as {} room state, our SFU identity is the plain \
                  {{user}}:{{device}} string, and the token comes from /sfu/get. Nothing about \
@@ -297,7 +298,7 @@ impl LiveKitCall {
             .room(
                 room_id.clone(),
                 RoomOptions {
-                    element_call_compat: options.element_call_compat,
+                    format: options.format,
                 },
             )
             .await?;
@@ -309,7 +310,7 @@ impl LiveKitCall {
         // per-participant HKDF mode.
         let provider = msc4195_key_provider();
         let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
-        let identity_mapper = identity_mapper(options.element_call_compat);
+        let identity_mapper = identity_mapper(options.format);
 
         // The transport is resolved here rather than by the join, because the
         // SFU connection below needs the LiveKit focus it names: the join's own
@@ -402,11 +403,11 @@ impl LiveKitCall {
                 // The same mapper the core got, so our own identity, the peers'
                 // and the key ring's all agree.
                 .with_identity_mapper(identity_mapper.clone())
-                .with_token_endpoint(match options.element_call_compat {
+                .with_token_endpoint(match options.format {
                     // Pre-MSC4195 `/sfu/get`, which is also where the unhashed
                     // `{user}:{device}` identity above comes from — the two are
                     // one decision, not two.
-                    ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                    MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
                     _ => TokenEndpoint::Msc4195,
                 }),
         );

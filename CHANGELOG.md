@@ -25,12 +25,14 @@ log only.
 - `JoinSessionParams.application` and `JoinedMembership.application` are the whole MSC4143 `ApplicationInfo`, and the wasm roster serializes it as an object.
 - `BaseRtcRoom::join` returns the event id of the membership it sent, and `RtcSession::membership_event_id` reads the current one.
 - The feeder feeds any `ApplicationIntake`, subscribing to the event types it names.
-- The feeder moves from `matrix_rtc_call::feeder` to `matrix_rtc_core::feeder`, reading a room through an `IngestDialect` (`SpecDialect`, or `ElementCallCompat` from the call crate).
+- The feeder moves from `matrix_rtc_call::feeder` to `matrix_rtc_core::feeder`, reading a room through an `IngestDialect`.
+- The pre-2026 membership formats move from `matrix_rtc_call::compat` to `matrix_rtc_core::compat`, and `ElementCallCompat { Off, StickyEvents, StateEvents }` becomes `MembershipFormat { Current, Sticky2025, RoomState }` on every host (`FfiMembershipFormat`, the wasm `format: "current" | "sticky_2025" | "room_state"` room option, `LiveKitCallOptions::format`, `RoomOptions::format`, the load test's `--format`).
 - `WasmRtcSession`, the bare single-session wasm API, is removed; `WasmRtcClient` over a `MatrixBackendHost` is the one entry point, and `joinCall` rings like every other host.
 
 ### Added
 
 - `BaseRtcClient` opens a core room that subscribes through the backend and feeds itself, so a host of the core alone feeds and ticks nothing.
+- A core room opens in a `MembershipFormat` (`BaseRtcClient::room(room_id, RoomOptions)`) and renders its joins in it, so a host of the core alone can join in the 2025 sticky or the pre-sticky room-state format.
 - `BaseRtcRoom::join` starts the slot's upkeep (keep-alive, sticky refresh, key rotations at their deadline) until the leave, so a host on the core alone ticks nothing either; `upkeep_abort_handle` stops it for an owner that drops the join without leaving.
 - `BaseRtcRoom::add_membership_listener`: synchronous notice of every change to a slot's joined memberships, for applications built on the core.
 - `ApplicationIntake` and `RelationsRequest`, how a host feeds an application beyond membership.

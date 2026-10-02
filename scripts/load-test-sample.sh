@@ -89,7 +89,7 @@ SLOT_ID="m.call#ROOM"
 # Publish the m.rtc.slot state event first. Needs the power level for it, and
 # is unnecessary when a real client already opened the call.
 #
-# Set this when the call was opened by Element Call (see ELEMENT_CALL_COMPAT):
+# Set this when the call was opened by Element Call (see MEMBERSHIP_FORMAT):
 # that client publishes no m.rtc.slot at all, and a slot nobody opened reads as
 # closed, which projects every member — including these devices — out of the
 # call.
@@ -98,7 +98,7 @@ OPEN_SLOT=0
 # Share the call with Element Call on the JS SDK, which still speaks a MatrixRTC
 # wire format from before the 2026 MSC4143 rewrite. One of:
 #
-#   off     current MSC4143 + MSC4354 only.
+#   current MSC4143 + MSC4354 only.
 #   sticky  the 2025 format. Our membership also carries the fields it needs
 #           (notably the device id it addresses media keys to, which it cannot
 #           obtain any other way — it runs as a widget and gets no decryption
@@ -114,7 +114,7 @@ OPEN_SLOT=0
 #           run does not enforce the slot condition at all.
 #
 # Reading the 2025 format needs no flag and is always on.
-ELEMENT_CALL_COMPAT=off
+MEMBERSHIP_FORMAT=current
 
 # Accept self-signed certificates (the demo/backend stack).
 INSECURE_TLS=0
@@ -225,7 +225,7 @@ args=(
 [[ "$AUDIO" == "1" ]] && args+=(--audio)
 [[ "$SUBSCRIBE" == "1" ]] && args+=(--subscribe)
 [[ "$OPEN_SLOT" == "1" ]] && args+=(--open-slot)
-args+=(--element-call-compat "$ELEMENT_CALL_COMPAT")
+args+=(--format "$MEMBERSHIP_FORMAT")
 [[ "$INSECURE_TLS" == "1" ]] && args+=(--insecure-tls)
 [[ -n "$STORE" ]] && args+=(--store "$STORE")
 

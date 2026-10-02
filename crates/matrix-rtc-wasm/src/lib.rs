@@ -28,10 +28,9 @@
 
 use std::sync::Arc;
 
-use matrix_rtc_call::compat::{DialectBackend, ElementCallCompat};
-use matrix_rtc_call::{
-    CallJoinOptions, JoinOptions, Mentions, NotificationType, NotifyConfig, RoomOptions,
-};
+use matrix_rtc_call::{CallJoinOptions, JoinOptions, Mentions, NotificationType, NotifyConfig};
+use matrix_rtc_core::RoomOptions;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::{
     EncryptionConfig, LeaveSessionParams, MatrixBackend, RtcTransport, SlotEncryption,
     TransportIntent,
@@ -84,7 +83,7 @@ impl WasmRtcClient {
     /// returned room ends its subscriptions without leaving; `close` leaves
     /// first.
     ///
-    /// `options` is `{ element_call_compat?: "off" | "sticky_events" | "state_events" }`.
+    /// `options` is `{ format?: "current" | "sticky_2025" | "room_state" }`.
     pub async fn room(
         &self,
         room_id: String,
@@ -95,17 +94,12 @@ impl WasmRtcClient {
         let compat = compat::parse_compat(
             options
                 .as_ref()
-                .and_then(|options| options.element_call_compat.as_deref()),
+                .and_then(|options| options.format.as_deref()),
         )?;
         log::info!("client: [{room_id}] opening in {compat:?} mode");
         let room = self
             .client
-            .room(
-                room_id.clone(),
-                RoomOptions {
-                    element_call_compat: compat,
-                },
-            )
+            .room(room_id.clone(), RoomOptions { format: compat })
             .await
             .map_err(js_error)?;
         room.seeded().await;
@@ -199,7 +193,7 @@ impl WasmRtcRoom {
             call.member_id()
         );
         Ok(WasmRtcCall {
-            compat: room.element_call_compat(),
+            compat: room.format(),
             backend: room.backend().clone(),
             call,
         })
@@ -280,7 +274,7 @@ pub struct WasmRtcCall {
     call: Call,
     /// The mode the room was opened in, for the media layer's identity and
     /// token endpoint.
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
     backend: Arc<DialectBackend<JsBackend>>,
 }
 
@@ -289,7 +283,7 @@ impl WasmRtcCall {
         &self.call
     }
 
-    pub(crate) fn element_call_compat(&self) -> ElementCallCompat {
+    pub(crate) fn format(&self) -> MembershipFormat {
         self.compat
     }
 
@@ -407,12 +401,12 @@ impl WasmRtcCall {
 /// How a room is opened.
 #[derive(Debug, Default, Deserialize)]
 pub struct WasmRoomOptions {
-    /// `"off"` (the default), `"sticky_events"` or `"state_events"`. One
+    /// `"current"` (the default), `"sticky_2025"` or `"room_state"`. One
     /// decision for the room: what the library subscribes to, how it renders
     /// our sends, the `member.id` we join with, how an inbound media key is
     /// bound, the SFU identity and the token endpoint.
     #[serde(default)]
-    pub element_call_compat: Option<String>,
+    pub format: Option<String>,
 }
 
 /// Element Call's reaction catalogue, as `ReactionKind[]` in the order its
@@ -799,7 +793,7 @@ mod tests {
         // A plain object, as a page passes: the default serializer turns a
         // `json!` map into an ES `Map`, which reads back as no options at all.
         let options = match compat {
-            Some(compat) => serde_json::json!({ "element_call_compat": compat })
+            Some(compat) => serde_json::json!({ "format": compat })
                 .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
                 .unwrap(),
             None => JsValue::UNDEFINED,
@@ -883,7 +877,7 @@ mod tests {
     }
 
     /// The sticky dialect's outbound rewrite, through the real send path: a
-    /// join in a `sticky_events` room must put the EC-2025 mirror fields on
+    /// join in a `sticky_2025` room must put the EC-2025 mirror fields on
     /// the wire, or that generation cannot see us.
     #[wasm_bindgen_test]
     async fn a_sticky_compat_join_mirrors_the_legacy_fields() {
@@ -907,7 +901,7 @@ mod tests {
                  || content.member.device_id === undefined) \
                  return Promise.reject(new Error('legacy mirror fields missing: ' + JSON.stringify(content)));",
         ));
-        let room = open(&client, Some("sticky_events")).await;
+        let room = open(&client, Some("sticky_2025")).await;
         let params = serde_wasm_bindgen::to_value(&TestJoinParams {
             slot_id: SLOT,
             application: "m.call",

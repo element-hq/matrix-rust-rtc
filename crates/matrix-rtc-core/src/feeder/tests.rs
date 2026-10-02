@@ -11,6 +11,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::*;
+use crate::compat::MembershipFormat;
 use crate::testing::MockBackend;
 use crate::{BaseRtcRoom, RawStickyEvent};
 
@@ -29,7 +30,7 @@ struct Harness {
 
 impl Harness {
     async fn attach() -> Self {
-        Self::attach_in(Arc::new(SpecDialect)).await
+        Self::attach_in(Arc::new(MembershipFormat::Current)).await
     }
 
     async fn attach_in(dialect: Arc<dyn IngestDialect>) -> Self {
@@ -140,11 +141,7 @@ impl IngestDialect for StateDialect {
                 ..event
             })
             .collect();
-        SpecDialect.current_membership(room_id, sticky, Vec::new())
-    }
-
-    fn key_event_types(&self) -> Vec<String> {
-        vec![EXTRA_KEY.to_owned()]
+        MembershipFormat::Current.current_membership(room_id, sticky, Vec::new())
     }
 
     fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {

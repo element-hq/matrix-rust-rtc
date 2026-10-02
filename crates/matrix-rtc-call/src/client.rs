@@ -9,7 +9,7 @@
 //!
 //! Opening a room, its feeds and the to-device routing are the core's
 //! [`BaseRtcClient`], over this crate's room state and read in the room's
-//! [`ElementCallCompat`]. Everything room-scoped is on the room, everything
+//! [`MembershipFormat`]. Everything room-scoped is on the room, everything
 //! about our own participation on the session. The library runs its own
 //! background work on the core's [`executor`](matrix_rtc_core::executor): a
 //! room's feeds while the room object lives; the core's upkeep (keep-alive,
@@ -32,12 +32,12 @@ use matrix_rtc_core::{
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
-use crate::compat::ingest::{member_id, outbound_dialect};
-use crate::compat::{DialectBackend, ElementCallCompat, LEGACY_KEY_EVENT_TYPE};
 use crate::notification::NotifyConfig;
 use crate::reactions::{RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction};
 use crate::room_state::{CallJoinParams, CallRoomState};
 use crate::transports;
+use matrix_rtc_core::RoomOptions;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::feeder::RoomAlreadyOpen;
 
 type Backend<B> = DialectBackend<B>;
@@ -73,15 +73,6 @@ impl From<OpenError> for RtcError {
             OpenError::Backend(error) => Self::Backend(error),
         }
     }
-}
-
-/// How a room is opened.
-#[derive(Clone, Debug, Default)]
-pub struct RoomOptions {
-    /// Which MatrixRTC generation the room is read and written for: what is
-    /// subscribed to, how our sends are rendered, the `member.id` we join
-    /// with, how a legacy media key is bound. See [`crate::compat`].
-    pub element_call_compat: ElementCallCompat,
 }
 
 /// A join into any application's slot.
@@ -146,16 +137,13 @@ const RETRY: Duration = Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIV
 
 /// One per backend. Creating it does no I/O (R1).
 pub struct RtcClient<B: MatrixBackend + 'static> {
-    base: BaseRtcClient<Backend<B>, State<B>>,
+    base: BaseRtcClient<B, State<B>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcClient<B> {
     pub fn new(backend: Arc<B>) -> Self {
         Self {
-            base: BaseRtcClient::with_key_event_types(
-                Arc::new(DialectBackend::new(backend)),
-                vec![LEGACY_KEY_EVENT_TYPE.to_owned()],
-            ),
+            base: BaseRtcClient::new(backend),
         }
     }
 
@@ -166,7 +154,7 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
     }
 
     /// Opens `room_id` (R2) through the core's
-    /// [`BaseRtcClient::open_with`], read in the room's compatibility mode.
+    /// [`BaseRtcClient::open_with`], in the room's membership format.
     /// The feeds run on the executor; await [`RtcRoom::seeded`] before
     /// joining.
     ///
@@ -178,16 +166,15 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         options: RoomOptions,
     ) -> Result<RtcRoom<B>, RtcError> {
         let room_id = room_id.into();
-        let mode = options.element_call_compat;
+        let mode = options.format;
         let backend = self.base.backend().clone();
         let state = Arc::new(Mutex::new(CallRoomState::with_backend(
             room_id.clone(),
             backend.clone(),
         )));
-        log::info!("client: [{room_id}] opening in {mode:?} mode");
         let handle = self
             .base
-            .open_with(room_id.clone(), state.clone(), Arc::new(mode))
+            .open_with(room_id.clone(), state.clone(), options)
             .await?;
 
         Ok(RtcRoom {
@@ -206,11 +193,11 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
 /// expires through its delayed leave.
 pub struct RtcRoom<B: MatrixBackend + 'static> {
     room_id: String,
-    mode: ElementCallCompat,
+    mode: MembershipFormat,
     state: SharedState<B>,
     backend: Arc<Backend<B>>,
     /// The core's open room, which feeds `state`; `None` once detached.
-    handle: Option<BaseRtcRoomHandle<Backend<B>, State<B>>>,
+    handle: Option<BaseRtcRoomHandle<B, State<B>>>,
     /// Whether each slot's current session object is live, by slot. A flag a
     /// session shares, so leaving, dropping it or closing the room ends it.
     sessions: StdMutex<HashMap<String, Arc<AtomicBool>>>,
@@ -221,7 +208,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         &self.room_id
     }
 
-    pub fn element_call_compat(&self) -> ElementCallCompat {
+    pub fn format(&self) -> MembershipFormat {
         self.mode
     }
 
@@ -408,26 +395,10 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             state.leave(&slot_id, LeaveSessionParams::new()).await?;
         }
 
-        let backend = &self.backend;
-        let user_id = backend.own_user_id();
-        let device_id = backend.own_device_id();
-        // Not always a fresh id: see `compat::ingest::member_id` for the one
-        // generation where a fresh one makes us mark ourselves departed.
-        let membership_id = member_id(self.mode, &user_id, &device_id);
-
-        // Before the join, not after: the join itself sends the membership
-        // (and arms the delayed leave), so a dialect registered afterwards
-        // would let exactly the two events that announce us go out
-        // spec-current.
-        backend.set_dialect(
-            &self.room_id,
-            outbound_dialect(self.mode, &user_id, &device_id, &self.room_id, &slot_id),
-        );
-
-        Ok(JoinSessionParams {
-            user_id,
-            device_id,
-            membership_id: Some(membership_id),
+        let mut params = JoinSessionParams {
+            user_id: self.backend.own_user_id(),
+            device_id: self.backend.own_device_id(),
+            membership_id: None,
             slot_id,
             application,
             transport,
@@ -436,7 +407,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             sticky_duration_ms,
             degraded_lifetime_ms,
             encryption_config,
-        })
+        };
+        // The `member.id` and our sends' dialect, in the room's format.
+        if let Some(handle) = &self.handle {
+            handle.prepare_join(&mut params);
+        }
+        Ok(params)
     }
 
     fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
@@ -501,10 +477,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// Ends the subscription and forgets the room; idempotent.
     fn detach(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.backend.clear_dialect(&self.room_id);
-            drop(handle);
-        }
+        drop(self.handle.take());
     }
 }
 

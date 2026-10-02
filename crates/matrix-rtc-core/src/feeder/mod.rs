@@ -30,7 +30,7 @@ mod dialect;
 #[cfg(test)]
 mod tests;
 
-pub use dialect::{IngestDialect, SpecDialect};
+pub use dialect::IngestDialect;
 
 const MEMBER_EVENT_TYPES: [&str; 2] = ["m.rtc.member", "org.matrix.msc4143.rtc.member"];
 const SLOT_EVENT_TYPES: [&str; 2] = [SLOT_EVENT_TYPE, "org.matrix.msc4143.rtc.slot"];

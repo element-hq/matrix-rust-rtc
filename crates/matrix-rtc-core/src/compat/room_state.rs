@@ -6,7 +6,7 @@
 //! The Element Call membership format from *before* MSC4354: MatrixRTC
 //! membership as `org.matrix.msc3401.call.member` **room state**.
 //!
-//! One generation older than [`super::element_call`], which handles the sticky
+//! One generation older than [`super::sticky_2025`], which handles the sticky
 //! dialect. Both are Element Call; the difference is where the membership
 //! lives. A deployment speaks one or the other, never both, so the two files
 //! barely interact and either can be deleted without touching the other.
@@ -32,7 +32,7 @@
 //! is derived differently, and the token comes from a different endpoint. A call
 //! joined this way is visible to this generation of Element Call and to nobody
 //! else, which is why it lives behind
-//! [`ElementCallCompat::StateEvents`](super::ElementCallCompat::StateEvents).
+//! [`MembershipFormat::RoomState`](super::MembershipFormat::RoomState).
 //!
 //! # The format, field by field
 //!
@@ -102,7 +102,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use super::element_call::{is_leave, legacy_session};
+use super::sticky_2025::{is_leave, legacy_session};
 
 /// The state event type carrying a pre-sticky Element Call membership.
 pub const STATE_MEMBER_EVENT_TYPE: &str = "org.matrix.msc3401.call.member";
@@ -459,7 +459,7 @@ fn resolve_focus<'a>(member: &Parsed<'a>, all: &[Parsed<'a>]) -> Option<&'a Valu
 /// not even a timeline event, so there is nothing to be additive with. See the
 /// module docs.
 #[derive(Clone, Debug)]
-pub struct ElementCallStateDialect {
+pub struct RoomStateDialect {
     own_user_id: String,
     own_device_id: String,
     room_id: String,
@@ -476,7 +476,7 @@ pub struct ElementCallStateDialect {
     created_ts: Arc<OnceLock<u64>>,
 }
 
-impl ElementCallStateDialect {
+impl RoomStateDialect {
     /// Builds the dialect for our own membership in `slot_id`.
     ///
     /// `room_id` is needed for the `livekit_alias` this generation expects on a
@@ -636,7 +636,7 @@ impl ElementCallStateDialect {
 
 #[cfg(test)]
 mod tests {
-    use matrix_rtc_core::{
+    use crate::{
         EventOrigin, RawStickyEvent, RawStickyEventContent, RtcMembershipEvent, RtcTransport,
     };
 
@@ -1076,8 +1076,8 @@ mod tests {
         "leave_reason": { "code": "m.delayed_leave", "reason": "Dead man's switch" }
     }"#;
 
-    fn dialect() -> ElementCallStateDialect {
-        ElementCallStateDialect::new(
+    fn dialect() -> RoomStateDialect {
+        RoomStateDialect::new(
             "@alice:example.io",
             "V5cP8FErcB",
             "!room:example.io",
@@ -1092,7 +1092,7 @@ mod tests {
             "_@alice:example.io_V5cP8FErcB_m.call"
         );
 
-        let named = ElementCallStateDialect::new(
+        let named = RoomStateDialect::new(
             "@alice:example.io",
             "V5cP8FErcB",
             "!room:example.io",

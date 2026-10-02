@@ -7,7 +7,7 @@ Please see LICENSE in the repository root for full details.
 
 /**
  * The web stack and the Rust stack in the same call, spec-current dialect
- * (`ElementCallCompat::Off`) — no Element Call involved.
+ * (`MembershipFormat::Current`) — no Element Call involved.
  * This is the web bindings' first contact with everything real: a real
  * homeserver (MSC4354 sticky sends, MSC4140 delayed leave, Olm-encrypted key
  * to-device with cross-signing), a real authorisation service, a real SFU —
@@ -40,7 +40,7 @@ test(`Web client and Rust client share a call — spec-current dialect`, async (
 
   const peer = RustPeer.spawn({
     // Spec-current MSC4143/MSC4354 on both sides; no Element Call dialect.
-    ELEMENT_CALL_COMPAT: "off",
+    ELEMENT_CALL_COMPAT: "current",
     INVITE_USER: webUser,
     DISPLAY_NAME,
     ROOM_NAME: `Web interop ${Date.now().toString(16)}`,
@@ -67,7 +67,7 @@ test(`Web client and Rust client share a call — spec-current dialect`, async (
     await web.send({
       cmd: "join",
       roomId,
-      compat: "off",
+      compat: "current",
       publish: { pattern: true, tone: true },
     });
     await web.waitFor("joined", { timeout: 120_000 });

@@ -3,21 +3,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! The core's feeder reading a room through [`ElementCallCompat`]: the
-//! subjects each mode asks for, the pre-sticky funnel, legacy media keys and
-//! the call layer's timeline events.
+//! The core's feeder reading a room through each [`MembershipFormat`]: the
+//! subjects each asks for, the pre-sticky funnel and legacy media keys.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use matrix_rtc_core::feeder::{RoomAttachment, RoomFeeder, parse_key_message};
-use matrix_rtc_core::testing::MockBackend;
-use matrix_rtc_core::{EventEncryption, EventIn, RoomSink, SLOT_EVENT_TYPE, ToDeviceMessageIn};
+use crate::feeder::{RoomAttachment, RoomFeeder, parse_key_message};
+use crate::testing::MockBackend;
+use crate::{EventEncryption, EventIn, RoomSink, SLOT_EVENT_TYPE, ToDeviceMessageIn};
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use super::{DialectBackend, ElementCallCompat, LEGACY_KEY_EVENT_TYPE, STATE_MEMBER_EVENT_TYPE};
-use crate::room_state::CallRoomState;
+use super::{DialectBackend, LEGACY_KEY_EVENT_TYPE, MembershipFormat, STATE_MEMBER_EVENT_TYPE};
+use crate::BaseRtcRoom;
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "m.call#ROOM";
@@ -25,7 +24,7 @@ const ME: &str = "@mock:example.org";
 const BOB: &str = "@bob:example.org";
 
 type Backend = DialectBackend<MockBackend>;
-type Manager = Arc<Mutex<CallRoomState<Backend>>>;
+type Manager = Arc<Mutex<BaseRtcRoom<Backend>>>;
 
 struct Harness {
     mock: Arc<MockBackend>,
@@ -34,13 +33,10 @@ struct Harness {
 }
 
 impl Harness {
-    async fn attach(mode: ElementCallCompat) -> Self {
+    async fn attach(mode: MembershipFormat) -> Self {
         let mock = Arc::new(MockBackend::new());
         let backend = Arc::new(DialectBackend::new(mock.clone()));
-        let manager = Arc::new(Mutex::new(CallRoomState::with_backend(
-            ROOM,
-            backend.clone(),
-        )));
+        let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, backend.clone())));
         let (attachment, run) = RoomFeeder::attach(backend, manager.clone(), Arc::new(mode))
             .await
             .expect("attach");
@@ -119,29 +115,26 @@ fn member_event(sender: &str, member_id: &str, event_id: &str) -> EventIn {
 
 #[tokio::test]
 async fn attach_subscribes_to_what_the_mode_needs() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach(MembershipFormat::Current).await;
     let subjects = &harness.mock.room_subscription(ROOM).unwrap().subjects;
     assert_eq!(
         subjects.state_event_types,
         [SLOT_EVENT_TYPE, "org.matrix.msc4143.rtc.slot"]
     );
-    assert_eq!(
-        subjects.timeline_event_types,
-        vec!["io.element.call.reaction", "m.reaction"]
-    );
+    assert!(subjects.timeline_event_types.is_empty());
 
-    let legacy = Harness::attach(ElementCallCompat::StateEvents).await;
+    let legacy = Harness::attach(MembershipFormat::RoomState).await;
     let subjects = &legacy.mock.room_subscription(ROOM).unwrap().subjects;
     assert_eq!(subjects.state_event_types, vec![STATE_MEMBER_EVENT_TYPE]);
 }
 
 #[tokio::test]
 async fn pre_sticky_state_membership_is_funnelled() {
-    let harness = Harness::attach(ElementCallCompat::StateEvents).await;
+    let harness = Harness::attach(MembershipFormat::RoomState).await;
     let sink = harness.sink();
     sink.on_encryption(false);
     sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
-    let now = crate::compat::element_call_state::now_ms();
+    let now = crate::compat::room_state::now_ms();
     sink.on_state_events(
         STATE_MEMBER_EVENT_TYPE.to_owned(),
         vec![EventIn {
@@ -173,57 +166,22 @@ async fn pre_sticky_state_membership_is_funnelled() {
 }
 
 #[tokio::test]
-async fn a_raised_hand_reaches_the_call_layer_and_a_redaction_lowers_it() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+async fn a_2025_sticky_member_is_read_in_the_current_format() {
+    let harness = Harness::attach(MembershipFormat::Current).await;
     harness.seed_room_state();
-    harness
-        .sink()
-        .on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
-    harness.attachment.seeded().await;
-
-    // Hands raised before we joined come from the relations of the
-    // membership event: one lookup per new event id.
-    harness
-        .wait_until(|| async { !harness.mock.relations_requests.lock().unwrap().is_empty() })
-        .await;
-    let requests = harness.mock.relations_requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].1, "$m1");
-    assert_eq!(requests[0].2, "m.annotation");
-    assert_eq!(requests[0].3, "m.reaction");
-
-    harness.sink().on_timeline_events(vec![EventIn {
-        event_id: "$hand".to_owned(),
-        sender: BOB.to_owned(),
-        event_type: "m.reaction".to_owned(),
-        state_key: None,
-        origin_server_ts: 3,
+    harness.sink().on_sticky_events(vec![EventIn {
         content: json!({
-            "m.relates_to": { "rel_type": "m.annotation", "event_id": "$m1", "key": "🖐️" }
+            "slot_id": SLOT,
+            "msc4354_sticky_key": "bob-1",
+            "application": { "type": "m.call" },
+            "member": { "id": "bob-1", "user_id": BOB, "device_id": "BOBDEVICE" },
+            "rtc_transports": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
         }),
-        encryption: EventEncryption::Cleartext,
+        ..member_event(BOB, "bob-1", "$m1")
     }]);
+    harness.attachment.seeded().await;
     harness
-        .wait_until(|| async {
-            harness
-                .manager
-                .lock()
-                .await
-                .raised_hands(SLOT)
-                .is_some_and(|hands| hands.len() == 1)
-        })
-        .await;
-
-    harness.sink().on_redaction("$hand".to_owned());
-    harness
-        .wait_until(|| async {
-            harness
-                .manager
-                .lock()
-                .await
-                .raised_hands(SLOT)
-                .is_some_and(|hands| hands.is_empty())
-        })
+        .wait_until(|| async { harness.member_count().await == Some(1) })
         .await;
 }
 
@@ -240,12 +198,15 @@ fn a_legacy_key_is_bound_in_the_mode_its_room_was_opened_in() {
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEVICE".to_owned()), None),
     };
-    let key_in = |mode: ElementCallCompat| {
+    let key_in = |mode: MembershipFormat| {
         parse_key_message(|_| Some(Arc::new(mode)), message.clone()).expect("a key")
     };
-    assert_eq!(key_in(ElementCallCompat::Off).member_id, "ec-session-uuid");
     assert_eq!(
-        key_in(ElementCallCompat::StateEvents).member_id,
+        key_in(MembershipFormat::Current).member_id,
+        "ec-session-uuid"
+    );
+    assert_eq!(
+        key_in(MembershipFormat::RoomState).member_id,
         format!("{BOB}:BOBDEVICE")
     );
 }

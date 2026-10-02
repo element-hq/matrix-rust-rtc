@@ -52,7 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::ElementCallCompat;
+use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, open_slot};
 use matrix_rtc_media::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
@@ -68,24 +68,24 @@ use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Clap-facing mirror of [`ElementCallCompat`], which lives in a crate that
+/// Clap-facing mirror of [`MembershipFormat`], which lives in a crate that
 /// should not grow a `clap` dependency for a delete-by-date module.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ElementCallCompatArg {
+enum MembershipFormatArg {
     /// Current MSC4143 + MSC4354 only.
-    Off,
+    Current,
     /// Element Call as of 2025: sticky events with the pre-2026 field names.
     Sticky,
     /// Element Call before MSC4354: membership as room state.
     State,
 }
 
-impl From<ElementCallCompatArg> for ElementCallCompat {
-    fn from(arg: ElementCallCompatArg) -> Self {
+impl From<MembershipFormatArg> for MembershipFormat {
+    fn from(arg: MembershipFormatArg) -> Self {
         match arg {
-            ElementCallCompatArg::Off => Self::Off,
-            ElementCallCompatArg::Sticky => Self::StickyEvents,
-            ElementCallCompatArg::State => Self::StateEvents,
+            MembershipFormatArg::Current => Self::Current,
+            MembershipFormatArg::Sticky => Self::Sticky2025,
+            MembershipFormatArg::State => Self::RoomState,
         }
     }
 }
@@ -232,8 +232,8 @@ struct Args {
     /// `org.matrix.msc3401.call.member` room state — nothing about such a run is
     /// visible to a spec-current peer. Note `--open-slot` is pointless with
     /// `state`: that generation has no slot concept.
-    #[arg(long, value_enum, default_value_t = ElementCallCompatArg::Off)]
-    element_call_compat: ElementCallCompatArg,
+    #[arg(long, value_enum, default_value_t = MembershipFormatArg::Current)]
+    format: MembershipFormatArg,
 
     #[arg(long)]
     insecure_tls: bool,
@@ -602,7 +602,7 @@ impl Fleet {
                     }),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
-                    element_call_compat: args.element_call_compat.into(),
+                    format: args.format.into(),
                     sticky_duration_ms: Some(args.sticky_duration_ms),
                     ..LiveKitCallOptions::default()
                 },

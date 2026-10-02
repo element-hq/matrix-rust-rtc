@@ -68,7 +68,7 @@ export class MatrixRtcCall {
    * events via `onEvent`.
    *
    * @param {object} config - `{ userId, deviceId, livekitServiceUrl,
-   *   keyRingSize?, elementCallCompat? }`
+   *   keyRingSize?, format? }`
    */
   async connect(config) {
     if (this.session) throw new Error('already connected');
@@ -81,7 +81,7 @@ export class MatrixRtcCall {
         device_id: config.deviceId,
         livekit_service_url: config.livekitServiceUrl,
         key_ring_size: config.keyRingSize,
-        element_call_compat: config.elementCallCompat,
+        format: config.format,
       },
       this.delegate(),
     );

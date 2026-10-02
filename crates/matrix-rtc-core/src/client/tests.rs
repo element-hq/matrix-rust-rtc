@@ -9,6 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
+use crate::compat::{OutboundDialect, STATE_MEMBER_EVENT_TYPE};
 use crate::testing::MockBackend;
 use crate::{
     EventEncryption, EventIn, KEY_MESSAGE_TYPE, LiveKitTransport, RtcTransport, SLOT_EVENT_TYPE,
@@ -62,7 +63,10 @@ async fn open(
     mock: &MockBackend,
     room_id: &str,
 ) -> BaseRtcRoomHandle<MockBackend> {
-    let room = client.room(room_id).await.expect("the room opens");
+    let room = client
+        .room(room_id, RoomOptions::default())
+        .await
+        .expect("the room opens");
     deliver_room(mock, room_id);
     room.seeded().await;
     room
@@ -71,7 +75,7 @@ async fn open(
 fn join_params(mock: &MockBackend) -> JoinSessionParams {
     JoinSessionParams::new(
         mock.user_id.clone(),
-        "MOCKDEV".to_owned(),
+        mock.device_id.clone(),
         SLOT.to_owned(),
         "m.call",
         RtcTransport::LiveKit(LiveKitTransport {
@@ -107,7 +111,7 @@ async fn a_second_handle_for_an_open_room_is_refused() {
     let room = open(&client, &mock, ROOM).await;
 
     assert!(matches!(
-        client.room(ROOM).await,
+        client.room(ROOM, RoomOptions::default()).await,
         Err(OpenError::RoomAlreadyOpen(_))
     ));
 
@@ -123,7 +127,7 @@ async fn an_opening_that_fails_leaves_nothing_behind() {
         Some(BackendError::not_implemented("subscribe_room"));
 
     assert!(matches!(
-        client.room(ROOM).await,
+        client.room(ROOM, RoomOptions::default()).await,
         Err(OpenError::Backend(_))
     ));
     let to_device = mock.to_device_subscriptions.lock().unwrap()[0].clone();
@@ -176,4 +180,113 @@ async fn a_media_key_for_a_room_that_is_not_open_is_dropped() {
             .cancelled
             .load(Ordering::SeqCst)
     );
+}
+
+/// Opens `ROOM` in `format` and delivers what a homeserver would for it: Bob
+/// in the call, as a pre-sticky state membership in `RoomState`.
+async fn open_in(
+    client: &BaseRtcClient<MockBackend>,
+    mock: &MockBackend,
+    format: MembershipFormat,
+) -> BaseRtcRoomHandle<MockBackend> {
+    let room = client
+        .room(ROOM, RoomOptions { format })
+        .await
+        .expect("the room opens");
+    if format != MembershipFormat::RoomState {
+        deliver_room(mock, ROOM);
+    } else {
+        let sink = mock
+            .room_subscription(ROOM)
+            .expect("subscribed")
+            .sink
+            .clone();
+        sink.on_encryption(false);
+        sink.on_joined_members(vec![mock.user_id.clone(), BOB.to_owned()]);
+        let now = crate::compat::room_state::now_ms();
+        sink.on_state_events(
+            STATE_MEMBER_EVENT_TYPE.to_owned(),
+            vec![EventIn {
+                event_id: "$bob".to_owned(),
+                sender: BOB.to_owned(),
+                event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+                state_key: Some(format!("_{BOB}_BOBDEV_m.call")),
+                origin_server_ts: now,
+                content: json!({
+                    "application": "m.call",
+                    "call_id": "",
+                    "scope": "m.room",
+                    "device_id": "BOBDEV",
+                    "expires": 3_600_000,
+                    "created_ts": now,
+                    "focus_active": { "type": "livekit", "focus_selection": "multi_sfu" },
+                    "foci_preferred": [{
+                        "type": "livekit",
+                        "livekit_alias": ROOM,
+                        "livekit_service_url": "https://sfu.example.org"
+                    }]
+                }),
+                encryption: EventEncryption::Cleartext,
+            }],
+        );
+    }
+    room.seeded().await;
+    room
+}
+
+#[tokio::test]
+async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
+    let subjects = mock.room_subscription(ROOM).unwrap().subjects.clone();
+    assert_eq!(subjects.state_event_types, vec![STATE_MEMBER_EVENT_TYPE]);
+    assert_eq!(room.observe(SLOT).await.borrow().len(), 1);
+
+    let member_id = room.join(join_params(&mock)).await.expect("join");
+    assert_eq!(
+        room.state().lock().await.own_member_id(SLOT),
+        Some(format!("{}:{}", mock.user_id, mock.device_id)),
+        "this format keys a membership on {{user}}:{{device}}; got {member_id}"
+    );
+    let state = mock.state_events.lock().unwrap();
+    assert!(
+        state
+            .iter()
+            .any(|(room_id, event_type, _, _)| room_id == ROOM
+                && event_type == STATE_MEMBER_EVENT_TYPE),
+        "the membership went out as room state"
+    );
+    assert!(mock.sticky_events.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_sticky_2025_join_carries_the_legacy_fields() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
+    room.join(join_params(&mock)).await.expect("join");
+
+    let sticky = mock.sticky_events.lock().unwrap();
+    let (_, _, content, _) = sticky.last().expect("a membership");
+    assert_eq!(content["member"]["user_id"], mock.user_id.as_str());
+    assert_eq!(content["member"]["device_id"], mock.device_id.as_str());
+}
+
+#[tokio::test]
+async fn dropping_the_room_forgets_its_dialect() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
+    room.join(join_params(&mock)).await.expect("join");
+    assert!(matches!(
+        client.backend().dialect(ROOM),
+        OutboundDialect::Sticky(_)
+    ));
+
+    drop(room);
+    assert!(matches!(
+        client.backend().dialect(ROOM),
+        OutboundDialect::None
+    ));
 }

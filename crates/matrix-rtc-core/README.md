@@ -27,12 +27,14 @@ feeds and ticks nothing. Off a tokio runtime (natively) nothing is spawned, and 
 
 `BaseRtcClient::room` opens a room: it subscribes through the backend to what the room needs and
 applies the room's current state in the right order (encryption and slots and members before the
-first membership), reading the spec's dialect:
+first membership), in the room's membership format:
 
 ```rust,ignore
 use std::sync::Arc;
 
-use matrix_rtc_core::{BaseRtcClient, JoinSessionParams, LeaveSessionParams, MatrixBackend};
+use matrix_rtc_core::{
+    BaseRtcClient, JoinSessionParams, LeaveSessionParams, MatrixBackend, RoomOptions,
+};
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "org.example.board#ROOM";
@@ -46,7 +48,7 @@ async fn run(
     let client = BaseRtcClient::new(backend);
 
     // Natively, from within a tokio runtime: the room spawns its feeds onto it.
-    let room = client.room(ROOM).await?;
+    let room = client.room(ROOM, RoomOptions::default()).await?;
     // Resolves once the room's current state has been applied.
     room.seeded().await;
 
@@ -69,11 +71,27 @@ async fn run(
 Dropping the room handle ends its subscriptions without leaving: a membership left behind expires
 through its delayed leave.
 
-An application over the core opens its own room state with `BaseRtcClient::open_with(room_id,
-state, dialect)`: the state is any `ApplicationIntake`, which also receives the timeline events,
-redactions and `/relations` it asks for, and the `IngestDialect` decides what is read and how.
-`matrix-rtc-call`'s `RtcClient` is this, with the call's room state and Element Call's dialects;
-`matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient` objects are built on it.
+### Older membership formats
+
+`RoomOptions::format` picks the MatrixRTC membership format the room is read and written in
+(`compat::MembershipFormat`):
+
+- `Current` (the default) is MSC4143 + MSC4354, and also reads the 2025 sticky shapes.
+- `Sticky2025` writes our membership with the 2025 fields alongside the spec ones.
+- `RoomState` reads and writes membership as pre-sticky `org.matrix.msc3401.call.member` room
+  state, joining with the `{user}:{device}` member id that generation expects.
+
+These are matrix-js-sdk's (and so Element Call's) pre-2026 formats, for any application.
+`compat` is scaffolding, to be deleted once Element Call catches up.
+
+### An application over the core
+
+An application opens its own room state with `BaseRtcClient::open_with(room_id, state,
+options)`: the state is any `ApplicationIntake`, which also receives the timeline events,
+redactions and `/relations` it asks for. It renders a join in the room's format with
+`BaseRtcRoomHandle::prepare_join` before joining. `matrix-rtc-call`'s `RtcClient` is this, with
+the call's room state; `matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient`
+objects are built on it.
 
 The per-room core type is `BaseRtcRoom`. What the feeder calls on it —
 `set_current_sticky_state(Vec<RawStickyEvent>)` with the room's **complete** current membership,

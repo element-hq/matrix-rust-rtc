@@ -17,12 +17,12 @@ use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::watch;
 
-#[cfg(feature = "media")]
-use matrix_rtc_call::compat::DialectBackend;
 use matrix_rtc_call::{self as call, RtcError};
 use matrix_rtc_core::JoinedMembership as CoreJoinedMembership;
 #[cfg(feature = "media")]
 use matrix_rtc_core::MatrixBackend as CoreBackend;
+#[cfg(feature = "media")]
+use matrix_rtc_core::compat::DialectBackend;
 mod backend;
 pub mod compat;
 mod logging;
@@ -33,7 +33,7 @@ pub use backend::{
     FfiOpenIdToken, FfiRoomSubjects, FfiToDeviceDelivery, FfiToDeviceMessageIn,
     FfiToDeviceRecipient, MatrixBackend, RoomSink, ToDeviceSink,
 };
-pub use compat::FfiElementCallCompat;
+pub use compat::FfiMembershipFormat;
 pub use logging::{
     RtcLogConfig, RtcLogLevel, RtcLogRecord, RtcLogSink, dropped_log_record_count, log_event,
     setup_logging,
@@ -255,7 +255,7 @@ pub struct FfiRoomOptions {
     /// how an inbound media key is bound, the SFU identity and the token
     /// endpoint. See [`crate::compat`].
     #[uniffi(default = None)]
-    pub element_call_compat: Option<FfiElementCallCompat>,
+    pub format: Option<FfiMembershipFormat>,
 }
 
 /// One per Matrix session, over the host's backend. Creating it does no I/O;
@@ -287,7 +287,7 @@ impl RtcClient {
         room_id: String,
         options: FfiRoomOptions,
     ) -> Result<Arc<RtcRoom>, MatrixRtcFfiError> {
-        let compat = compat::resolve(options.element_call_compat);
+        let compat = compat::resolve(options.format);
         log::info!("client: [{room_id}] opening in {compat:?} mode");
         // On the library's runtime: the room's feeds are spawned from here.
         runtime::on_runtime(async move {
@@ -295,9 +295,7 @@ impl RtcClient {
                 .client
                 .room(
                     room_id.clone(),
-                    call::RoomOptions {
-                        element_call_compat: compat,
-                    },
+                    matrix_rtc_core::RoomOptions { format: compat },
                 )
                 .await?;
             room.seeded().await;
@@ -370,7 +368,7 @@ impl RtcRoom {
         Ok(Arc::new(RtcCall {
             call: joined,
             #[cfg(feature = "media")]
-            compat: room.element_call_compat(),
+            compat: room.format(),
             #[cfg(feature = "media")]
             backend: room.backend().clone(),
         }))
@@ -507,7 +505,7 @@ pub struct RtcCall {
     call: Arc<call::RtcCall<FfiBackend>>,
     /// The room's mode and backend, for the media layer.
     #[cfg(feature = "media")]
-    compat: matrix_rtc_call::compat::ElementCallCompat,
+    compat: matrix_rtc_core::compat::MembershipFormat,
     #[cfg(feature = "media")]
     backend: Arc<DialectBackend<FfiBackend>>,
 }
@@ -519,7 +517,7 @@ impl RtcCall {
     }
 
     #[cfg(feature = "media")]
-    pub(crate) fn element_call_compat(&self) -> matrix_rtc_call::compat::ElementCallCompat {
+    pub(crate) fn format(&self) -> matrix_rtc_core::compat::MembershipFormat {
         self.compat
     }
 
@@ -723,7 +721,7 @@ mod tests {
     use super::*;
     use crate::backend::test_support::{Carrier, MockHost};
     use crate::backend::{FfiEventEncryption, FfiEventIn};
-    use matrix_rtc_call::compat::STATE_MEMBER_EVENT_TYPE;
+    use matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE;
 
     const ROOM: &str = "!room:example.org";
     const SLOT: &str = "m.call#ROOM";
@@ -788,7 +786,7 @@ mod tests {
     async fn open(
         client: &Arc<RtcClient>,
         mock: &MockHost,
-        compat: Option<FfiElementCallCompat>,
+        compat: Option<FfiMembershipFormat>,
         encrypted: bool,
         slots: Vec<FfiEventIn>,
         sticky: Vec<FfiEventIn>,
@@ -796,12 +794,9 @@ mod tests {
         // The open runs on the library's runtime, so it may not have
         // subscribed by the time the seeder first looks.
         mock.forget_room_sink(ROOM);
-        let open = client.clone().room(
-            ROOM.to_owned(),
-            FfiRoomOptions {
-                element_call_compat: compat,
-            },
-        );
+        let open = client
+            .clone()
+            .room(ROOM.to_owned(), FfiRoomOptions { format: compat });
         tokio::pin!(open);
         // The mock stores the sink inside `subscribe_room`; deliver the current
         // sets once it exists, the way a host does on subscribe.
@@ -1053,7 +1048,7 @@ mod tests {
             sender: "@carl:example.org".to_owned(),
             event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
             state_key: Some("_@carl:example.org_CARLDEV_m.call".to_owned()),
-            origin_server_ts: matrix_rtc_call::compat::element_call_state::now_ms(),
+            origin_server_ts: matrix_rtc_core::compat::room_state::now_ms(),
             content_json: serde_json::json!({
                 "application": "m.call",
                 "call_id": "",
@@ -1069,7 +1064,7 @@ mod tests {
         let room = open(
             &client,
             &mock,
-            Some(FfiElementCallCompat::StateEvents),
+            Some(FfiMembershipFormat::RoomState),
             false,
             Vec::new(),
             vec![spec, legacy_sticky],
@@ -1336,7 +1331,7 @@ mod tests {
 
     // --- Element Call compatibility ------------------------------------------
     //
-    // The dialects are tested in `matrix_rtc_call::compat`. Tested here: the
+    // The dialects are tested in `matrix_rtc_core::compat`. Tested here: the
     // mode chosen when the room opens reaches every send, the two of the join
     // included.
 
@@ -1347,7 +1342,7 @@ mod tests {
         let room = open(
             &client,
             &mock,
-            Some(FfiElementCallCompat::StickyEvents),
+            Some(FfiMembershipFormat::Sticky2025),
             false,
             vec![open_slot(None)],
             Vec::new(),
@@ -1390,7 +1385,7 @@ mod tests {
         let room = open(
             &client,
             &mock,
-            Some(FfiElementCallCompat::StateEvents),
+            Some(FfiMembershipFormat::RoomState),
             false,
             Vec::new(),
             Vec::new(),
@@ -1444,7 +1439,7 @@ mod tests {
         let room = open(
             &client,
             &mock,
-            Some(FfiElementCallCompat::StateEvents),
+            Some(FfiMembershipFormat::RoomState),
             false,
             Vec::new(),
             Vec::new(),
@@ -1483,7 +1478,7 @@ mod tests {
         let room = open(
             &client,
             &mock,
-            Some(FfiElementCallCompat::StateEvents),
+            Some(FfiMembershipFormat::RoomState),
             false,
             Vec::new(),
             Vec::new(),

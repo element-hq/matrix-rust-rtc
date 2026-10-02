@@ -5,10 +5,10 @@
 
 //! Pre-2026 Element Call interoperability, exposed to FFI hosts.
 //!
-//! The translation lives in [`matrix_rtc_call::compat`] and is applied by the
+//! The translation lives in [`matrix_rtc_core::compat`] and is applied by the
 //! library's feeder and dialect wrapper; nothing here re-implements a dialect.
 //! A host chooses the mode once, when it opens the room
-//! ([`FfiRoomOptions::element_call_compat`](crate::FfiRoomOptions::element_call_compat)),
+//! ([`FfiRoomOptions::format`](crate::FfiRoomOptions::format)),
 //! and delivers the same raw events in every mode.
 //!
 //! What the mode decides: which room subjects the library subscribes to (no
@@ -17,7 +17,7 @@
 //! how an inbound media key is bound, the SFU participant identity and the
 //! token endpoint. Those must agree or the call connects and nothing decrypts.
 
-use matrix_rtc_call::compat::ElementCallCompat;
+use matrix_rtc_core::compat::MembershipFormat;
 
 /// Which MatrixRTC generation a session speaks, for interoperating with Element
 /// Call builds that predate the 2026 MSC4143 rewrite.
@@ -29,13 +29,13 @@ use matrix_rtc_call::compat::ElementCallCompat;
 /// our token. Those must agree or the call connects and nothing decrypts.
 ///
 /// Scaffolding, and meant to be deleted once Element Call catches up. See
-/// [`matrix_rtc_call::compat`].
+/// [`matrix_rtc_core::compat`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiElementCallCompat {
+pub enum FfiMembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
     /// interoperates with spec-current peers.
     #[default]
-    Off,
+    Current,
     /// Element Call as of 2025: MSC4354 sticky events carrying the pre-2026
     /// field names alongside the spec ones.
     ///
@@ -44,28 +44,28 @@ pub enum FfiElementCallCompat {
     /// bare-sticky-key content and keys go out as
     /// `io.element.call.encryption_keys` *instead of* the spec type — so in this
     /// mode keys are exchanged with legacy peers and not with spec-current ones.
-    StickyEvents,
+    Sticky2025,
     /// Element Call before MSC4354: membership as `org.matrix.msc3401.call.member`
     /// **room state**, plain `{user}:{device}` SFU identities, and the
     /// pre-MSC4195 `/sfu/get` token endpoint.
     ///
     /// Nothing about this mode is additive: a call joined this way is visible to
     /// that generation of Element Call and to nobody else.
-    StateEvents,
+    RoomState,
 }
 
-impl From<FfiElementCallCompat> for ElementCallCompat {
-    fn from(value: FfiElementCallCompat) -> Self {
+impl From<FfiMembershipFormat> for MembershipFormat {
+    fn from(value: FfiMembershipFormat) -> Self {
         match value {
-            FfiElementCallCompat::Off => Self::Off,
-            FfiElementCallCompat::StickyEvents => Self::StickyEvents,
-            FfiElementCallCompat::StateEvents => Self::StateEvents,
+            FfiMembershipFormat::Current => Self::Current,
+            FfiMembershipFormat::Sticky2025 => Self::Sticky2025,
+            FfiMembershipFormat::RoomState => Self::RoomState,
         }
     }
 }
 
-/// An absent mode is [`ElementCallCompat::Off`]: hosts that predate this option,
+/// An absent mode is [`MembershipFormat::Current`]: hosts that predate this option,
 /// and every host not talking to Element Call, leave the field unset.
-pub(crate) fn resolve(compat: Option<FfiElementCallCompat>) -> ElementCallCompat {
+pub(crate) fn resolve(compat: Option<FfiMembershipFormat>) -> MembershipFormat {
     compat.unwrap_or_default().into()
 }

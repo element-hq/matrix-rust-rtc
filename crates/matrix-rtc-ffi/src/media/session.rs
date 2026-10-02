@@ -13,7 +13,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
-use matrix_rtc_call::compat::ElementCallCompat;
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_livekit::{
     LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
     identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
@@ -85,8 +85,8 @@ async fn build_media_session(
     // already published is not an error but a silence — peers sit in the roster
     // with no media, keys install under an identity the SFU never assigned, and
     // nothing logs a problem. See `crate::compat`.
-    let compat = call.element_call_compat();
-    if compat != ElementCallCompat::Off {
+    let compat = call.format();
+    if compat != MembershipFormat::Current {
         log::info!(
             "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode {compat:?}",
         );
@@ -144,7 +144,7 @@ async fn build_media_session(
                 // Pre-MSC4195 `/sfu/get`, which is also where that generation's
                 // unhashed `{user}:{device}` identity comes from — the endpoint mints
                 // the identity, so the two are one decision, not two.
-                ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
                 _ => TokenEndpoint::Msc4195,
             }),
     );
@@ -358,7 +358,7 @@ impl MediaSession {
     /// our media key under it).
     ///
     /// The MSC4195 pseudonymous hash, or — in
-    /// [`FfiElementCallCompat::StateEvents`](crate::FfiElementCallCompat::StateEvents)
+    /// [`FfiMembershipFormat::RoomState`](crate::FfiMembershipFormat::RoomState)
     /// — the plain `{user}:{device}` string that generation's authorisation
     /// service mints.
     pub fn local_identity(&self) -> String {

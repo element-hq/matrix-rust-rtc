@@ -5,26 +5,26 @@
 
 //! Pre-2026 Element Call interoperability, exposed to web hosts.
 //!
-//! The translation lives in [`matrix_rtc_call::compat`] and is applied by
+//! The translation lives in [`matrix_rtc_core::compat`] and is applied by
 //! the library's feeder and dialect wrapper; nothing here re-implements a
 //! dialect. A page chooses the mode once, when it opens the room
-//! (`room`'s `element_call_compat`), and delivers the same raw events in
+//! (`room`'s `format`), and delivers the same raw events in
 //! every mode. This module owns only the mode-string vocabulary
-//! (`"off" | "sticky_events" | "state_events"`).
+//! (`"current" | "sticky_2025" | "room_state"`).
 
-use matrix_rtc_call::compat::ElementCallCompat;
+use matrix_rtc_core::compat::MembershipFormat;
 use wasm_bindgen::JsError;
 
 /// The page's mode vocabulary, shared by `room` and `connectMedia` so
 /// the two can never disagree by spelling.
-pub(crate) fn parse_compat(value: Option<&str>) -> Result<ElementCallCompat, JsError> {
+pub(crate) fn parse_compat(value: Option<&str>) -> Result<MembershipFormat, JsError> {
     Ok(match value {
-        None | Some("off") => ElementCallCompat::Off,
-        Some("sticky_events") => ElementCallCompat::StickyEvents,
-        Some("state_events") => ElementCallCompat::StateEvents,
+        None | Some("current") => MembershipFormat::Current,
+        Some("sticky_2025") => MembershipFormat::Sticky2025,
+        Some("room_state") => MembershipFormat::RoomState,
         Some(other) => {
             return Err(JsError::new(&format!(
-                "unknown element_call_compat {other:?}: expected off | sticky_events | state_events",
+                "unknown format {other:?}: expected current | sticky_2025 | room_state",
             )));
         }
     })

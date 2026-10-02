@@ -105,7 +105,7 @@ export class WebPeerApp {
     // session closed. Encrypted room ⇒ MSC4143 requires `m.per_member`. Not in
     // the pre-sticky mode: that generation predates slots (a join in it leaves
     // the condition unenforced), and its Element Call ignores them anyway.
-    if (mode !== 'state_events') {
+    if (mode !== 'room_state') {
       // Opened only for the slot: `join` opens it again in its own mode.
       const rtcRoom = await this.rtc.room(response.room_id, undefined);
       try {
@@ -141,7 +141,7 @@ export class WebPeerApp {
     // its current state (encryption, slots, members, membership) before
     // publishing ours.
     this.rtcRoom = await this.rtc.room(roomId, {
-      element_call_compat: compat === 'off' ? undefined : compat,
+      format: compat === 'current' ? undefined : compat,
     });
 
     this.rtcCall = await this.rtcRoom.joinCall({
@@ -166,7 +166,7 @@ export class WebPeerApp {
       userId: this.userId,
       deviceId: this.deviceId,
       livekitServiceUrl: focusUrl,
-      elementCallCompat: compat === 'off' ? undefined : compat,
+      format: compat === 'current' ? undefined : compat,
     });
 
     await this.publishMedia(focusUrl, publish);
@@ -240,7 +240,7 @@ export class WebPeerApp {
       // derive SFU identities differently, so the peer maps to no membership,
       // its key binds to nothing, and its tile stays black. Name it.
       const looksHashed = !event.identity.includes(':');
-      const stateMode = this.compat === 'state_events';
+      const stateMode = this.compat === 'room_state';
       if (stateMode && looksHashed) {
         this.log(
           `HINT: ${event.identity} is a hashed identity but this call speaks state events — ` +

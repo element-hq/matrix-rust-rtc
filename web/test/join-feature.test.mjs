@@ -166,9 +166,9 @@ describe('WASM bindings with a mock backend host', () => {
       expect(closed._getStickyEvents().length).toBe(0);
     });
 
-    it('a sticky_events room mirrors the legacy fields on the membership', async () => {
+    it('a sticky_2025 room mirrors the legacy fields on the membership', async () => {
       const client = new bindings.WasmRtcClient(host);
-      const room = await client.room(ROOM_ID, { element_call_compat: 'sticky_events' });
+      const room = await client.room(ROOM_ID, { format: 'sticky_2025' });
       await room.joinCall(joinParams);
 
       const content = host._getStickyEvents()[0].content;

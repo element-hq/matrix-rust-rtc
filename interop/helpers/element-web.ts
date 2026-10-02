@@ -24,8 +24,8 @@ export type RtcMode = "legacy" | "compat" | "2_0";
 /**
  * Labels in Element Call's Developer tab, and what they mean for us:
  *
- * - `Compatibility: state events` ↔ `ElementCallCompat::StateEvents`
- * - `Matrix 2.0`                  ↔ `ElementCallCompat::StickyEvents`
+ * - `Compatibility: state events` ↔ `MembershipFormat::RoomState`
+ * - `Matrix 2.0`                  ↔ `MembershipFormat::Sticky2025`
  * - `Legacy: state events`        ↔ (not implemented on our side)
  */
 const RTC_MODE_LABEL: Record<RtcMode, string> = {

@@ -30,7 +30,7 @@
 //! comes from. Two consequences shape this module:
 //!
 //! - It cannot address a to-device key to us unless our member event *states*
-//!   our device, so [`ElementCallDialect::rewrite_member_content`] puts
+//!   our device, so [`Sticky2025Dialect::rewrite_member_content`] puts
 //!   `member.user_id` / `member.device_id` back on the wire. Without them,
 //!   Element Call has no way to send us its media key and its media never
 //!   decrypts for us.
@@ -200,7 +200,7 @@ fn infer_membership(object: &mut Map<String, Value>) {
 
 /// Whether this content states `member.membership = "leave"`.
 ///
-/// Shared with [`super::element_call_state`]: both legacy generations signal a
+/// Shared with [`super::room_state`]: both legacy generations signal a
 /// departure by replacing the content wholesale, so both need to recognise the
 /// spec leave they are translating *from*.
 pub(crate) fn is_leave(content: &Value) -> bool {
@@ -277,7 +277,7 @@ pub struct LegacyKeyMessage {
 /// `sender` is the to-device event's sender, needed only for the pre-sticky
 /// generation: that one has no `member` object, and binds the key to
 /// `{sender}:{content.device_id}` — the same string
-/// [`element_call_state::participant_identity`](super::element_call_state::participant_identity)
+/// [`room_state::participant_identity`](super::room_state::participant_identity)
 /// builds, and the same one the inbound state translation uses as `member.id`. If
 /// the two ever diverged the key would be filed against a membership that does
 /// not exist, so they share the one function rather than the one format string.
@@ -302,7 +302,7 @@ pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessa
         Some(Value::String(member_id)) if !member_id.is_empty() => member_id.clone(),
         _ => {
             let device_id = content.get("device_id")?.as_str()?;
-            super::element_call_state::participant_identity(sender, device_id)
+            super::room_state::participant_identity(sender, device_id)
         }
     };
 
@@ -317,7 +317,7 @@ pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessa
 /// The outbound half: rewrites what we send so a pre-2026 Element Call can read
 /// it.
 ///
-/// Opt-in per call (`matrix_rtc_livekit::LiveKitCallOptions::element_call_compat`),
+/// Opt-in per call (`matrix_rtc_livekit::LiveKitCallOptions::format`),
 /// because unlike the inbound normalisation this changes what every peer sees.
 ///
 /// Member events are rewritten **additively** — the MSC4143 fields all stay put
@@ -326,13 +326,13 @@ pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessa
 /// have seen anyway. Key messages cannot work that way: the message type is one
 /// or the other, so in this mode keys go out in the legacy dialect only.
 #[derive(Clone, Debug)]
-pub struct ElementCallDialect {
+pub struct Sticky2025Dialect {
     own_user_id: String,
     own_device_id: String,
     slot_id: String,
 }
 
-impl ElementCallDialect {
+impl Sticky2025Dialect {
     /// Builds the dialect for our own membership in `slot_id`.
     ///
     /// The user and device ids are the ones we publish in `member`; the slot id
@@ -545,7 +545,7 @@ pub fn flatten_notification_content(event_type: &str, content: &Value) -> Option
 /// slot id of the form `<application>#<call_id>`, where the sentinel `ROOM` is
 /// the room-scoped session that used to be an empty `call_id`.
 ///
-/// A free function, and shared with [`super::element_call_state`], because that
+/// A free function, and shared with [`super::room_state`], because that
 /// generation needs the same split in three places — the member content, the
 /// state key and the key message's `session` object — and a second copy of the
 /// sentinel rule is a second chance to get it wrong. Getting it wrong puts a
@@ -767,8 +767,8 @@ mod tests {
         );
     }
 
-    fn dialect() -> ElementCallDialect {
-        ElementCallDialect::new("@bob:example.io", "BOBDEVICE", "m.call#ROOM")
+    fn dialect() -> Sticky2025Dialect {
+        Sticky2025Dialect::new("@bob:example.io", "BOBDEVICE", "m.call#ROOM")
     }
 
     /// Additive: every MSC4143 field survives, so one event serves both
@@ -913,7 +913,7 @@ mod tests {
     /// Element Call build.
     #[test]
     fn a_notification_is_flattened_into_what_element_call_sends() {
-        // As `matrix_rtc_core::build_notification_content` writes it: the MSC's
+        // As `crate::build_notification_content` writes it: the MSC's
         // `application` block plus the top-level copies every deployed receiver
         // actually reads.
         let spec = json!({

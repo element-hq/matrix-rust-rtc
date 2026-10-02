@@ -15,22 +15,22 @@
 //! trickiest code in this repository.
 //!
 //! The dialect translation itself lives in the sibling modules
-//! ([`element_call`], [`element_call_state`]) and is shared verbatim with the
+//! ([`sticky_2025`], [`room_state`]) and is shared verbatim with the
 //! Rust-native path; this module owns only the host-shaped funnels around it,
 //! the [`IngestDialect`] the core's feeder reads a room through in each mode,
 //! and the two places a mode changes an identifier rather than a field
 //! ([`member_id`], [`outbound_dialect`]).
 
-use matrix_rtc_core::feeder::{IngestDialect, key_origin};
-use matrix_rtc_core::{
+use crate::feeder::{IngestDialect, key_origin};
+use crate::{
     EventIn, EventOrigin, RawStickyEvent, RawStickyEventContent, ReceivedEncryptionKey,
     ToDeviceMessageIn,
 };
 use serde_json::Value;
 
 use super::{
-    ElementCallCompat, ElementCallDialect, ElementCallStateDialect, LEGACY_KEY_EVENT_TYPE,
-    MemberContent, OutboundDialect, STATE_MEMBER_EVENT_TYPE, element_call, element_call_state,
+    MemberContent, MembershipFormat, OutboundDialect, RoomStateDialect, STATE_MEMBER_EVENT_TYPE,
+    Sticky2025Dialect, room_state, sticky_2025,
 };
 
 /// One `m.rtc.member` sticky event, with its content raw.
@@ -69,7 +69,7 @@ pub struct RawMemberEventIn {
 /// Not a sticky event and not typed as one: it has no sticky key, its lifetime
 /// is stated in the content rather than enforced by the homeserver, and it is
 /// translated into an MSC4143 membership before the core sees it. Only fed in
-/// [`ElementCallCompat::StateEvents`] mode.
+/// [`MembershipFormat::RoomState`] mode.
 #[derive(Clone, Debug)]
 pub struct LegacyStateMemberEventIn {
     /// The event's id, carried through to the translated membership so
@@ -97,20 +97,20 @@ pub struct LegacyStateMemberEventIn {
 /// our own user and device on the wire, and the state dialect derives a state
 /// key and a `livekit_alias` from the room.
 pub fn outbound_dialect(
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
     user_id: &str,
     device_id: &str,
     room_id: &str,
     slot_id: &str,
 ) -> OutboundDialect {
     match compat {
-        ElementCallCompat::Off => OutboundDialect::None,
-        ElementCallCompat::StickyEvents => {
-            OutboundDialect::Sticky(ElementCallDialect::new(user_id, device_id, slot_id))
+        MembershipFormat::Current => OutboundDialect::None,
+        MembershipFormat::Sticky2025 => {
+            OutboundDialect::Sticky(Sticky2025Dialect::new(user_id, device_id, slot_id))
         }
-        ElementCallCompat::StateEvents => OutboundDialect::State(ElementCallStateDialect::new(
-            user_id, device_id, room_id, slot_id,
-        )),
+        MembershipFormat::RoomState => {
+            OutboundDialect::State(RoomStateDialect::new(user_id, device_id, room_id, slot_id))
+        }
     }
 }
 
@@ -123,12 +123,10 @@ pub fn outbound_dialect(
 /// would leave our own state event, echoed back through sync, failing the
 /// core's `SupersededOwnParticipation` check: we would mark ourselves departed
 /// on our own join.
-pub fn member_id(compat: ElementCallCompat, user_id: &str, device_id: &str) -> String {
+pub fn member_id(compat: MembershipFormat, user_id: &str, device_id: &str) -> String {
     match compat {
-        ElementCallCompat::StateEvents => {
-            element_call_state::participant_identity(user_id, device_id)
-        }
-        _ => matrix_rtc_core::generate_member_id(),
+        MembershipFormat::RoomState => room_state::participant_identity(user_id, device_id),
+        _ => crate::generate_member_id(),
     }
 }
 
@@ -140,7 +138,7 @@ pub fn member_id(compat: ElementCallCompat, user_id: &str, device_id: &str) -> S
 pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<RawStickyEvent> {
     let mut value = event.content;
 
-    if element_call::normalize_member_content(&mut value) == MemberContent::BareLeave {
+    if sticky_2025::normalize_member_content(&mut value) == MemberContent::BareLeave {
         // A pre-2026 leave: the content is a sticky key and nothing else, so
         // there is no slot to file it under. Dropping it *is* the leave — the
         // membership set is applied whole, and a member who contributes no event
@@ -152,7 +150,7 @@ pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<Ra
         return None;
     }
 
-    let claimed_device = element_call::claimed_device_id(&value);
+    let claimed_device = sticky_2025::claimed_device_id(&value);
 
     let content: RawStickyEventContent = match serde_json::from_value(value) {
         Ok(content) => content,
@@ -212,7 +210,7 @@ pub fn to_core_state_memberships(
     room_id: &str,
     events: Vec<LegacyStateMemberEventIn>,
 ) -> Vec<RawStickyEvent> {
-    let parsed: Vec<element_call_state::StateMemberEvent> = events
+    let parsed: Vec<room_state::StateMemberEvent> = events
         .into_iter()
         .filter_map(|event| {
             let content = serde_json::from_value(event.content)
@@ -220,13 +218,13 @@ pub fn to_core_state_memberships(
                     log::warn!(
                         "[{room_id}] ignoring a {} from {} ({}) whose content does not parse: \
                          {error}",
-                        element_call_state::STATE_MEMBER_EVENT_TYPE,
+                        room_state::STATE_MEMBER_EVENT_TYPE,
                         event.sender,
                         event.state_key,
                     );
                 })
                 .ok()?;
-            Some(element_call_state::StateMemberEvent {
+            Some(room_state::StateMemberEvent {
                 event_id: event.event_id,
                 sender: event.sender,
                 state_key: event.state_key,
@@ -236,12 +234,11 @@ pub fn to_core_state_memberships(
         })
         .collect();
 
-    let translated =
-        element_call_state::translate_state_memberships(&parsed, element_call_state::now_ms());
+    let translated = room_state::translate_state_memberships(&parsed, room_state::now_ms());
     log::debug!(
         "[{room_id}] {} {} state event(s) translated to {} live membership(s)",
         parsed.len(),
-        element_call_state::STATE_MEMBER_EVENT_TYPE,
+        room_state::STATE_MEMBER_EVENT_TYPE,
         translated.len(),
     );
 
@@ -327,12 +324,12 @@ pub fn merge_current_membership(
 /// there is no device to bind it to — both mean the key cannot be used, and both
 /// are logged where they happen.
 pub fn parse_legacy_key(
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
     sender: &str,
     sender_device_id: Option<&str>,
     content: &Value,
-) -> Option<element_call::LegacyKeyMessage> {
-    let mut key = element_call::parse_key_message(sender, content)?;
+) -> Option<sticky_2025::LegacyKeyMessage> {
+    let mut key = sticky_2025::parse_key_message(sender, content)?;
 
     // In the pre-sticky generation the `member.id` a key message carries is
     // Element Call's own per-session UUID, and it appears in *no* field of the
@@ -343,11 +340,11 @@ pub fn parse_legacy_key(
     // identity, our translated `member_id`, the `membershipID` — so bind on that
     // instead. The device comes from Olm decryption where possible, so both
     // halves are authenticated rather than self-asserted.
-    if compat == ElementCallCompat::StateEvents {
+    if compat == MembershipFormat::RoomState {
         let device_id = sender_device_id
             .map(str::to_owned)
-            .or_else(|| element_call::claimed_key_device_id(content))?;
-        key.member_id = element_call_state::participant_identity(sender, &device_id);
+            .or_else(|| sticky_2025::claimed_key_device_id(content))?;
+        key.member_id = room_state::participant_identity(sender, &device_id);
     }
 
     Some(key)
@@ -355,8 +352,8 @@ pub fn parse_legacy_key(
 
 /// How the core's feeder reads a room in each mode: every member event through
 /// [`to_core_member_event`], the pre-sticky membership state in
-/// [`ElementCallCompat::StateEvents`], and legacy media keys in every mode.
-impl IngestDialect for ElementCallCompat {
+/// [`MembershipFormat::RoomState`], and legacy media keys in every mode.
+impl IngestDialect for MembershipFormat {
     fn membership_state_event_types(&self) -> Vec<String> {
         if self.reads_state_membership() {
             vec![STATE_MEMBER_EVENT_TYPE.to_owned()]
@@ -384,10 +381,6 @@ impl IngestDialect for ElementCallCompat {
                 .filter_map(to_legacy_state_member_event_in)
                 .collect(),
         )
-    }
-
-    fn key_event_types(&self) -> Vec<String> {
-        vec![LEGACY_KEY_EVENT_TYPE.to_owned()]
     }
 
     fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
@@ -458,7 +451,7 @@ mod tests {
         // Inferred: that generation has no `membership` field at all.
         assert_eq!(
             converted.content.member.membership,
-            Some(matrix_rtc_core::Membership::Join),
+            Some(crate::Membership::Join),
         );
         // Lifted out of the flat `rtc_transports` array.
         let transports = converted.content.transports.expect("transports");
@@ -506,7 +499,7 @@ mod tests {
 
     #[test]
     fn translates_pre_sticky_room_state() {
-        let now = element_call_state::now_ms();
+        let now = room_state::now_ms();
         let events = vec![LegacyStateMemberEventIn {
             event_id: None,
             sender: "@alice:example.org".to_owned(),
@@ -563,7 +556,7 @@ mod tests {
     /// two key exchanges for one peer.
     #[test]
     fn a_sticky_membership_wins_over_the_state_one_with_the_same_key() {
-        let now = element_call_state::now_ms();
+        let now = room_state::now_ms();
         let sticky = raw(serde_json::json!({
             "slot_id": "m.call#ROOM",
             "msc4354_sticky_key": "@alice:example.org:ALICEDEVICE",
@@ -599,7 +592,7 @@ mod tests {
         });
 
         let sticky = parse_legacy_key(
-            ElementCallCompat::StickyEvents,
+            MembershipFormat::Sticky2025,
             "@alice:example.org",
             Some("ALICEDEVICE"),
             &content,
@@ -608,7 +601,7 @@ mod tests {
         assert_eq!(sticky.member_id, "ef8adf45-0000-0000-0000-000000000000");
 
         let state = parse_legacy_key(
-            ElementCallCompat::StateEvents,
+            MembershipFormat::RoomState,
             "@alice:example.org",
             Some("ALICEDEVICE"),
             &content,
@@ -629,7 +622,7 @@ mod tests {
 
         assert!(
             parse_legacy_key(
-                ElementCallCompat::StateEvents,
+                MembershipFormat::RoomState,
                 "@alice:example.org",
                 None,
                 &content,

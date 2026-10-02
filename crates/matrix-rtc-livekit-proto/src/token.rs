@@ -122,7 +122,7 @@ struct LegacyGetTokenRequest<'a> {
 /// which nothing decrypts and nobody appears, and peer foci retry connects
 /// indefinitely, so a wrong guess would never surface. A 404 stays loud.
 ///
-/// Temporary; see `matrix_rtc_call::compat`.
+/// Temporary; see `matrix_rtc_core::compat`.
 pub fn legacy_token_request(
     livekit_service_url: &str,
     room: &str,

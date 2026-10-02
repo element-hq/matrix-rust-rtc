@@ -117,11 +117,11 @@ for a runnable two-client example against the local backend.
 - `crates/matrix-rtc-core`: the per-room MSC4143 core (`BaseRtcRoom`, a
   `SlotSession` per slot), the MSC4143/MSC4354 event conversion boundary, and
   the feeder that subscribes through a host's `MatrixBackend` and feeds it
-  (`BaseRtcClient` opens rooms that feed themselves).
+  (`BaseRtcClient` opens rooms that feed themselves), and `compat`, the
+  pre-2026 MatrixRTC membership formats Element Call still speaks.
 - `crates/matrix-rtc-call`: the host-facing objects (`RtcClient` → `RtcRoom` →
   `RtcSession`/`RtcCall`) and the call application — reactions, raised hand,
-  MSC4075 ringing — plus the dialect wrapper and `compat` for pre-2026 Element
-  Call wire formats, and the transport choice. No Matrix SDK,
+  MSC4075 ringing — and the transport choice. No Matrix SDK,
   so it tests in seconds against no git dependencies.
 - `crates/matrix-rtc-matrix-sdk`: `SdkMatrixBackend`, the `MatrixBackend` over
   matrix-rust-sdk. **No LiveKit**.

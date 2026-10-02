@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_sys::{Function, Reflect};
-use matrix_rtc_call::compat::ElementCallCompat;
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
@@ -48,11 +48,11 @@ struct WasmMediaSessionConfig {
     #[serde(default)]
     key_ring_size: Option<u16>,
     /// Element Call compatibility generation this room was joined for:
-    /// `"off"` (default), `"sticky_events"`, or `"state_events"`. Decides the
+    /// `"current"` (default), `"sticky_2025"`, or `"room_state"`. Decides the
     /// participant-identity derivation and the token endpoint, so it must
     /// match the membership the page published.
     #[serde(default)]
-    element_call_compat: Option<String>,
+    format: Option<String>,
     /// How much the tile order is damped. Omitted takes the defaults; so does
     /// any field left out of the object.
     #[serde(default)]
@@ -123,7 +123,7 @@ impl WasmRtcCall {
     /// the own-focus livekit-js room. The `member.id` comes from the join —
     /// the page neither chooses nor passes it.
     ///
-    /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, element_call_compat?, stability? }`;
+    /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, format?, stability? }`;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
     /// implement `onParticipants(roster)` and `onEvent(event)` — the push
@@ -154,17 +154,17 @@ impl WasmRtcCall {
         // silence — peers sit in the roster with no media, keys install under
         // an identity the SFU never assigned, and nothing logs a problem. The
         // config field is accepted only as a cross-check.
-        let compat = self.element_call_compat();
-        if let Some(requested) = config.element_call_compat.as_deref() {
+        let compat = self.format();
+        if let Some(requested) = config.format.as_deref() {
             let requested = crate::compat::parse_compat(Some(requested))?;
             if requested != compat {
                 return Err(JsError::new(&format!(
-                    "element_call_compat {requested:?} disagrees with the mode this room was \
+                    "format {requested:?} disagrees with the mode this room was \
                      joined in ({compat:?}); set the mode on join and drop it here",
                 )));
             }
         }
-        if compat != ElementCallCompat::Off {
+        if compat != MembershipFormat::Current {
             log::info!(
                 "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode \
                  {compat:?}",
@@ -228,7 +228,7 @@ impl WasmRtcCall {
                 // generation's unhashed `{user}:{device}` identity comes from
                 // — the endpoint mints the identity, so the two are one
                 // decision, not two.
-                ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
                 _ => TokenEndpoint::Msc4195,
             },
         ));

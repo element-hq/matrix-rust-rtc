@@ -11,6 +11,7 @@
 
 mod base_rtc_room;
 mod client;
+pub mod compat;
 mod encryption;
 mod error;
 pub mod executor;
@@ -27,7 +28,7 @@ mod upkeep;
 mod wire;
 
 pub use base_rtc_room::BaseRtcRoom;
-pub use client::{BaseRtcClient, BaseRtcRoomHandle, OpenError};
+pub use client::{BaseRoom, BaseRtcClient, BaseRtcRoomHandle, OpenError, RoomOptions};
 pub use encryption::types::{
     EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, KeyOrigin, KeyRejection,
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
