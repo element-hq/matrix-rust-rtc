@@ -1,0 +1,179 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use serde_json::json;
+
+use super::*;
+use crate::testing::MockBackend;
+use crate::{
+    EventEncryption, EventIn, KEY_MESSAGE_TYPE, LiveKitTransport, RtcTransport, SLOT_EVENT_TYPE,
+    ToDeviceMessageIn,
+};
+
+const ROOM: &str = "!room:example.org";
+const OTHER_ROOM: &str = "!other:example.org";
+const SLOT: &str = "m.call#ROOM";
+const BOB: &str = "@bob:example.org";
+
+/// What a homeserver delivers for a room: an open slot with Bob in it.
+fn deliver_room(mock: &MockBackend, room_id: &str) {
+    let sink = mock
+        .room_subscription(room_id)
+        .expect("subscribed")
+        .sink
+        .clone();
+    sink.on_encryption(false);
+    sink.on_state_events(
+        SLOT_EVENT_TYPE.to_owned(),
+        vec![EventIn {
+            event_id: "$slot".to_owned(),
+            sender: BOB.to_owned(),
+            event_type: SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 1,
+            content: json!({ "status": "open", "application": { "type": "m.call" } }),
+            encryption: EventEncryption::Cleartext,
+        }],
+    );
+    sink.on_joined_members(vec![mock.user_id.clone(), BOB.to_owned()]);
+    sink.on_sticky_events(vec![EventIn {
+        event_id: "$bob".to_owned(),
+        sender: BOB.to_owned(),
+        event_type: "m.rtc.member".to_owned(),
+        state_key: None,
+        origin_server_ts: 2,
+        content: json!({
+            "slot_id": SLOT,
+            "msc4354_sticky_key": "bob-1",
+            "member": { "id": "bob-1", "membership": "join" },
+            "application": { "type": "m.call" },
+        }),
+        encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
+    }]);
+}
+
+async fn open(
+    client: &BaseRtcClient<MockBackend>,
+    mock: &MockBackend,
+    room_id: &str,
+) -> BaseRtcRoomHandle<MockBackend> {
+    let room = client.room(room_id).await.expect("the room opens");
+    deliver_room(mock, room_id);
+    room.seeded().await;
+    room
+}
+
+fn join_params(mock: &MockBackend) -> JoinSessionParams {
+    JoinSessionParams::new(
+        mock.user_id.clone(),
+        "MOCKDEV".to_owned(),
+        SLOT.to_owned(),
+        "m.call",
+        RtcTransport::LiveKit(LiveKitTransport {
+            livekit_service_url: "https://sfu.example.org".to_owned(),
+        }),
+    )
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_room_feeds_itself_and_a_join_keeps_itself_alive() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    assert_eq!(room.observe(SLOT).await.borrow().len(), 1);
+
+    room.join(join_params(&mock)).await.expect("join");
+    assert_eq!(room.state().lock().await.joined_slots(), vec![SLOT]);
+    tokio::time::sleep(
+        Duration::from_millis(crate::DEFAULT_KEEP_ALIVE_INTERVAL_MS * 2) + Duration::from_millis(1),
+    )
+    .await;
+    assert_eq!(mock.restarted_events.lock().unwrap().len(), 2);
+
+    room.leave(SLOT, LeaveSessionParams::new())
+        .await
+        .expect("leave");
+}
+
+#[tokio::test]
+async fn a_second_handle_for_an_open_room_is_refused() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+
+    assert!(matches!(
+        client.room(ROOM).await,
+        Err(OpenError::RoomAlreadyOpen(_))
+    ));
+
+    drop(room);
+    let _reopened = open(&client, &mock, ROOM).await;
+}
+
+#[tokio::test]
+async fn an_opening_that_fails_leaves_nothing_behind() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    *mock.room_subscription_error.lock().unwrap() =
+        Some(BackendError::not_implemented("subscribe_room"));
+
+    assert!(matches!(
+        client.room(ROOM).await,
+        Err(OpenError::Backend(_))
+    ));
+    let to_device = mock.to_device_subscriptions.lock().unwrap()[0].clone();
+    assert!(to_device.cancelled.load(Ordering::SeqCst));
+
+    *mock.room_subscription_error.lock().unwrap() = None;
+    let _room = open(&client, &mock, ROOM).await;
+}
+
+#[tokio::test]
+async fn the_to_device_subscription_stops_with_the_last_room() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let other = open(&client, &mock, OTHER_ROOM).await;
+    assert_eq!(mock.to_device_subscriptions.lock().unwrap().len(), 1);
+    let to_device = mock.to_device_subscription().unwrap();
+
+    drop(room);
+    assert!(!to_device.cancelled.load(Ordering::SeqCst));
+    drop(other);
+    assert!(to_device.cancelled.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn a_media_key_for_a_room_that_is_not_open_is_dropped() {
+    let mock = Arc::new(MockBackend::new());
+    let client = BaseRtcClient::new(mock.clone());
+    let _room = open(&client, &mock, ROOM).await;
+
+    let key = |room_id: &str| ToDeviceMessageIn {
+        sender: BOB.to_owned(),
+        event_type: KEY_MESSAGE_TYPE.to_owned(),
+        content: json!({
+            "room_id": room_id,
+            "member_id": "bob-1",
+            "media_key": { "index": 0, "key": "AAECAwQFBgcICQoLDA0ODw==" },
+        }),
+        encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
+    };
+    let sink = mock.to_device_subscription().unwrap().sink.clone();
+    sink.on_to_device_message(key(OTHER_ROOM));
+    sink.on_to_device_message(key(ROOM));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    // The routing loop survived the key it could not deliver.
+    assert!(
+        !mock
+            .to_device_subscription()
+            .unwrap()
+            .cancelled
+            .load(Ordering::SeqCst)
+    );
+}

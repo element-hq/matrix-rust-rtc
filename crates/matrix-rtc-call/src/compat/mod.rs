@@ -69,9 +69,10 @@
 //!
 //! In this crate:
 //!
-//! 1. `feeder` — the inbound half for every host: normalises `m.rtc.member`
-//!    content (`ingest`), reads state-carried membership in `StateEvents`, and
-//!    parses legacy to-device keys, all from the mode the room was attached in.
+//! 1. `ingest` — the inbound half for every host: the `IngestDialect` the
+//!    core's feeder reads a room through, which normalises `m.rtc.member`
+//!    content, reads state-carried membership in `StateEvents`, and parses
+//!    legacy to-device keys, all from the mode the room was attached in.
 //! 2. `dialect_backend::DialectBackend` — the outbound half for every host:
 //!    routes and rewrites the sends of the one `MatrixBackend` wrapper the
 //!    bindings and the `LiveKitCall` facade all use.
@@ -93,6 +94,8 @@ use serde_json::Value;
 pub mod dialect_backend;
 pub mod element_call;
 pub mod element_call_state;
+#[cfg(test)]
+mod feeder_tests;
 pub mod ingest;
 
 pub use dialect_backend::DialectBackend;

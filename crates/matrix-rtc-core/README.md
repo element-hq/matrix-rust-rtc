@@ -14,27 +14,25 @@ It does four things:
 - **Encryption.** It creates, distributes, rotates and checks per-member media keys.
 - **Slots.** It resolves `m.rtc.slot` state, and opens and closes slots.
 
-The core does no I/O. It sends through the host-implemented `MatrixBackend`, and it is fed —
-by the feeder in `matrix-rtc-call`, which subscribes through that same backend — the room's
-state and membership as `RawStickyEvent`s, slot and room state, and decrypted key messages. Its
-`executor` module (tokio natively, `spawn_local` and `setTimeout` on wasm) is what the library's
-background work runs on. A join starts the slot's upkeep — keep-alive, sticky refresh, key
-rotations at their deadline — until the leave, so a host using the core alone ticks nothing
-either; off a tokio runtime (natively) there is none, and the host calls `keep_alive` itself.
+The core does its I/O through the host-implemented `MatrixBackend`: it sends through it, and
+its `BaseRtcClient` opens a room by subscribing through it. The `feeder` then applies the room's
+state and membership, slot and room state, and decrypted key messages. Its `executor` module
+(tokio natively, `spawn_local` and `setTimeout` on wasm) is what the library's background work
+runs on: a room's feeds while its handle lives, and from a join until the leave the slot's
+upkeep (keep-alive, sticky refresh, key rotations at their deadline). A host using the core alone
+feeds and ticks nothing. Off a tokio runtime (natively) nothing is spawned, and the host calls
+`keep_alive` itself.
 
 ## Quick start: join a slot and follow its memberships
 
-The core is **fed**, not polled: it never reads from the backend itself. A host
-reaches it through `matrix-rtc-call`'s `RtcClient`, which opens a room: it subscribes through the
-backend to what the room needs and applies the room's current state in the right order
-(encryption and slots and members before the first membership). Joining a slot on the room
-returns our participation in it:
+`BaseRtcClient::room` opens a room: it subscribes through the backend to what the room needs and
+applies the room's current state in the right order (encryption and slots and members before the
+first membership), reading the spec's dialect:
 
 ```rust,ignore
 use std::sync::Arc;
 
-use matrix_rtc_call::{JoinOptions, RoomOptions, RtcClient};
-use matrix_rtc_core::{LeaveSessionParams, MatrixBackend};
+use matrix_rtc_core::{BaseRtcClient, JoinSessionParams, LeaveSessionParams, MatrixBackend};
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "org.example.board#ROOM";
@@ -42,12 +40,13 @@ const SLOT: &str = "org.example.board#ROOM";
 async fn run(
     // The host's Matrix client, behind the one trait the library knows.
     backend: Arc<impl MatrixBackend + 'static>,
+    params: JoinSessionParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One per backend; creating it does no I/O.
-    let client = RtcClient::new(backend);
+    let client = BaseRtcClient::new(backend);
 
     // Natively, from within a tokio runtime: the room spawns its feeds onto it.
-    let room = client.room(ROOM, RoomOptions::default()).await?;
+    let room = client.room(ROOM).await?;
     // Resolves once the room's current state has been applied.
     room.seeded().await;
 
@@ -59,20 +58,22 @@ async fn run(
         }
     });
 
-    // The transport is the homeserver's first advertised LiveKit one. The
-    // session keeps itself alive until it leaves or is dropped.
-    let session = room.join(JoinOptions::new(SLOT, "org.example.board")).await?;
+    // The joined slot keeps itself alive until it leaves.
+    room.join(params).await?;
 
-    session.leave(LeaveSessionParams::new()).await?;
-    room.close().await;
+    room.leave(SLOT, LeaveSessionParams::new()).await?;
     Ok(())
 }
 ```
 
-`matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient` objects are all this
-sequence with a different backend and a different place to run the feed futures. Dropping the room
-without `close` ends its subscriptions without leaving: a membership left behind expires through
-its delayed leave.
+Dropping the room handle ends its subscriptions without leaving: a membership left behind expires
+through its delayed leave.
+
+An application over the core opens its own room state with `BaseRtcClient::open_with(room_id,
+state, dialect)`: the state is any `ApplicationIntake`, which also receives the timeline events,
+redactions and `/relations` it asks for, and the `IngestDialect` decides what is read and how.
+`matrix-rtc-call`'s `RtcClient` is this, with the call's room state and Element Call's dialects;
+`matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient` objects are built on it.
 
 The per-room core type is `BaseRtcRoom`. What the feeder calls on it —
 `set_current_sticky_state(Vec<RawStickyEvent>)` with the room's **complete** current membership,

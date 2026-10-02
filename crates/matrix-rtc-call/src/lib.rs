@@ -11,13 +11,12 @@
 //! It also holds how a host's `MatrixBackend` reaches the call, none of which
 //! needs a Matrix SDK: [`compat`], translation to and from the pre-2026
 //! dialects Element Call still speaks, with [`DialectBackend`], the backend
-//! wrapper that renders sends in a room's dialect; [`feeder`], which subscribes,
-//! seeds, orders and funnels a room into the call; and [`transports`], which
-//! transport a join publishes on.
+//! wrapper that renders sends in a room's dialect and the `IngestDialect` the
+//! core's feeder reads a room through; and [`transports`], which transport a
+//! join publishes on.
 
 mod client;
 pub mod compat;
-pub mod feeder;
 pub mod notification;
 pub mod reactions;
 mod room_state;
@@ -27,10 +26,6 @@ pub use compat::{
     DialectBackend, ElementCallCompat, ElementCallDialect, ElementCallStateDialect,
     LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent, MemberEventRoute, OutboundDialect,
     STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
-};
-pub use feeder::{
-    RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomFeederRun, RoomRegistry, ToDeviceFeeder,
-    ToDeviceFeederRun,
 };
 
 pub use client::{

@@ -7,22 +7,19 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::room_state::CallRoomState;
-use matrix_rtc_core::testing::MockBackend;
-use matrix_rtc_core::{EventEncryption, EventIn, ToDeviceMessageIn};
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::compat::DialectBackend;
+use crate::testing::MockBackend;
+use crate::{BaseRtcRoom, RawStickyEvent};
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "m.call#ROOM";
 const ME: &str = "@mock:example.org";
 const BOB: &str = "@bob:example.org";
 
-type Backend = DialectBackend<MockBackend>;
-type Manager = Arc<Mutex<CallRoomState<Backend>>>;
+type Manager = Arc<Mutex<BaseRtcRoom<MockBackend>>>;
 
 struct Harness {
     mock: Arc<MockBackend>,
@@ -31,14 +28,14 @@ struct Harness {
 }
 
 impl Harness {
-    async fn attach(mode: ElementCallCompat) -> Self {
+    async fn attach() -> Self {
+        Self::attach_in(Arc::new(SpecDialect)).await
+    }
+
+    async fn attach_in(dialect: Arc<dyn IngestDialect>) -> Self {
         let mock = Arc::new(MockBackend::new());
-        let backend = Arc::new(DialectBackend::new(mock.clone()));
-        let manager = Arc::new(Mutex::new(CallRoomState::with_backend(
-            ROOM,
-            backend.clone(),
-        )));
-        let (attachment, run) = RoomFeeder::attach(backend, manager.clone(), mode)
+        let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+        let (attachment, run) = RoomFeeder::attach(mock.clone(), manager.clone(), dialect)
             .await
             .expect("attach");
         tokio::spawn(run.run());
@@ -114,24 +111,102 @@ fn member_event(sender: &str, member_id: &str, event_id: &str) -> EventIn {
     }
 }
 
+const STATE_MEMBER: &str = "org.example.call.member";
+const EXTRA_KEY: &str = "org.example.call.key";
+
+/// Reads membership only from `STATE_MEMBER` state, one member per event, and
+/// keys of the `EXTRA_KEY` type as well.
+struct StateDialect;
+
+impl IngestDialect for StateDialect {
+    fn membership_state_event_types(&self) -> Vec<String> {
+        vec![STATE_MEMBER.to_owned()]
+    }
+
+    fn reads_slots(&self) -> bool {
+        false
+    }
+
+    fn current_membership(
+        &self,
+        room_id: &str,
+        _sticky: Vec<EventIn>,
+        state: Vec<EventIn>,
+    ) -> Vec<RawStickyEvent> {
+        let sticky = state
+            .into_iter()
+            .map(|event| EventIn {
+                event_type: "m.rtc.member".to_owned(),
+                ..event
+            })
+            .collect();
+        SpecDialect.current_membership(room_id, sticky, Vec::new())
+    }
+
+    fn key_event_types(&self) -> Vec<String> {
+        vec![EXTRA_KEY.to_owned()]
+    }
+
+    fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
+        Some(ReceivedEncryptionKey {
+            origin: key_origin(&message.encryption, &message.sender),
+            room_id: message.content["room_id"].as_str()?.to_owned(),
+            member_id: "from-the-dialect".to_owned(),
+            key_b64: "a2V5".to_owned(),
+            key_index: 0,
+        })
+    }
+}
+
 #[tokio::test]
-async fn attach_subscribes_to_what_the_mode_needs() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+async fn attach_subscribes_to_what_the_dialect_needs() {
+    let harness = Harness::attach().await;
     let subjects = &harness.mock.room_subscription(ROOM).unwrap().subjects;
     assert_eq!(subjects.state_event_types, SLOT_EVENT_TYPES);
-    assert_eq!(
-        subjects.timeline_event_types,
-        vec!["io.element.call.reaction", "m.reaction"]
-    );
+    assert!(subjects.timeline_event_types.is_empty());
 
-    let legacy = Harness::attach(ElementCallCompat::StateEvents).await;
-    let subjects = &legacy.mock.room_subscription(ROOM).unwrap().subjects;
-    assert_eq!(subjects.state_event_types, vec![STATE_MEMBER_EVENT_TYPE]);
+    let state = Harness::attach_in(Arc::new(StateDialect)).await;
+    let subjects = &state.mock.room_subscription(ROOM).unwrap().subjects;
+    assert_eq!(subjects.state_event_types, vec![STATE_MEMBER]);
+}
+
+#[tokio::test]
+async fn a_dialect_without_slots_seeds_from_its_membership_state() {
+    let harness = Harness::attach_in(Arc::new(StateDialect)).await;
+    let sink = harness.sink();
+    sink.on_encryption(false);
+    sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
+    sink.on_state_events(
+        STATE_MEMBER.to_owned(),
+        vec![EventIn {
+            event_type: STATE_MEMBER.to_owned(),
+            state_key: Some(BOB.to_owned()),
+            ..member_event(BOB, "bob-1", "$m1")
+        }],
+    );
+    harness.attachment.seeded().await;
+    assert!(harness.attachment.is_seeded());
+}
+
+#[test]
+fn a_key_of_an_extra_type_is_read_by_its_rooms_dialect() {
+    let message = ToDeviceMessageIn {
+        sender: BOB.to_owned(),
+        event_type: EXTRA_KEY.to_owned(),
+        content: json!({ "room_id": ROOM }),
+        encryption: EventEncryption::Cleartext,
+    };
+    let dialect: Arc<dyn IngestDialect> = Arc::new(StateDialect);
+    let key = parse_key_message(|_| Some(dialect.clone()), message.clone()).expect("a key");
+    assert_eq!(key.member_id, "from-the-dialect");
+
+    // A room that is not open has no dialect to read it.
+    assert!(parse_key_message(|_| None, message).is_none());
 }
 
 #[tokio::test]
 async fn a_membership_set_waits_for_the_room_state_and_then_seeds() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach().await;
     let sink = harness.sink();
 
     sink.on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
@@ -146,7 +221,7 @@ async fn a_membership_set_waits_for_the_room_state_and_then_seeds() {
 
 #[tokio::test]
 async fn a_members_set_without_us_is_ignored() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach().await;
     let sink = harness.sink();
     sink.on_encryption(false);
     sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), vec![open_slot()]);
@@ -162,7 +237,7 @@ async fn a_members_set_without_us_is_ignored() {
 
 #[tokio::test]
 async fn an_empty_sticky_set_clears_the_session() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach().await;
     harness.seed_room_state();
     harness
         .sink()
@@ -180,7 +255,7 @@ async fn an_empty_sticky_set_clears_the_session() {
 
 #[tokio::test]
 async fn a_closed_slot_projects_the_member_out() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach().await;
     let sink = harness.sink();
     sink.on_encryption(false);
     sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), Vec::new());
@@ -203,7 +278,7 @@ fn slot(event_type: &str, status: &str) -> EventIn {
 /// Seeds encryption, members and a sticky member, then the given slot sets in
 /// order, and returns the projected member count once they are applied.
 async fn member_count_after_slots(sets: Vec<(&str, Vec<EventIn>)>) -> Option<usize> {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach().await;
     let sink = harness.sink();
     sink.on_encryption(false);
     sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
@@ -263,100 +338,8 @@ async fn the_stable_slot_wins_over_the_unstable_one_in_either_order() {
 }
 
 #[tokio::test]
-async fn pre_sticky_state_membership_is_funnelled() {
-    let harness = Harness::attach(ElementCallCompat::StateEvents).await;
-    let sink = harness.sink();
-    sink.on_encryption(false);
-    sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
-    let now = crate::compat::element_call_state::now_ms();
-    sink.on_state_events(
-        STATE_MEMBER_EVENT_TYPE.to_owned(),
-        vec![EventIn {
-            event_id: "$legacy".to_owned(),
-            sender: BOB.to_owned(),
-            event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
-            state_key: Some(BOB.to_owned()),
-            origin_server_ts: now,
-            content: json!({
-                "application": "m.call",
-                "call_id": "",
-                "scope": "m.room",
-                "device_id": "BOBDEVICE",
-                "membershipID": format!("{BOB}:BOBDEVICE"),
-                "expires": 3_600_000,
-                "created_ts": now,
-                "focus_active": { "type": "livekit", "focus_selection": "multi_sfu" },
-                "foci_preferred": [{
-                    "type": "livekit",
-                    "livekit_alias": ROOM,
-                    "livekit_service_url": "https://sfu.example.org/livekit/jwt"
-                }]
-            }),
-            encryption: EventEncryption::Cleartext,
-        }],
-    );
-    harness.attachment.seeded().await;
-    assert_eq!(harness.member_count().await, Some(1));
-}
-
-#[tokio::test]
-async fn a_raised_hand_reaches_the_call_layer_and_a_redaction_lowers_it() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
-    harness.seed_room_state();
-    harness
-        .sink()
-        .on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
-    harness.attachment.seeded().await;
-
-    // Hands raised before we joined come from the relations of the
-    // membership event: one lookup per new event id.
-    harness
-        .wait_until(|| async { !harness.mock.relations_requests.lock().unwrap().is_empty() })
-        .await;
-    let requests = harness.mock.relations_requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].1, "$m1");
-    assert_eq!(requests[0].2, "m.annotation");
-    assert_eq!(requests[0].3, "m.reaction");
-
-    harness.sink().on_timeline_events(vec![EventIn {
-        event_id: "$hand".to_owned(),
-        sender: BOB.to_owned(),
-        event_type: "m.reaction".to_owned(),
-        state_key: None,
-        origin_server_ts: 3,
-        content: json!({
-            "m.relates_to": { "rel_type": "m.annotation", "event_id": "$m1", "key": "🖐️" }
-        }),
-        encryption: EventEncryption::Cleartext,
-    }]);
-    harness
-        .wait_until(|| async {
-            harness
-                .manager
-                .lock()
-                .await
-                .raised_hands(SLOT)
-                .is_some_and(|hands| hands.len() == 1)
-        })
-        .await;
-
-    harness.sink().on_redaction("$hand".to_owned());
-    harness
-        .wait_until(|| async {
-            harness
-                .manager
-                .lock()
-                .await
-                .raised_hands(SLOT)
-                .is_some_and(|hands| hands.is_empty())
-        })
-        .await;
-}
-
-#[tokio::test]
 async fn nothing_delivered_after_the_attachment_drops_is_applied() {
-    let harness = Harness::attach(ElementCallCompat::Off).await;
+    let harness = Harness::attach().await;
     harness.seed_room_state();
     let sink = harness.sink();
     sink.on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
@@ -383,17 +366,19 @@ async fn nothing_delivered_after_the_attachment_drops_is_applied() {
 }
 
 #[tokio::test]
-async fn the_to_device_feeder_subscribes_to_both_key_generations() {
+async fn the_to_device_feeder_subscribes_to_the_spec_and_extra_key_types() {
     let mock = Arc::new(MockBackend::new());
-    let backend = Arc::new(DialectBackend::new(mock.clone()));
-    let registry: RoomRegistry<CallRoomState<Backend>> = RoomRegistry::default();
-    let (feeder, run) = ToDeviceFeeder::start(backend, registry)
+    let registry: RoomRegistry<BaseRtcRoom<MockBackend>> = RoomRegistry::default();
+    let (feeder, run) = ToDeviceFeeder::start(mock.clone(), registry, vec![EXTRA_KEY.to_owned()])
         .await
         .expect("start");
     tokio::spawn(run.run());
 
     let subscription = mock.to_device_subscription().expect("a live subscription");
-    assert_eq!(subscription.event_types, KEY_EVENT_TYPES);
+    assert_eq!(
+        subscription.event_types,
+        [KEY_EVENT_TYPES.as_slice(), &[EXTRA_KEY]].concat()
+    );
 
     // A message the loop cannot use neither kills it nor reaches the core.
     subscription.sink.on_to_device_message(ToDeviceMessageIn {
@@ -432,7 +417,7 @@ fn key_origin_treats_an_unreported_cross_signing_as_not_cross_signed() {
 async fn dropping_an_attachment_ends_its_subscription() {
     let Harness {
         mock, attachment, ..
-    } = Harness::attach(ElementCallCompat::Off).await;
+    } = Harness::attach().await;
     let subscription = mock.room_subscription(ROOM).unwrap();
     assert!(!subscription.cancelled.load(Ordering::SeqCst));
 
@@ -443,9 +428,8 @@ async fn dropping_an_attachment_ends_its_subscription() {
 #[tokio::test]
 async fn dropping_the_to_device_feeder_ends_its_subscription() {
     let mock = Arc::new(MockBackend::new());
-    let backend = Arc::new(DialectBackend::new(mock.clone()));
-    let registry: RoomRegistry<CallRoomState<Backend>> = RoomRegistry::default();
-    let (feeder, _run) = ToDeviceFeeder::start(backend, registry)
+    let registry: RoomRegistry<BaseRtcRoom<MockBackend>> = RoomRegistry::default();
+    let (feeder, _run) = ToDeviceFeeder::start(mock.clone(), registry, Vec::new())
         .await
         .expect("start");
     let subscription = mock.to_device_subscription().unwrap();

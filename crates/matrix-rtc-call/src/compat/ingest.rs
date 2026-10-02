@@ -17,15 +17,20 @@
 //! The dialect translation itself lives in the sibling modules
 //! ([`element_call`], [`element_call_state`]) and is shared verbatim with the
 //! Rust-native path; this module owns only the host-shaped funnels around it,
+//! the [`IngestDialect`] the core's feeder reads a room through in each mode,
 //! and the two places a mode changes an identifier rather than a field
 //! ([`member_id`], [`outbound_dialect`]).
 
-use matrix_rtc_core::{EventOrigin, RawStickyEvent, RawStickyEventContent};
+use matrix_rtc_core::feeder::{IngestDialect, key_origin};
+use matrix_rtc_core::{
+    EventIn, EventOrigin, RawStickyEvent, RawStickyEventContent, ReceivedEncryptionKey,
+    ToDeviceMessageIn,
+};
 use serde_json::Value;
 
 use super::{
-    ElementCallCompat, ElementCallDialect, ElementCallStateDialect, MemberContent, OutboundDialect,
-    element_call, element_call_state,
+    ElementCallCompat, ElementCallDialect, ElementCallStateDialect, LEGACY_KEY_EVENT_TYPE,
+    MemberContent, OutboundDialect, STATE_MEMBER_EVENT_TYPE, element_call, element_call_state,
 };
 
 /// One `m.rtc.member` sticky event, with its content raw.
@@ -346,6 +351,81 @@ pub fn parse_legacy_key(
     }
 
     Some(key)
+}
+
+/// How the core's feeder reads a room in each mode: every member event through
+/// [`to_core_member_event`], the pre-sticky membership state in
+/// [`ElementCallCompat::StateEvents`], and legacy media keys in every mode.
+impl IngestDialect for ElementCallCompat {
+    fn membership_state_event_types(&self) -> Vec<String> {
+        if self.reads_state_membership() {
+            vec![STATE_MEMBER_EVENT_TYPE.to_owned()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The pre-sticky generation has no slots.
+    fn reads_slots(&self) -> bool {
+        !self.reads_state_membership()
+    }
+
+    fn current_membership(
+        &self,
+        room_id: &str,
+        sticky: Vec<EventIn>,
+        state: Vec<EventIn>,
+    ) -> Vec<RawStickyEvent> {
+        merge_current_membership(
+            room_id,
+            sticky.into_iter().map(to_member_event_in).collect(),
+            state
+                .into_iter()
+                .filter_map(to_legacy_state_member_event_in)
+                .collect(),
+        )
+    }
+
+    fn key_event_types(&self) -> Vec<String> {
+        vec![LEGACY_KEY_EVENT_TYPE.to_owned()]
+    }
+
+    fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
+        let key = parse_legacy_key(
+            *self,
+            &message.sender,
+            message.encryption.sender_device_id(),
+            &message.content,
+        )?;
+        Some(ReceivedEncryptionKey {
+            origin: key_origin(&message.encryption, &message.sender),
+            room_id: key.room_id,
+            member_id: key.member_id,
+            key_b64: key.key_b64,
+            key_index: key.key_index,
+        })
+    }
+}
+
+fn to_member_event_in(event: EventIn) -> RawMemberEventIn {
+    RawMemberEventIn {
+        event_id: Some(event.event_id),
+        sender: event.sender,
+        sender_device_id: event.encryption.sender_device_id().map(str::to_owned),
+        was_encrypted: Some(event.encryption.was_encrypted()),
+        event_type: event.event_type,
+        content: event.content,
+    }
+}
+
+fn to_legacy_state_member_event_in(event: EventIn) -> Option<LegacyStateMemberEventIn> {
+    Some(LegacyStateMemberEventIn {
+        event_id: Some(event.event_id),
+        sender: event.sender,
+        state_key: event.state_key?,
+        origin_server_ts: event.origin_server_ts,
+        content: event.content,
+    })
 }
 
 #[cfg(test)]

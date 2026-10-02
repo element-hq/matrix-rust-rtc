@@ -6,9 +6,10 @@ This document explains the initial architecture of the Matrix RTC Rust workspace
 
 The goal is to keep protocol logic in one Rust core crate and make all platform adaptation explicit at the edges.
 
-- `matrix-rtc-core` owns MSC4143, for any application.
-- `matrix-rtc-call` owns the call application on top of it, and how a host's
-  `MatrixBackend` feeds it (the feeder, the pre-2026 dialects).
+- `matrix-rtc-core` owns MSC4143, for any application, and how a host's
+  `MatrixBackend` feeds it (the feeder).
+- `matrix-rtc-call` owns the call application on top of it, and the pre-2026
+  dialects the feeder reads Element Call rooms in.
 - `matrix-rtc-matrix-sdk` owns the matrix-rust-sdk implementation of that backend.
 - `matrix-rtc-wasm` owns JavaScript-facing conversion and wasm export details.
 - `matrix-rtc-ffi` owns native binding-facing conversion and UniFFI boundary types.
@@ -36,7 +37,7 @@ Arrows point at what a crate depends on:
  matrix-rtc-media ─────────┐    │                             │
                            ▼    ▼                             ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│     matrix-rtc-call   (the call, the feeder, the dialects)         │
+│     matrix-rtc-call   (the call, the dialects)                     │
 ├────────────────────────────────────────────────────────────────────┤
 │                          matrix-rtc-core                           │
 └────────────────────────────────────────────────────────────────────┘
@@ -88,8 +89,10 @@ What lets an application sit on the core without the core knowing it:
   applied them.
 - **`host/`**: `send_room_event`, `redact_event` and `RawTimelineEvent` exist for
   applications; the core uses none of them.
-- **`ApplicationIntake`**: how the call crate's feeder feeds an application
-  timeline events and relations without knowing which application it is.
+- **`ApplicationIntake`**: how the feeder feeds an application timeline events
+  and relations without knowing which application it is.
+- **`IngestDialect`**: which generation of MatrixRTC the feeder reads a room
+  in; `SpecDialect` is the core's, `ElementCallCompat` the call crate's.
 
 ## Who drives the call
 
@@ -110,13 +113,15 @@ OpenID token and `GET /rtc/transports`). The host's app (through the FFI or
 wasm trait) and `matrix_rtc_matrix_sdk::SdkMatrixBackend` (a real `matrix_sdk::Client`)
 are two implementations, and the core cannot tell them apart.
 
-The core does nothing with the read half itself. The
-**feeder** in `matrix-rtc-call` (`RoomFeeder`, `ToDeviceFeeder`) subscribes
-through the backend, orders what arrives (encryption and slots and members
-before the first membership, so nobody is briefly joined to a closed slot),
-derives `EventOrigin`/`KeyOrigin` from the decryption facts the client
-reported, applies the pre-2026 compatibility funnels for the mode the room was
-opened in, and feeds that room. One copy, for every host.
+The core's **feeder** (`matrix_rtc_core::feeder`: `RoomFeeder`,
+`ToDeviceFeeder`) is the read half's one consumer. It subscribes through the
+backend, orders what arrives (encryption and slots and members before the
+first membership, so nobody is briefly joined to a closed slot), derives
+`EventOrigin`/`KeyOrigin` from the decryption facts the client reported, reads
+membership and keys through the room's `IngestDialect` (the spec's, or the
+call crate's pre-2026 funnels for the mode the room was opened in), and feeds
+that room. `BaseRtcClient` opens rooms through it and runs the feeds on the
+core's executor. One copy, for every host.
 
 ### Host-driven — production mobile and web
 
@@ -137,7 +142,7 @@ consumer, not a dependency:
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-call feeder ──▶ matrix-rtc-core  (+ media / livekit under "media")
+   matrix-rtc-call ──▶ matrix-rtc-core feeder  (+ media / livekit under "media")
 ```
 
 The bindings carry no Matrix SDK at all — not even transitively, and not even
@@ -165,7 +170,7 @@ below**. This is the topology of the e2e call test, `join_and_record`,
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-call feeder ──▶ matrix-rtc-core
+   matrix-rtc-call ──▶ matrix-rtc-core feeder
 ```
 
 ### What the two topologies share
@@ -174,8 +179,10 @@ below**. This is the topology of the e2e call test, `join_and_record`,
 `matrix_sdk::Client`, so it is gated on `matrix-sdk`. But the wiring under it
 is no longer its own: `LiveKitCall::join`, the FFI's `RtcClient` and the wasm
 `WasmRtcClient` all open rooms through `matrix_rtc_call::RtcClient` — which wraps
-the backend in `DialectBackend`, runs the `ToDeviceFeeder` while any room is
-open and attaches each room through `RoomFeeder` — and then join. What differs
+the backend in `DialectBackend` and opens each room through the core's
+`BaseRtcClient`, which runs the `ToDeviceFeeder` while any room is open and
+attaches each room through `RoomFeeder` — and then join. A host of the core
+alone opens rooms through `BaseRtcClient` directly. What differs
 between them is only where the backend comes from and which runtime is current:
 the library spawns the feeds, and the core each joined slot's upkeep, on
 `matrix_rtc_core::executor` (the current tokio runtime natively, `spawn_local`
@@ -186,7 +193,7 @@ on wasm).
 This is the host-driven topology above, in detail.
 
 1. The host opens a room (`RtcClient::room`), naming its compatibility mode.
-2. The feeder asks the backend to `subscribe_room` for what that mode needs; the host's client
+2. The core's feeder asks the backend to `subscribe_room` for what that mode needs; the host's client
    delivers the current sets into the `RoomSink` and keeps delivering them as they change.
 3. The feeder applies encryption, slot state and joined members first, then translates the
    sticky (or, pre-sticky, state) member events — content verbatim plus the client's decryption
@@ -212,6 +219,13 @@ Membership is always applied as a complete set: a member whose event is absent f
 - `MatrixBackend`, the host's contract (`host/backend.rs`), with the `EventIn`
   / `ToDeviceMessageIn` carriers the read half delivers; `testing::MockBackend`
   under the `testing` feature.
+- `feeder`: `RoomFeeder::attach` subscribes a room through the backend and runs
+  the routing described under "Who drives the call", reading it through an
+  `IngestDialect`; `ToDeviceFeeder` routes to-device keys to the open room they
+  are for (`RoomRegistry`) and drops those for a room that is not open.
+- `BaseRtcClient` opens rooms (one live handle per room; a second is refused)
+  and runs their feeds; `BaseRtcRoomHandle::seeded` resolves once the room's
+  current state has been applied.
 
 ## `crates/matrix-rtc-call`
 
@@ -228,12 +242,11 @@ Membership is always applied as a complete set: a member whose event is absent f
 - The library does not detect incoming calls: MSC4075 is send-only here, and a
   host learns of a ring through its own SDK or push path.
 - Depends on the core alone; its timers are the core executor's; compiles for wasm32.
-- `feeder`: `RoomFeeder::attach` subscribes a room through
-  the backend and runs the routing described under "Who drives the call";
-  `ToDeviceFeeder` routes to-device keys to the open room they are for
-  (`RoomRegistry`) and drops those for a room that is not open.
-  `RtcRoom::seeded` resolves once the room's current state has been applied,
-  which is what the bindings' `room` awaits.
+- `RtcClient` opens each room through the core's `BaseRtcClient`, with
+  `CallRoomState` as the room and its `ElementCallCompat` as the
+  `IngestDialect` (`compat::ingest`). `RtcRoom::seeded` resolves once the
+  room's current state has been applied, which is what the bindings' `room`
+  awaits.
 - `compat::dialect_backend::DialectBackend`: the one
   `MatrixBackend` wrapper that applies the outbound half of a room's dialect
   (member-event routing, legacy key type, pre-sticky leave) before delegating.

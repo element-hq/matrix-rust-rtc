@@ -272,7 +272,7 @@ hit deliberately:
 | --- | --- |
 | **`call`** *(feature `matrix-sdk`)* | The high-level facade: `LiveKitCall::join`/`LiveKitCall::leave`, `open_slot`. The transport comes from the homeserver's `GET /rtc/transports` unless `LiveKitCallOptions::livekit_transport` pins one. Start here. |
 | **`matrix-rtc-matrix-sdk`** *(separate crate)* | `SdkMatrixBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`). No LiveKit in it. Re-exported here (`SdkMatrixBackend`) so a host keeps one dependency. |
-| **`matrix-rtc-call`** *(separate crate)* | The feeder that subscribes through the backend and feeds the core, and `compat`, which translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`). |
+| **`matrix-rtc-call`** *(separate crate)* | The host-facing `RtcClient`, which opens rooms through the core's feeder, and `compat`, which translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`). |
 | **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the core's `MatrixBackend::openid_token`, so this layer is not hard-wired to a particular Matrix SDK. |
 | **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) picks the one a given compat generation's authorisation service issues. |
 | **`session`** | Connects to the SFU and exposes the LiveKit room + event stream. |

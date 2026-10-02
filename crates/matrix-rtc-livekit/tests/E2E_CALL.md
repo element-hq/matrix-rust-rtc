@@ -44,7 +44,7 @@ matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext au
         ▲                                                        relations, openid_token, rtc_transports
         │ DialectBackend (compat routing)                        │ complete current sets, on subscribe
         │                                                        ▼ and on every sticky / state wake
- RtcClient → RtcRoom ◀── RoomFeeder / ToDeviceFeeder (call: src/feeder) ── executor::spawn
+ RtcClient → RtcRoom ◀── RoomFeeder / ToDeviceFeeder (core: src/feeder) ── executor::spawn
    └─ join_call → RtcCall (own membership sticky + delayed leave; upkeep)
         │  └─ EncryptionManager: generates + distributes per-participant keys
         │        via the backend's send_to_device_message

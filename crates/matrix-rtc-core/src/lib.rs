@@ -10,9 +10,11 @@
 //! is decoupled from SDK-specific event types (JS SDK objects, FFI structs, etc.).
 
 mod base_rtc_room;
+mod client;
 mod encryption;
 mod error;
 pub mod executor;
+pub mod feeder;
 mod host;
 mod join;
 mod maybe_send;
@@ -25,6 +27,7 @@ mod upkeep;
 mod wire;
 
 pub use base_rtc_room::BaseRtcRoom;
+pub use client::{BaseRtcClient, BaseRtcRoomHandle, OpenError};
 pub use encryption::types::{
     EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, KeyOrigin, KeyRejection,
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,

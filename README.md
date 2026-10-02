@@ -115,12 +115,13 @@ for a runnable two-client example against the local backend.
   per-participant frame E2EE, the `MediaTransport` implementation, and the
   high-level `LiveKitCall::join` facade. Native-only (pulls in `libwebrtc`).
 - `crates/matrix-rtc-core`: the per-room MSC4143 core (`BaseRtcRoom`, a
-  `SlotSession` per slot) and the MSC4143/MSC4354 event conversion boundary.
+  `SlotSession` per slot), the MSC4143/MSC4354 event conversion boundary, and
+  the feeder that subscribes through a host's `MatrixBackend` and feeds it
+  (`BaseRtcClient` opens rooms that feed themselves).
 - `crates/matrix-rtc-call`: the host-facing objects (`RtcClient` → `RtcRoom` →
   `RtcSession`/`RtcCall`) and the call application — reactions, raised hand,
-  MSC4075 ringing — plus the feeder that subscribes through a host's
-  `MatrixBackend` and feeds the core, the dialect wrapper and `compat` for
-  pre-2026 Element Call wire formats, and the transport choice. No Matrix SDK,
+  MSC4075 ringing — plus the dialect wrapper and `compat` for pre-2026 Element
+  Call wire formats, and the transport choice. No Matrix SDK,
   so it tests in seconds against no git dependencies.
 - `crates/matrix-rtc-matrix-sdk`: `SdkMatrixBackend`, the `MatrixBackend` over
   matrix-rust-sdk. **No LiveKit**.
