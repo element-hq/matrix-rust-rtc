@@ -135,7 +135,7 @@ conventions the SDK follows.
 ## Staying in the call (keep-alive)
 
 Two independent clocks expire your membership, and the SDK tends both for you.
-`joinCall()` starts a keep-alive driver and `leave()` (or dropping the call)
+`joinCall()` starts the call's upkeep and `leave()` (or dropping the call)
 stops it — **there is nothing to call.**
 
 | Clock | Default | Kept alive by |
@@ -164,11 +164,6 @@ implement in a way that looks right and silently breaks the call:
   failed cancel leaks a delay that later fires — and because the sticky map
   resolves conflicts by *last to expire*, that leave out-expires your live
   membership and shows you as having left a call you are still in.
-
-To drive the keep-alive from your own scheduler instead (a foreground service, a
-workmanager job), call `call.heartbeat()` on your own cadence; it returns
-`false` once the call is over. The built-in driver runs
-regardless, so only reach for this if you need a different cadence.
 
 A client that dies without leaving stays visible to peers for up to
 `stickyDurationMs`, not `keepAliveTimeoutMs` — see Known limitations in

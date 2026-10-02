@@ -155,7 +155,6 @@ export class WebPeerApp {
 
     this.call = new MatrixRtcCall({
       call: this.rtcCall,
-      bindings,
       livekit,
       roomOptions: { e2ee: { worker: new E2EEWorker() } },
     });

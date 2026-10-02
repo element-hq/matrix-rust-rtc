@@ -60,8 +60,9 @@
 //! The lifetime cap is what a quiet call relies on: without it one key would encrypt
 //! a whole meeting, and anything that later recovered it would recover all of them.
 //!
-//! [`EncryptionManager::flush_due_rotation`] performs a deferred rotation and a
-//! consumer has to drive it, because the core owns no timer.
+//! [`EncryptionManager::flush_due_rotation`] performs a deferred rotation; the
+//! slot session's upkeep runs it at [`EncryptionManager::subscribe_rotation_due`]'s
+//! deadline.
 //!
 //! Membership changes that arrive *together* are cheaper still: a rollout sees a
 //! whole set of joined memberships, so any number of simultaneous changes cost one rotation between
@@ -97,10 +98,9 @@
 //!
 //! This module does not *wait*, it only says how long to wait: the delay travels
 //! to the consumer as [`KeyMaterialSignal::use_after_ms`], and the media layer
-//! schedules activation. That keeps the core free of any timer — it holds no
-//! reactor dependency at all, which is what lets a synchronous FFI host drive it
-//! from a plain thread. Enforcing the delay is therefore a consumer obligation;
-//! `matrix-rtc-livekit`'s `MediaKeyBridge` is the reference implementation.
+//! schedules activation, since only it knows when the transport installed the
+//! key. Enforcing the delay is therefore a consumer obligation; the
+//! `MediaKeyHandler` in `matrix-rtc-media` is the reference implementation.
 //!
 //! # Outdated Key Filtering
 //!
@@ -1362,10 +1362,8 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// When a rotation deferred into the current switch window falls due, if one
     /// is owed.
     ///
-    /// A consumer with a scheduler can use this to drive
-    /// [`Self::flush_due_rotation`] at the instant it comes up. One that only
-    /// ticks periodically can ignore it and call the flush on its own cadence —
-    /// the rotation happens late in that case, not never.
+    /// The session's scheduler drives [`Self::flush_due_rotation`] at the
+    /// instant it comes up; see [`Self::subscribe_rotation_due`].
     pub fn rotation_due_at_ms(&self) -> Option<u64> {
         *self.rotation_due_at.borrow()
     }

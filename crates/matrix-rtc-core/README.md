@@ -16,12 +16,15 @@ It does four things:
 
 The core does no I/O. It sends through the host-implemented `MatrixBackend`, and it is fed —
 by the feeder in `matrix-rtc-call`, which subscribes through that same backend — the room's
-state and membership as `RawStickyEvent`s, slot and room state, and decrypted key messages. It
-spawns no tasks and arms no timers: the host calls `heartbeat` periodically while joined.
+state and membership as `RawStickyEvent`s, slot and room state, and decrypted key messages. Its
+`executor` module (tokio natively, `spawn_local` and `setTimeout` on wasm) is what the library's
+background work runs on. A join starts the slot's upkeep — keep-alive, sticky refresh, key
+rotations at their deadline — until the leave, so a host using the core alone ticks nothing
+either; off a tokio runtime (natively) there is none, and the host calls `keep_alive` itself.
 
 ## Quick start: join a slot and follow its memberships
 
-The core is **fed**, not polled: it spawns nothing and never reads from the backend itself. A host
+The core is **fed**, not polled: it never reads from the backend itself. A host
 reaches it through `matrix-rtc-call`'s `RtcClient`, which opens a room: it subscribes through the
 backend to what the room needs and applies the room's current state in the right order
 (encryption and slots and members before the first membership). Joining a slot on the room
@@ -56,11 +59,9 @@ async fn run(
         }
     });
 
-    // The transport is the homeserver's first advertised LiveKit one.
+    // The transport is the homeserver's first advertised LiveKit one. The
+    // session keeps itself alive until it leaves or is dropped.
     let session = room.join(JoinOptions::new(SLOT, "org.example.board")).await?;
-
-    // Periodically, while joined.
-    session.heartbeat().await;
 
     session.leave(LeaveSessionParams::new()).await?;
     room.close().await;

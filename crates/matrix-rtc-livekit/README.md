@@ -52,8 +52,8 @@ async fn record_a_call() -> Result<(), Box<dyn std::error::Error>> {
 
 Two things the snippet glosses over:
 
-- **Runtime.** The core's backend futures are `?Send`, so `LiveKitCall::join` must run
-  inside a `tokio::task::LocalSet`:
+- **Runtime.** `LiveKitCall::join` spawns the call's background work onto the current
+  tokio runtime, so it must run inside one:
 
   ```rust,no_run
   fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,7 +62,7 @@ Two things the snippet glosses over:
       rustls::crypto::aws_lc_rs::default_provider().install_default().unwrap();
 
       let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-      runtime.block_on(tokio::task::LocalSet::new().run_until(record_a_call()))
+      runtime.block_on(record_a_call())
   }
   ```
 
@@ -169,8 +169,8 @@ Notes:
   clear them, because its delayed leave is a plain event that never replaces
   the sticky entry. An hour of ghost participants makes the next attempt
   useless. The cost is one extra membership send per device every half of it,
-  and it must stay well above twice the 15 s heartbeat or memberships lapse
-  between beats.
+  and it must stay well above twice the 10 s keep-alive or memberships lapse
+  between ticks.
 - **Scale is bounded by your machine, not the SFU** — see
   [How many devices?](#how-many-devices) below.
 - Devices join publish-only by default (`LiveKitCallOptions::auto_subscribe = false`).

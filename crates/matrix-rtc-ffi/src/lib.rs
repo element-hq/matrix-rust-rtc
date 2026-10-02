@@ -258,12 +258,6 @@ pub struct FfiRoomOptions {
     pub element_call_compat: Option<FfiElementCallCompat>,
 }
 
-/// How often each call's keep-alive is driven.
-///
-/// Three ticks inside the 30 s default delayed-leave timeout, so one slow round
-/// trip cannot let the switch fire.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-
 /// One per Matrix session, over the host's backend. Creating it does no I/O;
 /// the library holds nothing about a room until the host opens one.
 #[derive(uniffi::Object)]
@@ -337,21 +331,31 @@ impl RtcRoom {
     }
 
     /// [`Self::join_call`] with the keep-alive interval spelled out, so a test
-    /// can beat faster than a call ships with.
+    /// can beat faster than a call ships with. On the library's runtime: the
+    /// call's upkeep is spawned from here.
     pub(crate) async fn join_call_every(
+        self: Arc<Self>,
+        params: FfiJoinSessionParams,
+        interval: Option<Duration>,
+    ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
+        runtime::on_runtime(async move { self.join_on_runtime(params, interval).await }).await
+    }
+
+    async fn join_on_runtime(
         &self,
         params: FfiJoinSessionParams,
-        interval: Duration,
+        interval: Option<Duration>,
     ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
         log::info!(
             "room: [{}] join requested {}",
             self.room_id,
             params.summary()
         );
-        let options = params.into_call().map_err(|error| {
+        let mut options = params.into_call().map_err(|error| {
             log::warn!("room: join rejected before it started: {error}");
             MatrixRtcFfiError::InvalidInput(error.to_string())
         })?;
+        options.join.keep_alive_interval_ms = interval.map(|interval| interval.as_millis() as u64);
         let room = self.open().await?;
         let joined = room.join_call(options).await.inspect_err(|error| {
             log::warn!("room: [{}] join failed: {error}", self.room_id);
@@ -364,7 +368,6 @@ impl RtcRoom {
             joined.member_id()
         );
         Ok(Arc::new(RtcCall {
-            heartbeat: Mutex::new(Some(HeartbeatDriver::start(&joined, interval))),
             call: joined,
             #[cfg(feature = "media")]
             compat: room.element_call_compat(),
@@ -465,14 +468,15 @@ impl RtcRoom {
     /// already hold a key for while our key index restarts at 0 — every peer
     /// then decrypts our media with the previous call's key and never recovers.
     ///
-    /// The returned call keeps itself alive every 10 seconds until it leaves or
-    /// is dropped. Fails when the room's state holds no open slot of this id,
-    /// or while the slot is joined through a live call of this room.
+    /// The returned call keeps itself alive every 10 seconds, and performs its
+    /// key rotations when they fall due, until it leaves or is dropped. Fails
+    /// when the room's state holds no open slot of this id, or while the slot
+    /// is joined through a live call of this room.
     pub async fn join_call(
-        &self,
+        self: Arc<Self>,
         params: FfiJoinSessionParams,
     ) -> Result<Arc<RtcCall>, MatrixRtcFfiError> {
-        self.join_call_every(params, HEARTBEAT_INTERVAL).await
+        self.join_call_every(params, None).await
     }
 
     /// Leaves every slot joined through this room, then ends its
@@ -501,8 +505,6 @@ impl RtcRoom {
 #[derive(uniffi::Object)]
 pub struct RtcCall {
     call: Arc<call::RtcCall<FfiBackend>>,
-    /// `None` once stopped.
-    heartbeat: Mutex<Option<HeartbeatDriver>>,
     /// The room's mode and backend, for the media layer.
     #[cfg(feature = "media")]
     compat: matrix_rtc_call::compat::ElementCallCompat,
@@ -511,14 +513,6 @@ pub struct RtcCall {
 }
 
 impl RtcCall {
-    fn stop_heartbeat(&self) {
-        if let Ok(mut driver) = lock_mutex(&self.heartbeat)
-            && driver.take().is_some()
-        {
-            log::debug!("call: [{}] keep-alive stopped", self.call.slot_id());
-        }
-    }
-
     #[cfg(feature = "media")]
     pub(crate) fn inner(&self) -> &Arc<call::RtcCall<FfiBackend>> {
         &self.call
@@ -568,18 +562,6 @@ impl RtcCall {
     /// [`RtcRoom::subscribe_membership_snapshots`].
     pub async fn subscribe_membership_snapshots(&self) -> Arc<MembershipSnapshotSubscription> {
         MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await)
-    }
-
-    /// Restarts the keep-alive: reschedules the delayed leave, and re-sends the
-    /// membership if its sticky entry is halfway to expiring.
-    ///
-    /// **Hosts do not need to call this** — the call drives it every 10
-    /// seconds until it leaves. It is exported for hosts that would rather
-    /// drive the keep-alive from their own scheduler, and for tests.
-    ///
-    /// Returns `false` once there is nothing left to keep alive.
-    pub async fn heartbeat(&self) -> bool {
-        self.call.heartbeat().await
     }
 
     // ---- Reactions and raised hands ----
@@ -635,52 +617,12 @@ impl RtcCall {
             self.call.slot_id(),
             params.leave_reason,
         );
-        // Stop the keep-alive first, so it cannot re-arm a delayed leave after
-        // the leave below cancels it. A beat already in flight is harmless:
-        // once the leave has taken the membership machine it is a no-op.
-        self.stop_heartbeat();
         self.call
             .leave(params.into_core())
             .await
             .inspect_err(|error| log::warn!("call: leave failed: {error}"))?;
         log::info!("call: leave succeeded");
         Ok(())
-    }
-}
-
-/// Owns the task that drives one call's keep-alive. Dropping it stops the
-/// task; so does the call ending, or being dropped.
-struct HeartbeatDriver {
-    _stop: tokio::sync::mpsc::Sender<()>,
-}
-
-impl HeartbeatDriver {
-    fn start(call: &Arc<call::RtcCall<FfiBackend>>, interval: Duration) -> Self {
-        let (stop, mut stopped) = tokio::sync::mpsc::channel::<()>(1);
-        let call = Arc::downgrade(call);
-        // On `runtime()` rather than a thread of its own: the body is a sleep
-        // and an await, and `tokio::time::sleep` needs a timer to fire at all.
-        runtime::runtime().spawn(async move {
-            loop {
-                tokio::select! {
-                    // The driver was dropped (leave, or the call object died),
-                    // so a stop takes effect at once.
-                    _ = stopped.recv() => break,
-                    _ = tokio::time::sleep(interval) => {}
-                }
-                let Some(call) = call.upgrade() else {
-                    break;
-                };
-                if !call.heartbeat().await {
-                    log::debug!(
-                        "call: [{}] no longer joined; keep-alive done",
-                        call.slot_id()
-                    );
-                    break;
-                }
-            }
-        });
-        Self { _stop: stop }
     }
 }
 
@@ -944,12 +886,10 @@ mod tests {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
-        let call = room.join_call(join_params()).await.expect("join");
-        assert!(call.heartbeat().await);
+        let call = room.clone().join_call(join_params()).await.expect("join");
 
         call.leave(no_reason()).await.expect("leave");
         assert!(!call.is_live());
-        assert!(!call.heartbeat().await);
         assert!(matches!(
             call.leave(no_reason()).await,
             Err(MatrixRtcFfiError::CallOver(_))
@@ -963,7 +903,7 @@ mod tests {
         let room = open_call_room(&client, &mock).await;
         room.shutdown().await;
         assert!(matches!(
-            room.join_call(join_params()).await,
+            room.clone().join_call(join_params()).await,
             Err(MatrixRtcFfiError::Attachment(_))
         ));
         room.shutdown().await;
@@ -1171,6 +1111,7 @@ mod tests {
         let room = open_call_room(&client, &mock).await;
 
         let first = room
+            .clone()
             .join_call(FfiJoinSessionParams {
                 transport: None,
                 ..join_params()
@@ -1193,7 +1134,7 @@ mod tests {
         );
 
         first.leave(no_reason()).await.expect("leave");
-        let second = room.join_call(join_params()).await.expect("rejoin");
+        let second = room.clone().join_call(join_params()).await.expect("rejoin");
         assert_ne!(
             first.member_id(),
             second.member_id(),
@@ -1206,9 +1147,9 @@ mod tests {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
-        let _call = room.join_call(join_params()).await.expect("join");
+        let _call = room.clone().join_call(join_params()).await.expect("join");
         assert!(matches!(
-            room.join_call(join_params()).await,
+            room.clone().join_call(join_params()).await,
             Err(MatrixRtcFfiError::InvalidInput(_))
         ));
     }
@@ -1219,7 +1160,7 @@ mod tests {
         let client = RtcClient::new(mock.clone());
         let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
 
-        let result = room.join_call(join_params()).await;
+        let result = room.clone().join_call(join_params()).await;
         assert!(result.is_err(), "no open slot, no join");
         assert!(mock.sends().is_empty(), "nothing should have been sent");
     }
@@ -1231,7 +1172,8 @@ mod tests {
         let room = open_call_room(&client, &mock).await;
 
         let _call = room
-            .join_call_every(join_params(), Duration::from_millis(50))
+            .clone()
+            .join_call_every(join_params(), Some(Duration::from_millis(50)))
             .await
             .expect("join");
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1250,7 +1192,8 @@ mod tests {
         let room = open_call_room(&client, &mock).await;
 
         let call = room
-            .join_call_every(join_params(), Duration::from_millis(50))
+            .clone()
+            .join_call_every(join_params(), Some(Duration::from_millis(50)))
             .await
             .expect("join");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1268,7 +1211,8 @@ mod tests {
         let room = open_call_room(&client, &mock).await;
 
         let call = room
-            .join_call_every(join_params(), Duration::from_millis(50))
+            .clone()
+            .join_call_every(join_params(), Some(Duration::from_millis(50)))
             .await
             .expect("join");
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1291,7 +1235,7 @@ mod tests {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
-        let call = room.join_call(join_params()).await.expect("join");
+        let call = room.clone().join_call(join_params()).await.expect("join");
 
         room.shutdown().await;
         assert!(
@@ -1320,7 +1264,11 @@ mod tests {
         )
         .await;
 
-        let first = room.join_call(join_params()).await.expect("first join");
+        let first = room
+            .clone()
+            .join_call(join_params())
+            .await
+            .expect("first join");
         mock.room_sink(ROOM).on_sticky_events(vec![member_event(
             "@bob:example.org",
             "BOBDEV",
@@ -1332,7 +1280,7 @@ mod tests {
         first.leave(no_reason()).await.expect("leave");
         mock.clear_to_device();
 
-        let second = room.join_call(join_params()).await.expect("rejoin");
+        let second = room.clone().join_call(join_params()).await.expect("rejoin");
         let sent = mock.to_device_for("@bob:example.org", "BOBDEV");
         assert!(!sent.is_empty(), "the second call distributed no key");
         assert_eq!(
@@ -1406,7 +1354,7 @@ mod tests {
         )
         .await;
 
-        let call = room.join_call(join_params()).await.expect("join");
+        let call = room.clone().join_call(join_params()).await.expect("join");
         let membership = mock
             .sends()
             .into_iter()
@@ -1454,6 +1402,7 @@ mod tests {
         );
 
         let call = room
+            .clone()
             .join_call(FfiJoinSessionParams {
                 keep_alive_timeout_ms: Some(30_000),
                 ..join_params()
@@ -1502,7 +1451,8 @@ mod tests {
         )
         .await;
 
-        room.join_call(join_params())
+        room.clone()
+            .join_call(join_params())
             .await
             .expect("a refused delayed leave must not fail the join");
         let sends = mock.sends();
@@ -1539,7 +1489,7 @@ mod tests {
             Vec::new(),
         )
         .await;
-        let _call = room.join_call(join_params()).await.expect("join");
+        let _call = room.clone().join_call(join_params()).await.expect("join");
         room.shutdown().await;
         assert!(
             mock.sends()
@@ -1550,7 +1500,7 @@ mod tests {
         );
 
         let room = open_call_room(&client, &mock).await;
-        let _call = room.join_call(join_params()).await.expect("rejoin");
+        let _call = room.clone().join_call(join_params()).await.expect("rejoin");
         assert!(
             mock.sends()
                 .iter()

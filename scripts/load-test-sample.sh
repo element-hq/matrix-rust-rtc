@@ -128,7 +128,7 @@ INSECURE_TLS=0
 # for the next attempt; two minutes does not.
 #
 # Costs one extra membership send per device every half of this. Keep it well
-# above twice the 15s heartbeat, or memberships lapse between beats.
+# above twice the 10s keep-alive, or memberships lapse between ticks.
 STICKY_DURATION_MS=120000
 
 # Pacing, to stay under homeserver rate limits.

@@ -470,7 +470,8 @@ async fn the_hand_follows_our_membership_event_across_a_refresh() {
         "$sticky-1"
     );
 
-    assert!(call.keep_alive(SLOT).await);
+    assert!(call.rtc_mut().keep_alive(SLOT).await);
+    assert!(call.reannotate_hand_if_moved(SLOT).await);
 
     assert_eq!(
         call.rtc().own_membership_event_id(SLOT).as_deref(),

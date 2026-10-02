@@ -6,8 +6,8 @@
 //! Listeners told of every change to a slot's joined memberships (its
 //! `m.rtc.member` events considered joined to the slot), so an application's
 //! per-member state follows them. Registered on one room, never across rooms.
-//! Synchronous, because the core spawns nothing that could await the snapshot
-//! watch instead.
+//! Synchronous, so a listener sees each change in order, under the same lock
+//! that applied it.
 
 use std::sync::{Arc, Mutex};
 

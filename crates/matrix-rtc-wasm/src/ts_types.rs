@@ -186,8 +186,6 @@ export interface MediaDelegate {
     onParticipants?(roster: RtcParticipant[]): void;
     /** The push half: the unified call event stream. */
     onEvent?(event: RtcCallEvent): void;
-    /** A key's delayBeforeUse window closed: call `flushDueKeyRotation`. */
-    onSwitchComplete?(): void;
 }
 
 /** `joinCall`'s parameters. */

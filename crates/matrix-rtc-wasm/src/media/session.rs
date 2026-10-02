@@ -25,7 +25,7 @@ use matrix_rtc_media::{
     FrameEncryptionState, OwnMemberClaims, Participant, StabilityConfig, TransportConnection as _,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
@@ -126,9 +126,9 @@ impl WasmRtcCall {
     /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, element_call_compat?, stability? }`;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
-    /// implement `onParticipants(roster)`, `onEvent(event)`, and
-    /// `onSwitchComplete()` — the push half of the session, invoked from
-    /// spawned pumps for the life of the call.
+    /// implement `onParticipants(roster)` and `onEvent(event)` — the push
+    /// half of the session, invoked from spawned pumps for the life of the
+    /// call.
     #[wasm_bindgen(js_name = connectMedia)]
     pub async fn connect_media(
         &self,
@@ -272,16 +272,6 @@ impl WasmRtcCall {
             engine_handle.notify_key_discarded(discarded);
         }));
 
-        // A key rotation coalesced into a `delayBeforeUse` window falls due
-        // the instant the window closes, and the handler's timer is the only
-        // thing that knows when that is. The core cannot be flushed from the
-        // handler's task, so the moment is handed to JS (the
-        // `onSwitchComplete` pump below), which calls `flushDueKeyRotation`.
-        let (switch_tx, switch_rx) = watch::channel(0u64);
-        handler.set_switch_complete_listener(Box::new(move || {
-            switch_tx.send_modify(|count| *count += 1);
-        }));
-
         // Keys signalled between `join` and now were stored but dropped —
         // nothing was listening. Without this, every participant whose key
         // arrived before media attached stays undecryptable until a rotation.
@@ -355,19 +345,6 @@ impl WasmRtcCall {
                 }
             });
         }
-        // Optional but recommended: the heartbeat also flushes due rotations,
-        // so without this a coalesced rotation waits for the next beat instead
-        // of happening at the instant it is owed. The callback should call
-        // `call.flushDueKeyRotation()`.
-        if let Some(on_switch_complete) = delegate_callback(&delegate, "onSwitchComplete") {
-            let mut switch_rx = switch_rx;
-            wasm_bindgen_futures::spawn_local(async move {
-                while switch_rx.changed().await.is_ok() {
-                    let _ = on_switch_complete.call0(&JsValue::NULL);
-                }
-            });
-        }
-
         // Move our sender onto each key we rotate to. Importing a key only
         // fills the ring; the index our frames actually carry lives on the
         // frame cryptor, which livekit-js owns — hence through the delegate.
@@ -406,9 +383,9 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 /// rendering — stays in livekit-js; join roster entries to
 /// `room.getParticipantByIdentity(rtc_identity)`.
 ///
-/// Roster changes, call events, and switch-complete moments arrive through
-/// the delegate's `onParticipants` / `onEvent` / `onSwitchComplete`
-/// callbacks, registered at [`WasmRtcCall::connect_media`] time.
+/// Roster changes and call events arrive through the delegate's
+/// `onParticipants` / `onEvent` callbacks, registered at
+/// [`WasmRtcCall::connect_media`] time.
 ///
 /// End it with [`WasmMediaSession::disconnect`]; leaving the slot itself stays
 /// the call's ([`WasmRtcCall::leave`]).

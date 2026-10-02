@@ -211,10 +211,10 @@ struct Args {
     /// event that never replaces the sticky entry. An hour of ghosts poisons
     /// the room for the next attempt; two minutes does not.
     ///
-    /// The cost is signalling: the heartbeat re-sends each membership once it
+    /// The cost is signalling: the keep-alive re-sends each membership once it
     /// is halfway to expiring, so this many milliseconds means one extra send
-    /// per device every half of it. Keep it well above twice the heartbeat
-    /// interval (15s), or memberships lapse between beats.
+    /// per device every half of it. Keep it well above twice the keep-alive
+    /// interval (10s), or memberships lapse between ticks.
     #[arg(long, default_value_t = 120_000)]
     sticky_duration_ms: u64,
 
@@ -299,11 +299,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let args = Args::parse();
-    // `LiveKitCall::join` drives `!Send` futures, so it must run inside a `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(tokio::task::LocalSet::new().run_until(run(args)))
+    runtime.block_on(run(args))
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn Error>> {
@@ -428,9 +427,8 @@ async fn stop_on_input(rx: tokio::sync::oneshot::Receiver<()>) {
 /// homeserver this tool has just been hammering, "shutting down" can outlast
 /// anyone's patience with no way to abort but `kill -9` from another terminal.
 ///
-/// Spawned with `tokio::spawn`, so it lives on the multithreaded runtime rather
-/// than the `LocalSet` every device's signalling shares. A saturated local
-/// thread therefore cannot delay it.
+/// Spawned with `tokio::spawn`, a task of its own on the multithreaded
+/// runtime, so devices busy signalling cannot delay it.
 ///
 /// SIGTERM is handled alongside SIGINT so a plain `kill` behaves the same as
 /// Ctrl-C; nothing else in the process claims it.

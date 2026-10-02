@@ -5,7 +5,7 @@
 
 //! [`CallRoomState`]: one room's core [`BaseRtcRoom`] plus the call application's
 //! state in it — reactions and raised hands per slot, ringing on join. It wraps
-//! the three core operations the call acts around (join, leave, keep-alive) and
+//! the two core operations the call acts around (join, leave) and
 //! follows each slot's joined memberships through a core
 //! [`MembershipListener`](matrix_rtc_core::MembershipListener) registered on
 //! that room alone. The feeder writes into it; hosts reach it through
@@ -256,15 +256,6 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         Ok(())
     }
 
-    /// Then re-annotates our hand if the sticky refresh moved our membership.
-    pub async fn keep_alive(&mut self, slot_id: &str) -> bool {
-        let joined = self.rtc.keep_alive(slot_id).await;
-        if joined {
-            self.reannotate_hand_if_moved(slot_id).await;
-        }
-        joined
-    }
-
     /// Sends the MSC4075 notification that summons the room to this session;
     /// see [`notify_session_started`] for when it is suppressed.
     async fn notify_session_started(
@@ -495,23 +486,23 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
     /// and looks for one on the new event instead, so a hand that stayed on
     /// the join event would be lowered for us at the first refresh. Peers may
     /// see the hand drop for one round trip in between; that is inherent to
-    /// the protocol. A failed re-send is retried on the next keep-alive tick, since
-    /// the ids still differ.
-    async fn reannotate_hand_if_moved(&mut self, slot_id: &str) {
+    /// the protocol. Returns `false` when the re-send failed, for the caller to
+    /// retry.
+    pub(crate) async fn reannotate_hand_if_moved(&mut self, slot_id: &str) -> bool {
         let room_id = self.room_id();
         let Some(Some(hand)) =
             self.with_state(slot_id, |state| state.reactions.own_raised_hand().cloned())
         else {
-            return;
+            return true;
         };
         let Ok((own, member_id, current)) = self.own_relation_target(slot_id) else {
-            return;
+            return true;
         };
         if current == hand.annotated_membership_event_id {
-            return;
+            return true;
         }
         let Ok(backend) = self.backend() else {
-            return;
+            return true;
         };
 
         log::debug!(
@@ -547,11 +538,15 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
                         hand.reaction_event_id,
                     );
                 }
+                true
             }
-            Err(error) => log::warn!(
-                "[{room_id}/{slot_id}] could not raise the hand again on the refreshed \
-                 membership ({error}); retrying on the next keep-alive",
-            ),
+            Err(error) => {
+                log::warn!(
+                    "[{room_id}/{slot_id}] could not raise the hand again on the refreshed \
+                     membership ({error}); retrying",
+                );
+                false
+            }
         }
     }
 
@@ -595,7 +590,7 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
     }
 }
 
-/// `join`, `leave` and `keep_alive` are inherent, so they win over the core's;
+/// `join` and `leave` are inherent, so they win over the core's;
 /// `join` takes [`CallJoinParams`], so code written against the core's does not
 /// compile rather than silently skipping the notification.
 impl<T: MatrixBackend> std::ops::Deref for CallRoomState<T> {

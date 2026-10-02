@@ -165,9 +165,9 @@ impl WasmRtcRoom {
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
     ///
-    /// Refreshing the keep-alive is the page's job: call
-    /// [`WasmRtcCall::heartbeat`] on an interval while joined. The SDK
-    /// generates the `member.id` (MSC4143 requires a fresh one per join).
+    /// The call keeps itself alive, and performs its key rotations when they
+    /// fall due, until it leaves or is freed. The SDK generates the
+    /// `member.id` (MSC4143 requires a fresh one per join).
     /// Rejects when the slot is already joined, or the room's state holds no
     /// open slot of this id.
     #[wasm_bindgen(js_name = joinCall)]
@@ -337,35 +337,6 @@ impl WasmRtcCall {
         self.call.member_count().await as u32
     }
 
-    /// Restarts the keep-alive: reschedules the delayed leave, and re-sends
-    /// the membership if its sticky entry is halfway to expiring. Also
-    /// flushes a key rotation that has come due.
-    ///
-    /// The core arms no timers and this binding starts no driver — **the page
-    /// must call this on an interval while joined** (`setInterval`,
-    /// [`HEARTBEAT_INTERVAL_MS`]), or the dead man's switch fires and peers see
-    /// us depart mid-call. Resolves to `false` once there is nothing left to
-    /// keep alive.
-    pub async fn heartbeat(&self) -> bool {
-        self.call.heartbeat().await
-    }
-
-    /// When the next key rotation falls due, in epoch milliseconds, or
-    /// `undefined` when none is owed. Diagnostics: the rotation itself is
-    /// performed by [`Self::heartbeat`] and by the media layer's
-    /// switch-complete signal, not by polling this.
-    #[wasm_bindgen(js_name = keyRotationDueAtMs)]
-    pub async fn key_rotation_due_at_ms(&self) -> Option<f64> {
-        self.call.key_rotation_due_at_ms().await.map(|at| at as f64)
-    }
-
-    /// Performs the key rotation if one has come due; a no-op otherwise.
-    /// Resolves to whether a rotation ran.
-    #[wasm_bindgen(js_name = flushDueKeyRotation)]
-    pub async fn flush_due_key_rotation(&self) -> bool {
-        self.call.flush_due_key_rotation().await
-    }
-
     // ---- Reactions and raised hands ----
     //
     // Element Call's reactions are ordinary room events relating to the
@@ -442,13 +413,6 @@ pub struct WasmRoomOptions {
     /// bound, the SFU identity and the token endpoint.
     #[serde(default)]
     pub element_call_compat: Option<String>,
-}
-
-/// How often a page should call [`WasmRtcCall::heartbeat`] while
-/// joined. Matches the FFI's keep-alive driver interval.
-#[wasm_bindgen(js_name = HEARTBEAT_INTERVAL_MS)]
-pub fn heartbeat_interval_ms() -> u32 {
-    10_000
 }
 
 /// Element Call's reaction catalogue, as `ReactionKind[]` in the order its
@@ -773,7 +737,8 @@ mod tests {
         set(
             "restartDelayedEvent",
             "roomId,delayId",
-            "return Promise.resolve();",
+            "globalThis.__restarts = (globalThis.__restarts || 0) + 1; \
+             return Promise.resolve();",
         );
         set(
             "cancelDelayedEvent",
@@ -870,7 +835,39 @@ mod tests {
             .expect("join should succeed");
         assert!(!call.member_id().is_empty());
         assert!(call.is_live());
-        assert!(call.heartbeat().await);
+    }
+
+    fn restarts() -> f64 {
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("__restarts"))
+            .ok()
+            .and_then(|count| count.as_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// The page ticks nothing: the call restarts its own delayed leave. A
+    /// 400 ms timeout caps the interval at 200 ms.
+    #[wasm_bindgen_test]
+    async fn a_joined_call_keeps_itself_alive() {
+        #[derive(Serialize)]
+        struct TestJoinParams {
+            slot_id: &'static str,
+            application: &'static str,
+            keep_alive_timeout_ms: u64,
+        }
+        let client = WasmRtcClient::new(mock_host(""));
+        let room = open(&client, None).await;
+        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
+            slot_id: SLOT,
+            application: "m.call",
+            keep_alive_timeout_ms: 400,
+        })
+        .unwrap();
+        let call = room.join_call(params).await.expect("join");
+        let before = restarts();
+
+        matrix_rtc_core::executor::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(restarts() - before >= 2.0, "restarted on its own");
+        call.leave(JsValue::UNDEFINED).await.expect("leave");
     }
 
     #[wasm_bindgen_test]
@@ -933,6 +930,5 @@ mod tests {
         let call = room.join_call(join_params()).await.expect("join");
         call.leave(JsValue::UNDEFINED).await.expect("leave");
         assert!(!call.is_live());
-        assert!(!call.heartbeat().await);
     }
 }

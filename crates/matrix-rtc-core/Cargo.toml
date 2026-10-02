@@ -14,9 +14,10 @@ publish = false
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# Sync primitives on every target. Spawning and timers go through
-# `src/executor.rs`, which takes tokio's `time` off wasm32 only (below).
-tokio = { workspace = true }
+# Sync primitives and `select!` (the upkeep) on every target. Spawning and
+# timers go through `src/executor.rs`, which takes tokio's `time` off wasm32
+# only (below).
+tokio = { workspace = true, features = ["macros"] }
 log.workspace = true
 async-trait.workspace = true
 rand = "0.8"

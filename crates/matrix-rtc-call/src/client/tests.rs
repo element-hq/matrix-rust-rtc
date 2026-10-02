@@ -197,11 +197,9 @@ async fn a_left_session_is_over_and_a_rejoin_yields_a_new_one() {
         .await
         .expect("join");
     assert!(call.is_live());
-    assert!(call.heartbeat().await);
     call.leave(LeaveSessionParams::new()).await.expect("leave");
 
     assert!(!call.is_live());
-    assert!(!call.heartbeat().await);
     assert!(matches!(
         call.raise_hand().await,
         Err(RtcError::SessionOver)
@@ -391,6 +389,142 @@ async fn an_opening_that_fails_leaves_nothing_behind() {
     let _room = open(&client, &mock, ROOM).await;
 }
 
+const DEFAULT_KEEP_ALIVE_INTERVAL: Duration =
+    Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS);
+
+fn restarts(mock: &MockBackend) -> usize {
+    mock.restarted_events.lock().unwrap().len()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_joined_session_keeps_itself_alive() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let _call = room
+        .join_call(CallJoinOptions::new(SLOT))
+        .await
+        .expect("join");
+    assert_eq!(
+        restarts(&mock),
+        0,
+        "the join itself armed the delayed leave"
+    );
+
+    tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL * 3 + Duration::from_millis(1)).await;
+    assert_eq!(
+        restarts(&mock),
+        3,
+        "one restart per interval, nobody ticking"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_keep_alive_interval_is_capped_at_half_the_timeout() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let mut options = CallJoinOptions::new(SLOT);
+    options.join.keep_alive_timeout_ms = Some(4_000);
+    options.join.keep_alive_interval_ms = Some(60_000);
+    let _call = room.join_call(options).await.expect("join");
+
+    tokio::time::sleep(Duration::from_millis(4_001)).await;
+    assert_eq!(restarts(&mock), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn leaving_stops_the_keep_alive() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room
+        .join_call(CallJoinOptions::new(SLOT))
+        .await
+        .expect("join");
+    tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL + Duration::from_millis(1)).await;
+    assert_eq!(restarts(&mock), 1);
+
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+    tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL * 3).await;
+    assert_eq!(restarts(&mock), 1, "nothing restarted after the leave");
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropping_a_session_stops_its_keep_alive_without_leaving() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room
+        .join_call(CallJoinOptions::new(SLOT))
+        .await
+        .expect("join");
+    let cancelled_before = mock.cancelled_events.lock().unwrap().len();
+
+    drop(call);
+    tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL * 3).await;
+    assert_eq!(restarts(&mock), 0);
+    assert_eq!(
+        mock.cancelled_events.lock().unwrap().len(),
+        cancelled_before,
+        "no leave: the delayed leave ends the membership"
+    );
+}
+
+/// Real time: the rotation deadline is wall-clock, which paused tokio time
+/// does not move.
+#[tokio::test]
+async fn an_expired_key_is_rotated_at_its_deadline_with_nobody_ticking() {
+    let key_sends = |mock: &MockBackend| {
+        mock.to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, event_type, _)| event_type == KEY_MESSAGE_TYPE)
+            .count()
+    };
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    sink.on_encryption(true);
+    sink.on_state_events(
+        SLOT_EVENT_TYPE.to_owned(),
+        vec![EventIn {
+            event_id: "$slot".to_owned(),
+            sender: BOB.to_owned(),
+            event_type: SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 1,
+            content: json!({
+                "status": "open",
+                "application": { "type": "m.call" },
+                "encryption": { "type": "m.per_member" },
+            }),
+            encryption: EventEncryption::Cleartext,
+        }],
+    );
+    settle().await;
+    let mut options = CallJoinOptions::new(SLOT);
+    options.join.encryption_config = Some(EncryptionConfig {
+        delay_before_use_ms: 0,
+        key_rotation_grace_period_ms: 50,
+        max_key_lifetime_ms: 100,
+        require_cross_signed_sender: false,
+        ..EncryptionConfig::default()
+    });
+    let _call = room.join_call(options).await.expect("join");
+    settle().await;
+    let first = key_sends(&mock);
+    assert!(first > 0, "the first key went to Bob");
+
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(
+        key_sends(&mock) > first,
+        "the key was replaced on its own deadline, long before a keep-alive tick"
+    );
+}
+
 #[tokio::test]
 async fn dropping_a_room_aborts_its_feed() {
     let mock = mock();
@@ -406,5 +540,32 @@ async fn dropping_a_room_aborts_its_feed() {
     assert!(
         state.upgrade().is_none(),
         "the feed task no longer holds the room state"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_raised_hand_follows_our_membership_across_a_refresh_by_itself() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let mut options = CallJoinOptions::new(SLOT);
+    // A zero lifetime makes every keep-alive tick refresh the membership.
+    options.join.sticky_duration_ms = Some(0);
+    let call = room.join_call(options).await.expect("join");
+    call.raise_hand().await.expect("raise");
+    let annotations = |mock: &MockBackend| mock.room_events.lock().unwrap().len();
+    assert_eq!(annotations(&mock), 1);
+
+    tokio::time::sleep(DEFAULT_KEEP_ALIVE_INTERVAL + Duration::from_millis(1)).await;
+    settle().await;
+    assert_eq!(
+        annotations(&mock),
+        2,
+        "re-raised on the refreshed membership"
+    );
+    assert_eq!(
+        mock.redactions.lock().unwrap().len(),
+        1,
+        "the old one redacted"
     );
 }

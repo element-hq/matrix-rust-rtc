@@ -18,6 +18,11 @@ use crate::transport::RtcTransport;
 /// This is the delay before the cleanup event would fire if not restarted.
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 
+/// Default interval between keep-alive ticks, in milliseconds (10 seconds):
+/// three inside the default timeout, so one slow round trip cannot let the
+/// delayed leave fire.
+pub const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
+
 /// Default sticky-map lifetime for our membership event, in milliseconds
 /// (1 hour).
 ///
@@ -132,11 +137,17 @@ pub struct JoinSessionParams {
     /// Defaults to `DEFAULT_KEEP_ALIVE_TIMEOUT_MS` if not specified.
     pub keep_alive_timeout_ms: Option<u64>,
 
+    /// How often the session's upkeep ticks the keep-alive, in milliseconds.
+    ///
+    /// Defaults to `DEFAULT_KEEP_ALIVE_INTERVAL_MS`; clamped to half the
+    /// keep-alive timeout, so one late tick does not end the membership.
+    pub keep_alive_interval_ms: Option<u64>,
+
     /// How long the homeserver should keep our membership in the sticky map,
     /// in milliseconds.
     ///
     /// Defaults to `DEFAULT_STICKY_DURATION_MS` if not specified. The
-    /// heartbeat re-sends the membership before this elapses, so a host that
+    /// keep-alive re-sends the membership before this elapses, so a host that
     /// shortens it is choosing a higher signalling rate, not a shorter
     /// presence.
     pub sticky_duration_ms: Option<u64>,
@@ -174,6 +185,7 @@ impl JoinSessionParams {
             application: application.into(),
             transport: TransportIntent::Publish(transport),
             keep_alive_timeout_ms: None,
+            keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
@@ -196,6 +208,7 @@ impl JoinSessionParams {
             application: application.into(),
             transport,
             keep_alive_timeout_ms: None,
+            keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
@@ -219,6 +232,24 @@ impl JoinSessionParams {
     pub fn keep_alive_timeout_ms(&self) -> u64 {
         self.keep_alive_timeout_ms
             .unwrap_or(DEFAULT_KEEP_ALIVE_TIMEOUT_MS)
+    }
+
+    /// Gets the keep-alive interval to use: the configured one or the
+    /// default, at most half the keep-alive timeout.
+    pub fn keep_alive_interval_ms(&self) -> u64 {
+        let interval = self
+            .keep_alive_interval_ms
+            .unwrap_or(DEFAULT_KEEP_ALIVE_INTERVAL_MS);
+        let ceiling = self.keep_alive_timeout_ms() / 2;
+        if interval > ceiling {
+            log::warn!(
+                "[{}] keep-alive interval {interval}ms clamped to {ceiling}ms, half the timeout",
+                self.slot_id,
+            );
+            ceiling
+        } else {
+            interval
+        }
     }
 
     /// Gets the sticky-map lifetime to use.

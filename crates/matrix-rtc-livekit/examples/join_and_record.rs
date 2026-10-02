@@ -63,12 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `LiveKitCall::join` drives `!Send` futures internally, so it must run inside a
-    // `LocalSet` — this runtime skeleton is part of the quick start.
+    // `LiveKitCall::join` spawns onto the current tokio runtime — this runtime
+    // skeleton is part of the quick start.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(tokio::task::LocalSet::new().run_until(run()))
+    runtime.block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {

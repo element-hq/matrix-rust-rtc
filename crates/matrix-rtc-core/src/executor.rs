@@ -160,6 +160,11 @@ impl<T> AbortOnDrop<T> {
     pub fn new(handle: JoinHandle<T>) -> Self {
         Self(handle)
     }
+
+    /// Aborts the task without owning it, e.g. from a `Drop` elsewhere.
+    pub fn abort_handle(&self) -> AbortHandle {
+        self.0.abort_handle()
+    }
 }
 
 impl<T> Drop for AbortOnDrop<T> {

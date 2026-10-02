@@ -10,11 +10,10 @@
 //! *current* runtime (`matrix_rtc_core::executor`), and under uniffi that is
 //! async_compat's — an implementation detail of the binding layer that no
 //! entry point promises. So every export that spawns hops onto this one first
-//! ([`on_runtime`]), or spawns onto it directly:
+//! ([`on_runtime`]):
 //!
 //! - opening a room, which spawns its feeds;
-//! - the keep-alive driver a join spawns, which outlives the call that started
-//!   it;
+//! - joining a call, which spawns its upkeep (keep-alive, key rotations);
 //! - the media layer: `connect_media_session` hops here so every task it
 //!   spawns afterwards — the engine actor, the connection pool, IO — inherits
 //!   the same context regardless of which thread the FFI call arrived on.

@@ -137,7 +137,6 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     const rosterUpdates = [];
     const call = new MatrixRtcCall({
       call: rtcCall,
-      bindings,
       livekit,
       fetchJson: () =>
         Promise.resolve({

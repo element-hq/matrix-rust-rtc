@@ -10,21 +10,25 @@
 //! The client holds nothing about a room until one is asked for; the only state
 //! spanning rooms is the backend and the routing of to-device media keys to the
 //! room they name, through a registry of weak handles. Everything room-scoped
-//! is on the room, everything about our own participation on the session. A
-//! room's feeds run on the core's [`executor`](matrix_rtc_core::executor)
-//! while the room object lives. Off wasm32 that is the current tokio runtime,
-//! so a native host opens rooms from within one.
+//! is on the room, everything about our own participation on the session. The
+//! library runs its own background work on the core's
+//! [`executor`](matrix_rtc_core::executor): a room's feeds while the room
+//! object lives; the core's upkeep (keep-alive, key rotations) and, for a call,
+//! the raised hand following our membership event while the session does. Off
+//! wasm32 that is the current tokio runtime, so a native host opens rooms and
+//! joins from within one.
 
 use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::time::Duration;
 
 use matrix_rtc_core::{
     ApplicationInfo, BackendError, CommandError, EncryptionConfig, EncryptionKeySignalHandler,
     JoinError, JoinSessionParams, JoinedMembership, LeaveError, LeaveSessionParams, MatrixBackend,
     RtcIdentityMapper, SlotEncryption, SlotState, TransportIntent,
-    executor::{self, AbortOnDrop, JoinHandleExt},
+    executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
@@ -82,6 +86,11 @@ pub struct JoinOptions {
     pub transport: Option<TransportIntent>,
     pub encryption_config: Option<EncryptionConfig>,
     pub keep_alive_timeout_ms: Option<u64>,
+    /// How often the session restarts its delayed leave; `None` is
+    /// [`DEFAULT_KEEP_ALIVE_INTERVAL_MS`](matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS).
+    /// Clamped to half the keep-alive timeout, so one late tick does not end
+    /// the membership.
+    pub keep_alive_interval_ms: Option<u64>,
     pub sticky_duration_ms: Option<u64>,
     pub degraded_lifetime_ms: Option<u64>,
 }
@@ -94,6 +103,7 @@ impl JoinOptions {
             transport: None,
             encryption_config: None,
             keep_alive_timeout_ms: None,
+            keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
         }
@@ -121,6 +131,9 @@ impl CallJoinOptions {
         }
     }
 }
+
+/// How long the raised hand waits before retrying a failed re-annotation.
+const RETRY: Duration = Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS);
 
 /// What every room of a client shares.
 struct ClientShared<B: MatrixBackend + 'static> {
@@ -366,8 +379,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let params = self.prepare_join(&mut state, options, transport).await?;
         let member_id = params.membership_id();
         state.rtc_mut().join(params).await?;
+        let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         drop(state);
-        Ok(self.session(slot_id, member_id))
+        Ok(self.session(slot_id, member_id, upkeep))
     }
 
     /// Joins a call slot: the generic join, then the call layer — reactions
@@ -390,9 +404,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                 reactions,
             })
             .await?;
+        let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
+        let event_moves = state.rtc().subscribe_own_membership_event_id(&slot_id);
         drop(state);
         Ok(RtcCall {
-            session: self.session(slot_id, member_id),
+            _hand: event_moves.map(|moves| self.follow_hand(slot_id.clone(), moves)),
+            session: self.session(slot_id, member_id, upkeep),
         })
     }
 
@@ -445,6 +462,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             transport: _,
             encryption_config,
             keep_alive_timeout_ms,
+            keep_alive_interval_ms,
             sticky_duration_ms,
             degraded_lifetime_ms,
         } = options;
@@ -500,6 +518,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             application,
             transport,
             keep_alive_timeout_ms,
+            keep_alive_interval_ms,
             sticky_duration_ms,
             degraded_lifetime_ms,
             encryption_config,
@@ -518,7 +537,14 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             .is_some_and(|live| live.load(Ordering::SeqCst))
     }
 
-    fn session(&self, slot_id: String, member_id: String) -> RtcSession<B> {
+    /// The session object for a join that just succeeded. `upkeep` is the
+    /// core's, stopped when the session object goes.
+    fn session(
+        &self,
+        slot_id: String,
+        member_id: String,
+        upkeep: Option<AbortHandle>,
+    ) -> RtcSession<B> {
         let live = Arc::new(AtomicBool::new(true));
         self.sessions().insert(slot_id.clone(), live.clone());
         RtcSession {
@@ -527,7 +553,28 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             member_id,
             state: self.state.clone(),
             live,
+            upkeep,
         }
+    }
+
+    /// Re-raises our hand on each new membership event a sticky refresh puts
+    /// in place (see `CallRoomState::reannotate_hand_if_moved`), retrying a
+    /// failed re-send every keep-alive interval. Ends when the join's machine
+    /// goes, at leave.
+    fn follow_hand(
+        &self,
+        slot_id: String,
+        mut moves: watch::Receiver<Option<String>>,
+    ) -> AbortOnDrop<()> {
+        let state = self.state.clone();
+        executor::spawn(async move {
+            while moves.changed().await.is_ok() {
+                while !state.lock().await.reannotate_hand_if_moved(&slot_id).await {
+                    executor::sleep(RETRY).await;
+                }
+            }
+        })
+        .abort_on_drop()
     }
 
     fn end_sessions(&self) {
@@ -565,6 +612,9 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     member_id: String,
     state: SharedState<B>,
     live: Arc<AtomicBool>,
+    /// The core's upkeep for this join, aborted when the session object
+    /// drops: a dropped session sends no leave and stops keeping alive.
+    upkeep: Option<AbortHandle>,
 }
 
 impl<B: MatrixBackend + 'static> RtcSession<B> {
@@ -598,15 +648,6 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .own_membership_event_id(&self.slot_id)
     }
 
-    /// Restarts the delayed leave; call periodically while joined. `false`
-    /// means there is nothing left to keep alive.
-    pub async fn heartbeat(&self) -> bool {
-        if !self.is_live() {
-            return false;
-        }
-        self.state.lock().await.keep_alive(&self.slot_id).await
-    }
-
     pub async fn member_count(&self) -> usize {
         self.subscribe_memberships().await.borrow().len()
     }
@@ -617,30 +658,6 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .await
             .rtc_mut()
             .observe_slot(&self.slot_id)
-    }
-
-    /// See [`matrix_rtc_core::BaseRtcRoom::key_rotation_due_at_ms`].
-    pub async fn key_rotation_due_at_ms(&self) -> Option<u64> {
-        if !self.is_live() {
-            return None;
-        }
-        self.state
-            .lock()
-            .await
-            .rtc()
-            .key_rotation_due_at_ms(&self.slot_id)
-    }
-
-    /// See [`matrix_rtc_core::BaseRtcRoom::flush_due_key_rotation`].
-    pub async fn flush_due_key_rotation(&self) -> bool {
-        self.is_live()
-            && self
-                .state
-                .lock()
-                .await
-                .rtc()
-                .flush_due_key_rotation(&self.slot_id)
-                .await
     }
 
     pub async fn set_encryption_signal_handler(
@@ -700,6 +717,9 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
 impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
     fn drop(&mut self) {
         self.live.store(false, Ordering::SeqCst);
+        if let Some(upkeep) = &self.upkeep {
+            upkeep.abort();
+        }
     }
 }
 
@@ -707,6 +727,8 @@ impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
 /// `Deref`) plus reactions and the raised hand.
 pub struct RtcCall<B: MatrixBackend + 'static> {
     session: RtcSession<B>,
+    /// Keeps our raised hand on our current membership event.
+    _hand: Option<AbortOnDrop<()>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcCall<B> {

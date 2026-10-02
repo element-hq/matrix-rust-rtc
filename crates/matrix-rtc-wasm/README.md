@@ -157,10 +157,9 @@ messages are `{ sender, event_type, content, encryption }` with the Olm sender
 metadata and cross-signing status — MSC4153 discards keys from devices that are
 not cross-signed, so bootstrap cross-signing before joining anything encrypted.
 
-The page owns every clock: call `rtcCall.heartbeat()` on an interval
-(`HEARTBEAT_INTERVAL_MS()`, 10 s) while joined — without it the dead man's
-switch fires and peers see you depart mid-call. `MatrixRtcCall.connect` starts
-that interval for you.
+The page ticks nothing: a joined call restarts its delayed leave every 10 s,
+refreshes its sticky membership and performs its key rotations on its own
+until it leaves or is freed.
 
 ### Element Call compatibility
 

@@ -84,8 +84,8 @@ until the call-side roster and tiles move above the call crate.
 What lets an application sit on the core without the core knowing it:
 
 - **`MembershipListener`**: told synchronously of every change to a slot's
-  joined memberships in a `BaseRtcRoom`, since the core spawns nothing to await
-  the watch.
+  joined memberships in a `BaseRtcRoom`, in order and under the lock that
+  applied them.
 - **`host/`**: `send_room_event`, `redact_event` and `RawTimelineEvent` exist for
   applications; the core uses none of them.
 - **`ApplicationIntake`**: how the call crate's feeder feeds an application
@@ -110,7 +110,7 @@ OpenID token and `GET /rtc/transports`). The host's app (through the FFI or
 wasm trait) and `matrix_rtc_matrix_sdk::SdkMatrixBackend` (a real `matrix_sdk::Client`)
 are two implementations, and the core cannot tell them apart.
 
-The core does nothing with the read half itself — it spawns no tasks. The
+The core does nothing with the read half itself. The
 **feeder** in `matrix-rtc-call` (`RoomFeeder`, `ToDeviceFeeder`) subscribes
 through the backend, orders what arrives (encryption and slots and members
 before the first membership, so nobody is briefly joined to a closed slot),
@@ -177,8 +177,9 @@ is no longer its own: `LiveKitCall::join`, the FFI's `RtcClient` and the wasm
 the backend in `DialectBackend`, runs the `ToDeviceFeeder` while any room is
 open and attaches each room through `RoomFeeder` — and then join. What differs
 between them is only where the backend comes from and which runtime is current:
-the library spawns the feeds itself, on `matrix_rtc_core::executor` (the
-current tokio runtime natively, `spawn_local` on wasm).
+the library spawns the feeds, and the core each joined slot's upkeep, on
+`matrix_rtc_core::executor` (the current tokio runtime natively, `spawn_local`
+on wasm).
 
 ## High-level data flow
 
@@ -192,7 +193,9 @@ This is the host-driven topology above, in detail.
    facts — into `RawStickyEvent`s and hands the whole set to the room's `BaseRtcRoom`.
 4. The room groups events by `slot_id` and forwards each batch once to that slot's `SlotSession`.
 5. The host joins a slot on the room (`join` / `join_call`) and gets back an `RtcSession` /
-   `RtcCall`: our participation, with its heartbeat, keys and leave.
+   `RtcCall`: our participation, with its keys and leave. The core's join starts the slot's upkeep
+   task, which keeps it alive (MSC4140 restart, sticky refresh) and performs each key rotation at
+   its deadline until the leave; the session object aborts it when dropped without leaving.
 
 Membership is always applied as a complete set: a member whose event is absent from the set has left.
 
@@ -220,11 +223,11 @@ Membership is always applied as a complete set: a member whose event is absent f
   membership.
 - Reactions and the raised hand (Element Call, unspecced) and MSC4075
   notifications, in `CallRoomState` over the room's `BaseRtcRoom`: `join` rings
-  the room if we started, `leave` lowers our hand first, `heartbeat` moves our
-  hand onto the refreshed membership.
+  the room if we started, `leave` lowers our hand first, and the hand follows
+  our membership event onto each refresh (the core's event-id watch).
 - The library does not detect incoming calls: MSC4075 is send-only here, and a
   host learns of a ring through its own SDK or push path.
-- Depends on the core alone; arms no timers; compiles for wasm32.
+- Depends on the core alone; its timers are the core executor's; compiles for wasm32.
 - `feeder`: `RoomFeeder::attach` subscribes a room through
   the backend and runs the routing described under "Who drives the call";
   `ToDeviceFeeder` routes to-device keys to the open room they are for
@@ -335,10 +338,8 @@ Membership is always applied as a complete set: a member whose event is absent f
   `JsBackend` adapts the JS object to the core trait;
   `WasmRoomSink`/`WasmToDeviceSink` are the sinks the host pushes into).
   `client.room` runs the room's feed on `spawn_local`; `room.close` leaves and
-  unsubscribes. The room has `openSlot`/`closeSlot` and `joinCall`.
-- Host-driven hooks the page must call on the call: `heartbeat` on an interval
-  while joined (`HEARTBEAT_INTERVAL_MS`), `flushDueKeyRotation` when told a
-  switch completed.
+  unsubscribes. The room has `openSlot`/`closeSlot` and `joinCall`. A joined
+  call keeps itself alive and rotates its keys; the page ticks nothing.
 - `media/`: `call.connectMedia` attaches media to the joined call — the shared
   `CallEngine` (roster + multi-focus pool) over `JsMediaTransport`, a JS
   delegate driving livekit-js. Rust owns the protocol (token requests via
@@ -362,7 +363,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   with megolm sender attribution) and to-device keys with their Olm metadata.
 - `src/matrix-rtc-call.mjs` (export `./call`): the `MatrixRtcCall` wrapper —
   implements the media delegate over `livekit-client` (optional peer
-  dependency, injected), drives the heartbeat, and joins roster entries to
+  dependency, injected) and joins roster entries to
   live livekit-js participants by `rtc_identity`.
 
 ## `crates/matrix-rtc-ffi`
@@ -375,7 +376,8 @@ Membership is always applied as a complete set: a member whose event is absent f
   through it and resolves to an `RtcRoom` once the room's current state is
   applied, and `RtcRoom::shutdown` leaves and unsubscribes (not `close`, which
   Kotlin's `AutoCloseable` owns). `join_call` returns an `RtcCall` whose 10 s
-  keep-alive driver runs until it leaves or is dropped. Inbound events reach
+  upkeep (keep-alive, key rotations) runs until it leaves or is dropped. Both hop onto the
+  crate's own runtime (`runtime.rs`) so what they spawn lands there. Inbound events reach
   the library only through the `RoomSink`/`ToDeviceSink` objects the
   subscriptions hand the host — there are no feed methods on the objects.
 - Behind the **`media` cargo feature** (default off — pulls the LiveKit
@@ -557,7 +559,7 @@ protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven per room by
   matrix-js-sdk's `CallMembership.eventId` follows it, and Element Call drops a
   raised hand whose membership event has moved on, re-querying the new event's
   relations. So `OwnMembershipMachine` now tracks the latest event id, and
-  `RtcCall::heartbeat` re-annotates our hand onto the new event (redacting the old
+  each keep-alive tick re-annotates our hand onto the new event (redacting the old
   annotation) whenever it has moved — every 30 minutes at the default lifetime.
   Peers may see the hand drop for one round trip in between; that is the
   protocol's, not ours. As a *receiver* we are more lenient: a hand stays up for

@@ -44,8 +44,8 @@ matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext au
         ▲                                                        relations, openid_token, rtc_transports
         │ DialectBackend (compat routing)                        │ complete current sets, on subscribe
         │                                                        ▼ and on every sticky / state wake
- RtcClient → RtcRoom ◀── RoomFeeder / ToDeviceFeeder (call: src/feeder) ── spawn_local(run)
-   └─ join_call → RtcCall (own membership sticky + delayed leave; heartbeat)
+ RtcClient → RtcRoom ◀── RoomFeeder / ToDeviceFeeder (call: src/feeder) ── executor::spawn
+   └─ join_call → RtcCall (own membership sticky + delayed leave; upkeep)
         │  └─ EncryptionManager: generates + distributes per-participant keys
         │        via the backend's send_to_device_message
         │  └─ MediaKeyBridge (src/keys.rs): received keys ──▶ LiveKit KeyProvider
@@ -54,9 +54,8 @@ matrix_sdk::Client ──login──▶ SyncService (sliding sync; sticky ext au
                                             └─ publish_tone / record_track (src/media.rs)
 ```
 
-The futures behind `LiveKitCall::join` are `!Send` (the core `MatrixBackend` is
-`?Send`), so the test runs on a single-thread `tokio::task::LocalSet`, with a
-300 s overall timeout so a wedged stack fails fast.
+The test runs on a multi-thread tokio runtime, with a 300 s overall timeout so
+a wedged stack fails fast.
 
 ## Prerequisites
 

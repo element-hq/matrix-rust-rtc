@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `LiveKitCall::join` drives `!Send` futures, so everything runs on a `LocalSet`.
+    // A `LocalSet` for this tool's own `spawn_local` tasks (stdin, the video ticker).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

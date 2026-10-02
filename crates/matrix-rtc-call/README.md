@@ -85,4 +85,4 @@ backend comes from and which runtime is current when it does:
 `matrix_rtc_livekit::LiveKitCall::join` (`SdkMatrixBackend`, the caller's tokio runtime),
 `matrix_rtc_ffi::RtcClient` (the host's foreign trait, the FFI runtime) and
 `matrix_rtc_wasm::WasmRtcClient` (the page's `MatrixBackendHost`, the JS event loop).
-The library spawns the feeds itself.
+The library spawns the feeds itself; the core runs each joined slot's upkeep.

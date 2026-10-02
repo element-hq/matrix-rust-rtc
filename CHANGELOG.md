@@ -10,7 +10,8 @@ log only.
 
 ### Breaking
 
-- `RtcClient::room` spawns the room's feeds on `matrix_rtc_core::executor` and returns the room alone (`RoomRuns` is gone); natively it must be called within a tokio runtime.
+- The library keeps a joined session alive and performs its key rotations at their deadline itself; `heartbeat()`, `flushDueKeyRotation()`/`flush_due_key_rotation`, `keyRotationDueAtMs()`/`key_rotation_due_at_ms` and `HEARTBEAT_INTERVAL_MS` are gone, and `LiveKitCallOptions::heartbeat_interval` becomes `keep_alive_interval_ms` (default 10 s).
+- `RtcClient::room` spawns the room's feeds on `matrix_rtc_core::executor` and returns the room alone (`RoomRuns` is gone); natively it must be called within a tokio runtime, and `LiveKitCall::join` no longer needs a `LocalSet`.
 - The session managers are replaced by client → room → session (`RtcClient` → `RtcRoom` → `RtcSession`/`RtcCall`, likewise on the FFI and wasm), and the core's manager by the per-room `BaseRtcRoom`.
 - `matrix_rtc_livekit::Call`, `CallOptions` and `CallError` are renamed `LiveKitCall`, `LiveKitCallOptions` and `LiveKitCallError`, so they no longer read as the call crate's `RtcCall`.
 - `compat`, `feeder` and `transports` move from `matrix-rtc-bridge` to `matrix-rtc-call`, and what remains is renamed `matrix-rtc-matrix-sdk`, with no `matrix-sdk` feature; its `SdkBackend` becomes `SdkMatrixBackend`.
@@ -28,6 +29,7 @@ log only.
 
 ### Added
 
+- `BaseRtcRoom::join` starts the slot's upkeep (keep-alive, sticky refresh, key rotations at their deadline) until the leave, so a host on the core alone ticks nothing either; `upkeep_abort_handle` stops it for an owner that drops the join without leaving.
 - `BaseRtcRoom::add_membership_listener`: synchronous notice of every change to a slot's joined memberships, for applications built on the core.
 - `ApplicationIntake` and `RelationsRequest`, how a host feeds an application beyond membership.
 - `BaseRtcRoom::backend()`, and a core `testing` feature exposing `MockBackend`, whose sinks a test delivers sets into.

@@ -424,15 +424,13 @@ fn harness(scenario: Scenario, compat: ElementCallCompat) {
     init_test_process();
     let cfg = Config::from_env();
 
-    // The futures behind `LiveKitCall::join` are `!Send` (the core command sender is
-    // `?Send`), so the whole flow runs on a single-thread `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    let outcome = runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+    let outcome = runtime.block_on(async {
         tokio::time::timeout(OVERALL_DEADLINE, run(cfg, scenario, compat)).await
-    }));
+    });
 
     match outcome {
         Err(_) => panic!("e2e call did not finish within {OVERALL_DEADLINE:?}"),
@@ -609,8 +607,8 @@ async fn run(
         (true, true)
     };
 
-    // Tear down both peers cleanly and symmetrically: `LiveKitCall::leave` stops the
-    // heartbeat, sends the leave event (cancelling the delayed leave), shuts
+    // Tear down both peers cleanly and symmetrically: `LiveKitCall::leave` ends the
+    // keep-alive, sends the leave event (cancelling the delayed leave), shuts
     // the media engine down (closing peer-focus connections), and closes the
     // own SFU connection. A per-leave timeout keeps a wedged teardown from
     // eating the overall deadline; failures are logged rather than aborting

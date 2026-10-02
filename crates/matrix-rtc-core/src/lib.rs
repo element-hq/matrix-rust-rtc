@@ -21,6 +21,7 @@ mod own_membership;
 mod session;
 mod slot;
 mod transport;
+mod upkeep;
 mod wire;
 
 pub use base_rtc_room::BaseRtcRoom;
@@ -42,7 +43,10 @@ pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     RawTimelineEvent, RelationsRequest, StickyEventsUpdate,
 };
-pub use join::{JoinSessionParams, LeaveSessionParams, TransportIntent, generate_member_id};
+pub use join::{
+    DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS, JoinSessionParams,
+    LeaveSessionParams, TransportIntent, generate_member_id,
+};
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
 pub use own_membership::{
@@ -1096,5 +1100,74 @@ mod tests {
             }
             RtcMembershipEvent::Left(_) => panic!("Expected Joined membership"),
         }
+    }
+
+    fn restarts(sender: &crate::host::backend::MockBackend) -> usize {
+        sender.restarted_events.lock().unwrap().len()
+    }
+
+    const TICK: std::time::Duration =
+        std::time::Duration::from_millis(DEFAULT_KEEP_ALIVE_INTERVAL_MS);
+
+    /// The core keeps a join alive by itself: nobody ticks it.
+    #[tokio::test(start_paused = true)]
+    async fn a_joined_slot_keeps_itself_alive_until_it_leaves() {
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        assert_eq!(
+            restarts(&sender),
+            0,
+            "the join itself armed the delayed leave"
+        );
+
+        tokio::time::sleep(TICK * 3 + std::time::Duration::from_millis(1)).await;
+        assert_eq!(restarts(&sender), 3, "one restart per interval");
+
+        room.leave("m.call#ROOM", LeaveSessionParams::new())
+            .await
+            .expect("leave");
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(restarts(&sender), 3, "nothing restarted after the leave");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_room_stops_its_upkeep() {
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+
+        drop(room);
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(restarts(&sender), 0);
+    }
+
+    /// What lets an owner that drops a join without leaving stop its upkeep.
+    #[tokio::test(start_paused = true)]
+    async fn aborting_the_upkeep_handle_stops_it_and_sends_no_leave() {
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+
+        room.upkeep_abort_handle("m.call#ROOM")
+            .expect("an upkeep runs")
+            .abort();
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(restarts(&sender), 0);
+        assert!(sender.cancelled_events.lock().unwrap().is_empty());
+        assert!(room.own_member_id("m.call#ROOM").is_some(), "still joined");
+    }
+
+    /// Without a runtime the join still succeeds; the host ticks it instead.
+    #[test]
+    fn a_join_off_a_runtime_has_no_upkeep() {
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        futures::executor::block_on(async {
+            let mut room = encrypted_call_room(sender.clone()).await;
+            join_as(&mut room, "alice-a").await;
+            assert!(room.upkeep_abort_handle("m.call#ROOM").is_none());
+            assert!(room.keep_alive("m.call#ROOM").await);
+        });
+        assert_eq!(restarts(&sender), 1);
     }
 }

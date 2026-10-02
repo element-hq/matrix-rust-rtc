@@ -130,7 +130,6 @@ describe('WASM bindings with a mock backend host', () => {
       expect(cancelledEvents[0].delayId).toBe('delayed-event-0');
 
       expect(call.isLive).toBe(false);
-      expect(await call.heartbeat()).toBe(false);
       await expect(call.leave(undefined)).rejects.toThrow(/over/);
     });
 

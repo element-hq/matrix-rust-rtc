@@ -290,25 +290,13 @@ judgement, not a technical one, and it is currently decided in favour of UX.
 
 ## Who performs a deferred rotation
 
-`matrix-rtc-core` owns no timer — deliberately, so a synchronous FFI host can
-drive it from a plain thread — so it cannot wake itself up when a rotation falls
-due. It exposes the deadline instead:
-
-- `RtcSession::key_rotation_due_at_ms()` — when one is owed, if any.
-- `RtcSession::flush_due_key_rotation()` — performs it, if due. A no-op
-  otherwise, so it is safe on any tick.
-
-`matrix-rtc-livekit` is the reference driver, and it needs *two* wake-ups, because
-neither alone is enough:
-
-- `MediaKeyBridge` reports every key coming into use (the same scheduled task that
-  installs it). That is when a rotation *becomes* owed — a member left while the
-  key was fresh — but not when it is due: freshness outlasts `delayBeforeUse`, so
-  there is usually nothing to do yet.
-- A timer set from the reported deadline. This is the wake-up that performs it.
-
-`RtcSession::heartbeat` flushes as well, so a consumer that wires neither is late
-rather than broken.
+The session does, on every host. The core publishes the deadline as a watch
+(`EncryptionManager::subscribe_rotation_due`, surfaced as
+`BaseRtcRoom::subscribe_key_rotation_due`), and each joined slot session's upkeep
+task in `matrix-rtc-core` sleeps until it, re-arming whenever it moves, then calls
+`flush_due_key_rotation` — a no-op unless a rotation is actually due. Every
+keep-alive tick flushes too, so a missed wake-up makes a rotation late by one
+tick rather than lost.
 
 This is load-bearing. If nothing ever collected an owed rotation, a member who
 left while a key was fresh would keep a working key for as long as the roster
