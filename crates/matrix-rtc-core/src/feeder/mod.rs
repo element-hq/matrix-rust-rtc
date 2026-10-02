@@ -4,51 +4,46 @@
 // Please see LICENSE in the repository root for full details.
 
 //! Feeds one room's state from a `MatrixBackend`: subscribes to what the room
-//! needs in its compatibility mode, seeds room state before membership,
-//! funnels the pre-2026 dialects, and forwards timeline events, redactions and
-//! relations. Media keys arrive on one to-device subscription per client and
-//! are routed to the room they name through the [`RoomRegistry`]. The one place
-//! Matrix becomes core input, on every binding.
+//! needs in its [`IngestDialect`], seeds room state before membership, and
+//! forwards timeline events, redactions and relations to the room's
+//! [`ApplicationIntake`]. Media keys arrive on one to-device subscription per
+//! client and are routed to the room they name through the [`RoomRegistry`].
+//! The one place Matrix becomes core input, on every binding.
 //!
 //! Sinks only enqueue; `run()` does the work under the room's lock and is a
-//! plain future the binding spawns where its background work already runs.
+//! plain future the caller spawns.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 
-use matrix_rtc_core::{
-    ApplicationIntake, BackendError, EventEncryption, EventIn, KEY_MESSAGE_TYPE, KeyOrigin,
-    MatrixBackend, RawSlotEvent, RawTimelineEvent, ReceivedEncryptionKey, RoomSink, RoomSubjects,
-    SLOT_EVENT_TYPE, Subscription, ToDeviceMessageIn, ToDeviceSink,
-};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, watch};
 
-use crate::compat::ingest::{
-    LegacyStateMemberEventIn, RawMemberEventIn, merge_current_membership, parse_legacy_key,
+use crate::{
+    ApplicationIntake, BackendError, EventEncryption, EventIn, EventOrigin, KEY_MESSAGE_TYPE,
+    KeyOrigin, MatrixBackend, RawSlotEvent, RawTimelineEvent, ReceivedEncryptionKey, RoomSink,
+    RoomSubjects, SLOT_EVENT_TYPE, Subscription, ToDeviceMessageIn, ToDeviceSink,
 };
-use crate::compat::{ElementCallCompat, LEGACY_KEY_EVENT_TYPE, STATE_MEMBER_EVENT_TYPE};
 
+mod dialect;
 #[cfg(test)]
 mod tests;
 
+pub use dialect::IngestDialect;
+
 const MEMBER_EVENT_TYPES: [&str; 2] = ["m.rtc.member", "org.matrix.msc4143.rtc.member"];
 const SLOT_EVENT_TYPES: [&str; 2] = [SLOT_EVENT_TYPE, "org.matrix.msc4143.rtc.slot"];
-const KEY_EVENT_TYPES: [&str; 3] = [
-    "m.rtc.encryption_key",
-    KEY_MESSAGE_TYPE,
-    LEGACY_KEY_EVENT_TYPE,
-];
+const KEY_EVENT_TYPES: [&str; 2] = ["m.rtc.encryption_key", KEY_MESSAGE_TYPE];
 
-/// The rooms a client holds, by room id: each one's compatibility mode, which
-/// binds a legacy media key, and a weak handle the to-device feeder routes keys
-/// to. Holding no strong reference is what lets a dropped room stop receiving
+/// The rooms a client holds, by room id: each one's dialect, which reads a
+/// media key of a type beyond the spec's, and a weak handle the to-device
+/// feeder routes keys to. Holding no strong reference is what lets a dropped room stop receiving
 /// keys without anyone unregistering it first.
 pub struct RoomRegistry<M>(Arc<StdMutex<HashMap<String, RegisteredRoom<M>>>>);
 
 struct RegisteredRoom<M> {
-    mode: ElementCallCompat,
+    dialect: Arc<dyn IngestDialect>,
     room: Weak<Mutex<M>>,
 }
 
@@ -75,7 +70,7 @@ impl<M> RoomRegistry<M> {
     pub fn register(
         &self,
         room_id: &str,
-        mode: ElementCallCompat,
+        dialect: Arc<dyn IngestDialect>,
         room: &Arc<Mutex<M>>,
     ) -> Result<(), RoomAlreadyOpen> {
         let mut rooms = self.lock();
@@ -88,7 +83,7 @@ impl<M> RoomRegistry<M> {
         rooms.insert(
             room_id.to_owned(),
             RegisteredRoom {
-                mode,
+                dialect,
                 room: Arc::downgrade(room),
             },
         );
@@ -102,12 +97,9 @@ impl<M> RoomRegistry<M> {
         rooms.is_empty()
     }
 
-    /// The mode `room_id` was opened in, or `Off` for a room not held.
-    pub fn mode(&self, room_id: &str) -> ElementCallCompat {
-        self.lock()
-            .get(room_id)
-            .map(|entry| entry.mode)
-            .unwrap_or_default()
+    /// The dialect `room_id` was opened in, if it is held.
+    pub fn dialect(&self, room_id: &str) -> Option<Arc<dyn IngestDialect>> {
+        Some(self.lock().get(room_id)?.dialect.clone())
     }
 
     /// The live room for `room_id`, if one is held.
@@ -128,14 +120,17 @@ impl<M> RoomRegistry<M> {
     }
 }
 
-/// What a room needs in `mode`: the slot state only where the generation has
-/// slots, the pre-sticky membership state only in that generation.
-pub fn subjects_for(mode: ElementCallCompat, timeline_event_types: Vec<String>) -> RoomSubjects {
-    let state_event_types = if mode.reads_state_membership() {
-        vec![STATE_MEMBER_EVENT_TYPE.to_owned()]
-    } else {
-        SLOT_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect()
-    };
+/// What a room needs in `dialect`: the slot state where the dialect reads
+/// slots, and the membership state it reads.
+pub fn subjects_for(
+    dialect: &dyn IngestDialect,
+    timeline_event_types: Vec<String>,
+) -> RoomSubjects {
+    let mut state_event_types: Vec<String> = Vec::new();
+    if dialect.reads_slots() {
+        state_event_types.extend(SLOT_EVENT_TYPES.iter().map(|t| (*t).to_owned()));
+    }
+    state_event_types.extend(dialect.membership_state_event_types());
     RoomSubjects {
         state_event_types,
         timeline_event_types,
@@ -143,12 +138,12 @@ pub fn subjects_for(mode: ElementCallCompat, timeline_event_types: Vec<String>) 
 }
 
 /// The `EventOrigin` of a message-like event, from what the client reported.
-pub fn event_origin(encryption: &EventEncryption) -> matrix_rtc_core::EventOrigin {
+pub fn event_origin(encryption: &EventEncryption) -> EventOrigin {
     match encryption {
-        EventEncryption::Cleartext => matrix_rtc_core::EventOrigin::Cleartext,
+        EventEncryption::Cleartext => EventOrigin::Cleartext,
         EventEncryption::Encrypted {
             sender_device_id, ..
-        } => matrix_rtc_core::EventOrigin::encrypted(sender_device_id.clone()),
+        } => EventOrigin::encrypted(sender_device_id.clone()),
     }
 }
 
@@ -178,27 +173,6 @@ fn to_timeline_event(room_id: &str, event: EventIn) -> RawTimelineEvent {
         origin_server_ts: event.origin_server_ts,
         content: event.content,
     }
-}
-
-fn to_member_event_in(event: EventIn) -> RawMemberEventIn {
-    RawMemberEventIn {
-        event_id: Some(event.event_id),
-        sender: event.sender,
-        sender_device_id: event.encryption.sender_device_id().map(str::to_owned),
-        was_encrypted: Some(event.encryption.was_encrypted()),
-        event_type: event.event_type,
-        content: event.content,
-    }
-}
-
-fn to_legacy_state_member_event_in(event: EventIn) -> Option<LegacyStateMemberEventIn> {
-    Some(LegacyStateMemberEventIn {
-        event_id: Some(event.event_id),
-        sender: event.sender,
-        state_key: event.state_key?,
-        origin_server_ts: event.origin_server_ts,
-        content: event.content,
-    })
 }
 
 /// One slot's state event under each spelling of the slot type.
@@ -335,13 +309,13 @@ impl Drop for RoomAttachment {
 pub struct RoomFeeder;
 
 impl RoomFeeder {
-    /// Subscribes to what `room` needs in `mode` and returns the attachment
-    /// plus the future that applies what arrives. The caller spawns
+    /// Subscribes to what `room` needs in `dialect` and returns the
+    /// attachment plus the future that applies what arrives. The caller spawns
     /// [`RoomFeederRun::run`].
     pub async fn attach<B, M>(
         backend: Arc<B>,
         room: Arc<Mutex<M>>,
-        mode: ElementCallCompat,
+        dialect: Arc<dyn IngestDialect>,
     ) -> Result<(RoomAttachment, RoomFeederRun<B, M>), BackendError>
     where
         B: MatrixBackend + 'static,
@@ -351,8 +325,8 @@ impl RoomFeeder {
             let mut room = room.lock().await;
             (room.rtc().room_id().to_owned(), room.timeline_event_types())
         };
-        let subjects = subjects_for(mode, timeline_event_types);
-        log::info!("[{room_id}] attaching in {mode:?} mode: {subjects:?}");
+        let subjects = subjects_for(dialect.as_ref(), timeline_event_types);
+        log::info!("[{room_id}] attaching: {subjects:?}");
 
         let (tx, rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn RoomSink> = Arc::new(ChannelRoomSink { tx: tx.clone() });
@@ -371,7 +345,7 @@ impl RoomFeeder {
             backend,
             room,
             room_id,
-            mode,
+            dialect,
             rx,
             seeded: seeded_tx,
             state: FeedState::default(),
@@ -388,10 +362,11 @@ struct FeedState {
     /// The room's slots by slot id (state key), each under both spellings: a
     /// delivery replaces only its own spelling's events.
     slots: HashMap<String, SlotEvents>,
-    /// The latest sticky set, as member events, once one arrived.
-    sticky: Option<Vec<RawMemberEventIn>>,
-    /// The latest pre-sticky membership state, once one arrived.
-    legacy: Option<Vec<LegacyStateMemberEventIn>>,
+    /// The latest sticky set's member events, once one arrived.
+    sticky: Option<Vec<EventIn>>,
+    /// The latest membership state, by event type, of the types the dialect
+    /// reads it from.
+    membership_state: HashMap<String, Vec<EventIn>>,
     membership_dirty: bool,
 }
 
@@ -400,7 +375,7 @@ pub struct RoomFeederRun<B, M> {
     backend: Arc<B>,
     room: Arc<Mutex<M>>,
     room_id: String,
-    mode: ElementCallCompat,
+    dialect: Arc<dyn IngestDialect>,
     rx: mpsc::UnboundedReceiver<RoomInput>,
     seeded: watch::Sender<bool>,
     state: FeedState,
@@ -431,7 +406,6 @@ where
                         events
                             .into_iter()
                             .filter(|event| MEMBER_EVENT_TYPES.contains(&event.event_type.as_str()))
-                            .map(to_member_event_in)
                             .collect(),
                     );
                     self.state.membership_dirty = true;
@@ -467,13 +441,12 @@ where
                 .collect();
             self.room.lock().await.rtc().on_slots_received(slots).await;
             self.state.seen_slots = true;
-        } else if event_type == STATE_MEMBER_EVENT_TYPE {
-            self.state.legacy = Some(
-                events
-                    .into_iter()
-                    .filter_map(to_legacy_state_member_event_in)
-                    .collect(),
-            );
+        } else if self
+            .dialect
+            .membership_state_event_types()
+            .contains(&event_type)
+        {
+            self.state.membership_state.insert(event_type, events);
             self.state.membership_dirty = true;
         } else {
             log::debug!(
@@ -510,16 +483,23 @@ where
     /// Room state before membership: a member is never briefly joined to a
     /// slot the room's state says is closed.
     fn gate_open(&self) -> bool {
-        let needs_slots = !self.mode.reads_state_membership();
         self.state.seen_encryption
             && self.state.seen_members
-            && (!needs_slots || self.state.seen_slots)
+            && (!self.dialect.reads_slots() || self.state.seen_slots)
     }
 
     async fn apply_membership(&mut self) {
         let sticky = self.state.sticky.clone().unwrap_or_default();
-        let legacy = self.state.legacy.clone().unwrap_or_default();
-        let current = merge_current_membership(&self.room_id, sticky, legacy);
+        let state = self
+            .state
+            .membership_state
+            .values()
+            .flatten()
+            .cloned()
+            .collect();
+        let current = self
+            .dialect
+            .current_membership(&self.room_id, sticky, state);
         if let Err(error) = self
             .room
             .lock()
@@ -595,34 +575,30 @@ struct MediaKey {
     key: String,
 }
 
-/// A media key from a to-device message, in either generation, or `None` with
-/// the reason logged.
+/// A media key from a to-device message, or `None` with the reason logged. A
+/// type beyond the spec's is read by the dialect of the room its content
+/// names.
 pub fn parse_key_message(
-    mode_of: impl Fn(&str) -> ElementCallCompat,
+    dialect_of: impl Fn(&str) -> Option<Arc<dyn IngestDialect>>,
     message: ToDeviceMessageIn,
 ) -> Option<ReceivedEncryptionKey> {
-    let origin = key_origin(&message.encryption, &message.sender);
-    if message.event_type == LEGACY_KEY_EVENT_TYPE {
+    if !KEY_EVENT_TYPES.contains(&message.event_type.as_str()) {
         let room_id = message
             .content
             .get("room_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let key = parse_legacy_key(
-            mode_of(room_id),
-            &message.sender,
-            message.encryption.sender_device_id(),
-            &message.content,
-        )?;
-        return Some(ReceivedEncryptionKey {
-            origin,
-            room_id: key.room_id,
-            member_id: key.member_id,
-            key_b64: key.key_b64,
-            key_index: key.key_index,
-        });
+        let Some(dialect) = dialect_of(room_id) else {
+            log::debug!(
+                "[{room_id}] dropping a {} for a room that is not open",
+                message.event_type
+            );
+            return None;
+        };
+        return dialect.parse_key(&message);
     }
 
+    let origin = key_origin(&message.encryption, &message.sender);
     let content: KeyMessageContent = serde_json::from_value(message.content)
         .inspect_err(|error| {
             log::warn!(
@@ -658,12 +634,13 @@ pub struct ToDeviceFeeder {
 }
 
 impl ToDeviceFeeder {
-    /// Subscribes to media keys of both generations and returns the future
-    /// that routes each to the room it names. The caller spawns
-    /// [`ToDeviceFeederRun::run`].
+    /// Subscribes to media keys of the spec's types and of
+    /// `extra_key_event_types`, and returns the future that routes each to the
+    /// room it names. The caller spawns [`ToDeviceFeederRun::run`].
     pub async fn start<B, M>(
         backend: Arc<B>,
         registry: RoomRegistry<M>,
+        extra_key_event_types: Vec<String>,
     ) -> Result<(ToDeviceFeeder, ToDeviceFeederRun<B, M>), BackendError>
     where
         B: MatrixBackend + 'static,
@@ -671,8 +648,12 @@ impl ToDeviceFeeder {
     {
         let (tx, rx) = mpsc::unbounded_channel();
         let sink: Arc<dyn ToDeviceSink> = Arc::new(ChannelToDeviceSink { tx: tx.clone() });
-        let event_types = KEY_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect();
-        let subscription = backend.subscribe_to_device(event_types, sink).await?;
+        let mut event_types: Vec<String> =
+            KEY_EVENT_TYPES.iter().map(|t| (*t).to_owned()).collect();
+        event_types.extend(extra_key_event_types);
+        let subscription = backend
+            .subscribe_to_device(event_types.clone(), sink)
+            .await?;
         Ok((
             ToDeviceFeeder {
                 subscription,
@@ -680,6 +661,7 @@ impl ToDeviceFeeder {
             },
             ToDeviceFeederRun {
                 registry,
+                event_types,
                 rx,
                 _backend: backend,
             },
@@ -701,6 +683,7 @@ impl Drop for ToDeviceFeeder {
 /// The future that routes media keys. Ends on stop.
 pub struct ToDeviceFeederRun<B, M> {
     registry: RoomRegistry<M>,
+    event_types: Vec<String>,
     rx: mpsc::UnboundedReceiver<Option<ToDeviceMessageIn>>,
     _backend: Arc<B>,
 }
@@ -712,10 +695,10 @@ where
 {
     pub async fn run(mut self) {
         while let Some(Some(message)) = self.rx.recv().await {
-            if !KEY_EVENT_TYPES.contains(&message.event_type.as_str()) {
+            if !self.event_types.contains(&message.event_type) {
                 continue;
             }
-            let Some(key) = parse_key_message(|room_id| self.registry.mode(room_id), message)
+            let Some(key) = parse_key_message(|room_id| self.registry.dialect(room_id), message)
             else {
                 continue;
             };

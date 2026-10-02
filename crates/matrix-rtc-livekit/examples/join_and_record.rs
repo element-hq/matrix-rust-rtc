@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::ElementCallCompat;
+use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::RoomId;
@@ -63,12 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `LiveKitCall::join` drives `!Send` futures internally, so it must run inside a
-    // `LocalSet` — this runtime skeleton is part of the quick start.
+    // `LiveKitCall::join` spawns onto the current tokio runtime — this runtime
+    // skeleton is part of the quick start.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(tokio::task::LocalSet::new().run_until(run()))
+    runtime.block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -89,10 +89,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     //
     // `state`: the generation before MSC4354, where membership is room state.
     // Nothing about such a call is visible to a spec-current peer.
-    let element_call_compat = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
-        None => ElementCallCompat::Off,
-        Some("state") => ElementCallCompat::StateEvents,
-        Some(_) => ElementCallCompat::StickyEvents,
+    let format = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
+        None => MembershipFormat::Current,
+        Some("state") => MembershipFormat::RoomState,
+        Some(_) => MembershipFormat::Sticky2025,
     };
     let record_secs: u64 = env::var("RECORD_SECS")
         .ok()
@@ -194,7 +194,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 livekit_service_url,
             }),
             http: Some(http),
-            element_call_compat,
+            format,
             ..LiveKitCallOptions::default()
         },
     )

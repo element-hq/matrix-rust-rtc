@@ -8,35 +8,20 @@
 //! ([`notification`]), and the host-facing [`RtcClient`] → [`RtcRoom`] →
 //! [`RtcSession`] / [`RtcCall`].
 //!
-//! It also holds how a host's `MatrixBackend` reaches the call, none of which
-//! needs a Matrix SDK: [`compat`], translation to and from the pre-2026
-//! dialects Element Call still speaks, with [`DialectBackend`], the backend
-//! wrapper that renders sends in a room's dialect; [`feeder`], which subscribes,
-//! seeds, orders and funnels a room into the call; and [`transports`], which
-//! transport a join publishes on.
+//! It also holds [`transports`], which transport a join publishes on: the
+//! homeserver's first advertised LiveKit one unless the join names one.
+//! Opening a room, its feeds and the pre-2026 membership formats
+//! (`matrix_rtc_core::compat`) are the core's.
 
 mod client;
-pub mod compat;
-pub mod feeder;
+#[cfg(test)]
+mod feeder_tests;
 pub mod notification;
 pub mod reactions;
 mod room_state;
 pub mod transports;
 
-pub use compat::{
-    DialectBackend, ElementCallCompat, ElementCallDialect, ElementCallStateDialect,
-    LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent, MemberEventRoute, OutboundDialect,
-    STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
-};
-pub use feeder::{
-    RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomFeederRun, RoomRegistry, ToDeviceFeeder,
-    ToDeviceFeederRun,
-};
-
-pub use client::{
-    CallJoinOptions, JoinOptions, RoomOptions, RoomRuns, RtcCall, RtcClient, RtcError, RtcRoom,
-    RtcSession,
-};
+pub use client::{CallJoinOptions, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession};
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,

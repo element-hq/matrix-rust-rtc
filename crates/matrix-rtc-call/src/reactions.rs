@@ -32,7 +32,7 @@
 //!
 //! - Our own raised hand is re-annotated onto the new membership event after
 //!   every refresh (and the old annotation redacted), or Element Call peers
-//!   would lower it for us. See [`crate::RtcSession::heartbeat`].
+//!   would lower it for us. See `CallRoomState::keep_alive`.
 //! - As a receiver we are more lenient than Element Call: a hand stays raised
 //!   for as long as the member is in the call, whichever of their membership
 //!   events it was annotated on. A member's reaction is validated against every

@@ -1,0 +1,344 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+//! Opening rooms that feed themselves: a [`BaseRtcClient`] per backend, a
+//! [`BaseRtcRoomHandle`] per open room. Opening a room subscribes to it through
+//! the [`feeder`](crate::feeder) and runs the feed on the
+//! [`executor`](crate::executor) while the handle lives; the client's one
+//! to-device subscription runs while any room is open.
+//!
+//! The only state spanning rooms is the backend and the routing of to-device
+//! media keys to the room they name, through a registry of weak handles. A
+//! room is any [`ApplicationIntake`]: [`BaseRtcRoom`] for a host of the core
+//! alone, an application's room state over it otherwise.
+
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+
+use tokio::sync::{Mutex, watch};
+
+use crate::compat::ingest::{member_id, outbound_dialect};
+use crate::compat::{DialectBackend, LEGACY_KEY_EVENT_TYPE, MembershipFormat};
+use crate::executor::{self, AbortOnDrop, JoinHandleExt};
+use crate::feeder::{RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomRegistry, ToDeviceFeeder};
+use crate::{
+    ApplicationIntake, BackendError, BaseRtcRoom, JoinError, JoinSessionParams, JoinedMembership,
+    LeaveError, LeaveSessionParams, MatrixBackend, MaybeSend,
+};
+
+#[cfg(test)]
+mod tests;
+
+/// How a room is opened.
+#[derive(Clone, Debug, Default)]
+pub struct RoomOptions {
+    /// Which MatrixRTC membership format the room is read and written in: what
+    /// is subscribed to, how our sends are rendered, the `member.id` we join
+    /// with, how a legacy media key is bound. See [`crate::compat`].
+    pub format: MembershipFormat,
+}
+
+/// Why a room did not open.
+#[derive(Debug, thiserror::Error)]
+pub enum OpenError {
+    /// The room already has a live handle.
+    #[error(transparent)]
+    RoomAlreadyOpen(#[from] RoomAlreadyOpen),
+    #[error("backend: {0}")]
+    Backend(#[from] BackendError),
+}
+
+/// What every room of a client shares.
+struct ClientShared<B: MatrixBackend + 'static, M> {
+    backend: Arc<DialectBackend<B>>,
+    registry: RoomRegistry<M>,
+    /// Running while at least one room is open. Locked together with the
+    /// registry's changes, so a room opening and the last one closing cannot
+    /// interleave into an open room with no subscription.
+    to_device: StdMutex<Option<ToDeviceRunning>>,
+    /// Serialises opening rooms, so two first rooms do not both subscribe.
+    opening: Mutex<()>,
+}
+
+/// The client's to-device subscription and the task draining it.
+struct ToDeviceRunning {
+    feeder: ToDeviceFeeder,
+    _task: AbortOnDrop<()>,
+}
+
+impl<B: MatrixBackend + 'static, M> ClientShared<B, M> {
+    fn to_device(&self) -> MutexGuard<'_, Option<ToDeviceRunning>> {
+        self.to_device
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Forgets `room_id`, and stops the to-device subscription with the last
+    /// room.
+    fn release(&self, room_id: &str) {
+        let mut to_device = self.to_device();
+        if self.registry.unregister(room_id)
+            && let Some(running) = to_device.take()
+        {
+            log::info!("client: last room closed; to-device subscription stopped");
+            running.feeder.stop();
+        }
+    }
+}
+
+/// The room state a [`BaseRtcClient`] opens by default.
+pub type BaseRoom<B> = BaseRtcRoom<DialectBackend<B>>;
+
+/// One per backend, over rooms of type `M`. Creating it does no I/O. It wraps
+/// the backend in a [`DialectBackend`], which renders each room's sends in the
+/// room's [`MembershipFormat`].
+pub struct BaseRtcClient<B: MatrixBackend + 'static, M = BaseRoom<B>> {
+    shared: Arc<ClientShared<B, M>>,
+}
+
+impl<B: MatrixBackend + 'static, M> Clone for BaseRtcClient<B, M> {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl<B: MatrixBackend + 'static, M> BaseRtcClient<B, M>
+where
+    M: ApplicationIntake<DialectBackend<B>> + MaybeSend + 'static,
+{
+    pub fn new(backend: Arc<B>) -> Self {
+        Self {
+            shared: Arc::new(ClientShared {
+                backend: Arc::new(DialectBackend::new(backend)),
+                registry: RoomRegistry::default(),
+                to_device: StdMutex::new(None),
+                opening: Mutex::new(()),
+            }),
+        }
+    }
+
+    /// The host's backend behind the dialect wrapper, which every room state
+    /// is built over.
+    pub fn backend(&self) -> &Arc<DialectBackend<B>> {
+        &self.shared.backend
+    }
+
+    /// Opens `room_id` with `room` as its state: registers it, subscribes to
+    /// what its format needs, and starts the to-device subscription if this is
+    /// the first open room. The feeds run on the executor; await
+    /// [`BaseRtcRoomHandle::seeded`] before joining.
+    ///
+    /// Refused while the room has a live handle. Cancelling the call part-way
+    /// leaves nothing behind: the room is free again, and the to-device
+    /// subscription stops if no other room is open.
+    pub async fn open_with(
+        &self,
+        room_id: impl Into<String>,
+        room: Arc<Mutex<M>>,
+        options: RoomOptions,
+    ) -> Result<BaseRtcRoomHandle<B, M>, OpenError> {
+        let room_id = room_id.into();
+        let format = options.format;
+        let shared = &self.shared;
+        let _opening = shared.opening.lock().await;
+
+        let needs_to_device = {
+            let to_device = shared.to_device();
+            shared
+                .registry
+                .register(&room_id, Arc::new(format), &room)?;
+            to_device.is_none()
+        };
+        // From here every early return — an error, or the caller dropping
+        // this future at an await — must undo the registration.
+        let opening = Opening {
+            shared,
+            room_id: &room_id,
+            opened: false,
+        };
+        log::info!("client: [{room_id}] opening in the {format:?} format");
+
+        if needs_to_device {
+            // The legacy key type whatever the formats: the current one reads
+            // it too, from 2025 peers.
+            let (feeder, run) = ToDeviceFeeder::start(
+                shared.backend.clone(),
+                shared.registry.clone(),
+                vec![LEGACY_KEY_EVENT_TYPE.to_owned()],
+            )
+            .await?;
+            *shared.to_device() = Some(ToDeviceRunning {
+                feeder,
+                _task: executor::spawn(run.run()).abort_on_drop(),
+            });
+            log::info!("client: to-device subscription started");
+        }
+
+        let (attachment, feed) =
+            RoomFeeder::attach(shared.backend.clone(), room.clone(), Arc::new(format)).await?;
+        opening.opened();
+
+        Ok(BaseRtcRoomHandle {
+            room_id,
+            format,
+            room,
+            attached: Some(Attached {
+                attachment,
+                _feed: executor::spawn(feed.run()).abort_on_drop(),
+            }),
+            client: shared.clone(),
+        })
+    }
+}
+
+impl<B: MatrixBackend + 'static> BaseRtcClient<B> {
+    /// Opens `room_id` as a [`BaseRtcRoom`]. See [`Self::open_with`].
+    pub async fn room(
+        &self,
+        room_id: impl Into<String>,
+        options: RoomOptions,
+    ) -> Result<BaseRtcRoomHandle<B>, OpenError> {
+        let room_id = room_id.into();
+        let room = Arc::new(Mutex::new(BaseRtcRoom::with_backend(
+            room_id.clone(),
+            self.shared.backend.clone(),
+        )));
+        self.open_with(room_id, room, options).await
+    }
+}
+
+/// Releases a room whose opening did not finish.
+struct Opening<'a, B: MatrixBackend + 'static, M> {
+    shared: &'a ClientShared<B, M>,
+    room_id: &'a str,
+    opened: bool,
+}
+
+impl<B: MatrixBackend + 'static, M> Opening<'_, B, M> {
+    fn opened(mut self) {
+        self.opened = true;
+    }
+}
+
+impl<B: MatrixBackend + 'static, M> Drop for Opening<'_, B, M> {
+    fn drop(&mut self) {
+        if !self.opened {
+            log::info!("client: [{}] opening abandoned", self.room_id);
+            self.shared.release(self.room_id);
+        }
+    }
+}
+
+/// A room's subscription and the task feeding it.
+struct Attached {
+    attachment: RoomAttachment,
+    _feed: AbortOnDrop<()>,
+}
+
+/// One open room. Dropping it ends its subscription and frees the room id; it
+/// sends nothing, so a membership left behind expires through its delayed
+/// leave.
+pub struct BaseRtcRoomHandle<B: MatrixBackend + 'static, M = BaseRoom<B>> {
+    room_id: String,
+    format: MembershipFormat,
+    room: Arc<Mutex<M>>,
+    /// `None` once detached.
+    attached: Option<Attached>,
+    client: Arc<ClientShared<B, M>>,
+}
+
+impl<B: MatrixBackend + 'static, M> BaseRtcRoomHandle<B, M> {
+    pub fn room_id(&self) -> &str {
+        &self.room_id
+    }
+
+    /// The room's state, which the feed writes into.
+    pub fn state(&self) -> &Arc<Mutex<M>> {
+        &self.room
+    }
+
+    pub fn format(&self) -> MembershipFormat {
+        self.format
+    }
+
+    pub fn backend(&self) -> &Arc<DialectBackend<B>> {
+        &self.client.backend
+    }
+
+    /// Renders a join in the room's format: the `member.id` it joins with,
+    /// when the params name none, and the dialect our sends to the room go
+    /// out in. Before the join, not after: the join itself sends the
+    /// membership and arms the delayed leave, so a dialect registered
+    /// afterwards would let the two events that announce us go out in the
+    /// current format.
+    pub fn prepare_join(&self, params: &mut JoinSessionParams) {
+        let backend = &self.client.backend;
+        let user_id = backend.own_user_id();
+        let device_id = backend.own_device_id();
+        // Not always a fresh id: see `compat::ingest::member_id` for the one
+        // format where a fresh one makes us mark ourselves departed.
+        params
+            .membership_id
+            .get_or_insert_with(|| member_id(self.format, &user_id, &device_id));
+        backend.set_dialect(
+            &self.room_id,
+            outbound_dialect(
+                self.format,
+                &user_id,
+                &device_id,
+                &self.room_id,
+                &params.slot_id,
+            ),
+        );
+    }
+
+    /// Resolves once the room's current state is applied, so a join issued
+    /// afterwards sees it.
+    pub async fn seeded(&self) {
+        if let Some(attached) = &self.attached {
+            attached.attachment.seeded().await;
+        }
+    }
+
+    pub fn is_seeded(&self) -> bool {
+        self.attached
+            .as_ref()
+            .is_some_and(|attached| attached.attachment.is_seeded())
+    }
+
+    /// Ends the subscription and forgets the room; idempotent.
+    pub fn detach(&mut self) {
+        if let Some(attached) = self.attached.take() {
+            drop(attached);
+            self.client.backend.clear_dialect(&self.room_id);
+            self.client.release(&self.room_id);
+        }
+    }
+}
+
+impl<B: MatrixBackend + 'static, M> Drop for BaseRtcRoomHandle<B, M> {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+impl<B: MatrixBackend + 'static> BaseRtcRoomHandle<B> {
+    /// See [`BaseRtcRoom::join`], rendered in the room's format (see
+    /// [`Self::prepare_join`]): the joined slot keeps itself alive until left.
+    pub async fn join(&self, mut params: JoinSessionParams) -> Result<String, JoinError> {
+        self.prepare_join(&mut params);
+        self.room.lock().await.join(params).await
+    }
+
+    pub async fn leave(&self, slot_id: &str, params: LeaveSessionParams) -> Result<(), LeaveError> {
+        self.room.lock().await.leave(slot_id, params).await
+    }
+
+    /// The slot's joined memberships as they change, without joining it.
+    pub async fn observe(&self, slot_id: &str) -> watch::Receiver<Vec<JoinedMembership>> {
+        self.room.lock().await.observe_slot(slot_id)
+    }
+}

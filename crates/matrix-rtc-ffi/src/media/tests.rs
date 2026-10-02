@@ -41,7 +41,9 @@ fn config() -> MediaSessionConfig {
 fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
     let client = RtcClient::new(mock.clone());
     runtime().block_on(async {
-        let open = client.room("!room:example.org".to_owned(), FfiRoomOptions::default());
+        let open = client
+            .clone()
+            .room("!room:example.org".to_owned(), FfiRoomOptions::default());
         tokio::pin!(open);
         let seed = async {
             while mock.subjects("!room:example.org").is_none() {
@@ -71,6 +73,7 @@ fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
         let (room, ()) = tokio::join!(open, seed);
         let room = room.unwrap();
         let call = room
+            .clone()
             .join_call(FfiJoinSessionParams {
                 slot_id: "m.call#ROOM".to_owned(),
                 application: "m.call".to_owned(),

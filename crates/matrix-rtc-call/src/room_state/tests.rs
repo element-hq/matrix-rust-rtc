@@ -74,18 +74,20 @@ fn member_event(
 }
 
 fn join_params() -> JoinSessionParams {
-    JoinSessionParams::new(
-        ALICE.to_owned(),
-        "ALICEDEV".to_owned(),
-        SLOT.to_owned(),
-        "m.call",
-        RtcTransport::LiveKit(LiveKitTransport {
-            livekit_service_url: "https://sfu.example.org".to_owned(),
-        }),
-    )
+    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(LiveKitTransport {
+        livekit_service_url: "https://sfu.example.org".to_owned(),
+    }))
 }
 
 type Call = CallRoomState<MockBackend>;
+
+/// The account these tests join as: the backend's, as every join's is.
+fn alice_backend() -> Arc<MockBackend> {
+    let mut backend = MockBackend::new();
+    backend.user_id = ALICE.to_owned();
+    backend.device_id = "ALICEDEV".to_owned();
+    Arc::new(backend)
+}
 
 async fn set_roster(call: &mut Call, events: Vec<RawStickyEvent>) {
     call.rtc_mut()
@@ -97,7 +99,7 @@ async fn set_roster(call: &mut Call, events: Vec<RawStickyEvent>) {
 /// Alice joined (her membership event is `$sticky-1`), Bob in the roster with
 /// membership event `$bob-member-1`.
 async fn joined_call(mut params: CallJoinParams) -> (Call, Arc<MockBackend>, String) {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = CallRoomState::with_backend(ROOM, sender.clone());
     let own_member_id = params.rtc.membership_id();
     params.rtc.membership_id = Some(own_member_id.clone());
@@ -456,7 +458,7 @@ async fn hands_are_ordered_by_when_they_were_raised() {
 
 #[tokio::test]
 async fn the_hand_follows_our_membership_event_across_a_refresh() {
-    // A zero lifetime makes every heartbeat refresh the sticky membership.
+    // A zero lifetime makes every keep-alive tick refresh the sticky membership.
     let params = JoinSessionParams {
         sticky_duration_ms: Some(0),
         ..join_params()
@@ -470,12 +472,13 @@ async fn the_hand_follows_our_membership_event_across_a_refresh() {
         "$sticky-1"
     );
 
-    assert!(call.heartbeat(SLOT).await);
+    assert!(call.rtc_mut().keep_alive(SLOT).await);
+    assert!(call.reannotate_hand_if_moved(SLOT).await);
 
     assert_eq!(
         call.rtc().own_membership_event_id(SLOT).as_deref(),
         Some("$sticky-2"),
-        "the heartbeat refreshed the membership"
+        "the keep-alive refreshed the membership"
     );
     let sent = sender.room_events.lock().unwrap().clone();
     assert_eq!(sent.len(), 2);
@@ -556,7 +559,7 @@ async fn disabled_reactions_neither_send_nor_receive() {
 /// to both sessions and only the one holding the member keeps it.
 #[tokio::test]
 async fn a_rooms_reactions_reach_the_session_holding_the_member() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = CallRoomState::with_backend(ROOM, sender);
     let other_slot = "m.call#OTHER";
 
@@ -688,7 +691,7 @@ fn notifications_sent(sender: &MockBackend) -> Vec<(Value, u64)> {
 /// join's sticky send reported has to come back out as the relation target.
 #[tokio::test]
 async fn starting_a_call_notifies_the_room() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
 
     let mut notify = NotifyConfig::ring();
@@ -744,7 +747,7 @@ async fn starting_a_call_notifies_the_room() {
 /// hits "call" and nobody's phone rings.
 #[tokio::test]
 async fn our_own_membership_does_not_count_as_somebody_else() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
 
     // The echo of our own membership, under the very id we are about to join
@@ -773,7 +776,7 @@ async fn our_own_membership_does_not_count_as_somebody_else() {
 /// subsequent call in the process until the app restarts.
 #[tokio::test]
 async fn a_stale_participation_of_ours_does_not_count_either() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = CallRoomState::with_backend(ROOM, sender.clone());
     call.rtc_mut()
         .on_slots_received(vec![open_slot(false)])
@@ -800,7 +803,7 @@ async fn a_stale_participation_of_ours_does_not_count_either() {
 /// ordinary peer, and one already in the call started it.
 #[tokio::test]
 async fn another_device_of_ours_already_in_the_call_counts() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
 
     set_roster(
@@ -825,7 +828,7 @@ async fn another_device_of_ours_already_in_the_call_counts() {
 /// even if the host asked for a notification.
 #[tokio::test]
 async fn joining_an_occupied_session_notifies_nobody() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
 
     set_roster(
@@ -843,7 +846,7 @@ async fn joining_an_occupied_session_notifies_nobody() {
 
 #[tokio::test]
 async fn joining_quietly_notifies_nobody() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
 
     join_and_notify(&mut call, "alice-a", None).await;
@@ -853,7 +856,7 @@ async fn joining_quietly_notifies_nobody() {
 
 #[tokio::test]
 async fn a_call_layer_over_an_existing_manager_sees_its_rosters() {
-    let sender = Arc::new(MockBackend::new());
+    let sender = alice_backend();
     let mut rtc = matrix_rtc_core::BaseRtcRoom::with_backend(ROOM, sender);
     rtc.set_current_sticky_state(vec![member_event(
         BOB,

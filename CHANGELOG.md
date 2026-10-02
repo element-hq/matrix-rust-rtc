@@ -10,6 +10,8 @@ log only.
 
 ### Breaking
 
+- The library keeps a joined session alive and performs its key rotations at their deadline itself; `heartbeat()`, `flushDueKeyRotation()`/`flush_due_key_rotation`, `keyRotationDueAtMs()`/`key_rotation_due_at_ms` and `HEARTBEAT_INTERVAL_MS` are gone, and `LiveKitCallOptions::heartbeat_interval` becomes `keep_alive_interval_ms` (default 10 s).
+- `RtcClient::room` spawns the room's feeds on `matrix_rtc_core::executor` and returns the room alone (`RoomRuns` is gone); natively it must be called within a tokio runtime, and `LiveKitCall::join` no longer needs a `LocalSet`.
 - The session managers are replaced by client → room → session (`RtcClient` → `RtcRoom` → `RtcSession`/`RtcCall`, likewise on the FFI and wasm), and the core's manager by the per-room `BaseRtcRoom`.
 - `matrix_rtc_livekit::Call`, `CallOptions` and `CallError` are renamed `LiveKitCall`, `LiveKitCallOptions` and `LiveKitCallError`, so they no longer read as the call crate's `RtcCall`.
 - `compat`, `feeder` and `transports` move from `matrix-rtc-bridge` to `matrix-rtc-call`, and what remains is renamed `matrix-rtc-matrix-sdk`, with no `matrix-sdk` feature; its `SdkBackend` becomes `SdkMatrixBackend`.
@@ -23,10 +25,16 @@ log only.
 - `JoinSessionParams.application` and `JoinedMembership.application` are the whole MSC4143 `ApplicationInfo`, and the wasm roster serializes it as an object.
 - `BaseRtcRoom::join` returns the event id of the membership it sent, and `RtcSession::membership_event_id` reads the current one.
 - The feeder feeds any `ApplicationIntake`, subscribing to the event types it names.
+- The feeder moves from `matrix_rtc_call::feeder` to `matrix_rtc_core::feeder`, reading a room through an `IngestDialect`.
+- `JoinSessionParams` no longer takes the user and device, which are the backend's: `JoinSessionParams::application("org.example.board").slot("planning")` composes the slot id (`{application}#ROOM` without `.slot`), and every other field is a named setter (`.transport(..)`, required, `.member_id(..)`, `.keep_alive_interval_ms(..)`, …); `JoinSessionParams::new` and `with_transport_intent` are gone. The call layer's options read the same way: `CallJoinOptions::new()` joins `m.call#ROOM` and `.slot("standup")` names another, `JoinOptions::application(..).slot(..)` for any application; `JoinOptions::new` and `CallJoinOptions::new(slot_id)` are gone.
+- The pre-2026 membership formats move from `matrix_rtc_call::compat` to `matrix_rtc_core::compat`, and `ElementCallCompat { Off, StickyEvents, StateEvents }` becomes `MembershipFormat { Current, Sticky2025, RoomState }` on every host (`FfiMembershipFormat`, the wasm `format: "current" | "sticky_2025" | "room_state"` room option, `LiveKitCallOptions::format`, `RoomOptions::format`, the load test's `--format`).
 - `WasmRtcSession`, the bare single-session wasm API, is removed; `WasmRtcClient` over a `MatrixBackendHost` is the one entry point, and `joinCall` rings like every other host.
 
 ### Added
 
+- `BaseRtcClient` opens a core room that subscribes through the backend and feeds itself, so a host of the core alone feeds and ticks nothing.
+- A core room opens in a `MembershipFormat` (`BaseRtcClient::room(room_id, RoomOptions)`) and renders its joins in it, so a host of the core alone can join in the 2025 sticky or the pre-sticky room-state format.
+- `BaseRtcRoom::join` starts the slot's upkeep (keep-alive, sticky refresh, key rotations at their deadline) until the leave, so a host on the core alone ticks nothing either; `upkeep_abort_handle` stops it for an owner that drops the join without leaving.
 - `BaseRtcRoom::add_membership_listener`: synchronous notice of every change to a slot's joined memberships, for applications built on the core.
 - `ApplicationIntake` and `RelationsRequest`, how a host feeds an application beyond membership.
 - `BaseRtcRoom::backend()`, and a core `testing` feature exposing `MockBackend`, whose sinks a test delivers sets into.

@@ -2703,7 +2703,9 @@ dependencies = [
  "async-trait",
  "base64 0.21.7",
  "futures",
+ "futures-util",
  "getrandom 0.2.17",
+ "gloo-timers 0.3.0",
  "log",
  "rand 0.8.8",
  "rand_core 0.6.4",
@@ -2711,6 +2713,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "wasm-bindgen-futures",
  "web-time",
 ]
 
@@ -2768,7 +2771,6 @@ name = "matrix-rtc-livekit-proto"
 version = "0.4.0-rc.1"
 dependencies = [
  "base64 0.22.1",
- "matrix-rtc-call",
  "matrix-rtc-core",
  "serde",
  "serde_json",
@@ -2797,13 +2799,11 @@ dependencies = [
  "async-trait",
  "futures-core",
  "futures-util",
- "gloo-timers 0.3.0",
  "log",
  "matrix-rtc-call",
  "matrix-rtc-core",
  "thiserror 2.0.21",
  "tokio",
- "wasm-bindgen-futures",
 ]
 
 [[package]]

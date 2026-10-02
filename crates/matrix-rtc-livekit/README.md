@@ -52,8 +52,8 @@ async fn record_a_call() -> Result<(), Box<dyn std::error::Error>> {
 
 Two things the snippet glosses over:
 
-- **Runtime.** The core's backend futures are `?Send`, so `LiveKitCall::join` must run
-  inside a `tokio::task::LocalSet`:
+- **Runtime.** `LiveKitCall::join` spawns the call's background work onto the current
+  tokio runtime, so it must run inside one:
 
   ```rust,no_run
   fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,7 +62,7 @@ Two things the snippet glosses over:
       rustls::crypto::aws_lc_rs::default_provider().install_default().unwrap();
 
       let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-      runtime.block_on(tokio::task::LocalSet::new().run_until(record_a_call()))
+      runtime.block_on(record_a_call())
   }
   ```
 
@@ -169,8 +169,8 @@ Notes:
   clear them, because its delayed leave is a plain event that never replaces
   the sticky entry. An hour of ghost participants makes the next attempt
   useless. The cost is one extra membership send per device every half of it,
-  and it must stay well above twice the 15 s heartbeat or memberships lapse
-  between beats.
+  and it must stay well above twice the 10 s keep-alive or memberships lapse
+  between ticks.
 - **Scale is bounded by your machine, not the SFU** — see
   [How many devices?](#how-many-devices) below.
 - Devices join publish-only by default (`LiveKitCallOptions::auto_subscribe = false`).
@@ -189,7 +189,7 @@ Notes:
   `(user, device, member_id)`, and the core distributes media keys to other
   devices of our own user like any other peer.
 - **Sharing the call with Element Call** (the JS SDK, which still speaks a
-  pre-2026 MatrixRTC format) needs `--element-call-compat sticky` /
+  pre-2026 MatrixRTC format) needs `--format sticky` /
   `LEGACY_ELEMENT_CALL=sticky`, plus `--open-slot`: that client publishes no
   `m.rtc.slot`, and a slot nobody opened reads as closed, which projects every
   member out of the call. Media keys then go out under the legacy to-device type
@@ -197,7 +197,7 @@ Notes:
   with spec-current peers, never both. Reading that format needs no flag.
   For a build older still — membership as `org.matrix.msc3401.call.member` room
   state — use `state` instead of `sticky`, and leave `--open-slot` off: that
-  generation has no slot concept. See [`compat`](src/compat/).
+  generation has no slot concept. See `matrix_rtc_core::compat`.
 
 Homeservers with rate limiting may reject a burst of logins or messages;
 `--login-delay-ms` and `--ramp-ms` space them out. **Past 3 devices this is not
@@ -272,7 +272,7 @@ hit deliberately:
 | --- | --- |
 | **`call`** *(feature `matrix-sdk`)* | The high-level facade: `LiveKitCall::join`/`LiveKitCall::leave`, `open_slot`. The transport comes from the homeserver's `GET /rtc/transports` unless `LiveKitCallOptions::livekit_transport` pins one. Start here. |
 | **`matrix-rtc-matrix-sdk`** *(separate crate)* | `SdkMatrixBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`). No LiveKit in it. Re-exported here (`SdkMatrixBackend`) so a host keeps one dependency. |
-| **`matrix-rtc-call`** *(separate crate)* | The feeder that subscribes through the backend and feeds the core, and `compat`, which translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`). |
+| **`matrix-rtc-call`** *(separate crate)* | The host-facing `RtcClient`, which opens rooms through the core's feeder. `compat` is the core's (`matrix_rtc_core::compat`), which translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`). |
 | **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the core's `MatrixBackend::openid_token`, so this layer is not hard-wired to a particular Matrix SDK. |
 | **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) picks the one a given compat generation's authorisation service issues. |
 | **`session`** | Connects to the SFU and exposes the LiveKit room + event stream. |

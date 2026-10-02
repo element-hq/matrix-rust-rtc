@@ -37,7 +37,7 @@ import { expectPeerVideoPattern } from "../helpers/video";
 interface Scenario {
   /** Element Call's Developer-tab dialect. */
   ec: RtcMode;
-  /** The matching `ElementCallCompat` for the Rust peer. */
+  /** The matching `MembershipFormat` for the Rust peer. */
   rust: "state" | "sticky";
   title: string;
 }
@@ -49,7 +49,7 @@ const SCENARIOS: Scenario[] = [
   { ec: "compat", rust: "state", title: "ec-2024 state events" },
   // Element Call labels this "Matrix 2.0", but it is its *2025* sticky
   // generation — MSC4354 membership carrying the pre-2026 field names. The
-  // actually-spec-current format is our `ElementCallCompat::Off`, which Element
+  // actually-spec-current format is our `MembershipFormat::Current`, which Element
   // Call does not speak at all. Naming the test after the UI string would
   // propagate that confusion; the string itself lives in `RTC_MODE_LABEL`.
   { ec: "2_0", rust: "sticky", title: "ec-2025 sticky events" },

@@ -28,10 +28,9 @@
 
 use std::sync::Arc;
 
-use matrix_rtc_call::compat::{DialectBackend, ElementCallCompat};
-use matrix_rtc_call::{
-    CallJoinOptions, JoinOptions, Mentions, NotificationType, NotifyConfig, RoomOptions,
-};
+use matrix_rtc_call::{CallJoinOptions, JoinOptions, Mentions, NotificationType, NotifyConfig};
+use matrix_rtc_core::RoomOptions;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::{
     EncryptionConfig, LeaveSessionParams, MatrixBackend, RtcTransport, SlotEncryption,
     TransportIntent,
@@ -84,7 +83,7 @@ impl WasmRtcClient {
     /// returned room ends its subscriptions without leaving; `close` leaves
     /// first.
     ///
-    /// `options` is `{ element_call_compat?: "off" | "sticky_events" | "state_events" }`.
+    /// `options` is `{ format?: "current" | "sticky_2025" | "room_state" }`.
     pub async fn room(
         &self,
         room_id: String,
@@ -95,26 +94,14 @@ impl WasmRtcClient {
         let compat = compat::parse_compat(
             options
                 .as_ref()
-                .and_then(|options| options.element_call_compat.as_deref()),
+                .and_then(|options| options.format.as_deref()),
         )?;
         log::info!("client: [{room_id}] opening in {compat:?} mode");
-        let (room, runs) = self
+        let room = self
             .client
-            .room(
-                room_id.clone(),
-                RoomOptions {
-                    element_call_compat: compat,
-                },
-            )
+            .room(room_id.clone(), RoomOptions { format: compat })
             .await
             .map_err(js_error)?;
-        // Both feeds end on their own — the room's when the room goes, the
-        // to-device one when the last room does.
-        let (feed, to_device) = runs.into_futures();
-        wasm_bindgen_futures::spawn_local(feed);
-        if let Some(to_device) = to_device {
-            wasm_bindgen_futures::spawn_local(to_device);
-        }
         room.seeded().await;
         log::info!("client: [{room_id}] open and seeded");
         Ok(WasmRtcRoom {
@@ -172,9 +159,9 @@ impl WasmRtcRoom {
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
     ///
-    /// Refreshing the keep-alive is the page's job: call
-    /// [`WasmRtcCall::heartbeat`] on an interval while joined. The SDK
-    /// generates the `member.id` (MSC4143 requires a fresh one per join).
+    /// The call keeps itself alive, and performs its key rotations when they
+    /// fall due, until it leaves or is freed. The SDK generates the
+    /// `member.id` (MSC4143 requires a fresh one per join).
     /// Rejects when the slot is already joined, or the room's state holds no
     /// open slot of this id.
     #[wasm_bindgen(js_name = joinCall)]
@@ -206,7 +193,7 @@ impl WasmRtcRoom {
             call.member_id()
         );
         Ok(WasmRtcCall {
-            compat: room.element_call_compat(),
+            compat: room.format(),
             backend: room.backend().clone(),
             call,
         })
@@ -287,7 +274,7 @@ pub struct WasmRtcCall {
     call: Call,
     /// The mode the room was opened in, for the media layer's identity and
     /// token endpoint.
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
     backend: Arc<DialectBackend<JsBackend>>,
 }
 
@@ -296,7 +283,7 @@ impl WasmRtcCall {
         &self.call
     }
 
-    pub(crate) fn element_call_compat(&self) -> ElementCallCompat {
+    pub(crate) fn format(&self) -> MembershipFormat {
         self.compat
     }
 
@@ -342,35 +329,6 @@ impl WasmRtcCall {
     #[wasm_bindgen(js_name = memberCount)]
     pub async fn member_count(&self) -> u32 {
         self.call.member_count().await as u32
-    }
-
-    /// Restarts the keep-alive: reschedules the delayed leave, and re-sends
-    /// the membership if its sticky entry is halfway to expiring. Also
-    /// flushes a key rotation that has come due.
-    ///
-    /// The core arms no timers and this binding starts no driver — **the page
-    /// must call this on an interval while joined** (`setInterval`,
-    /// [`HEARTBEAT_INTERVAL_MS`]), or the dead man's switch fires and peers see
-    /// us depart mid-call. Resolves to `false` once there is nothing left to
-    /// keep alive.
-    pub async fn heartbeat(&self) -> bool {
-        self.call.heartbeat().await
-    }
-
-    /// When the next key rotation falls due, in epoch milliseconds, or
-    /// `undefined` when none is owed. Diagnostics: the rotation itself is
-    /// performed by [`Self::heartbeat`] and by the media layer's
-    /// switch-complete signal, not by polling this.
-    #[wasm_bindgen(js_name = keyRotationDueAtMs)]
-    pub async fn key_rotation_due_at_ms(&self) -> Option<f64> {
-        self.call.key_rotation_due_at_ms().await.map(|at| at as f64)
-    }
-
-    /// Performs the key rotation if one has come due; a no-op otherwise.
-    /// Resolves to whether a rotation ran.
-    #[wasm_bindgen(js_name = flushDueKeyRotation)]
-    pub async fn flush_due_key_rotation(&self) -> bool {
-        self.call.flush_due_key_rotation().await
     }
 
     // ---- Reactions and raised hands ----
@@ -443,19 +401,12 @@ impl WasmRtcCall {
 /// How a room is opened.
 #[derive(Debug, Default, Deserialize)]
 pub struct WasmRoomOptions {
-    /// `"off"` (the default), `"sticky_events"` or `"state_events"`. One
+    /// `"current"` (the default), `"sticky_2025"` or `"room_state"`. One
     /// decision for the room: what the library subscribes to, how it renders
     /// our sends, the `member.id` we join with, how an inbound media key is
     /// bound, the SFU identity and the token endpoint.
     #[serde(default)]
-    pub element_call_compat: Option<String>,
-}
-
-/// How often a page should call [`WasmRtcCall::heartbeat`] while
-/// joined. Matches the FFI's keep-alive driver interval.
-#[wasm_bindgen(js_name = HEARTBEAT_INTERVAL_MS)]
-pub fn heartbeat_interval_ms() -> u32 {
-    10_000
+    pub format: Option<String>,
 }
 
 /// Element Call's reaction catalogue, as `ReactionKind[]` in the order its
@@ -650,7 +601,12 @@ impl WasmJoinSessionParams {
     /// join.
     fn into_call(self) -> Result<CallJoinOptions, JsError> {
         let transport = self.transport_intent()?;
-        let mut join = JoinOptions::new(self.slot_id, self.application);
+        // The binding names the whole slot id; the room checks it belongs to
+        // the application.
+        let mut join = JoinOptions {
+            slot_id: self.slot_id,
+            ..JoinOptions::application(self.application)
+        };
         join.transport = transport;
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
@@ -780,7 +736,8 @@ mod tests {
         set(
             "restartDelayedEvent",
             "roomId,delayId",
-            "return Promise.resolve();",
+            "globalThis.__restarts = (globalThis.__restarts || 0) + 1; \
+             return Promise.resolve();",
         );
         set(
             "cancelDelayedEvent",
@@ -841,7 +798,7 @@ mod tests {
         // A plain object, as a page passes: the default serializer turns a
         // `json!` map into an ES `Map`, which reads back as no options at all.
         let options = match compat {
-            Some(compat) => serde_json::json!({ "element_call_compat": compat })
+            Some(compat) => serde_json::json!({ "format": compat })
                 .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
                 .unwrap(),
             None => JsValue::UNDEFINED,
@@ -877,7 +834,39 @@ mod tests {
             .expect("join should succeed");
         assert!(!call.member_id().is_empty());
         assert!(call.is_live());
-        assert!(call.heartbeat().await);
+    }
+
+    fn restarts() -> f64 {
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("__restarts"))
+            .ok()
+            .and_then(|count| count.as_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// The page ticks nothing: the call restarts its own delayed leave. A
+    /// 400 ms timeout caps the interval at 200 ms.
+    #[wasm_bindgen_test]
+    async fn a_joined_call_keeps_itself_alive() {
+        #[derive(Serialize)]
+        struct TestJoinParams {
+            slot_id: &'static str,
+            application: &'static str,
+            keep_alive_timeout_ms: u64,
+        }
+        let client = WasmRtcClient::new(mock_host(""));
+        let room = open(&client, None).await;
+        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
+            slot_id: SLOT,
+            application: "m.call",
+            keep_alive_timeout_ms: 400,
+        })
+        .unwrap();
+        let call = room.join_call(params).await.expect("join");
+        let before = restarts();
+
+        matrix_rtc_core::executor::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(restarts() - before >= 2.0, "restarted on its own");
+        call.leave(JsValue::UNDEFINED).await.expect("leave");
     }
 
     #[wasm_bindgen_test]
@@ -893,7 +882,7 @@ mod tests {
     }
 
     /// The sticky dialect's outbound rewrite, through the real send path: a
-    /// join in a `sticky_events` room must put the EC-2025 mirror fields on
+    /// join in a `sticky_2025` room must put the EC-2025 mirror fields on
     /// the wire, or that generation cannot see us.
     #[wasm_bindgen_test]
     async fn a_sticky_compat_join_mirrors_the_legacy_fields() {
@@ -917,7 +906,7 @@ mod tests {
                  || content.member.device_id === undefined) \
                  return Promise.reject(new Error('legacy mirror fields missing: ' + JSON.stringify(content)));",
         ));
-        let room = open(&client, Some("sticky_events")).await;
+        let room = open(&client, Some("sticky_2025")).await;
         let params = serde_wasm_bindgen::to_value(&TestJoinParams {
             slot_id: SLOT,
             application: "m.call",
@@ -940,6 +929,5 @@ mod tests {
         let call = room.join_call(join_params()).await.expect("join");
         call.leave(JsValue::UNDEFINED).await.expect("leave");
         assert!(!call.is_live());
-        assert!(!call.heartbeat().await);
     }
 }

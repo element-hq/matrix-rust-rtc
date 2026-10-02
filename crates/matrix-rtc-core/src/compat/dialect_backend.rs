@@ -11,11 +11,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use async_trait::async_trait;
-use matrix_rtc_core::{
+use crate::{
     BackendError, CommandError, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
     Subscription, ToDeviceDelivery, ToDeviceRecipient, ToDeviceSink, wire_event_type,
 };
+use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{MemberEventRoute, OutboundDialect};
@@ -294,12 +294,12 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
 
 #[cfg(test)]
 mod tests {
-    use matrix_rtc_core::testing::MockBackend;
-    use matrix_rtc_core::{KEY_MESSAGE_TYPE, ToDeviceRecipient};
+    use crate::testing::MockBackend;
+    use crate::{KEY_MESSAGE_TYPE, ToDeviceRecipient};
     use serde_json::json;
 
     use super::*;
-    use crate::compat::ElementCallCompat;
+    use crate::compat::MembershipFormat;
     use crate::compat::ingest::outbound_dialect;
 
     fn backend() -> (Arc<MockBackend>, DialectBackend<MockBackend>) {
@@ -307,7 +307,7 @@ mod tests {
         (mock.clone(), DialectBackend::new(mock))
     }
 
-    fn dialect(compat: ElementCallCompat, room_id: &str) -> OutboundDialect {
+    fn dialect(compat: MembershipFormat, room_id: &str) -> OutboundDialect {
         outbound_dialect(
             compat,
             "@alice:example.org",
@@ -332,7 +332,7 @@ mod tests {
         backend
             .send_state_event(
                 "!room:example.org".to_owned(),
-                matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+                crate::SLOT_EVENT_TYPE.to_owned(),
                 "m.call#ROOM".to_owned(),
                 json!({ "status": "open" }),
             )
@@ -370,7 +370,7 @@ mod tests {
         let (mock, backend) = backend();
         backend.set_dialect(
             "!legacy:example.org",
-            dialect(ElementCallCompat::StateEvents, "!legacy:example.org"),
+            dialect(MembershipFormat::RoomState, "!legacy:example.org"),
         );
         let notification = json!({
             "application": { "type": "m.call", "notification_type": "ring" },
@@ -406,7 +406,7 @@ mod tests {
         let (mock, backend) = backend();
         backend.set_dialect(
             "!legacy:example.org",
-            dialect(ElementCallCompat::StickyEvents, "!legacy:example.org"),
+            dialect(MembershipFormat::Sticky2025, "!legacy:example.org"),
         );
         let key = |room_id: &str| {
             json!({
@@ -451,7 +451,7 @@ mod tests {
         let (mock, backend) = backend();
         backend.set_dialect(
             "!legacy:example.org",
-            dialect(ElementCallCompat::StateEvents, "!legacy:example.org"),
+            dialect(MembershipFormat::RoomState, "!legacy:example.org"),
         );
         backend
             .send_delayed_event(

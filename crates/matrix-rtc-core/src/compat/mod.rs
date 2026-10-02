@@ -3,40 +3,42 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! Interoperability with MatrixRTC implementations that predate the 2026
-//! MSC4143 rewrite.
+//! The MatrixRTC membership formats that predate the 2026 MSC4143 rewrite,
+//! which matrix-js-sdk — and so Element Call — still speaks. They carry any
+//! application; nothing here is about calls beyond the fields those formats
+//! put on every membership.
 //!
 //! # This module is scaffolding, and is meant to be deleted
 //!
 //! Everything here exists for one reason: the only other MatrixRTC
 //! implementation available to test against — Element Call on the JS SDK — still
 //! speaks a pre-2026 wire format. Once it catches up, delete this directory, the
-//! call sites listed below, and `matrix_rtc_livekit::LiveKitCallOptions::element_call_compat`.
-//! Nothing else should ever grow a dependency on it.
+//! call sites listed below, and every host's [`MembershipFormat`] option.
 //!
 //! # Two generations, not one
 //!
 //! There are two, and they disagree about more than field names:
 //!
-//! - [`element_call`] — Element Call as of 2025. Already MSC4354 sticky-based;
-//!   only the fields inside the member content differ.
-//! - [`element_call_state`] — Element Call before MSC4354, when membership was
+//! - [`sticky_2025`] — the 2025 format. Already MSC4354 sticky-based; only the
+//!   fields inside the member content differ.
+//! - [`room_state`] — the format before MSC4354, when membership was
 //!   `org.matrix.msc3401.call.member` **room state**. A different carrier, a
 //!   different SFU participant identity, and a different token endpoint.
 //!
-//! [`ElementCallCompat`] selects between them and current MSC4143. It is an enum
+//! [`MembershipFormat`] selects between them and current MSC4143. It is an enum
 //! rather than a pair of flags because the generations are mutually exclusive by
 //! construction: a membership is a sticky event or a state event, never both.
 //!
 //! # Why it is shaped this way
 //!
-//! The rest of the stack speaks current MSC4143 and nothing else — no dialect
-//! parameter reaches `matrix-rtc-core`, no legacy field appears in a domain
-//! type. Compatibility is confined to JSON funnels at the very edge:
+//! `BaseRtcRoom` and the rest of the core speak current MSC4143 and nothing
+//! else — no legacy field appears in a domain type. The format is confined to
+//! this module and the feeder's [`IngestDialect`](crate::feeder::IngestDialect)
+//! seam, as JSON funnels at the very edge:
 //!
 //! - **Inbound for the sticky dialect**
-//!   ([`element_call::normalize_member_content`],
-//!   [`element_call::parse_key_message`]) is *permissive and always on*. Every
+//!   ([`sticky_2025::normalize_member_content`],
+//!   [`sticky_2025::parse_key_message`]) is *permissive and always on*. Every
 //!   rule is of the form "the modern field is absent and the legacy one is
 //!   present", so a spec-shaped event passes through byte-identical and no flag
 //!   is needed to protect it. Being always on is deliberate: a legacy path that
@@ -44,7 +46,7 @@
 //! - **Everything about the state dialect** is *opt-in*, in both directions.
 //!   Reading it is not normalisation — it is a second membership source, in a
 //!   different part of the room, with a lifetime the content states rather than
-//!   the homeserver enforcing. See [`element_call_state`] for why that cannot be
+//!   the homeserver enforcing. See [`room_state`] for why that cannot be
 //!   always-on the way its sibling is.
 //! - **Outbound** ([`OutboundDialect`]) is opt-in for both, because it is the
 //!   half that changes what other clients see.
@@ -55,26 +57,30 @@
 //! the boundary stays deliberate rather than eroding: the choice of ruma request
 //! type (a membership is `PUT .../state/...` rather than a sticky send), the
 //! choice of token endpoint, and the participant-identity derivation. Each is one
-//! `match` on [`ElementCallCompat`] or [`OutboundDialect`] at the call site.
+//! `match` on [`MembershipFormat`] or [`OutboundDialect`] at the call site.
 //! [`MemberEventRoute`] exists precisely to keep the *decision* here while the
 //! *performing* stays in the `sdk` module.
 //!
 //! The identity derivation is the one that also refuses to be *Matrix*: it
 //! hashes per MSC4195, which is a LiveKit document. So it lives wholly in the
 //! transport crate — `matrix_rtc_livekit::identity_mapper` matches on
-//! [`ElementCallCompat`] there rather than this module reaching for a hash it has
+//! [`MembershipFormat`] there rather than this module reaching for a hash it has
 //! no business knowing.
 //!
 //! # Call sites
 //!
 //! In this crate:
 //!
-//! 1. `feeder` — the inbound half for every host: normalises `m.rtc.member`
-//!    content (`ingest`), reads state-carried membership in `StateEvents`, and
-//!    parses legacy to-device keys, all from the mode the room was attached in.
+//! 1. `ingest` — the inbound half for every host: the `IngestDialect` the
+//!    feeder reads a room through, which normalises `m.rtc.member` content,
+//!    reads state-carried membership in `RoomState`, and parses legacy
+//!    to-device keys, all in the format the room was opened in.
 //! 2. `dialect_backend::DialectBackend` — the outbound half for every host:
 //!    routes and rewrites the sends of the one `MatrixBackend` wrapper the
 //!    bindings and the `LiveKitCall` facade all use.
+//!
+//! In `matrix-rtc-call`: `RtcRoom`'s join — the `member.id` and the outbound
+//! dialect for the room's format.
 //!
 //! In `matrix-rtc-livekit`:
 //!
@@ -91,54 +97,54 @@
 use serde_json::Value;
 
 pub mod dialect_backend;
-pub mod element_call;
-pub mod element_call_state;
+#[cfg(test)]
+mod feeder_tests;
 pub mod ingest;
+pub mod room_state;
+pub mod sticky_2025;
 
 pub use dialect_backend::DialectBackend;
-pub use element_call::{
-    ElementCallDialect, LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent,
+pub use room_state::{
+    RoomStateDialect, STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
 };
-pub use element_call_state::{
-    ElementCallStateDialect, STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
-};
+pub use sticky_2025::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent, Sticky2025Dialect};
 
-/// Which MatrixRTC generation a call renders itself for, and reads.
+/// Which MatrixRTC membership format a room is read and written in.
 ///
 /// Mutually exclusive by construction, because the two legacy generations
 /// disagree about the *carrier* of a membership, not just its fields. Reading the
 /// 2025 sticky dialect needs no flag and is always on regardless of this setting;
 /// see the module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ElementCallCompat {
+pub enum MembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
     /// interoperates with spec-current peers.
     #[default]
-    Off,
-    /// Element Call as of 2025: MSC4354 sticky events carrying the pre-2026 field
-    /// names alongside the spec ones.
+    Current,
+    /// The 2025 format: MSC4354 sticky events carrying the pre-2026 field names
+    /// alongside the spec ones.
     ///
     /// Joins stay MSC4143-valid — the legacy fields ride alongside — so one event
     /// serves both dialects. Leaves and media keys cannot be additive: a leave
     /// becomes the legacy bare-sticky-key content, and keys go out as
     /// `io.element.call.encryption_keys` *instead of* the spec type, since a
     /// to-device message has only one type.
-    StickyEvents,
-    /// Element Call before MSC4354: membership as
+    Sticky2025,
+    /// The format before MSC4354: membership as
     /// `org.matrix.msc3401.call.member` **room state**, plain
     /// `{user}:{device}` SFU identities, and the pre-MSC4195 `/sfu/get` token
     /// endpoint.
     ///
-    /// Nothing about this mode is additive — a call joined this way is visible to
-    /// that generation of Element Call and to nobody else. It exists for interop
+    /// Nothing about this format is additive — a session joined this way is
+    /// visible to that generation of clients and to nobody else. It exists for interop
     /// testing.
-    StateEvents,
+    RoomState,
 }
 
-impl ElementCallCompat {
+impl MembershipFormat {
     /// Whether membership is carried as room state in this mode.
     pub fn reads_state_membership(self) -> bool {
-        matches!(self, Self::StateEvents)
+        matches!(self, Self::RoomState)
     }
 }
 
@@ -149,8 +155,8 @@ impl ElementCallCompat {
 #[derive(Clone, Debug)]
 pub enum MemberEventRoute {
     /// An MSC4354 sticky timeline event — the only carrier the spec knows, and
-    /// the one both [`ElementCallCompat::Off`] and
-    /// [`ElementCallCompat::StickyEvents`] take.
+    /// the one both [`MembershipFormat::Current`] and
+    /// [`MembershipFormat::Sticky2025`] take.
     Sticky { event_type: String, content: Value },
     /// A room state event, which is how MatrixRTC membership worked before
     /// MSC4354. The core's sticky `duration_ms` is meaningless here: room state
@@ -162,7 +168,7 @@ pub enum MemberEventRoute {
     },
     /// An ordinary message-like room event, with no TTL. What a non-membership
     /// event (the MSC4075 notification) becomes for a generation whose wire
-    /// has no sticky map at all — [`ElementCallCompat::StateEvents`] — so that
+    /// has no sticky map at all — [`MembershipFormat::RoomState`] — so that
     /// a host with no MSC4354 support is never asked for a sticky send.
     Room { event_type: String, content: Value },
 }
@@ -174,9 +180,9 @@ pub enum OutboundDialect {
     /// Current MSC4143 + MSC4354, unmodified.
     None,
     /// Element Call as of 2025.
-    Sticky(ElementCallDialect),
+    Sticky(Sticky2025Dialect),
     /// Element Call before MSC4354.
-    State(ElementCallStateDialect),
+    State(RoomStateDialect),
 }
 
 impl OutboundDialect {
@@ -187,14 +193,14 @@ impl OutboundDialect {
     /// *carrier* still follows the generation: a sticky event for the two that
     /// have a sticky map, an ordinary room event for the pre-sticky one, which
     /// has none. That keeps a host that cannot send sticky events at all (no
-    /// MSC4354 in its SDK) able to run a [`ElementCallCompat::StateEvents`]
+    /// MSC4354 in its SDK) able to run a [`MembershipFormat::RoomState`]
     /// call end to end, notification included.
     ///
     /// `lifetime_ms` is how long the membership should stay valid from now. The
     /// sticky routes ignore it — the homeserver is told separately, as the
     /// sticky TTL — but the pre-sticky state route has nowhere else to put a
     /// deadline and writes it into `expires`
-    /// ([`ElementCallStateDialect::member_content`]). `None` means "no opinion",
+    /// ([`RoomStateDialect::member_content`]). `None` means "no opinion",
     /// which is what a delayed leave has.
     pub fn route_member_event(
         &self,
@@ -202,7 +208,7 @@ impl OutboundDialect {
         content: Value,
         lifetime_ms: Option<u64>,
     ) -> MemberEventRoute {
-        if !ElementCallDialect::is_member_event(&event_type) {
+        if !Sticky2025Dialect::is_member_event(&event_type) {
             return match self {
                 Self::State(_) => MemberEventRoute::Room {
                     event_type,
@@ -251,7 +257,7 @@ impl OutboundDialect {
         let flattened = match self {
             Self::None => None,
             Self::Sticky(_) | Self::State(_) => {
-                element_call::flatten_notification_content(event_type, &content)
+                sticky_2025::flatten_notification_content(event_type, &content)
             }
         };
         flattened.unwrap_or(content)
@@ -272,7 +278,7 @@ impl OutboundDialect {
         match self {
             Self::None => None,
             Self::Sticky(dialect) => dialect.rewrite_key_message(message_type, content),
-            Self::State(dialect) => element_call::rewrite_key_message(
+            Self::State(dialect) => sticky_2025::rewrite_key_message(
                 dialect.own_device_id(),
                 dialect.slot_id(),
                 message_type,
@@ -296,7 +302,7 @@ mod tests {
     }
 
     fn state_dialect() -> OutboundDialect {
-        OutboundDialect::State(ElementCallStateDialect::new(
+        OutboundDialect::State(RoomStateDialect::new(
             "@us:example.io",
             "DEVICE",
             "!room:example.io",
@@ -322,7 +328,7 @@ mod tests {
     fn a_notification_stays_sticky_in_the_other_dialects() {
         for dialect in [
             OutboundDialect::None,
-            OutboundDialect::Sticky(ElementCallDialect::new(
+            OutboundDialect::Sticky(Sticky2025Dialect::new(
                 "@us:example.io",
                 "DEVICE",
                 "m.call#ROOM",

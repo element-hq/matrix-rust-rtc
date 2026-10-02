@@ -7,36 +7,38 @@
 //! room the host opens, and an [`RtcSession`] — or, for a call slot, an
 //! [`RtcCall`] — per slot it joins.
 //!
-//! The client holds nothing about a room until one is asked for; the only state
-//! spanning rooms is the backend and the routing of to-device media keys to the
-//! room they name, through a registry of weak handles. Everything room-scoped
-//! is on the room, everything about our own participation on the session. The
-//! library spawns nothing: opening a room returns the futures that feed it, and
-//! the binding runs them where its background work already runs.
+//! Opening a room, its feeds and the to-device routing are the core's
+//! [`BaseRtcClient`], over this crate's room state and read in the room's
+//! [`MembershipFormat`]. Everything room-scoped is on the room, everything
+//! about our own participation on the session. The library runs its own
+//! background work on the core's [`executor`](matrix_rtc_core::executor): a
+//! room's feeds while the room object lives; the core's upkeep (keep-alive,
+//! key rotations) and, for a call, the raised hand following our membership
+//! event while the session does. Off wasm32 that is the current tokio runtime,
+//! so a native host opens rooms and joins from within one.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::time::Duration;
 
 use matrix_rtc_core::{
-    ApplicationInfo, BackendError, CommandError, EncryptionConfig, EncryptionKeySignalHandler,
-    JoinError, JoinSessionParams, JoinedMembership, LeaveError, LeaveSessionParams, MatrixBackend,
-    RtcIdentityMapper, SlotEncryption, SlotState, TransportIntent,
+    ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoomHandle, CommandError,
+    EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
+    LeaveError, LeaveSessionParams, MatrixBackend, OpenError, ROOM_SLOT_NAME, RtcIdentityMapper,
+    SlotEncryption, SlotState, TransportIntent,
+    executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
-use crate::compat::ingest::{member_id, outbound_dialect};
-use crate::compat::{DialectBackend, ElementCallCompat};
-use crate::feeder::{
-    RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomFeederRun, RoomRegistry, ToDeviceFeeder,
-    ToDeviceFeederRun,
-};
 use crate::notification::NotifyConfig;
 use crate::reactions::{RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction};
 use crate::room_state::{CallJoinParams, CallRoomState};
 use crate::transports;
+use matrix_rtc_core::RoomOptions;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
+use matrix_rtc_core::feeder::RoomAlreadyOpen;
 
 type Backend<B> = DialectBackend<B>;
 type State<B> = CallRoomState<Backend<B>>;
@@ -64,13 +66,13 @@ pub enum RtcError {
     SessionOver,
 }
 
-/// How a room is opened.
-#[derive(Clone, Debug, Default)]
-pub struct RoomOptions {
-    /// Which MatrixRTC generation the room is read and written for: what is
-    /// subscribed to, how our sends are rendered, the `member.id` we join
-    /// with, how a legacy media key is bound. See [`crate::compat`].
-    pub element_call_compat: ElementCallCompat,
+impl From<OpenError> for RtcError {
+    fn from(error: OpenError) -> Self {
+        match error {
+            OpenError::RoomAlreadyOpen(error) => Self::RoomAlreadyOpen(error),
+            OpenError::Backend(error) => Self::Backend(error),
+        }
+    }
 }
 
 /// A join into any application's slot.
@@ -84,22 +86,77 @@ pub struct JoinOptions {
     pub transport: Option<TransportIntent>,
     pub encryption_config: Option<EncryptionConfig>,
     pub keep_alive_timeout_ms: Option<u64>,
+    /// How often the session restarts its delayed leave; `None` is
+    /// [`DEFAULT_KEEP_ALIVE_INTERVAL_MS`](matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS).
+    /// Clamped to half the keep-alive timeout, so one late tick does not end
+    /// the membership.
+    pub keep_alive_interval_ms: Option<u64>,
     pub sticky_duration_ms: Option<u64>,
     pub degraded_lifetime_ms: Option<u64>,
 }
 
 impl JoinOptions {
-    pub fn new(slot_id: impl Into<String>, application: impl Into<ApplicationInfo>) -> Self {
+    /// Joins `application`'s room-wide slot, `{application}#ROOM`, with
+    /// everything else defaulted; each setter overrides one default.
+    pub fn application(application: impl Into<ApplicationInfo>) -> Self {
+        let application = application.into();
         Self {
-            slot_id: slot_id.into(),
-            application: application.into(),
+            slot_id: slot_id_of(&application, ROOM_SLOT_NAME),
+            application,
             transport: None,
             encryption_config: None,
             keep_alive_timeout_ms: None,
+            keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
         }
     }
+
+    /// Joins the application's slot named `name`: `{application}#{name}`.
+    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
+        self.slot_id = slot_id_of(&self.application, name.as_ref());
+        self
+    }
+
+    /// Publishes on (or only receives from) `transport` instead of the
+    /// homeserver's first advertised LiveKit transport.
+    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
+        self.transport = Some(transport.into());
+        self
+    }
+
+    pub fn encryption_config(mut self, config: EncryptionConfig) -> Self {
+        self.encryption_config = Some(config);
+        self
+    }
+
+    pub fn keep_alive_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.keep_alive_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    pub fn keep_alive_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.keep_alive_interval_ms = Some(interval_ms);
+        self
+    }
+
+    pub fn sticky_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.sticky_duration_ms = Some(duration_ms);
+        self
+    }
+
+    pub fn degraded_lifetime_ms(mut self, lifetime_ms: u64) -> Self {
+        self.degraded_lifetime_ms = Some(lifetime_ms);
+        self
+    }
+}
+
+/// `{application}#{name}`, MSC4143's slot id.
+fn slot_id_of(application: &ApplicationInfo, name: &str) -> String {
+    format!(
+        "{}#{name}",
+        application.application_type().unwrap_or_default()
+    )
 }
 
 /// A join into a call slot: the generic join plus what a call adds.
@@ -114,171 +171,102 @@ pub struct CallJoinOptions {
 }
 
 impl CallJoinOptions {
-    /// A quiet `m.call` join with default reactions.
-    pub fn new(slot_id: impl Into<String>) -> Self {
+    /// A quiet join of the room-wide call, `m.call#ROOM`, with default
+    /// reactions.
+    pub fn new() -> Self {
         Self {
-            join: JoinOptions::new(slot_id, "m.call"),
+            join: JoinOptions::application(CALL_APPLICATION),
             notify: None,
             reactions: None,
         }
     }
-}
 
-/// What every room of a client shares.
-struct ClientShared<B: MatrixBackend + 'static> {
-    backend: Arc<Backend<B>>,
-    registry: RoomRegistry<State<B>>,
-    /// Running while at least one room is open. Locked together with the
-    /// registry's changes, so a room opening and the last one closing cannot
-    /// interleave into an open room with no subscription.
-    to_device: StdMutex<Option<ToDeviceFeeder>>,
-    /// Serialises opening rooms, so two first rooms do not both subscribe.
-    opening: Mutex<()>,
-}
-
-impl<B: MatrixBackend + 'static> ClientShared<B> {
-    fn to_device(&self) -> MutexGuard<'_, Option<ToDeviceFeeder>> {
-        self.to_device
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// Joins the call slot named `name`: `m.call#{name}`.
+    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
+        self.join = self.join.slot(name);
+        self
     }
 
-    /// Forgets `room_id`, and stops the to-device subscription with the last
-    /// room.
-    fn release(&self, room_id: &str) {
-        let mut to_device = self.to_device();
-        if self.registry.unregister(room_id)
-            && let Some(feeder) = to_device.take()
-        {
-            log::info!("client: last room closed; to-device subscription stopped");
-            feeder.stop();
-        }
+    /// See [`JoinOptions::transport`].
+    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
+        self.join = self.join.transport(transport);
+        self
+    }
+
+    /// Rings the room when we start the call.
+    pub fn notify(mut self, notify: NotifyConfig) -> Self {
+        self.notify = Some(notify);
+        self
+    }
+
+    pub fn reactions(mut self, reactions: ReactionsConfig) -> Self {
+        self.reactions = Some(reactions);
+        self
     }
 }
+
+impl Default for CallJoinOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The MSC4143 application type of a call.
+const CALL_APPLICATION: &str = "m.call";
+
+/// How long the raised hand waits before retrying a failed re-annotation.
+const RETRY: Duration = Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS);
 
 /// One per backend. Creating it does no I/O (R1).
 pub struct RtcClient<B: MatrixBackend + 'static> {
-    shared: Arc<ClientShared<B>>,
+    base: BaseRtcClient<B, State<B>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcClient<B> {
     pub fn new(backend: Arc<B>) -> Self {
         Self {
-            shared: Arc::new(ClientShared {
-                backend: Arc::new(DialectBackend::new(backend)),
-                registry: RoomRegistry::default(),
-                to_device: StdMutex::new(None),
-                opening: Mutex::new(()),
-            }),
+            base: BaseRtcClient::new(backend),
         }
     }
 
     /// The host's backend behind the dialect wrapper, for what sends outside
     /// the rooms (a media layer's token exchange).
     pub fn backend(&self) -> &Arc<DialectBackend<B>> {
-        &self.shared.backend
+        self.base.backend()
     }
 
-    /// Opens `room_id` (R2): registers it, subscribes to what its mode needs,
-    /// and starts the to-device subscription if this is the first open room.
-    /// Spawn [`RoomRuns::into_futures`], then await [`RtcRoom::seeded`].
+    /// Opens `room_id` (R2) through the core's
+    /// [`BaseRtcClient::open_with`], in the room's membership format.
+    /// The feeds run on the executor; await [`RtcRoom::seeded`] before
+    /// joining.
     ///
     /// Refused while the room has a live room object (R5). Cancelling the call
-    /// part-way leaves nothing behind: the room is free again, and the
-    /// to-device subscription stops if no other room is open.
+    /// part-way leaves nothing behind.
     pub async fn room(
         &self,
         room_id: impl Into<String>,
         options: RoomOptions,
-    ) -> Result<(RtcRoom<B>, RoomRuns<B>), RtcError> {
+    ) -> Result<RtcRoom<B>, RtcError> {
         let room_id = room_id.into();
-        let mode = options.element_call_compat;
-        let shared = &self.shared;
-        let _opening = shared.opening.lock().await;
-
+        let mode = options.format;
+        let backend = self.base.backend().clone();
         let state = Arc::new(Mutex::new(CallRoomState::with_backend(
             room_id.clone(),
-            shared.backend.clone(),
+            backend.clone(),
         )));
-        let needs_to_device = {
-            let to_device = shared.to_device();
-            shared.registry.register(&room_id, mode, &state)?;
-            to_device.is_none()
-        };
-        // From here every early return — an error, or the caller dropping
-        // this future at an await — must undo the registration.
-        let opening = Opening {
-            shared,
-            room_id: &room_id,
-            opened: false,
-        };
-        log::info!("client: [{room_id}] opening in {mode:?} mode");
+        let handle = self
+            .base
+            .open_with(room_id.clone(), state.clone(), options)
+            .await?;
 
-        let to_device = if needs_to_device {
-            let (feeder, run) =
-                ToDeviceFeeder::start(shared.backend.clone(), shared.registry.clone()).await?;
-            *shared.to_device() = Some(feeder);
-            log::info!("client: to-device subscription started");
-            Some(run)
-        } else {
-            None
-        };
-
-        let (attachment, feed) =
-            RoomFeeder::attach(shared.backend.clone(), state.clone(), mode).await?;
-        opening.opened();
-
-        let room = RtcRoom {
+        Ok(RtcRoom {
             room_id,
             mode,
             state,
-            attachment: Some(attachment),
+            backend,
+            handle: Some(handle),
             sessions: StdMutex::new(HashMap::new()),
-            client: shared.clone(),
-        };
-        Ok((room, RoomRuns { feed, to_device }))
-    }
-}
-
-/// Releases a room whose opening did not finish.
-struct Opening<'a, B: MatrixBackend + 'static> {
-    shared: &'a ClientShared<B>,
-    room_id: &'a str,
-    opened: bool,
-}
-
-impl<B: MatrixBackend + 'static> Opening<'_, B> {
-    fn opened(mut self) {
-        self.opened = true;
-    }
-}
-
-impl<B: MatrixBackend + 'static> Drop for Opening<'_, B> {
-    fn drop(&mut self) {
-        if !self.opened {
-            log::info!("client: [{}] opening abandoned", self.room_id);
-            self.shared.release(self.room_id);
-        }
-    }
-}
-
-/// The futures that feed an opened room. The binding spawns them.
-pub struct RoomRuns<B: MatrixBackend + 'static> {
-    feed: RoomFeederRun<Backend<B>, State<B>>,
-    to_device: Option<ToDeviceFeederRun<Backend<B>, State<B>>>,
-}
-
-impl<B: MatrixBackend + 'static> RoomRuns<B> {
-    /// The room's feed, which ends when the room closes or drops, and — for a
-    /// client's first open room — the to-device feed, which ends when the last
-    /// room does.
-    pub fn into_futures(
-        self,
-    ) -> (
-        impl Future<Output = ()> + use<B>,
-        Option<impl Future<Output = ()> + use<B>>,
-    ) {
-        (self.feed.run(), self.to_device.map(ToDeviceFeederRun::run))
+        })
     }
 }
 
@@ -287,14 +275,14 @@ impl<B: MatrixBackend + 'static> RoomRuns<B> {
 /// expires through its delayed leave.
 pub struct RtcRoom<B: MatrixBackend + 'static> {
     room_id: String,
-    mode: ElementCallCompat,
+    mode: MembershipFormat,
     state: SharedState<B>,
-    /// `None` once detached.
-    attachment: Option<RoomAttachment>,
+    backend: Arc<Backend<B>>,
+    /// The core's open room, which feeds `state`; `None` once detached.
+    handle: Option<BaseRtcRoomHandle<B, State<B>>>,
     /// Whether each slot's current session object is live, by slot. A flag a
     /// session shares, so leaving, dropping it or closing the room ends it.
     sessions: StdMutex<HashMap<String, Arc<AtomicBool>>>,
-    client: Arc<ClientShared<B>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcRoom<B> {
@@ -302,27 +290,27 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         &self.room_id
     }
 
-    pub fn element_call_compat(&self) -> ElementCallCompat {
+    pub fn format(&self) -> MembershipFormat {
         self.mode
     }
 
     /// The host's backend behind the dialect wrapper.
     pub fn backend(&self) -> &Arc<DialectBackend<B>> {
-        &self.client.backend
+        &self.backend
     }
 
     /// Resolves once the room's current state is applied, so a join issued
     /// afterwards sees it.
     pub async fn seeded(&self) {
-        if let Some(attachment) = &self.attachment {
-            attachment.seeded().await;
+        if let Some(handle) = &self.handle {
+            handle.seeded().await;
         }
     }
 
     pub fn is_seeded(&self) -> bool {
-        self.attachment
+        self.handle
             .as_ref()
-            .is_some_and(RoomAttachment::is_seeded)
+            .is_some_and(BaseRtcRoomHandle::is_seeded)
     }
 
     /// Opens a slot by publishing its `m.rtc.slot` state. See
@@ -374,8 +362,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let params = self.prepare_join(&mut state, options, transport).await?;
         let member_id = params.membership_id();
         state.rtc_mut().join(params).await?;
+        let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         drop(state);
-        Ok(self.session(slot_id, member_id))
+        Ok(self.session(slot_id, member_id, upkeep))
     }
 
     /// Joins a call slot: the generic join, then the call layer — reactions
@@ -398,9 +387,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                 reactions,
             })
             .await?;
+        let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
+        let event_moves = state.rtc().subscribe_own_membership_event_id(&slot_id);
         drop(state);
         Ok(RtcCall {
-            session: self.session(slot_id, member_id),
+            _hand: event_moves.map(|moves| self.follow_hand(slot_id.clone(), moves)),
+            session: self.session(slot_id, member_id, upkeep),
         })
     }
 
@@ -434,7 +426,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         &self,
         chosen: Option<TransportIntent>,
     ) -> Result<TransportIntent, RtcError> {
-        Ok(transports::resolve(self.client.backend.as_ref(), chosen).await?)
+        Ok(transports::resolve(self.backend.as_ref(), chosen).await?)
     }
 
     /// Everything else a join needs that the host does not say: who we are,
@@ -453,6 +445,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             transport: _,
             encryption_config,
             keep_alive_timeout_ms,
+            keep_alive_interval_ms,
             sticky_duration_ms,
             degraded_lifetime_ms,
         } = options;
@@ -484,34 +477,22 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             state.leave(&slot_id, LeaveSessionParams::new()).await?;
         }
 
-        let backend = &self.client.backend;
-        let user_id = backend.own_user_id();
-        let device_id = backend.own_device_id();
-        // Not always a fresh id: see `compat::ingest::member_id` for the one
-        // generation where a fresh one makes us mark ourselves departed.
-        let membership_id = member_id(self.mode, &user_id, &device_id);
-
-        // Before the join, not after: the join itself sends the membership
-        // (and arms the delayed leave), so a dialect registered afterwards
-        // would let exactly the two events that announce us go out
-        // spec-current.
-        backend.set_dialect(
-            &self.room_id,
-            outbound_dialect(self.mode, &user_id, &device_id, &self.room_id, &slot_id),
-        );
-
-        Ok(JoinSessionParams {
-            user_id,
-            device_id,
-            membership_id: Some(membership_id),
+        let mut params = JoinSessionParams {
+            membership_id: None,
             slot_id,
             application,
-            transport,
+            transport: Some(transport),
             keep_alive_timeout_ms,
+            keep_alive_interval_ms,
             sticky_duration_ms,
             degraded_lifetime_ms,
             encryption_config,
-        })
+        };
+        // The `member.id` and our sends' dialect, in the room's format.
+        if let Some(handle) = &self.handle {
+            handle.prepare_join(&mut params);
+        }
+        Ok(params)
     }
 
     fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
@@ -526,7 +507,14 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             .is_some_and(|live| live.load(Ordering::SeqCst))
     }
 
-    fn session(&self, slot_id: String, member_id: String) -> RtcSession<B> {
+    /// The session object for a join that just succeeded. `upkeep` is the
+    /// core's, stopped when the session object goes.
+    fn session(
+        &self,
+        slot_id: String,
+        member_id: String,
+        upkeep: Option<AbortHandle>,
+    ) -> RtcSession<B> {
         let live = Arc::new(AtomicBool::new(true));
         self.sessions().insert(slot_id.clone(), live.clone());
         RtcSession {
@@ -535,7 +523,28 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             member_id,
             state: self.state.clone(),
             live,
+            upkeep,
         }
+    }
+
+    /// Re-raises our hand on each new membership event a sticky refresh puts
+    /// in place (see `CallRoomState::reannotate_hand_if_moved`), retrying a
+    /// failed re-send every keep-alive interval. Ends when the join's machine
+    /// goes, at leave.
+    fn follow_hand(
+        &self,
+        slot_id: String,
+        mut moves: watch::Receiver<Option<String>>,
+    ) -> AbortOnDrop<()> {
+        let state = self.state.clone();
+        executor::spawn(async move {
+            while moves.changed().await.is_ok() {
+                while !state.lock().await.reannotate_hand_if_moved(&slot_id).await {
+                    executor::sleep(RETRY).await;
+                }
+            }
+        })
+        .abort_on_drop()
     }
 
     fn end_sessions(&self) {
@@ -548,11 +557,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// Ends the subscription and forgets the room; idempotent.
     fn detach(&mut self) {
-        if let Some(attachment) = self.attachment.take() {
-            drop(attachment);
-            self.client.backend.clear_dialect(&self.room_id);
-            self.client.release(&self.room_id);
-        }
+        drop(self.handle.take());
     }
 }
 
@@ -573,6 +578,9 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     member_id: String,
     state: SharedState<B>,
     live: Arc<AtomicBool>,
+    /// The core's upkeep for this join, aborted when the session object
+    /// drops: a dropped session sends no leave and stops keeping alive.
+    upkeep: Option<AbortHandle>,
 }
 
 impl<B: MatrixBackend + 'static> RtcSession<B> {
@@ -606,15 +614,6 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .own_membership_event_id(&self.slot_id)
     }
 
-    /// Restarts the delayed leave; call periodically while joined. `false`
-    /// means there is nothing left to keep alive.
-    pub async fn heartbeat(&self) -> bool {
-        if !self.is_live() {
-            return false;
-        }
-        self.state.lock().await.heartbeat(&self.slot_id).await
-    }
-
     pub async fn member_count(&self) -> usize {
         self.subscribe_memberships().await.borrow().len()
     }
@@ -625,30 +624,6 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .await
             .rtc_mut()
             .observe_slot(&self.slot_id)
-    }
-
-    /// See [`matrix_rtc_core::BaseRtcRoom::key_rotation_due_at_ms`].
-    pub async fn key_rotation_due_at_ms(&self) -> Option<u64> {
-        if !self.is_live() {
-            return None;
-        }
-        self.state
-            .lock()
-            .await
-            .rtc()
-            .key_rotation_due_at_ms(&self.slot_id)
-    }
-
-    /// See [`matrix_rtc_core::BaseRtcRoom::flush_due_key_rotation`].
-    pub async fn flush_due_key_rotation(&self) -> bool {
-        self.is_live()
-            && self
-                .state
-                .lock()
-                .await
-                .rtc()
-                .flush_due_key_rotation(&self.slot_id)
-                .await
     }
 
     pub async fn set_encryption_signal_handler(
@@ -708,6 +683,9 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
 impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
     fn drop(&mut self) {
         self.live.store(false, Ordering::SeqCst);
+        if let Some(upkeep) = &self.upkeep {
+            upkeep.abort();
+        }
     }
 }
 
@@ -715,6 +693,8 @@ impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
 /// `Deref`) plus reactions and the raised hand.
 pub struct RtcCall<B: MatrixBackend + 'static> {
     session: RtcSession<B>,
+    /// Keeps our raised hand on our current membership event.
+    _hand: Option<AbortOnDrop<()>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcCall<B> {

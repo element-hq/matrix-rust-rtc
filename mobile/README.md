@@ -135,7 +135,7 @@ conventions the SDK follows.
 ## Staying in the call (keep-alive)
 
 Two independent clocks expire your membership, and the SDK tends both for you.
-`joinCall()` starts a keep-alive driver and `leave()` (or dropping the call)
+`joinCall()` starts the call's upkeep and `leave()` (or dropping the call)
 stops it — **there is nothing to call.**
 
 | Clock | Default | Kept alive by |
@@ -164,11 +164,6 @@ implement in a way that looks right and silently breaks the call:
   failed cancel leaks a delay that later fires — and because the sticky map
   resolves conflicts by *last to expire*, that leave out-expires your live
   membership and shows you as having left a call you are still in.
-
-To drive the keep-alive from your own scheduler instead (a foreground service, a
-workmanager job), call `call.heartbeat()` on your own cadence; it returns
-`false` once the call is over. The built-in driver runs
-regardless, so only reach for this if you need a different cadence.
 
 A client that dies without leaving stays visible to peers for up to
 `stickyDurationMs`, not `keepAliveTimeoutMs` — see Known limitations in
@@ -235,13 +230,13 @@ when (val event = session.nextEvent()) {
 Element Call is the only other MatrixRTC implementation there is to test against,
 and it still speaks a pre-2026 wire format — two of them, in fact, which disagree
 about where a membership lives rather than merely what it says. Pass
-`elementCallCompat` when you open the room to speak one of them:
+`format` when you open the room to speak one of them:
 
 | Mode | Element Call generation | Membership lives in |
 | --- | --- | --- |
-| `null` / `OFF` | none — current MSC4143 + MSC4354 | sticky events |
-| `STICKY_EVENTS` | 2025 | sticky events, legacy fields alongside the spec ones |
-| `STATE_EVENTS` | before MSC4354 | `org.matrix.msc3401.call.member` room state |
+| `null` / `CURRENT` | none — current MSC4143 + MSC4354 | sticky events |
+| `STICKY2025` | 2025 | sticky events, legacy fields alongside the spec ones |
+| `ROOM_STATE` | before MSC4354 | `org.matrix.msc3401.call.member` room state |
 
 It is one decision, not a wire-format flag: it also fixes the `member.id` you
 join with, how an inbound media key is bound to a membership, your SFU
@@ -256,28 +251,28 @@ must do differently:
 
 ```kotlin
 val room = client.room(roomId, FfiRoomOptions(
-    elementCallCompat = FfiElementCallCompat.STATE_EVENTS,
+    format = FfiMembershipFormat.ROOM_STATE,
 ))
 ```
 
 - **Nothing changes on the inbound side.** Your `MatrixBackend` delivers the
   same raw events in every mode; the library subscribes to the room state the
-  mode needs (`org.matrix.msc3401.call.member` in `STATE_EVENTS`), translates
+  mode needs (`org.matrix.msc3401.call.member` in `ROOM_STATE`), translates
   it, and reads that generation's `io.element.call.encryption_keys` to-device
   messages through the same to-device subscription. Do set `originServerTs` on
   every event: it is the deadline base for a membership that states no
   `created_ts`, and `0` reads as long expired.
-- **In `STATE_EVENTS` only:** honour the `stateKey` of `sendDelayedEvent` — the
+- **In `ROOM_STATE` only:** honour the `stateKey` of `sendDelayedEvent` — the
   dead man's switch has to be a state event too.
 
 Slots need nothing from you. Both generations of Element Call publish no
 `m.rtc.slot`, so the truthful "no slots" your backend reports would resolve the
-session closed and drop every member, you included. In `STATE_EVENTS` the SDK
+session closed and drop every member, you included. In `ROOM_STATE` the SDK
 absorbs that: it does not subscribe to slot state for the room at all, leaving
 the condition unenforced — that generation predates the concept entirely, so
 "unknowable" is the honest answer rather than "closed".
 
-In `STICKY_EVENTS` the condition stays enforced, because those rooms are
+In `STICKY2025` the condition stays enforced, because those rooms are
 otherwise spec-shaped and a slot in one is meaningful. Someone has to open the
 slot — otherwise the room reads as all-closed, and `join` refuses with
 `SlotClosed`. Element Call will not, so open it yourself (it needs the power

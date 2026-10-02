@@ -46,7 +46,7 @@
 //! | Variable | Default |
 //! | -------- | ------- |
 //! | `HOMESERVER_URL` | `https://synapse.m.localhost` |
-//! | `ELEMENT_CALL_COMPAT` | `state` (also: `sticky`, `off`) |
+//! | `ELEMENT_CALL_COMPAT` | `state` (also: `sticky`, `current`) |
 //! | `INVITE_USER` | *required* — the Matrix ID Element Call will log in as |
 //! | `DISPLAY_NAME` | `Rust Peer` — what the browser asserts it can see |
 //! | `ROOM_NAME` | `Interop LiveKitCall` |
@@ -76,7 +76,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::ElementCallCompat;
+use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_rtc_media::{
     CallEvent, I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `LiveKitCall::join` drives `!Send` futures, so everything runs on a `LocalSet`.
+    // A `LocalSet` for this tool's own `spawn_local` tasks (stdin, the video ticker).
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -186,7 +186,7 @@ struct Config {
     display_name: String,
     room_name: String,
     invite_user: String,
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
     record_secs: u64,
     out_wav: Option<String>,
     insecure_tls: bool,
@@ -210,9 +210,9 @@ impl Config {
                 .map_err(|_| "INVITE_USER is required (the Matrix ID Element Call logs in as)")?,
             // Defaults to the dialect real Element Call deployments speak today.
             compat: match env::var("ELEMENT_CALL_COMPAT").ok().as_deref() {
-                Some("off") => ElementCallCompat::Off,
-                Some("sticky") => ElementCallCompat::StickyEvents,
-                None | Some("state") => ElementCallCompat::StateEvents,
+                Some("current") => MembershipFormat::Current,
+                Some("sticky") => MembershipFormat::Sticky2025,
+                None | Some("state") => MembershipFormat::RoomState,
                 Some(other) => return Err(format!("unknown ELEMENT_CALL_COMPAT {other:?}").into()),
             },
             record_secs: env::var("RECORD_SECS")
@@ -561,7 +561,7 @@ async fn join_call(
     // The pre-sticky generation has no slot concept at all. Publishing one
     // there is a claim about the room that Element Call never makes, and the
     // bridge leaves the slot condition unenforced in that mode anyway.
-    if cfg.compat != ElementCallCompat::StateEvents {
+    if cfg.compat != MembershipFormat::RoomState {
         open_slot(
             client,
             room_id.as_str(),
@@ -586,7 +586,7 @@ async fn join_call(
                 }
             }),
             http: Some(http.clone()),
-            element_call_compat: cfg.compat,
+            format: cfg.compat,
             ..LiveKitCallOptions::default()
         },
     )

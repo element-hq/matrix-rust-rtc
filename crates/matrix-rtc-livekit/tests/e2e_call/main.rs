@@ -29,9 +29,9 @@
 //! - [`Scenario`] — the media topology: both on one SFU (`single_focus`),
 //!   each on their own (`two_foci`, MSC4195 multi-SFU), or one peer redialling
 //!   while the other stays (`rejoin`).
-//! - [`ElementCallCompat`] — the wire dialect both peers speak: spec-current
-//!   (`off`), the 2025 sticky dialect (`sticky_events`), or pre-sticky room
-//!   state (`state_events`). In `state_events` step 4 is skipped (that
+//! - [`MembershipFormat`] — the wire dialect both peers speak: spec-current
+//!   (`current`), the 2025 sticky dialect (`sticky_2025`), or pre-sticky room
+//!   state (`room_state`). In `room_state` step 4 is skipped (that
 //!   generation has no slot concept) and membership is
 //!   `org.matrix.msc3401.call.member` room state rather than a sticky event.
 //!
@@ -65,7 +65,7 @@ use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::ElementCallCompat;
+use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_rtc_media::{
     CallEvent, I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant,
@@ -180,7 +180,7 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
 /// Log in and start the sync service. Sliding sync enables the sticky-events
 /// extension, so `m.rtc.member` stickies flow into the base room's sticky map
 /// (see `matrix_rtc_matrix_sdk::sdk`); it also delivers the
-/// `org.matrix.msc3401.call.member` room state the `state_events` compat mode
+/// `org.matrix.msc3401.call.member` room state the `room_state` compat mode
 /// reads.
 ///
 /// Cross-signing is bootstrapped at login: each user is freshly registered
@@ -270,7 +270,7 @@ async fn join_call(
     room: matrix_sdk::Room,
     user: &str,
     livekit_service_url: &str,
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
 ) -> Result<Participant, Box<dyn Error>> {
     let SyncedClient { client: _, sync } = synced;
     let call = open_call(cfg, &room, user, livekit_service_url, compat).await?;
@@ -284,7 +284,7 @@ async fn open_call(
     room: &matrix_sdk::Room,
     user: &str,
     livekit_service_url: &str,
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
 ) -> Result<LiveKitCall, Box<dyn Error>> {
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(cfg.insecure_tls)
@@ -297,7 +297,7 @@ async fn open_call(
                 livekit_service_url: livekit_service_url.to_owned(),
             }),
             http: Some(http),
-            element_call_compat: compat,
+            format: compat,
             ..LiveKitCallOptions::default()
         },
     )
@@ -388,21 +388,21 @@ macro_rules! e2e_tests {
         #[test]
         #[ignore = "requires the demo/backend docker stack (make backend-up)"]
         fn $name() {
-            harness(Scenario::$scenario, ElementCallCompat::$compat);
+            harness(Scenario::$scenario, MembershipFormat::$compat);
         }
     )*};
 }
 
 e2e_tests! {
-    e2e_call_single_focus_off => (SingleFocus, Off),
-    e2e_call_single_focus_sticky_events => (SingleFocus, StickyEvents),
-    e2e_call_single_focus_state_events => (SingleFocus, StateEvents),
-    e2e_call_two_foci_off => (TwoFoci, Off),
-    e2e_call_two_foci_sticky_events => (TwoFoci, StickyEvents),
-    e2e_call_two_foci_state_events => (TwoFoci, StateEvents),
-    e2e_call_rejoin_off => (RejoinSameProcess, Off),
-    e2e_call_rejoin_sticky_events => (RejoinSameProcess, StickyEvents),
-    e2e_call_rejoin_state_events => (RejoinSameProcess, StateEvents),
+    e2e_call_single_focus_current => (SingleFocus, Current),
+    e2e_call_single_focus_sticky_2025 => (SingleFocus, Sticky2025),
+    e2e_call_single_focus_room_state => (SingleFocus, RoomState),
+    e2e_call_two_foci_current => (TwoFoci, Current),
+    e2e_call_two_foci_sticky_2025 => (TwoFoci, Sticky2025),
+    e2e_call_two_foci_room_state => (TwoFoci, RoomState),
+    e2e_call_rejoin_current => (RejoinSameProcess, Current),
+    e2e_call_rejoin_sticky_2025 => (RejoinSameProcess, Sticky2025),
+    e2e_call_rejoin_room_state => (RejoinSameProcess, RoomState),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -420,19 +420,17 @@ fn init_test_process() {
         .try_init();
 }
 
-fn harness(scenario: Scenario, compat: ElementCallCompat) {
+fn harness(scenario: Scenario, compat: MembershipFormat) {
     init_test_process();
     let cfg = Config::from_env();
 
-    // The futures behind `LiveKitCall::join` are `!Send` (the core command sender is
-    // `?Send`), so the whole flow runs on a single-thread `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    let outcome = runtime.block_on(tokio::task::LocalSet::new().run_until(async {
+    let outcome = runtime.block_on(async {
         tokio::time::timeout(OVERALL_DEADLINE, run(cfg, scenario, compat)).await
-    }));
+    });
 
     match outcome {
         Err(_) => panic!("e2e call did not finish within {OVERALL_DEADLINE:?}"),
@@ -444,7 +442,7 @@ fn harness(scenario: Scenario, compat: ElementCallCompat) {
 async fn run(
     cfg: Config,
     scenario: Scenario,
-    compat: ElementCallCompat,
+    compat: MembershipFormat,
 ) -> Result<(), Box<dyn Error>> {
     let (alice_creds, bob_creds) = credentials(&cfg).await?;
 
@@ -474,7 +472,7 @@ async fn run(
     //    opening one there would be a claim about a room that generation of
     //    Element Call never makes, and the bridge leaves the slot condition
     //    unenforced in that mode anyway.
-    if compat != ElementCallCompat::StateEvents {
+    if compat != MembershipFormat::RoomState {
         open_slot(
             &alice.client,
             room_id.as_str(),
@@ -609,8 +607,8 @@ async fn run(
         (true, true)
     };
 
-    // Tear down both peers cleanly and symmetrically: `LiveKitCall::leave` stops the
-    // heartbeat, sends the leave event (cancelling the delayed leave), shuts
+    // Tear down both peers cleanly and symmetrically: `LiveKitCall::leave` ends the
+    // keep-alive, sends the leave event (cancelling the delayed leave), shuts
     // the media engine down (closing peer-focus connections), and closes the
     // own SFU connection. A per-leave timeout keeps a wedged teardown from
     // eating the overall deadline; failures are logged rather than aborting

@@ -14,70 +14,94 @@ It does four things:
 - **Encryption.** It creates, distributes, rotates and checks per-member media keys.
 - **Slots.** It resolves `m.rtc.slot` state, and opens and closes slots.
 
-The core does no I/O. It sends through the host-implemented `MatrixBackend`, and it is fed —
-by the feeder in `matrix-rtc-call`, which subscribes through that same backend — the room's
-state and membership as `RawStickyEvent`s, slot and room state, and decrypted key messages. It
-spawns no tasks and arms no timers: the host calls `heartbeat` periodically while joined.
+The core does its I/O through the host-implemented `MatrixBackend`: it sends through it, and
+its `BaseRtcClient` opens a room by subscribing through it. The `feeder` then applies the room's
+state and membership, slot and room state, and decrypted key messages. Its `executor` module
+(tokio natively, `spawn_local` and `setTimeout` on wasm) is what the library's background work
+runs on: a room's feeds while its handle lives, and from a join until the leave the slot's
+upkeep (keep-alive, sticky refresh, key rotations at their deadline). A host using the core alone
+feeds and ticks nothing. Off a tokio runtime (natively) nothing is spawned, and the host calls
+`keep_alive` itself.
 
 ## Quick start: join a slot and follow its memberships
 
-The core is **fed**, not polled: it spawns nothing and never reads from the backend itself. A host
-reaches it through `matrix-rtc-call`'s `RtcClient`, which opens a room: it subscribes through the
-backend to what the room needs and applies the room's current state in the right order
-(encryption and slots and members before the first membership). Joining a slot on the room
-returns our participation in it:
+`BaseRtcClient::room` opens a room: it subscribes through the backend to what the room needs and
+applies the room's current state in the right order (encryption and slots and members before the
+first membership), in the room's membership format:
 
 ```rust,ignore
 use std::sync::Arc;
 
-use matrix_rtc_call::{JoinOptions, RoomOptions, RtcClient};
-use matrix_rtc_core::{LeaveSessionParams, MatrixBackend};
+use matrix_rtc_core::{
+    BaseRtcClient, JoinSessionParams, LeaveSessionParams, LiveKitTransport, MatrixBackend,
+    RoomOptions, RtcTransport,
+};
 
 const ROOM: &str = "!room:example.org";
-const SLOT: &str = "org.example.board#ROOM";
+const SLOT: &str = "org.example.board#planning";
 
 async fn run(
     // The host's Matrix client, behind the one trait the library knows.
     backend: Arc<impl MatrixBackend + 'static>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One per backend; creating it does no I/O.
-    let client = RtcClient::new(backend);
+    let client = BaseRtcClient::new(backend);
 
-    // The room returns the futures that apply what arrives; run them where
-    // you like (they are `!Send`: a `LocalSet`, or `spawn_local` on wasm).
-    let (room, runs) = client.room(ROOM, RoomOptions::default()).await?;
-    let (feed, to_device) = runs.into_futures();
-    tokio::task::spawn_local(feed);
-    if let Some(to_device) = to_device {
-        tokio::task::spawn_local(to_device);
-    }
+    // Natively, from within a tokio runtime: the room spawns its feeds onto it.
+    let room = client.room(ROOM, RoomOptions::default()).await?;
     // Resolves once the room's current state has been applied.
     room.seeded().await;
 
     // The slot's joined memberships, without joining it.
     let mut members = room.observe(SLOT).await;
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         while members.changed().await.is_ok() {
             println!("{} joined", members.borrow().len());
         }
     });
 
-    // The transport is the homeserver's first advertised LiveKit one.
-    let session = room.join(JoinOptions::new(SLOT, "org.example.board")).await?;
+    // Who joins is the backend's account. The transport is the application's
+    // choice (`matrix-rtc-call` takes the homeserver's first LiveKit one).
+    // Without `.slot`, the application's room-wide slot,
+    // `org.example.board#ROOM`; other setters override one default each
+    // (`.keep_alive_interval_ms(..)`, `.member_id(..)`, …). The joined slot
+    // keeps itself alive until it leaves.
+    let join = JoinSessionParams::application("org.example.board")
+        .slot("planning")
+        .transport(RtcTransport::LiveKit(LiveKitTransport {
+            livekit_service_url: "https://sfu.example.org".to_owned(),
+        }));
+    room.join(join).await?;
 
-    // Periodically, while joined.
-    session.heartbeat().await;
-
-    session.leave(LeaveSessionParams::new()).await?;
-    room.close().await;
+    room.leave(SLOT, LeaveSessionParams::new()).await?;
     Ok(())
 }
 ```
 
-`matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient` objects are all this
-sequence with a different backend and a different place to run the feed futures. Dropping the room
-without `close` ends its subscriptions without leaving: a membership left behind expires through
-its delayed leave.
+Dropping the room handle ends its subscriptions without leaving: a membership left behind expires
+through its delayed leave.
+
+### Older membership formats
+
+`RoomOptions::format` picks the MatrixRTC membership format the room is read and written in
+(`compat::MembershipFormat`):
+
+- `Current` (the default) is MSC4143 + MSC4354, and also reads the 2025 sticky shapes.
+- `Sticky2025` writes our membership with the 2025 fields alongside the spec ones.
+- `RoomState` reads and writes membership as pre-sticky `org.matrix.msc3401.call.member` room
+  state, joining with the `{user}:{device}` member id that generation expects.
+
+These are matrix-js-sdk's (and so Element Call's) pre-2026 formats, for any application.
+`compat` is scaffolding, to be deleted once Element Call catches up.
+
+### An application over the core
+
+An application opens its own room state with `BaseRtcClient::open_with(room_id, state,
+options)`: the state is any `ApplicationIntake`, which also receives the timeline events,
+redactions and `/relations` it asks for. It renders a join in the room's format with
+`BaseRtcRoomHandle::prepare_join` before joining. `matrix-rtc-call`'s `RtcClient` is this, with
+the call's room state; `matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient`
+objects are built on it.
 
 The per-room core type is `BaseRtcRoom`. What the feeder calls on it —
 `set_current_sticky_state(Vec<RawStickyEvent>)` with the room's **complete** current membership,

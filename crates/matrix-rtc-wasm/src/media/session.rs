@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_sys::{Function, Reflect};
-use matrix_rtc_call::compat::ElementCallCompat;
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
@@ -25,7 +25,7 @@ use matrix_rtc_media::{
     FrameEncryptionState, OwnMemberClaims, Participant, StabilityConfig, TransportConnection as _,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
@@ -48,11 +48,11 @@ struct WasmMediaSessionConfig {
     #[serde(default)]
     key_ring_size: Option<u16>,
     /// Element Call compatibility generation this room was joined for:
-    /// `"off"` (default), `"sticky_events"`, or `"state_events"`. Decides the
+    /// `"current"` (default), `"sticky_2025"`, or `"room_state"`. Decides the
     /// participant-identity derivation and the token endpoint, so it must
     /// match the membership the page published.
     #[serde(default)]
-    element_call_compat: Option<String>,
+    format: Option<String>,
     /// How much the tile order is damped. Omitted takes the defaults; so does
     /// any field left out of the object.
     #[serde(default)]
@@ -123,12 +123,12 @@ impl WasmRtcCall {
     /// the own-focus livekit-js room. The `member.id` comes from the join —
     /// the page neither chooses nor passes it.
     ///
-    /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, element_call_compat?, stability? }`;
+    /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, format?, stability? }`;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
-    /// implement `onParticipants(roster)`, `onEvent(event)`, and
-    /// `onSwitchComplete()` — the push half of the session, invoked from
-    /// spawned pumps for the life of the call.
+    /// implement `onParticipants(roster)` and `onEvent(event)` — the push
+    /// half of the session, invoked from spawned pumps for the life of the
+    /// call.
     #[wasm_bindgen(js_name = connectMedia)]
     pub async fn connect_media(
         &self,
@@ -154,17 +154,17 @@ impl WasmRtcCall {
         // silence — peers sit in the roster with no media, keys install under
         // an identity the SFU never assigned, and nothing logs a problem. The
         // config field is accepted only as a cross-check.
-        let compat = self.element_call_compat();
-        if let Some(requested) = config.element_call_compat.as_deref() {
+        let compat = self.format();
+        if let Some(requested) = config.format.as_deref() {
             let requested = crate::compat::parse_compat(Some(requested))?;
             if requested != compat {
                 return Err(JsError::new(&format!(
-                    "element_call_compat {requested:?} disagrees with the mode this room was \
+                    "format {requested:?} disagrees with the mode this room was \
                      joined in ({compat:?}); set the mode on join and drop it here",
                 )));
             }
         }
-        if compat != ElementCallCompat::Off {
+        if compat != MembershipFormat::Current {
             log::info!(
                 "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode \
                  {compat:?}",
@@ -228,7 +228,7 @@ impl WasmRtcCall {
                 // generation's unhashed `{user}:{device}` identity comes from
                 // — the endpoint mints the identity, so the two are one
                 // decision, not two.
-                ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
                 _ => TokenEndpoint::Msc4195,
             },
         ));
@@ -270,16 +270,6 @@ impl WasmRtcCall {
         let engine_handle = engine.handle();
         handler.set_key_discard_listener(Box::new(move |discarded| {
             engine_handle.notify_key_discarded(discarded);
-        }));
-
-        // A key rotation coalesced into a `delayBeforeUse` window falls due
-        // the instant the window closes, and the handler's timer is the only
-        // thing that knows when that is. The core cannot be flushed from the
-        // handler's task, so the moment is handed to JS (the
-        // `onSwitchComplete` pump below), which calls `flushDueKeyRotation`.
-        let (switch_tx, switch_rx) = watch::channel(0u64);
-        handler.set_switch_complete_listener(Box::new(move || {
-            switch_tx.send_modify(|count| *count += 1);
         }));
 
         // Keys signalled between `join` and now were stored but dropped —
@@ -355,19 +345,6 @@ impl WasmRtcCall {
                 }
             });
         }
-        // Optional but recommended: the heartbeat also flushes due rotations,
-        // so without this a coalesced rotation waits for the next beat instead
-        // of happening at the instant it is owed. The callback should call
-        // `call.flushDueKeyRotation()`.
-        if let Some(on_switch_complete) = delegate_callback(&delegate, "onSwitchComplete") {
-            let mut switch_rx = switch_rx;
-            wasm_bindgen_futures::spawn_local(async move {
-                while switch_rx.changed().await.is_ok() {
-                    let _ = on_switch_complete.call0(&JsValue::NULL);
-                }
-            });
-        }
-
         // Move our sender onto each key we rotate to. Importing a key only
         // fills the ring; the index our frames actually carry lives on the
         // frame cryptor, which livekit-js owns — hence through the delegate.
@@ -406,9 +383,9 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 /// rendering — stays in livekit-js; join roster entries to
 /// `room.getParticipantByIdentity(rtc_identity)`.
 ///
-/// Roster changes, call events, and switch-complete moments arrive through
-/// the delegate's `onParticipants` / `onEvent` / `onSwitchComplete`
-/// callbacks, registered at [`WasmRtcCall::connect_media`] time.
+/// Roster changes and call events arrive through the delegate's
+/// `onParticipants` / `onEvent` callbacks, registered at
+/// [`WasmRtcCall::connect_media`] time.
 ///
 /// End it with [`WasmMediaSession::disconnect`]; leaving the slot itself stays
 /// the call's ([`WasmRtcCall::leave`]).

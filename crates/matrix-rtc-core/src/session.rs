@@ -12,11 +12,13 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
+use crate::executor::{AbortHandle, AbortOnDrop};
 use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
@@ -24,6 +26,7 @@ use crate::membership_listener::MembershipScope;
 use crate::own_membership::{MembershipTimings, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
+use crate::upkeep::{self, SessionUpkeep};
 
 #[allow(unused_imports)]
 use log::*;
@@ -131,7 +134,11 @@ pub struct SlotSession<T: MatrixBackend> {
     /// Command sender for sending events to the Matrix room.
     backend: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
-    own_membership_machine: Option<OwnMembershipMachine<T>>,
+    /// Shared with the upkeep, which ticks it.
+    own_membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
+    /// The task keeping our membership alive and rotating keys on time, from
+    /// join until leave; dropping the session stops it.
+    upkeep: Option<AbortOnDrop<()>>,
     /// Identity of the current join, or `None` while not joined.
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
@@ -156,8 +163,9 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             backend: self.backend.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
-            encryption_manager: None,     // Don't clone the encryption manager
-            own_participation: None,      // A clone holds no machine, so it is not joined
+            upkeep: None,
+            encryption_manager: None, // Don't clone the encryption manager
+            own_participation: None,  // A clone holds no machine, so it is not joined
             room_id: self.room_id.clone(),
             slot_id: self.slot_id.clone(),
             membership_scope: self.membership_scope.clone(), // Shares the watch, so shares its listeners
@@ -187,6 +195,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             membership_snapshots_tx,
             backend,
             own_membership_machine: None,
+            upkeep: None,
             encryption_manager: None,
             own_participation: None,
             room_id,
@@ -253,11 +262,18 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .and_then(|manager| manager.rotation_due_at_ms())
     }
 
+    /// Follows [`Self::key_rotation_due_at_ms`], so a scheduler can wake at the
+    /// deadline. `None` when not joined.
+    pub fn subscribe_key_rotation_due(&self) -> Option<watch::Receiver<Option<u64>>> {
+        self.encryption_manager
+            .as_ref()
+            .map(EncryptionManager::subscribe_rotation_due)
+    }
+
     /// Performs a key rotation coalesced into a fresh key's window, if one is owed
     /// and due.
     ///
-    /// See `BaseRtcRoom::flush_due_key_rotation` for why this is the
-    /// consumer's to call. Returns `false` if the session has not joined.
+    /// Returns `false` if the session has not joined.
     pub async fn flush_due_key_rotation(&self) -> bool {
         match &self.encryption_manager {
             Some(manager) => {
@@ -318,7 +334,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     ///
     /// # Arguments
     ///
-    /// * `params` - The join parameters including user info, transport, etc.
+    /// * `params` - The slot, the application, the transport, and any
+    ///   overrides; the user and device are the backend's.
     ///
     /// # Returns
     ///
@@ -341,6 +358,12 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         })?;
 
         let membership_id = params.membership_id();
+        let user_id = backend.own_user_id();
+        let device_id = backend.own_device_id();
+        let transport = params
+            .transport
+            .clone()
+            .expect("validate() refuses a join without a transport");
 
         // Check if already joined with this membership
         if self
@@ -353,14 +376,11 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         log::info!(
-            "[{}] joining as {membership_id} ({}/{}, transport {:?})",
+            "[{}] joining as {membership_id} ({user_id}/{device_id}, transport {transport:?})",
             self.log_tag,
-            params.user_id,
-            params.device_id,
-            params.transport,
         );
 
-        let transports = match &params.transport {
+        let transports = match &transport {
             TransportIntent::Publish(transport) => MemberTransports::publishing(
                 serde_json::from_value(transport_to_json(transport))
                     .expect("a transport always serializes to an object with a type"),
@@ -370,6 +390,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 can_subscribe: can_subscribe.clone(),
             },
         };
+        let keep_alive_interval = Duration::from_millis(params.effective_keep_alive_interval_ms());
         let machine = OwnMembershipMachine::new(
             backend.clone(),
             self.room_id.clone(),
@@ -377,9 +398,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             membership_id.clone(),
             params.application.clone(),
             MembershipTimings {
-                keep_alive_timeout_ms: params.keep_alive_timeout_ms(),
-                sticky_duration_ms: params.sticky_duration_ms(),
-                degraded_lifetime_ms: params.degraded_lifetime_ms(),
+                keep_alive_timeout_ms: params.effective_keep_alive_timeout_ms(),
+                sticky_duration_ms: params.effective_sticky_duration_ms(),
+                degraded_lifetime_ms: params.effective_degraded_lifetime_ms(),
             },
         );
 
@@ -387,10 +408,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         let membership_event_id = machine.join(transports).await?;
 
         // Store the machine
-        self.own_membership_machine = Some(machine);
+        self.own_membership_machine = Some(Arc::new(machine));
         self.own_participation = Some(OwnParticipation {
-            user_id: params.user_id.clone(),
-            device_id: params.device_id.clone(),
+            user_id: user_id.clone(),
+            device_id: device_id.clone(),
             member_id: membership_id.clone(),
         });
 
@@ -401,7 +422,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // an identical prefix, and the interleaving cannot be untangled even in
         // principle: "membership changed" from one device sits next to
         // "candidate added" from another, and any conclusion drawn is a guess.
-        self.log_tag = format!("{}/{}", self.log_tag, params.device_id);
+        self.log_tag = format!("{}/{device_id}", self.log_tag);
 
         // Create the encryption manager
         // We need a closure that can access self.members
@@ -412,7 +433,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             move || members_tx.borrow().clone()
         };
 
-        let mut encryption_config = params.encryption_config();
+        let mut encryption_config = params.effective_encryption_config();
         if let Some(negotiated) = self.negotiated_encryption() {
             // The slot decides whether RTC data is encrypted; the local flag only
             // applies where no slot state has been supplied to negotiate from.
@@ -421,8 +442,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         let mut encryption_manager = EncryptionManager::new(
             backend.clone(),
-            params.user_id.clone(),
-            params.device_id.clone(),
+            user_id,
+            device_id,
             membership_id.clone(),
             self.room_id.clone(),
             self.slot_id.clone(),
@@ -475,6 +496,16 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             );
         }
 
+        self.upkeep = self.own_membership_machine.clone().and_then(|machine| {
+            SessionUpkeep {
+                machine,
+                encryption: self.encryption_manager.clone(),
+                interval: keep_alive_interval,
+                log_tag: self.log_tag.clone(),
+            }
+            .spawn()
+        });
+
         log::info!(
             "[{}] joined as {membership_id} (media keys {})",
             self.log_tag,
@@ -522,6 +553,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             log::warn!("[{}] leave rejected: not joined", self.log_tag);
             LeaveError::NotJoined
         })?;
+        // A tick in flight finishes first (the machine serialises the two),
+        // and finds nothing joined afterwards.
+        let upkeep = self.upkeep.take();
 
         log::info!(
             "[{}] leaving as {} (reason {:?})",
@@ -541,6 +575,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             encryption_manager.leave();
         }
         self.own_participation = None;
+        drop(upkeep);
 
         // Republish the joined memberships now that we are no longer among them, rather than
         // waiting for the host's next sticky delta. Room state and peer
@@ -554,40 +589,20 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         Ok(())
     }
 
-    /// Performs a heartbeat to restart the keep-alive delayed leave event.
+    /// One keep-alive tick: restarts the delayed leave, refreshes the sticky
+    /// membership when due, and performs a due key rotation.
     ///
-    /// This should be called periodically (e.g., every 15-20 seconds) to keep the
-    /// membership active. The dead man's switch strategy ensures that if the
-    /// client stops sending heartbeats, the delayed leave will fire and clean up.
+    /// The session's upkeep ticks this on an interval from join until leave;
+    /// a host calls it only where the upkeep had no runtime to run on. If
+    /// nothing ticks, the delayed leave fires and cleans up.
     ///
-    /// # Returns
-    ///
-    /// Returns `true` if the heartbeat was processed successfully.
     /// Returns `false` if not joined (no membership machine active).
-    pub async fn heartbeat(&mut self) -> bool {
+    pub async fn keep_alive(&mut self) -> bool {
         if let Some(machine) = self.own_membership_machine.as_ref() {
-            log::trace!("[{}] heartbeat", self.log_tag);
-            machine.heartbeat().await;
-
-            // A rotation coalesced into a key's `delayBeforeUse` window needs
-            // somebody to come back for it once the window closes, and in a call
-            // whose joined memberships have gone quiet nothing else will. This tick is the only
-            // periodic one the core is given, so it doubles as that collector: the
-            // rotation lands within one heartbeat of falling due rather than
-            // waiting for the next membership change. A consumer that wants it on
-            // time can drive `EncryptionManager::flush_due_rotation` from
-            // `rotation_due_at_ms()` instead.
-            if let Some(encryption_manager) = self.encryption_manager.as_ref()
-                && let Err(error) = encryption_manager.flush_due_rotation().await
-            {
-                log::warn!(
-                    "[{}] a deferred key rotation failed: {error:?}",
-                    self.log_tag,
-                );
-            }
+            upkeep::tick(machine, self.encryption_manager.as_ref(), &self.log_tag).await;
             true
         } else {
-            log::debug!("[{}] heartbeat ignored: not joined", self.log_tag);
+            log::debug!("[{}] keep-alive ignored: not joined", self.log_tag);
             false
         }
     }
@@ -617,7 +632,21 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     pub fn own_membership_event_id(&self) -> Option<String> {
         self.own_membership_machine
             .as_ref()
-            .and_then(OwnMembershipMachine::membership_event_id)
+            .and_then(|machine| machine.membership_event_id())
+    }
+
+    /// Follows [`Self::own_membership_event_id`] for this join, which moves on
+    /// every sticky refresh; `None` while not joined.
+    pub fn subscribe_own_membership_event_id(&self) -> Option<watch::Receiver<Option<String>>> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.subscribe_membership_event_id())
+    }
+
+    /// Stops this join's upkeep when aborted, for an owner that lets go of
+    /// the join without leaving; `None` while not joined or without one.
+    pub fn upkeep_abort_handle(&self) -> Option<AbortHandle> {
+        self.upkeep.as_ref().map(AbortOnDrop::abort_handle)
     }
 
     /// Whether a dead man's switch is protecting our membership.
@@ -628,7 +657,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     pub fn delayed_leave_supported(&self) -> Option<bool> {
         self.own_membership_machine
             .as_ref()
-            .map(OwnMembershipMachine::delayed_leave_supported)
+            .map(|machine| machine.delayed_leave_supported())
     }
 
     /// Subscribes to full membership snapshots for this session as a watch receiver.
@@ -1048,7 +1077,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             "delayed_leave_supported": self
                 .own_membership_machine
                 .as_ref()
-                .map(OwnMembershipMachine::delayed_leave_supported),
+                .map(|machine| machine.delayed_leave_supported()),
             "has_encryption_manager": self.encryption_manager.is_some(),
         })
     }

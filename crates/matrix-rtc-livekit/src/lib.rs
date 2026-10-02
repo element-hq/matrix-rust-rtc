@@ -48,9 +48,9 @@ pub mod call;
 // Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite.
 // Scaffolding with a delete-by date; nothing else should depend on it. Lives in
 // `matrix-rtc-call` (it is pure Matrix wire translation, with no LiveKit in
-// it), and is re-exported because `LiveKitCallOptions::element_call_compat` names
-// `ElementCallCompat` in this crate's own public API.
-pub use matrix_rtc_call::compat;
+// it), and is re-exported because `LiveKitCallOptions::format` names
+// `MembershipFormat` in this crate's own public API.
+pub use matrix_rtc_core::compat;
 
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
@@ -109,7 +109,7 @@ async fn acquire_token(
         // `room` is the room id, because that is the `livekit_alias` this
         // generation announces on a focus; the two must agree or the clients land
         // in different LiveKit rooms. See
-        // `compat::element_call_state::ElementCallStateDialect::member_content`.
+        // `compat::room_state::RoomStateDialect::member_content`.
         TokenEndpoint::LegacyElementCall => {
             token::get_legacy_token(
                 http,

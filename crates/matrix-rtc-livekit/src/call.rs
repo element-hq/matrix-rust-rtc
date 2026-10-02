@@ -21,10 +21,10 @@
 //!
 //! # Runtime requirements
 //!
-//! The backend's futures are `?Send`, so the futures driving the session
-//! are `!Send`: **[`LiveKitCall::join`] must be called from within a
-//! [`tokio::task::LocalSet`]** (it uses `spawn_local` internally) and panics
-//! outside one. See `examples/join_and_record.rs` for the runtime skeleton.
+//! [`LiveKitCall::join`] must be called from within a tokio runtime: the
+//! library spawns the room's feeds and the session's keep-alive onto the
+//! current one (`matrix_rtc_core::executor`). See `examples/join_and_record.rs`
+//! for the runtime skeleton.
 //!
 //! # Preconditions
 //!
@@ -36,20 +36,19 @@
 //!   MSC4143 counts nobody as joined against a closed slot.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use livekit::RoomEvent;
 use matrix_sdk::{Client, Room};
-use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{broadcast, watch};
-use tokio::task::JoinHandle;
 
-use matrix_rtc_call::compat::{self, ElementCallCompat};
 use matrix_rtc_call::transports;
 use matrix_rtc_call::{
     CallJoinOptions, JoinOptions, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
-    RoomOptions, RtcCall, RtcClient, RtcError, RtcRoom,
+    RtcCall, RtcClient, RtcError, RtcRoom,
 };
+use matrix_rtc_core::RoomOptions;
+use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{
     BaseRtcRoom, EncryptionConfig, LiveKitTransport, MatrixBackend, RtcTransport, SlotEncryption,
     TransportIntent,
@@ -122,8 +121,9 @@ pub struct LiveKitCallOptions {
     /// default, which requires key senders to be cross-signed (MSC4153) —
     /// only relax this for test setups whose users have no cross-signing.
     pub encryption_config: Option<EncryptionConfig>,
-    /// How often to refresh the dead man's switch delayed leave.
-    pub heartbeat_interval: Duration,
+    /// How often to refresh the dead man's switch delayed leave; `None` is
+    /// [`DEFAULT_KEEP_ALIVE_INTERVAL_MS`](matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS).
+    pub keep_alive_interval_ms: Option<u64>,
     /// How long the homeserver keeps our membership in the sticky map. `None`
     /// keeps the core's default of an hour.
     ///
@@ -133,10 +133,10 @@ pub struct LiveKitCallOptions {
     /// until this elapses. A tool that expects to be killed — a load generator,
     /// a test — wants it short.
     ///
-    /// Not free: the heartbeat re-sends the membership once it is halfway to
+    /// Not free: the keep-alive re-sends the membership once it is halfway to
     /// expiring, so halving this doubles that signalling rate. Keep it well
-    /// above twice [`heartbeat_interval`](Self::heartbeat_interval), or the
-    /// entry can lapse between beats.
+    /// above twice [`keep_alive_interval_ms`](Self::keep_alive_interval_ms), or the
+    /// entry can lapse between ticks.
     pub sticky_duration_ms: Option<u64>,
     /// The membership lifetime to publish instead of
     /// [`sticky_duration_ms`](Self::sticky_duration_ms) when the homeserver
@@ -146,7 +146,7 @@ pub struct LiveKitCallOptions {
     /// Only ever reached on a homeserver without MSC4140, where the join
     /// degrades rather than failing. Subject to the same rule as
     /// `sticky_duration_ms`: keep it well above twice
-    /// [`heartbeat_interval`](Self::heartbeat_interval).
+    /// [`keep_alive_interval_ms`](Self::keep_alive_interval_ms).
     pub degraded_lifetime_ms: Option<u64>,
     /// HTTP client used for the token exchange with the authorisation
     /// service. Supply one to control TLS behaviour (e.g. self-signed dev
@@ -162,7 +162,7 @@ pub struct LiveKitCallOptions {
     /// with Element Call builds that have not caught up with the 2026 MSC4143
     /// rewrite.
     ///
-    /// [`ElementCallCompat::StickyEvents`] keeps a join MSC4143-valid — the
+    /// [`MembershipFormat::Sticky2025`] keeps a join MSC4143-valid — the
     /// legacy fields ride alongside. A leave and a media key cannot: a leave
     /// becomes the legacy bare-sticky-key content (that generation has no
     /// `membership` field, and a padded spec leave would read to it as still
@@ -171,7 +171,7 @@ pub struct LiveKitCallOptions {
     /// mode therefore exchanges keys with legacy peers and not with spec-current
     /// ones.
     ///
-    /// [`ElementCallCompat::StateEvents`] goes further and is not additive at
+    /// [`MembershipFormat::RoomState`] goes further and is not additive at
     /// all: the membership moves to `org.matrix.msc3401.call.member` room state,
     /// the SFU participant identity becomes the plain `{user}:{device}` string,
     /// and the token comes from the pre-MSC4195 `/sfu/get` endpoint. Nothing
@@ -179,7 +179,7 @@ pub struct LiveKitCallOptions {
     ///
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
     /// [`crate::compat`], and delete all of it once Element Call catches up.
-    pub element_call_compat: ElementCallCompat,
+    pub format: MembershipFormat,
     /// Ask for an MSC4075 notification to be sent with this join, so other
     /// devices in the room ring or show an incoming call.
     ///
@@ -210,26 +210,16 @@ impl Default for LiveKitCallOptions {
             application: "m.call".to_owned(),
             livekit_transport: None,
             encryption_config: None,
-            heartbeat_interval: Duration::from_secs(15),
+            keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             http: None,
             auto_subscribe: true,
-            element_call_compat: ElementCallCompat::default(),
+            format: MembershipFormat::default(),
             notify: None,
             reactions: None,
             stability: StabilityConfig::default(),
         }
-    }
-}
-
-/// Aborts the wrapped task when dropped, so a [`LiveKitCall`] going out of scope
-/// never leaks its background loops.
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
     }
 }
 
@@ -241,7 +231,7 @@ impl Drop for AbortOnDrop {
 /// handler, but sends no leave event — peers then see this member disappear
 /// only when the dead man's switch fires.
 pub struct LiveKitCall {
-    /// Shared with the heartbeat and rotation pumps.
+    /// Keeps itself alive and rotates its keys while it lives.
     call: Arc<RtcCall<SdkMatrixBackend>>,
     /// Holds the room's subscription; dropping it detaches.
     room: RtcRoom<SdkMatrixBackend>,
@@ -250,10 +240,6 @@ pub struct LiveKitCall {
     raw_events: UnboundedReceiver<RoomEvent>,
     bridge: Arc<MediaKeyBridge>,
     own_identity: String,
-    heartbeat: AbortOnDrop,
-    rotation_pump: AbortOnDrop,
-    _room_feed: AbortOnDrop,
-    _to_device_feed: Option<AbortOnDrop>,
 }
 
 impl LiveKitCall {
@@ -261,12 +247,12 @@ impl LiveKitCall {
     /// per-participant frame E2EE.
     ///
     /// Publishes this device's `m.rtc.member` membership as a sticky event,
-    /// arms the dead man's switch delayed leave (kept alive by an internal
-    /// heartbeat), starts distributing/ingesting media keys over Olm-encrypted
+    /// arms the dead man's switch delayed leave (kept alive by the session),
+    /// starts distributing/ingesting media keys over Olm-encrypted
     /// to-device messages, discovers the LiveKit transport, and connects.
     ///
-    /// Must run inside a [`tokio::task::LocalSet`]; see the module docs for
-    /// this and the other preconditions.
+    /// Must run inside a tokio runtime; see the module docs for this and the
+    /// other preconditions.
     pub async fn join(
         room: &Room,
         options: LiveKitCallOptions,
@@ -286,15 +272,15 @@ impl LiveKitCall {
             .to_string();
         let room_id = room.room_id().to_string();
 
-        match options.element_call_compat {
-            ElementCallCompat::Off => {}
-            ElementCallCompat::StickyEvents => log::warn!(
+        match options.format {
+            MembershipFormat::Current => {}
+            MembershipFormat::Sticky2025 => log::warn!(
                 "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
                  go out as {} and will not reach spec-current peers",
                 options.slot_id,
                 compat::LEGACY_KEY_EVENT_TYPE,
             ),
-            ElementCallCompat::StateEvents => log::warn!(
+            MembershipFormat::RoomState => log::warn!(
                 "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
                  membership goes out as {} room state, our SFU identity is the plain \
                  {{user}}:{{device}} string, and the token comes from /sfu/get. Nothing about \
@@ -306,19 +292,16 @@ impl LiveKitCall {
 
         // One client for this call: it opens the room (the feeder subscribes to
         // what the mode needs and seeds room state before membership) and the
-        // to-device key subscription. Both feeds run on this `LocalSet`.
+        // to-device key subscription; the library runs both feeds.
         let client = RtcClient::new(Arc::new(SdkMatrixBackend::new(client.clone())));
-        let (room, runs) = client
+        let room = client
             .room(
                 room_id.clone(),
                 RoomOptions {
-                    element_call_compat: options.element_call_compat,
+                    format: options.format,
                 },
             )
             .await?;
-        let (feed, to_device) = runs.into_futures();
-        let room_feed = AbortOnDrop(tokio::task::spawn_local(feed));
-        let to_device_feed = to_device.map(|run| AbortOnDrop(tokio::task::spawn_local(run)));
         room.seeded().await;
 
         // Frame encryption: a single shared KeyProvider handle feeds both the
@@ -327,7 +310,7 @@ impl LiveKitCall {
         // per-participant HKDF mode.
         let provider = msc4195_key_provider();
         let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
-        let identity_mapper = identity_mapper(options.element_call_compat);
+        let identity_mapper = identity_mapper(options.format);
 
         // The transport is resolved here rather than by the join, because the
         // SFU connection below needs the LiveKit focus it names: the join's own
@@ -355,13 +338,17 @@ impl LiveKitCall {
         // join, except in the pre-sticky generation; see
         // `compat::ingest::member_id`) and renders our sends in the room's
         // dialect.
-        let mut join = JoinOptions::new(options.slot_id.clone(), options.application.clone());
+        let mut join = JoinOptions {
+            slot_id: options.slot_id.clone(),
+            ..JoinOptions::application(options.application.clone())
+        };
         join.transport = Some(TransportIntent::Publish(RtcTransport::LiveKit(
             livekit.clone(),
         )));
         join.encryption_config = options.encryption_config.clone();
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
+        join.keep_alive_interval_ms = options.keep_alive_interval_ms;
         let call = Arc::new(
             room.join_call(CallJoinOptions {
                 join,
@@ -405,24 +392,6 @@ impl LiveKitCall {
         let reactions = call.subscribe_reactions().await;
         let memberships = call.subscribe_memberships().await;
 
-        // Rotations the core coalesced into a key's `delayBeforeUse` window fall
-        // due the moment that window closes, and the bridge's scheduled
-        // installation is the only thing that knows when that is. Route it back:
-        // the bridge notifies from a plain `tokio` task, which cannot touch the
-        // `!Send` call, so it sends on a channel that a `spawn_local` pump
-        // drains — the same shape the receive path uses.
-        //
-        // Without this the rotation still happens, on the next heartbeat; the
-        // point of wiring it is that a member who left during the window is locked
-        // out when the window ends rather than up to a heartbeat later.
-        let (switch_tx, switch_rx) = unbounded_channel::<()>();
-        bridge.set_switch_complete_listener(Box::new(move || {
-            let _ = switch_tx.send(());
-        }));
-        let rotation_pump = AbortOnDrop(spawn_rotation_pump(call.clone(), switch_rx));
-
-        let heartbeat = AbortOnDrop(spawn_heartbeat(call.clone(), options.heartbeat_interval));
-
         // The media layer: a LiveKit transport sharing the E2EE key provider,
         // and the engine reconciling memberships with connection events. The
         // client is the OpenID token source for the MSC4195 token exchange.
@@ -437,11 +406,11 @@ impl LiveKitCall {
                 // The same mapper the core got, so our own identity, the peers'
                 // and the key ring's all agree.
                 .with_identity_mapper(identity_mapper.clone())
-                .with_token_endpoint(match options.element_call_compat {
+                .with_token_endpoint(match options.format {
                     // Pre-MSC4195 `/sfu/get`, which is also where the unhashed
                     // `{user}:{device}` identity above comes from — the two are
                     // one decision, not two.
-                    ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                    MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
                     _ => TokenEndpoint::Msc4195,
                 }),
         );
@@ -521,8 +490,6 @@ impl LiveKitCall {
                 );
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
-                drop(heartbeat);
-                drop(rotation_pump);
                 if let Err(leave_error) = call.leave(Default::default()).await {
                     log::warn!("leave after failed SFU connect also failed: {leave_error}");
                 }
@@ -568,10 +535,6 @@ impl LiveKitCall {
             raw_events,
             bridge,
             own_identity,
-            heartbeat,
-            rotation_pump,
-            _room_feed: room_feed,
-            _to_device_feed: to_device_feed,
         })
     }
 
@@ -730,23 +693,16 @@ impl LiveKitCall {
     /// Leave the call cleanly: send the leave event (cancelling the delayed
     /// leave) and close the SFU connection.
     ///
-    /// The heartbeat stops first so it cannot re-arm a delayed leave after
-    /// `leave` cancels the current one. The SFU connection is closed even if
-    /// the Matrix-side leave fails; the first error wins.
+    /// The SFU connection is closed even if the Matrix-side leave fails; the
+    /// first error wins.
     pub async fn leave(self) -> Result<(), LiveKitCallError> {
         let LiveKitCall {
             call,
             room,
             engine,
             connection,
-            heartbeat,
-            rotation_pump,
             ..
         } = self;
-        drop(heartbeat);
-        // Nothing left to rotate for once we are leaving, and the core drops its
-        // encryption manager as part of the leave below.
-        drop(rotation_pump);
         let room_id = room.room_id().to_owned();
 
         // Step logs bracket every await so a wedged teardown pinpoints itself.
@@ -793,83 +749,4 @@ pub async fn open_slot(
         .open_slot(slot_id.to_owned(), application.to_owned(), encryption)
         .await
         .map_err(signalling_error)
-}
-
-/// Perform a coalesced key rotation at the instant it falls due.
-///
-/// Two things wake this up, because neither alone is enough:
-///
-/// - The bridge, whenever a key comes into use. That is where a rotation *becomes*
-///   owed (a member left while the key was fresh), but it is not when the rotation
-///   is due — freshness outlasts `delayBeforeUse`, so there is usually nothing to
-///   do yet.
-/// - A timer, set from the deadline the core reports. This is the wake-up that
-///   actually performs the rotation.
-///
-/// The core decides whether anything is owed, so a wake-up with nothing due costs a
-/// lock and a comparison. `RtcSession::heartbeat` flushes too, so a stall here
-/// makes the rotation late rather than lost.
-fn spawn_rotation_pump(
-    call: Arc<RtcCall<SdkMatrixBackend>>,
-    mut switch_rx: UnboundedReceiver<()>,
-) -> JoinHandle<()> {
-    tokio::task::spawn_local(async move {
-        loop {
-            // How long until the next owed rotation, if any. Recomputed on every
-            // pass: the flush below may itself mint a key whose window a later
-            // change gets coalesced into.
-            let due_in = call
-                .key_rotation_due_at_ms()
-                .await
-                .map(|due_at| Duration::from_millis(due_at.saturating_sub(matrix_rtc_now_ms())));
-
-            match due_in {
-                // Nothing owed: wait for the bridge to tell us a key came into use,
-                // which is the only thing that can make one owed.
-                None => {
-                    if switch_rx.recv().await.is_none() {
-                        return;
-                    }
-                }
-                // Owed: race the deadline against further news from the bridge, so
-                // a key coming into use in the meantime is not ignored.
-                Some(delay) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(delay) => {}
-                        received = switch_rx.recv() => {
-                            if received.is_none() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            call.flush_due_key_rotation().await;
-        }
-    })
-}
-
-/// Wall-clock milliseconds, to compare against the deadlines the core reports.
-///
-/// The core reads the same clock (`EncryptionManager::set_clock` is not installed
-/// here, so it is the system one).
-fn matrix_rtc_now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// Keep pushing the dead man's switch delayed leave back while joined.
-fn spawn_heartbeat(call: Arc<RtcCall<SdkMatrixBackend>>, interval: Duration) -> JoinHandle<()> {
-    tokio::task::spawn_local(async move {
-        let mut ticker = tokio::time::interval(interval);
-        loop {
-            ticker.tick().await;
-            if !call.heartbeat().await {
-                return;
-            }
-        }
-    })
 }

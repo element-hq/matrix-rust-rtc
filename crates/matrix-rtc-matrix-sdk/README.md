@@ -1,8 +1,8 @@
 # matrix-rtc-matrix-sdk
 
 The matrix-rust-sdk implementation of `matrix-rtc-core`'s `MatrixBackend`. The
-core and the call layer (`matrix-rtc-call`, which also holds the feeder and the
-pre-2026 Element Call dialects) drive any backend; this crate is the one over a
+core (which also holds the feeder) and the call layer (`matrix-rtc-call`, which
+also holds the pre-2026 Element Call dialects) drive any backend; this crate is the one over a
 `matrix_sdk::Client`. It is deliberately **transport-free** — nothing in it
 knows what a LiveKit SFU is.
 
