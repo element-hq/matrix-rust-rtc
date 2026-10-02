@@ -34,8 +34,7 @@ pub use feeder::{
 };
 
 pub use client::{
-    CallJoinOptions, JoinOptions, RoomOptions, RoomRuns, RtcCall, RtcClient, RtcError, RtcRoom,
-    RtcSession,
+    CallJoinOptions, JoinOptions, RoomOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession,
 };
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,

@@ -46,7 +46,7 @@ learns of a ring through its own SDK or push path.
 | **`reactions`** | Element Call's emoji reactions and raised hand: the wire format, the send cooldown, and the per-session state the call keeps. |
 | **`notification`** | MSC4075 ringing: who notifies, and the notification content. |
 | **`compat`** | Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite (today: Element Call on the JS SDK), in two generations. `StickyEvents` is the 2025 format — MSC4354 stickies with pre-2026 field names; reading it is always on, writing it is opt-in. `StateEvents` is the format before MSC4354, with membership as `org.matrix.msc3401.call.member` **room state**; opt-in in both directions, and visible to nobody but that generation. Pure JSON in, pure JSON out — no Matrix SDK, no async runtime. Scaffolding, to be deleted once Element Call catches up. |
-| **`feeder`** | What feeds an open room from a host's `MatrixBackend`. `RoomFeeder::attach(backend, room, mode)` subscribes to what the room's compatibility mode needs, applies encryption, slot state and joined members before the first membership, translates the member events (client-reported decryption facts → `EventOrigin`; the pre-2026 funnels), feeds timeline events, redactions and `/relations`, and reports `seeded` once the current state is in. `ToDeviceFeeder` routes the to-device key messages to the open room they are for, through the `RoomRegistry`, and drops those for a room that is not open. The core spawns nothing; the caller runs each feeder's future where it likes. |
+| **`feeder`** | What feeds an open room from a host's `MatrixBackend`. `RoomFeeder::attach(backend, room, mode)` subscribes to what the room's compatibility mode needs, applies encryption, slot state and joined members before the first membership, translates the member events (client-reported decryption facts → `EventOrigin`; the pre-2026 funnels), feeds timeline events, redactions and `/relations`, and reports `seeded` once the current state is in. `ToDeviceFeeder` routes the to-device key messages to the open room they are for, through the `RoomRegistry`, and drops those for a room that is not open. `RtcClient::room` runs both feeders' futures on the core's executor. |
 | **`compat::dialect_backend`** | `DialectBackend<B>`: the one `MatrixBackend` wrapper applying a room's outbound dialect (member-event routing, legacy key type, pre-sticky leave as a delayed *state* event) before delegating. Registered at join, from the mode the room was opened in. |
 | **`transports`** | `choose(rtc_transports, override)`: the library's transport pick — the join's override, else the first LiveKit entry the homeserver advertises. |
 
@@ -81,7 +81,8 @@ the edge — read the module docs before touching it.
 ## Who uses the client
 
 Every entry point opens rooms through `RtcClient` and differs only in where the
-backend comes from and where the feed futures run:
-`matrix_rtc_livekit::LiveKitCall::join` (`SdkMatrixBackend`, `spawn_local`),
+backend comes from and which runtime is current when it does:
+`matrix_rtc_livekit::LiveKitCall::join` (`SdkMatrixBackend`, the caller's tokio runtime),
 `matrix_rtc_ffi::RtcClient` (the host's foreign trait, the FFI runtime) and
-`matrix_rtc_wasm::WasmRtcClient` (the page's `MatrixBackendHost`, `spawn_local`).
+`matrix_rtc_wasm::WasmRtcClient` (the page's `MatrixBackendHost`, the JS event loop).
+The library spawns the feeds itself.

@@ -10,12 +10,12 @@
 //! The client holds nothing about a room until one is asked for; the only state
 //! spanning rooms is the backend and the routing of to-device media keys to the
 //! room they name, through a registry of weak handles. Everything room-scoped
-//! is on the room, everything about our own participation on the session. The
-//! library spawns nothing: opening a room returns the futures that feed it, and
-//! the binding runs them where its background work already runs.
+//! is on the room, everything about our own participation on the session. A
+//! room's feeds run on the core's [`executor`](matrix_rtc_core::executor)
+//! while the room object lives. Off wasm32 that is the current tokio runtime,
+//! so a native host opens rooms from within one.
 
 use std::collections::HashMap;
-use std::future::Future;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
@@ -24,15 +24,13 @@ use matrix_rtc_core::{
     ApplicationInfo, BackendError, CommandError, EncryptionConfig, EncryptionKeySignalHandler,
     JoinError, JoinSessionParams, JoinedMembership, LeaveError, LeaveSessionParams, MatrixBackend,
     RtcIdentityMapper, SlotEncryption, SlotState, TransportIntent,
+    executor::{self, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::compat::ingest::{member_id, outbound_dialect};
 use crate::compat::{DialectBackend, ElementCallCompat};
-use crate::feeder::{
-    RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomFeederRun, RoomRegistry, ToDeviceFeeder,
-    ToDeviceFeederRun,
-};
+use crate::feeder::{RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomRegistry, ToDeviceFeeder};
 use crate::notification::NotifyConfig;
 use crate::reactions::{RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction};
 use crate::room_state::{CallJoinParams, CallRoomState};
@@ -131,13 +129,19 @@ struct ClientShared<B: MatrixBackend + 'static> {
     /// Running while at least one room is open. Locked together with the
     /// registry's changes, so a room opening and the last one closing cannot
     /// interleave into an open room with no subscription.
-    to_device: StdMutex<Option<ToDeviceFeeder>>,
+    to_device: StdMutex<Option<ToDeviceRunning>>,
     /// Serialises opening rooms, so two first rooms do not both subscribe.
     opening: Mutex<()>,
 }
 
+/// The client's to-device subscription and the task draining it.
+struct ToDeviceRunning {
+    feeder: ToDeviceFeeder,
+    _task: AbortOnDrop<()>,
+}
+
 impl<B: MatrixBackend + 'static> ClientShared<B> {
-    fn to_device(&self) -> MutexGuard<'_, Option<ToDeviceFeeder>> {
+    fn to_device(&self) -> MutexGuard<'_, Option<ToDeviceRunning>> {
         self.to_device
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -148,10 +152,10 @@ impl<B: MatrixBackend + 'static> ClientShared<B> {
     fn release(&self, room_id: &str) {
         let mut to_device = self.to_device();
         if self.registry.unregister(room_id)
-            && let Some(feeder) = to_device.take()
+            && let Some(running) = to_device.take()
         {
             log::info!("client: last room closed; to-device subscription stopped");
-            feeder.stop();
+            running.feeder.stop();
         }
     }
 }
@@ -181,7 +185,7 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
 
     /// Opens `room_id` (R2): registers it, subscribes to what its mode needs,
     /// and starts the to-device subscription if this is the first open room.
-    /// Spawn [`RoomRuns::into_futures`], then await [`RtcRoom::seeded`].
+    /// The feeds run on the executor; await [`RtcRoom::seeded`] before joining.
     ///
     /// Refused while the room has a live room object (R5). Cancelling the call
     /// part-way leaves nothing behind: the room is free again, and the
@@ -190,7 +194,7 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         &self,
         room_id: impl Into<String>,
         options: RoomOptions,
-    ) -> Result<(RtcRoom<B>, RoomRuns<B>), RtcError> {
+    ) -> Result<RtcRoom<B>, RtcError> {
         let room_id = room_id.into();
         let mode = options.element_call_compat;
         let shared = &self.shared;
@@ -214,29 +218,31 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         };
         log::info!("client: [{room_id}] opening in {mode:?} mode");
 
-        let to_device = if needs_to_device {
+        if needs_to_device {
             let (feeder, run) =
                 ToDeviceFeeder::start(shared.backend.clone(), shared.registry.clone()).await?;
-            *shared.to_device() = Some(feeder);
+            *shared.to_device() = Some(ToDeviceRunning {
+                feeder,
+                _task: executor::spawn(run.run()).abort_on_drop(),
+            });
             log::info!("client: to-device subscription started");
-            Some(run)
-        } else {
-            None
-        };
+        }
 
         let (attachment, feed) =
             RoomFeeder::attach(shared.backend.clone(), state.clone(), mode).await?;
         opening.opened();
 
-        let room = RtcRoom {
+        Ok(RtcRoom {
             room_id,
             mode,
             state,
-            attachment: Some(attachment),
+            attachment: Some(Attached {
+                attachment,
+                _feed: executor::spawn(feed.run()).abort_on_drop(),
+            }),
             sessions: StdMutex::new(HashMap::new()),
             client: shared.clone(),
-        };
-        Ok((room, RoomRuns { feed, to_device }))
+        })
     }
 }
 
@@ -262,24 +268,10 @@ impl<B: MatrixBackend + 'static> Drop for Opening<'_, B> {
     }
 }
 
-/// The futures that feed an opened room. The binding spawns them.
-pub struct RoomRuns<B: MatrixBackend + 'static> {
-    feed: RoomFeederRun<Backend<B>, State<B>>,
-    to_device: Option<ToDeviceFeederRun<Backend<B>, State<B>>>,
-}
-
-impl<B: MatrixBackend + 'static> RoomRuns<B> {
-    /// The room's feed, which ends when the room closes or drops, and — for a
-    /// client's first open room — the to-device feed, which ends when the last
-    /// room does.
-    pub fn into_futures(
-        self,
-    ) -> (
-        impl Future<Output = ()> + use<B>,
-        Option<impl Future<Output = ()> + use<B>>,
-    ) {
-        (self.feed.run(), self.to_device.map(ToDeviceFeederRun::run))
-    }
+/// A room's subscription and the task feeding it.
+struct Attached {
+    attachment: RoomAttachment,
+    _feed: AbortOnDrop<()>,
 }
 
 /// One open room (R3). Dropping it without [`close`](Self::close) ends its
@@ -290,7 +282,7 @@ pub struct RtcRoom<B: MatrixBackend + 'static> {
     mode: ElementCallCompat,
     state: SharedState<B>,
     /// `None` once detached.
-    attachment: Option<RoomAttachment>,
+    attachment: Option<Attached>,
     /// Whether each slot's current session object is live, by slot. A flag a
     /// session shares, so leaving, dropping it or closing the room ends it.
     sessions: StdMutex<HashMap<String, Arc<AtomicBool>>>,
@@ -314,15 +306,15 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// Resolves once the room's current state is applied, so a join issued
     /// afterwards sees it.
     pub async fn seeded(&self) {
-        if let Some(attachment) = &self.attachment {
-            attachment.seeded().await;
+        if let Some(attached) = &self.attachment {
+            attached.attachment.seeded().await;
         }
     }
 
     pub fn is_seeded(&self) -> bool {
         self.attachment
             .as_ref()
-            .is_some_and(RoomAttachment::is_seeded)
+            .is_some_and(|attached| attached.attachment.is_seeded())
     }
 
     /// Opens a slot by publishing its `m.rtc.slot` state. See
@@ -548,8 +540,8 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// Ends the subscription and forgets the room; idempotent.
     fn detach(&mut self) {
-        if let Some(attachment) = self.attachment.take() {
-            drop(attachment);
+        if let Some(attached) = self.attachment.take() {
+            drop(attached);
             self.client.backend.clear_dialect(&self.room_id);
             self.client.release(&self.room_id);
         }

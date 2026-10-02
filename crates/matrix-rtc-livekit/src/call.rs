@@ -252,8 +252,6 @@ pub struct LiveKitCall {
     own_identity: String,
     heartbeat: AbortOnDrop,
     rotation_pump: AbortOnDrop,
-    _room_feed: AbortOnDrop,
-    _to_device_feed: Option<AbortOnDrop>,
 }
 
 impl LiveKitCall {
@@ -306,9 +304,9 @@ impl LiveKitCall {
 
         // One client for this call: it opens the room (the feeder subscribes to
         // what the mode needs and seeds room state before membership) and the
-        // to-device key subscription. Both feeds run on this `LocalSet`.
+        // to-device key subscription; the library runs both feeds.
         let client = RtcClient::new(Arc::new(SdkMatrixBackend::new(client.clone())));
-        let (room, runs) = client
+        let room = client
             .room(
                 room_id.clone(),
                 RoomOptions {
@@ -316,9 +314,6 @@ impl LiveKitCall {
                 },
             )
             .await?;
-        let (feed, to_device) = runs.into_futures();
-        let room_feed = AbortOnDrop(tokio::task::spawn_local(feed));
-        let to_device_feed = to_device.map(|run| AbortOnDrop(tokio::task::spawn_local(run)));
         room.seeded().await;
 
         // Frame encryption: a single shared KeyProvider handle feeds both the
@@ -570,8 +565,6 @@ impl LiveKitCall {
             own_identity,
             heartbeat,
             rotation_pump,
-            _room_feed: room_feed,
-            _to_device_feed: to_device_feed,
         })
     }
 

@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- `RtcClient::room` spawns the room's feeds on `matrix_rtc_core::executor` and returns the room alone (`RoomRuns` is gone); natively it must be called within a tokio runtime.
 - The session managers are replaced by client → room → session (`RtcClient` → `RtcRoom` → `RtcSession`/`RtcCall`, likewise on the FFI and wasm), and the core's manager by the per-room `BaseRtcRoom`.
 - `matrix_rtc_livekit::Call`, `CallOptions` and `CallError` are renamed `LiveKitCall`, `LiveKitCallOptions` and `LiveKitCallError`, so they no longer read as the call crate's `RtcCall`.
 - `compat`, `feeder` and `transports` move from `matrix-rtc-bridge` to `matrix-rtc-call`, and what remains is renamed `matrix-rtc-matrix-sdk`, with no `matrix-sdk` feature; its `SdkBackend` becomes `SdkMatrixBackend`.

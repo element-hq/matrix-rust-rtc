@@ -35,15 +35,10 @@ async fn open(
     mock: &MockBackend,
     room_id: &str,
 ) -> RtcRoom<MockBackend> {
-    let (room, runs) = client
+    let room = client
         .room(room_id, RoomOptions::default())
         .await
         .expect("the room opens");
-    let (feed, to_device) = runs.into_futures();
-    tokio::spawn(feed);
-    if let Some(to_device) = to_device {
-        tokio::spawn(to_device);
-    }
 
     let sink = mock
         .room_subscription(room_id)
@@ -394,4 +389,22 @@ async fn an_opening_that_fails_leaves_nothing_behind() {
     // The room is free again.
     *mock.room_subscription_error.lock().unwrap() = None;
     let _room = open(&client, &mock, ROOM).await;
+}
+
+#[tokio::test]
+async fn dropping_a_room_aborts_its_feed() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    let state = Arc::downgrade(&room.state);
+
+    drop(room);
+    settle().await;
+    sink.on_joined_members(vec![BOB.to_owned()]);
+    settle().await;
+    assert!(
+        state.upgrade().is_none(),
+        "the feed task no longer holds the room state"
+    );
 }

@@ -176,8 +176,9 @@ is no longer its own: `LiveKitCall::join`, the FFI's `RtcClient` and the wasm
 `WasmRtcClient` all open rooms through `matrix_rtc_call::RtcClient` — which wraps
 the backend in `DialectBackend`, runs the `ToDeviceFeeder` while any room is
 open and attaches each room through `RoomFeeder` — and then join. What differs
-between them is only where the backend comes from and how the feed futures are
-spawned (`spawn_local`, the FFI runtime).
+between them is only where the backend comes from and which runtime is current:
+the library spawns the feeds itself, on `matrix_rtc_core::executor` (the
+current tokio runtime natively, `spawn_local` on wasm).
 
 ## High-level data flow
 

@@ -43,20 +43,14 @@ async fn run(
     // One per backend; creating it does no I/O.
     let client = RtcClient::new(backend);
 
-    // The room returns the futures that apply what arrives; run them where
-    // you like (they are `!Send`: a `LocalSet`, or `spawn_local` on wasm).
-    let (room, runs) = client.room(ROOM, RoomOptions::default()).await?;
-    let (feed, to_device) = runs.into_futures();
-    tokio::task::spawn_local(feed);
-    if let Some(to_device) = to_device {
-        tokio::task::spawn_local(to_device);
-    }
+    // Natively, from within a tokio runtime: the room spawns its feeds onto it.
+    let room = client.room(ROOM, RoomOptions::default()).await?;
     // Resolves once the room's current state has been applied.
     room.seeded().await;
 
     // The slot's joined memberships, without joining it.
     let mut members = room.observe(SLOT).await;
-    tokio::task::spawn_local(async move {
+    tokio::spawn(async move {
         while members.changed().await.is_ok() {
             println!("{} joined", members.borrow().len());
         }

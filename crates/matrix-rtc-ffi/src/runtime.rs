@@ -3,27 +3,29 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! The runtime the crate's own background work runs on.
+//! The runtime the library's own background work runs on.
 //!
 //! The exported handle methods are `async` and driven by uniffi's own Tokio
-//! integration (`async_runtime = "tokio"`), so they need nothing from here. Two
-//! things do, and one of them is in the slim build, so this is not gated on
-//! `media`:
+//! integration (`async_runtime = "tokio"`). The library spawns onto the
+//! *current* runtime (`matrix_rtc_core::executor`), and under uniffi that is
+//! async_compat's — an implementation detail of the binding layer that no
+//! entry point promises. So every export that spawns hops onto this one first
+//! ([`on_runtime`]), or spawns onto it directly:
 //!
+//! - opening a room, which spawns its feeds;
 //! - the keep-alive driver a join spawns, which outlives the call that started
-//!   it. `tokio::spawn` would put it on whichever runtime uniffi happened to be
-//!   polling that call on — async_compat's, an implementation detail of the
-//!   binding layer that no entry point promises.
-//! - the media layer: `connect_media_session` hops onto this runtime so every
-//!   task it spawns afterwards — the engine actor, the connection pool, IO —
-//!   inherits the same context regardless of which thread the FFI call arrived
-//!   on.
+//!   it;
+//! - the media layer: `connect_media_session` hops here so every task it
+//!   spawns afterwards — the engine actor, the connection pool, IO — inherits
+//!   the same context regardless of which thread the FFI call arrived on.
 //!
-//! It must be multi-threaded. The core arms a `tokio::time::sleep` on the
-//! key-rotation path (the MSC4143 `delayBeforeUse` wait), and a current-thread
-//! runtime with nothing driving it would leave that timer to never fire.
+//! Multi-threaded, so the library's timers fire with nothing else driving it.
 
-/// The process-wide runtime backing the keep-alive drivers and the media layer.
+use std::future::Future;
+
+use matrix_rtc_core::executor::JoinHandleExt;
+
+/// The process-wide runtime backing the library's tasks and the media layer.
 pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     use std::sync::OnceLock;
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -34,4 +36,18 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
             .build()
             .expect("failed to build the matrix-rtc tokio runtime")
     })
+}
+
+/// Runs `future` on [`runtime`], so whatever it spawns lands there. Dropping
+/// the returned future cancels `future`, as awaiting it in place would.
+pub(crate) async fn on_runtime<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    match runtime().spawn(future).abort_on_drop().await {
+        Ok(output) => output,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => panic!("matrix-rtc runtime task cancelled: {error}"),
+    }
 }

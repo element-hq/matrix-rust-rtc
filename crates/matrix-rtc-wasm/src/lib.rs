@@ -98,7 +98,7 @@ impl WasmRtcClient {
                 .and_then(|options| options.element_call_compat.as_deref()),
         )?;
         log::info!("client: [{room_id}] opening in {compat:?} mode");
-        let (room, runs) = self
+        let room = self
             .client
             .room(
                 room_id.clone(),
@@ -108,13 +108,6 @@ impl WasmRtcClient {
             )
             .await
             .map_err(js_error)?;
-        // Both feeds end on their own — the room's when the room goes, the
-        // to-device one when the last room does.
-        let (feed, to_device) = runs.into_futures();
-        wasm_bindgen_futures::spawn_local(feed);
-        if let Some(to_device) = to_device {
-            wasm_bindgen_futures::spawn_local(to_device);
-        }
         room.seeded().await;
         log::info!("client: [{room_id}] open and seeded");
         Ok(WasmRtcRoom {

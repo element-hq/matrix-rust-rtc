@@ -289,34 +289,31 @@ impl RtcClient {
     /// Cancelling the call leaves nothing behind. Dropping the returned room
     /// ends its subscriptions without leaving; `shutdown` leaves first.
     pub async fn room(
-        &self,
+        self: Arc<Self>,
         room_id: String,
         options: FfiRoomOptions,
     ) -> Result<Arc<RtcRoom>, MatrixRtcFfiError> {
         let compat = compat::resolve(options.element_call_compat);
         log::info!("client: [{room_id}] opening in {compat:?} mode");
-        let (room, runs) = self
-            .client
-            .room(
-                room_id.clone(),
-                call::RoomOptions {
-                    element_call_compat: compat,
-                },
-            )
-            .await?;
-        // Both feeds end on their own — the room's when the room goes, the
-        // to-device one when the last room does — so they run detached.
-        let (feed, to_device) = runs.into_futures();
-        runtime::runtime().spawn(feed);
-        if let Some(to_device) = to_device {
-            runtime::runtime().spawn(to_device);
-        }
-        room.seeded().await;
-        log::info!("client: [{room_id}] open and seeded");
-        Ok(Arc::new(RtcRoom {
-            room_id,
-            room: TokioRwLock::new(Some(room)),
-        }))
+        // On the library's runtime: the room's feeds are spawned from here.
+        runtime::on_runtime(async move {
+            let room = self
+                .client
+                .room(
+                    room_id.clone(),
+                    call::RoomOptions {
+                        element_call_compat: compat,
+                    },
+                )
+                .await?;
+            room.seeded().await;
+            log::info!("client: [{room_id}] open and seeded");
+            Ok(Arc::new(RtcRoom {
+                room_id,
+                room: TokioRwLock::new(Some(room)),
+            }))
+        })
+        .await
     }
 }
 
@@ -847,14 +844,17 @@ mod tests {
 
     /// Seeds the room's gating subjects and `sticky`, then opens the room.
     async fn open(
-        client: &RtcClient,
+        client: &Arc<RtcClient>,
         mock: &MockHost,
         compat: Option<FfiElementCallCompat>,
         encrypted: bool,
         slots: Vec<FfiEventIn>,
         sticky: Vec<FfiEventIn>,
     ) -> Arc<RtcRoom> {
-        let open = client.room(
+        // The open runs on the library's runtime, so it may not have
+        // subscribed by the time the seeder first looks.
+        mock.forget_room_sink(ROOM);
+        let open = client.clone().room(
             ROOM.to_owned(),
             FfiRoomOptions {
                 element_call_compat: compat,
@@ -894,7 +894,7 @@ mod tests {
     }
 
     /// [`open`] with an open slot and nobody in it.
-    async fn open_call_room(client: &RtcClient, mock: &MockHost) -> Arc<RtcRoom> {
+    async fn open_call_room(client: &Arc<RtcClient>, mock: &MockHost) -> Arc<RtcRoom> {
         open(client, mock, None, false, vec![open_slot(None)], Vec::new()).await
     }
 
@@ -1023,6 +1023,7 @@ mod tests {
         let room = open_call_room(&client, &mock).await;
 
         let again = client
+            .clone()
             .room(ROOM.to_owned(), FfiRoomOptions::default())
             .await;
         assert!(matches!(again, Err(MatrixRtcFfiError::Attachment(_))));
@@ -1053,7 +1054,9 @@ mod tests {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         {
-            let first = client.room(ROOM.to_owned(), FfiRoomOptions::default());
+            let first = client
+                .clone()
+                .room(ROOM.to_owned(), FfiRoomOptions::default());
             tokio::pin!(first);
             // Subscribed, never seeded.
             tokio::select! {
@@ -1065,14 +1068,16 @@ mod tests {
                 } => {}
             }
             let second = client
+                .clone()
                 .room(ROOM.to_owned(), FfiRoomOptions::default())
                 .await;
             assert!(matches!(second, Err(MatrixRtcFfiError::Attachment(_))));
         }
         // The first open was dropped (its caller cancelled it): its room
         // subscription ended, the room is free again, and with no room left
-        // the to-device subscription went too.
-        assert_eq!(mock.live_subscriptions(), 0);
+        // the to-device subscription went too. Asynchronously: the open runs
+        // on the library's runtime, where the cancellation lands a moment later.
+        wait_until(async || mock.live_subscriptions() == 0).await;
         let _room = open_call_room(&client, &mock).await;
         assert_eq!(mock.live_subscriptions(), 2);
     }
