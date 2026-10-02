@@ -253,6 +253,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .and_then(|manager| manager.rotation_due_at_ms())
     }
 
+    /// Follows [`Self::key_rotation_due_at_ms`], so a scheduler can wake at the
+    /// deadline. `None` when not joined.
+    pub fn subscribe_key_rotation_due(&self) -> Option<watch::Receiver<Option<u64>>> {
+        self.encryption_manager
+            .as_ref()
+            .map(EncryptionManager::subscribe_rotation_due)
+    }
+
     /// Performs a key rotation coalesced into a fresh key's window, if one is owed
     /// and due.
     ///

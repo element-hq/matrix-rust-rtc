@@ -369,6 +369,17 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             .and_then(|session| session.key_rotation_due_at_ms())
     }
 
+    /// Follows [`Self::key_rotation_due_at_ms`] for one slot; `None` if the slot
+    /// has not joined.
+    pub fn subscribe_key_rotation_due(
+        &self,
+        slot_id: &str,
+    ) -> Option<watch::Receiver<Option<u64>>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(SlotSession::subscribe_key_rotation_due)
+    }
+
     /// Performs a key rotation that was coalesced into a fresh key's window, if one
     /// is owed and the window has closed.
     ///

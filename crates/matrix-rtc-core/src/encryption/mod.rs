@@ -224,6 +224,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use serde_json::json;
+use tokio::sync::watch;
 use types::*;
 
 /// Closure type for getting current memberships, wrapped for thread-safety.
@@ -424,8 +425,9 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// Set when a membership change that warrants a new key arrives while one is
     /// already propagating; cleared by the rotation that answers it. See
     /// [`Self::flush_due_rotation`], which is what makes it happen in a call
-    /// where nothing else moves.
-    rotation_due_at: Arc<Mutex<Option<u64>>>,
+    /// where nothing else moves. A watch, so a scheduler re-arms on every move
+    /// ([`Self::subscribe_rotation_due`]).
+    rotation_due_at: Arc<watch::Sender<Option<u64>>>,
 
     /// Our outbound key as last signalled to the app, so the same rotation is
     /// not installed twice and a replay can honour the remaining
@@ -508,7 +510,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             keys_without_membership: Arc::new(Mutex::new(Vec::new())),
             clock: Arc::new(system_clock),
             superseded_key: Arc::new(RwLock::new(None)),
-            rotation_due_at: Arc::new(Mutex::new(None)),
+            rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
         }
     }
@@ -742,7 +744,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         *self.next_key_index.lock().unwrap() = 0;
         *self.signalled_key.lock().unwrap() = None;
         *self.superseded_key.write().unwrap() = None;
-        *self.rotation_due_at.lock().unwrap() = None;
+        self.set_rotation_due_at(None);
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -1088,11 +1090,11 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         //
         // Always set, because every key expires: a scheduler always has a next
         // wake-up, and an owed rotation is simply one whose instant has not come yet.
-        *self.rotation_due_at.lock().unwrap() = Some(if rotating {
+        self.set_rotation_due_at(Some(if rotating {
             now.saturating_add(lifetime_ms)
         } else {
             expires_at
-        });
+        }));
 
         if !rotating && joined_participants.is_empty() {
             // Nothing to rotate to and nobody waiting for what we already have.
@@ -1365,7 +1367,20 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// ticks periodically can ignore it and call the flush on its own cadence —
     /// the rotation happens late in that case, not never.
     pub fn rotation_due_at_ms(&self) -> Option<u64> {
-        *self.rotation_due_at.lock().unwrap()
+        *self.rotation_due_at.borrow()
+    }
+
+    /// Follows [`Self::rotation_due_at_ms`]; wakes on every change.
+    pub fn subscribe_rotation_due(&self) -> watch::Receiver<Option<u64>> {
+        self.rotation_due_at.subscribe()
+    }
+
+    fn set_rotation_due_at(&self, due_at: Option<u64>) {
+        self.rotation_due_at.send_if_modified(|current| {
+            let changed = *current != due_at;
+            *current = due_at;
+            changed
+        });
     }
 
     /// Performs a rotation that was deferred into a switch window, once it is due.
