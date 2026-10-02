@@ -572,10 +572,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     ///
     /// Returns `true` if the heartbeat was processed successfully.
     /// Returns `false` if not joined (no membership machine active).
-    pub async fn heartbeat(&mut self) -> bool {
+    pub async fn keep_alive(&mut self) -> bool {
         if let Some(machine) = self.own_membership_machine.as_ref() {
             log::trace!("[{}] heartbeat", self.log_tag);
-            machine.heartbeat().await;
+            machine.keep_alive().await;
 
             // A rotation coalesced into a key's `delayBeforeUse` window needs
             // somebody to come back for it once the window closes, and in a call

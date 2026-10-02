@@ -5,7 +5,7 @@
 
 //! [`CallRoomState`]: one room's core [`BaseRtcRoom`] plus the call application's
 //! state in it — reactions and raised hands per slot, ringing on join. It wraps
-//! the three core operations the call acts around (join, leave, heartbeat) and
+//! the three core operations the call acts around (join, leave, keep-alive) and
 //! follows each slot's joined memberships through a core
 //! [`MembershipListener`](matrix_rtc_core::MembershipListener) registered on
 //! that room alone. The feeder writes into it; hosts reach it through
@@ -257,8 +257,8 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
     }
 
     /// Then re-annotates our hand if the sticky refresh moved our membership.
-    pub async fn heartbeat(&mut self, slot_id: &str) -> bool {
-        let joined = self.rtc.heartbeat(slot_id).await;
+    pub async fn keep_alive(&mut self, slot_id: &str) -> bool {
+        let joined = self.rtc.keep_alive(slot_id).await;
         if joined {
             self.reannotate_hand_if_moved(slot_id).await;
         }
@@ -495,7 +495,7 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
     /// and looks for one on the new event instead, so a hand that stayed on
     /// the join event would be lowered for us at the first refresh. Peers may
     /// see the hand drop for one round trip in between; that is inherent to
-    /// the protocol. A failed re-send is retried on the next heartbeat, since
+    /// the protocol. A failed re-send is retried on the next keep-alive tick, since
     /// the ids still differ.
     async fn reannotate_hand_if_moved(&mut self, slot_id: &str) {
         let room_id = self.room_id();
@@ -550,7 +550,7 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
             }
             Err(error) => log::warn!(
                 "[{room_id}/{slot_id}] could not raise the hand again on the refreshed \
-                 membership ({error}); retrying on the next heartbeat",
+                 membership ({error}); retrying on the next keep-alive",
             ),
         }
     }
@@ -595,7 +595,7 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
     }
 }
 
-/// `join`, `leave` and `heartbeat` are inherent, so they win over the core's;
+/// `join`, `leave` and `keep_alive` are inherent, so they win over the core's;
 /// `join` takes [`CallJoinParams`], so code written against the core's does not
 /// compile rather than silently skipping the notification.
 impl<T: MatrixBackend> std::ops::Deref for CallRoomState<T> {

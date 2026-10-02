@@ -269,9 +269,9 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
     /// Call periodically (e.g. every 15 s) while joined so the dead man's switch
     /// timer keeps getting pushed back. Returns `false` if the slot is not
     /// joined.
-    pub async fn heartbeat(&mut self, slot_id: &str) -> bool {
+    pub async fn keep_alive(&mut self, slot_id: &str) -> bool {
         match self.sessions.get_mut(slot_id) {
-            Some(session) => session.heartbeat().await,
+            Some(session) => session.keep_alive().await,
             None => false,
         }
     }
@@ -391,7 +391,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
     /// ends. `matrix-rtc-livekit`'s `MediaKeyBridge` drives it from the same
     /// scheduled wake-up that installs the key.
     ///
-    /// A consumer that does not is not left broken, only late: [`Self::heartbeat`]
+    /// A consumer that does not is not left broken, only late: [`Self::keep_alive`]
     /// performs any owed rotation too, so it lands within one heartbeat instead.
     ///
     /// Cheap and idempotent — a no-op unless a rotation is actually due. Returns

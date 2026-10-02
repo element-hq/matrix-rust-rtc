@@ -24,10 +24,10 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 /// Distinct from [`DEFAULT_KEEP_ALIVE_TIMEOUT_MS`]: that one arms the delayed
 /// leave (the dead man's switch for a client that dies), while this one is how
 /// long the homeserver keeps our membership in the sticky map at all. Both are
-/// refreshed by [`heartbeat`], the sticky one only once it is halfway to
+/// refreshed by [`keep_alive`], the sticky one only once it is halfway to
 /// expiry.
 ///
-/// [`heartbeat`]: crate::OwnMembershipMachine::heartbeat
+/// [`keep_alive`]: crate::OwnMembershipMachine::keep_alive
 pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 
 /// The longest sticky lifetime that is actually honoured (1 hour).

@@ -456,7 +456,7 @@ async fn hands_are_ordered_by_when_they_were_raised() {
 
 #[tokio::test]
 async fn the_hand_follows_our_membership_event_across_a_refresh() {
-    // A zero lifetime makes every heartbeat refresh the sticky membership.
+    // A zero lifetime makes every keep-alive tick refresh the sticky membership.
     let params = JoinSessionParams {
         sticky_duration_ms: Some(0),
         ..join_params()
@@ -470,12 +470,12 @@ async fn the_hand_follows_our_membership_event_across_a_refresh() {
         "$sticky-1"
     );
 
-    assert!(call.heartbeat(SLOT).await);
+    assert!(call.keep_alive(SLOT).await);
 
     assert_eq!(
         call.rtc().own_membership_event_id(SLOT).as_deref(),
         Some("$sticky-2"),
-        "the heartbeat refreshed the membership"
+        "the keep-alive refreshed the membership"
     );
     let sent = sender.room_events.lock().unwrap().clone();
     assert_eq!(sent.len(), 2);

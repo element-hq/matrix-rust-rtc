@@ -612,7 +612,7 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
         if !self.is_live() {
             return false;
         }
-        self.state.lock().await.heartbeat(&self.slot_id).await
+        self.state.lock().await.keep_alive(&self.slot_id).await
     }
 
     pub async fn member_count(&self) -> usize {

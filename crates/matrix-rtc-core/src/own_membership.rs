@@ -21,7 +21,7 @@
 //! # Two clocks, one heartbeat
 //!
 //! Our membership expires in two independent ways, and
-//! [`OwnMembershipMachine::heartbeat`] has to tend both:
+//! [`OwnMembershipMachine::keep_alive`] has to tend both:
 //!
 //! - The **delayed leave** (`keep_alive_timeout_ms`, seconds) is the dead man's
 //!   switch above. Its timer is pushed back out on every heartbeat via MSC4140's
@@ -84,7 +84,7 @@ const DELAYED_LEAVE_PROBE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 ///
 /// `SystemTime` rather than a tokio timer on purpose: the core arms no timers,
 /// so the sticky refresh is decided by comparing timestamps when the host
-/// happens to call [`OwnMembershipMachine::heartbeat`], not by a task waking
+/// happens to call [`OwnMembershipMachine::keep_alive`], not by a task waking
 /// itself up.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
@@ -692,7 +692,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     ///
     /// This method is fire-and-forget (doesn't return Result) because heartbeat failures
     /// should not break the application - we'll retry on the next heartbeat.
-    pub async fn heartbeat(&self) {
+    pub async fn keep_alive(&self) {
         let room_id = self.room_id.clone();
         log::trace!("[{}] Heartbeat: restarting keep-alive", room_id);
 
@@ -878,7 +878,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 
     /// Schedules a delayed leave event to clean up our membership if we disconnect.
     ///
-    /// This is used internally by join() and heartbeat().
+    /// This is used internally by join() and keep_alive().
     ///
     /// # Returns
     ///
@@ -1169,7 +1169,7 @@ mod tests {
             .delayed_event_id()
             .expect("join arms a delayed leave");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         // The beat restarts the existing delay in place: one request, the same
         // delay id, and no second delay scheduled. Scheduling a replacement
@@ -1212,7 +1212,7 @@ mod tests {
 
         // The mock fails every restart. The delay was armed moments ago, so it
         // cannot have fired yet: keep it and retry next beat.
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(*sender.scheduled.lock().unwrap(), 1, "no replacement armed");
         assert_eq!(machine.delayed_event_id(), Some(delay_id));
@@ -1244,7 +1244,7 @@ mod tests {
         // Let real time pass the (zero) delay, so the check has unambiguously
         // elapsed rather than sitting exactly on the boundary.
         tokio::time::sleep(Duration::from_millis(5)).await;
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             *sender.scheduled.lock().unwrap(),
@@ -1578,7 +1578,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             sender.sticky_events.lock().unwrap().len(),
@@ -1622,8 +1622,8 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
-        machine.heartbeat().await;
+        machine.keep_alive().await;
+        machine.keep_alive().await;
         machine.leave(None).await.expect("leave should succeed");
 
         let durations: Vec<u64> = sender
@@ -1651,7 +1651,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(*sender.restarts.lock().unwrap(), 0);
     }
@@ -1667,8 +1667,8 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
-        machine.heartbeat().await;
+        machine.keep_alive().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             *sender.refused.lock().unwrap(),
@@ -1699,7 +1699,7 @@ mod tests {
         };
         sender.accepts_now.store(true, Ordering::Relaxed);
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert!(machine.delayed_leave_supported());
         assert!(machine.delayed_event_id().is_some(), "armed on the retry");
@@ -1764,7 +1764,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         let sticky = mock_sender.sticky_events.lock().unwrap();
         assert_eq!(sticky.len(), 2, "the heartbeat should re-send the join");
@@ -1783,7 +1783,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             mock_sender.sticky_events.lock().unwrap().len(),
@@ -1797,7 +1797,7 @@ mod tests {
         let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert!(
             mock_sender.sticky_events.lock().unwrap().is_empty(),
@@ -1816,7 +1816,7 @@ mod tests {
         machine.leave(None).await.expect("leave should succeed");
 
         let after_leave = mock_sender.sticky_events.lock().unwrap().len();
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             mock_sender.sticky_events.lock().unwrap().len(),
