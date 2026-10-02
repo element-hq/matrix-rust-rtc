@@ -17,30 +17,17 @@ matrix-rtc-core = { path = "../matrix-rtc-core" }
 # reactions). Temporary: the call-side roster is to move above this crate.
 matrix-rtc-call = { path = "../matrix-rtc-call" }
 # The engine's actor loop multiplexes channels with `tokio::select!`
-# (`macros`). Timers are NOT tokio's on every target — see `src/rt.rs` and the
-# per-target sections below.
+# (`macros`). Tasks and timers go through `matrix_rtc_core::executor`.
 tokio = { workspace = true, features = ["macros"] }
 # `BoxStream`/`LocalBoxStream` for the frame streams handed out by
 # `RemoteTrackHandle`. Only the type is needed here; combinators stay in the
 # transport implementations.
 futures-core = "0.3"
-# `join_all`, so a batched stats read awaits every track at once; and
-# `Abortable`, so `rt::TaskHandle::abort` has a wasm counterpart to
-# `JoinHandle::abort`. Both need `alloc`.
+# `join_all`, so a batched stats read awaits every track at once (`alloc`).
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 async-trait.workspace = true
 log.workspace = true
 thiserror.workspace = true
-
-# The task/timer seam (`src/rt.rs`): tokio's spawn and timer driver off wasm32;
-# `spawn_local` plus setTimeout-backed sleeps on it. `tokio::time` must not
-# reach the wasm build at all — it panics at runtime on wasm32-unknown-unknown.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-tokio = { workspace = true, features = ["time"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-wasm-bindgen-futures = "0.4"
-gloo-timers = { version = "0.3", features = ["futures"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "test-util"] }

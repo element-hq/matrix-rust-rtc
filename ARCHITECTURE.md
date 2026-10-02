@@ -305,9 +305,9 @@ Membership is always applied as a complete set: a member whose event is absent f
   reaction types) + tokio/futures — no LiveKit, no
   libwebrtc, fully unit-testable (`FakeTransport`). Compiles for wasm32:
   the transport traits are `Send + Sync` off wasm (via `MaybeSend`) and
-  unconstrained on it, and tasks/timers go through the `rt` seam (tokio
-  natively; `spawn_local` + setTimeout-backed sleeps in the browser, where
-  the engine's actor runs on the JS microtask queue).
+  unconstrained on it, and tasks/timers go through `matrix_rtc_core::executor`
+  (tokio natively; `spawn_local` + setTimeout-backed sleeps in the browser,
+  where the engine's actor runs on the JS microtask queue).
 - Also owns the transport-agnostic media-key handler (`keys`):
   `FrameKeyRing` is the seam a transport's key ring implements (LiveKit
   native's `KeyProvider`, livekit-js's `ExternalE2EEKeyProvider`), and

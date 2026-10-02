@@ -50,7 +50,6 @@ use crate::event::{
 };
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::participant::{MediaStreamKind, Participant, StreamState};
-use crate::rt;
 use crate::stats::ReceiveStats;
 use crate::tile::{
     CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
@@ -59,6 +58,7 @@ use crate::transport::{
     ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
     TransportError,
 };
+use matrix_rtc_core::executor as rt;
 
 /// Capacity of the broadcast [`CallEvent`] channel. Subscribers that fall
 /// further behind than this observe a `Lagged` error and miss events; they
@@ -298,7 +298,7 @@ pub struct CallEngine {
     tiles_rx: watch::Receiver<TileRoster>,
     local_rx: watch::Receiver<Option<LocalState>>,
     tracks: TrackMap,
-    task: rt::TaskHandle,
+    task: rt::JoinHandle<()>,
 }
 
 impl Drop for CallEngine {

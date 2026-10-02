@@ -12,6 +12,7 @@
 mod base_rtc_room;
 mod encryption;
 mod error;
+pub mod executor;
 mod host;
 mod join;
 mod maybe_send;
