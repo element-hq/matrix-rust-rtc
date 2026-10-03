@@ -28,13 +28,12 @@
 
 use std::sync::Arc;
 
-use matrix_rtc_call::{CallJoinOptions, JoinOptions, Mentions, NotificationType, NotifyConfig};
+use matrix_rtc_call::{
+    CallJoinOptions, JoinOptions, JoinTransport, Mentions, NotificationType, NotifyConfig,
+};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
-use matrix_rtc_core::{
-    EncryptionConfig, LeaveSessionParams, MatrixBackend, RtcTransport, SlotEncryption,
-    TransportIntent,
-};
+use matrix_rtc_core::{EncryptionConfig, LeaveSessionParams, MatrixBackend, SlotEncryption};
 
 mod backend;
 mod compat;
@@ -151,10 +150,11 @@ impl WasmRtcRoom {
     ///
     /// `params`:
     ///   - `slot_id` (e.g. "m.call#ROOM"), `application` (e.g. "m.call")
-    ///   - `transport`: the transport to publish on; omit to take the first
-    ///     LiveKit one the homeserver advertises (the host's `rtcTransports`)
-    ///   - `receive_only`: join without publishing; `can_subscribe` then lists
-    ///     the transport types this member can receive on
+    ///   - `transport`: `{ kind: "advertised" }` (the default when omitted)
+    ///     publishes on the first LiveKit transport the homeserver advertises
+    ///     (the host's `rtcTransports`); `{ kind: "publish",
+    ///     livekit_service_url }` publishes on that focus; `{ kind:
+    ///     "receive_only" }` publishes nothing
     ///   - `keep_alive_timeout_ms` (default 30000), `sticky_duration_ms`
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
@@ -446,18 +446,9 @@ pub fn reaction_sound_for(name: String) -> Option<String> {
 pub struct WasmJoinSessionParams {
     pub slot_id: String,
     pub application: String,
-    /// The transport to publish on. Omit to take the first LiveKit transport
-    /// the homeserver advertises.
+    /// What the join publishes on, if anything. Omitted is advertised.
     #[serde(default)]
-    pub transport: Option<WasmTransportConfig>,
-    /// Join without publishing — valid per MSC4143, and what a recorder or
-    /// other observer wants. `transport` is then ignored.
-    #[serde(default)]
-    pub receive_only: bool,
-    /// Transport types this member can receive on. Only read when
-    /// `receive_only`; a publishing member advertises its own transport's type.
-    #[serde(default)]
-    pub can_subscribe: Vec<String>,
+    pub transport: WasmJoinTransport,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -583,31 +574,16 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
 }
 
 impl WasmJoinSessionParams {
-    /// The transport the join names, if any; `None` leaves the choice to the
-    /// library.
-    fn transport_intent(&self) -> Result<Option<TransportIntent>, JsError> {
-        if self.receive_only {
-            return Ok(Some(TransportIntent::ReceiveOnly {
-                can_subscribe: self.can_subscribe.clone(),
-            }));
-        }
-        self.transport
-            .clone()
-            .map(|transport| transport.into_core().map(TransportIntent::Publish))
-            .transpose()
-    }
-
     /// The SDK generates the `member.id`: MSC4143 requires a fresh one per
     /// join.
     fn into_call(self) -> Result<CallJoinOptions, JsError> {
-        let transport = self.transport_intent()?;
         // The binding names the whole slot id; the room checks it belongs to
         // the application.
         let mut join = JoinOptions {
             slot_id: self.slot_id,
             ..JoinOptions::application(self.application)
         };
-        join.transport = transport;
+        join.transport = self.transport.into();
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
@@ -620,43 +596,30 @@ impl WasmJoinSessionParams {
     }
 }
 
-/// WASM-friendly transport configuration.
-#[derive(Clone, Debug, Deserialize)]
-pub struct WasmTransportConfig {
-    #[serde(rename = "type")]
-    pub transport_type: String,
-    #[serde(default)]
-    pub livekit_service_url: Option<String>,
-    #[serde(flatten)]
-    pub extra_fields: std::collections::BTreeMap<String, serde_json::Value>,
+/// What a join does with transports, tagged by `kind`. Only LiveKit is
+/// supported, so every member says it can subscribe to `livekit`.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WasmJoinTransport {
+    /// Publish on the first LiveKit transport the homeserver advertises.
+    #[default]
+    Advertised,
+    /// Publish on this LiveKit focus, whatever the homeserver advertises.
+    Publish { livekit_service_url: String },
+    /// Publish nothing and only receive, as a recorder or other observer does.
+    ReceiveOnly,
 }
 
-impl WasmTransportConfig {
-    pub fn into_core(self) -> Result<RtcTransport, JsError> {
-        match self.transport_type.as_str() {
-            "livekit" => {
-                let url = self.livekit_service_url.ok_or_else(|| {
-                    JsError::new("livekit transport requires livekit_service_url")
-                })?;
-                Ok(RtcTransport::LiveKit(matrix_rtc_core::LiveKitTransport {
-                    livekit_service_url: url,
-                }))
-            }
-            _ => {
-                let mut extra_fields = self.extra_fields;
-                if let Some(url) = self.livekit_service_url {
-                    extra_fields.insert(
-                        "livekit_service_url".to_string(),
-                        serde_json::Value::String(url),
-                    );
-                }
-                Ok(RtcTransport::Unsupported(
-                    matrix_rtc_core::UnsupportedTransport {
-                        transport_type: self.transport_type,
-                        extra_fields,
-                    },
-                ))
-            }
+impl From<WasmJoinTransport> for JoinTransport {
+    fn from(value: WasmJoinTransport) -> Self {
+        match value {
+            WasmJoinTransport::Advertised => Self::Advertised,
+            WasmJoinTransport::Publish {
+                livekit_service_url,
+            } => Self::Publish(matrix_rtc_core::LiveKitTransport {
+                livekit_service_url,
+            }),
+            WasmJoinTransport::ReceiveOnly => Self::ReceiveOnly,
         }
     }
 }
@@ -888,7 +851,6 @@ mod tests {
     async fn a_sticky_compat_join_mirrors_the_legacy_fields() {
         #[derive(Serialize)]
         struct TestTransport {
-            #[serde(rename = "type")]
             kind: &'static str,
             livekit_service_url: &'static str,
         }
@@ -911,7 +873,7 @@ mod tests {
             slot_id: SLOT,
             application: "m.call",
             transport: TestTransport {
-                kind: "livekit",
+                kind: "publish",
                 livekit_service_url: "https://sfu.example.org/livekit/jwt",
             },
         })

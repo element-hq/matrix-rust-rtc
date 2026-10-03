@@ -148,7 +148,7 @@ export class WebPeerApp {
       slot_id: slotId,
       application: 'm.call',
       // The demo pins the focus it discovered; omit to take the homeserver's.
-      transport: { type: 'livekit', livekit_service_url: focusUrl },
+      transport: { kind: 'publish', livekit_service_url: focusUrl },
     });
     const memberId = this.rtcCall.memberId;
     this.memberId = memberId;

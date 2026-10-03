@@ -44,8 +44,8 @@ use tokio::sync::{broadcast, watch};
 
 use matrix_rtc_call::transports;
 use matrix_rtc_call::{
-    CallJoinOptions, JoinOptions, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
-    RtcCall, RtcClient, RtcError, RtcRoom,
+    CallJoinOptions, JoinOptions, JoinTransport, NotifyConfig, RaisedHand, ReactionError,
+    ReactionsConfig, RtcCall, RtcClient, RtcError, RtcRoom,
 };
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
@@ -318,7 +318,7 @@ impl LiveKitCall {
         let chosen = options
             .livekit_transport
             .clone()
-            .map(|transport| TransportIntent::Publish(RtcTransport::LiveKit(transport)));
+            .map_or(JoinTransport::Advertised, JoinTransport::Publish);
         let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
             transports::resolve(room.backend().as_ref(), chosen)
                 .await
@@ -342,9 +342,7 @@ impl LiveKitCall {
             slot_id: options.slot_id.clone(),
             ..JoinOptions::application(options.application.clone())
         };
-        join.transport = Some(TransportIntent::Publish(RtcTransport::LiveKit(
-            livekit.clone(),
-        )));
+        join.transport = JoinTransport::Publish(livekit.clone());
         join.encryption_config = options.encryption_config.clone();
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;

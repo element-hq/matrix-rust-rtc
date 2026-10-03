@@ -6,13 +6,17 @@
 //! The uniffi records a host passes to join and leave, and their conversion
 //! to core types. DTOs keep uniffi shapes out of the core.
 
-/// FFI-friendly transport configuration for join operations.
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct FfiTransportConfig {
-    /// Transport type (e.g., "livekit")
-    pub r#type: String,
-    /// LiveKit service URL (required for livekit transport)
-    pub livekit_service_url: Option<String>,
+/// What a join does with transports. Only LiveKit is supported, so every
+/// member says it can subscribe to `livekit`.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiJoinTransport {
+    /// Publish on the first LiveKit transport the homeserver advertises
+    /// (`rtcTransports` on the backend); the join fails if there is none.
+    Advertised,
+    /// Publish on this LiveKit focus, whatever the homeserver advertises.
+    Publish { livekit_service_url: String },
+    /// Publish nothing and only receive, as a recorder or other observer does.
+    ReceiveOnly,
 }
 
 /// FFI-friendly encryption configuration.
@@ -90,20 +94,9 @@ pub struct FfiJoinSessionParams {
     pub slot_id: String,
     /// Application type (e.g., "m.call")
     pub application: String,
-    /// The transport to publish on. `None` — the usual case — takes the first
-    /// LiveKit transport the homeserver advertises (`rtcTransports` on the
-    /// backend); the join fails if there is none. Set it to pin a specific
-    /// focus.
-    #[uniffi(default = None)]
-    pub transport: Option<FfiTransportConfig>,
-    /// Join without publishing — valid per MSC4143, and what a recorder or
-    /// other observer wants. `transport` is then ignored.
-    #[uniffi(default = false)]
-    pub receive_only: bool,
-    /// Transport types this member can receive on. Only read when
-    /// `receive_only`; a publishing member advertises its own transport's type.
-    #[uniffi(default = [])]
-    pub can_subscribe: Vec<String>,
+    /// What the join publishes on, if anything. Usually
+    /// [`FfiJoinTransport::Advertised`].
+    pub transport: FfiJoinTransport,
     /// Optional keep-alive timeout in milliseconds (default: 30000).
     ///
     /// Arms the delayed leave (the dead man's switch for a client that dies).
@@ -180,34 +173,16 @@ pub struct FfiLeaveSessionParams {
     pub leave_reason: Option<crate::FfiLeaveReason>,
 }
 
-/// Conversion from FFI transport config to core transport type.
-impl FfiTransportConfig {
-    pub fn into_core(self) -> Result<matrix_rtc_core::RtcTransport, matrix_rtc_core::CommandError> {
-        use matrix_rtc_core::{LiveKitTransport, RtcTransport, UnsupportedTransport};
-        use std::collections::BTreeMap;
-
-        let mut extra_fields = BTreeMap::new();
-
-        match self.r#type.as_str() {
-            "livekit" => {
-                let url = self.livekit_service_url.ok_or_else(|| {
-                    matrix_rtc_core::CommandError::SendError(
-                        "livekit transport requires livekit_service_url".to_string(),
-                    )
-                })?;
-                Ok(RtcTransport::LiveKit(LiveKitTransport {
-                    livekit_service_url: url,
-                }))
-            }
-            _ => {
-                if let Some(url) = self.livekit_service_url {
-                    extra_fields.insert("livekit_service_url".to_string(), url.into());
-                }
-                Ok(RtcTransport::Unsupported(UnsupportedTransport {
-                    transport_type: self.r#type,
-                    extra_fields,
-                }))
-            }
+impl From<FfiJoinTransport> for matrix_rtc_call::JoinTransport {
+    fn from(value: FfiJoinTransport) -> Self {
+        match value {
+            FfiJoinTransport::Advertised => Self::Advertised,
+            FfiJoinTransport::Publish {
+                livekit_service_url,
+            } => Self::Publish(matrix_rtc_core::LiveKitTransport {
+                livekit_service_url,
+            }),
+            FfiJoinTransport::ReceiveOnly => Self::ReceiveOnly,
         }
     }
 }
@@ -230,21 +205,12 @@ impl FfiJoinSessionParams {
     /// join is accepted and how the member is projected — including the
     /// transport intent, which is the field integrators most often get wrong.
     pub(crate) fn summary(&self) -> String {
-        let transport = if self.receive_only {
-            format!("receive_only:{:?}", self.can_subscribe)
-        } else {
-            match &self.transport {
-                Some(transport) => format!(
-                    "publish:{}{}",
-                    transport.r#type,
-                    transport
-                        .livekit_service_url
-                        .as_deref()
-                        .map(|url| format!("@{url}"))
-                        .unwrap_or_default(),
-                ),
-                None => "publish:advertised".to_owned(),
-            }
+        let transport = match &self.transport {
+            FfiJoinTransport::Advertised => "advertised".to_owned(),
+            FfiJoinTransport::Publish {
+                livekit_service_url,
+            } => format!("publish:{livekit_service_url}"),
+            FfiJoinTransport::ReceiveOnly => "receive_only".to_owned(),
         };
 
         format!(
@@ -258,51 +224,28 @@ impl FfiJoinSessionParams {
         )
     }
 
-    /// The transport the join names, if any: what it pins, or receive-only.
-    /// `None` leaves the choice to the library.
-    pub(crate) fn transport_intent(
-        &self,
-    ) -> Result<Option<matrix_rtc_core::TransportIntent>, matrix_rtc_core::CommandError> {
-        if self.receive_only {
-            return Ok(Some(matrix_rtc_core::TransportIntent::ReceiveOnly {
-                can_subscribe: self.can_subscribe.clone(),
-            }));
-        }
-        self.transport
-            .clone()
-            .map(|transport| {
-                transport
-                    .into_core()
-                    .map(matrix_rtc_core::TransportIntent::Publish)
-            })
-            .transpose()
-    }
-
     /// Who we are, the `member.id` and — when the join names none — the
     /// transport are the library's to decide, so none of them is here. A
     /// host-chosen `member.id` reused across joins would keep the MSC4195
     /// participant identity stable while the key index restarts at 0, so peers
     /// decrypt new media with a stale key and never recover.
-    pub(crate) fn into_call(
-        self,
-    ) -> Result<matrix_rtc_call::CallJoinOptions, matrix_rtc_core::CommandError> {
-        let transport = self.transport_intent()?;
+    pub(crate) fn into_call(self) -> matrix_rtc_call::CallJoinOptions {
         // The binding names the whole slot id; the room checks it belongs to
         // the application.
         let mut join = matrix_rtc_call::JoinOptions {
             slot_id: self.slot_id,
             ..matrix_rtc_call::JoinOptions::application(self.application)
         };
-        join.transport = transport;
+        join.transport = self.transport.into();
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        Ok(matrix_rtc_call::CallJoinOptions {
+        matrix_rtc_call::CallJoinOptions {
             join,
             notify: self.notify.map(Into::into),
             reactions: self.reactions.map(Into::into),
-        })
+        }
     }
 }
 

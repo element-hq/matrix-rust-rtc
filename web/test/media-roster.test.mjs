@@ -104,7 +104,7 @@ describe('web media roster over a fake transport delegate', () => {
     const call = await room.joinCall({
       slot_id: SLOT_ID,
       application: 'm.call',
-      transport: { type: 'livekit', livekit_service_url: OWN_FOCUS },
+      transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
     });
     const memberId = call.memberId;
     host._sink(ROOM_ID).onStickyEvents([

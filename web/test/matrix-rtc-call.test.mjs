@@ -118,7 +118,7 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     const rtcCall = await rtcRoom.joinCall({
       slot_id: SLOT_ID,
       application: 'm.call',
-      transport: { type: 'livekit', livekit_service_url: OWN_FOCUS },
+      transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
     });
     const memberId = rtcCall.memberId;
     // The sticky set as the server echoes it: ourselves plus one peer.

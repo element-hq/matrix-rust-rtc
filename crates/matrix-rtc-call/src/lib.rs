@@ -9,7 +9,7 @@
 //! [`RtcSession`] / [`RtcCall`].
 //!
 //! It also holds [`transports`], which transport a join publishes on: the
-//! homeserver's first advertised LiveKit one unless the join names one.
+//! homeserver's first advertised LiveKit one, a named one, or none.
 //! Opening a room, its feeds and the pre-2026 membership formats
 //! (`matrix_rtc_core::compat`) are the core's.
 
@@ -33,6 +33,7 @@ pub use reactions::{
     ReactionSound, ReactionsConfig, ReceivedReaction, RelationLookup, build_raised_hand_content,
     build_reaction_content, first_grapheme, reaction_kind, sound_for,
 };
+pub use transports::JoinTransport;
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};

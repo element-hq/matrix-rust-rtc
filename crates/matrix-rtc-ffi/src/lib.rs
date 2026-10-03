@@ -39,8 +39,8 @@ pub use logging::{
     setup_logging,
 };
 pub use params::{
-    FfiEncryptionConfig, FfiJoinSessionParams, FfiLeaveSessionParams, FfiNotificationType,
-    FfiNotifyConfig, FfiReactionsConfig, FfiTransportConfig,
+    FfiEncryptionConfig, FfiJoinSessionParams, FfiJoinTransport, FfiLeaveSessionParams,
+    FfiNotificationType, FfiNotifyConfig, FfiReactionsConfig,
 };
 
 /// Participants with observable frame streams, publishing, and constraints —
@@ -349,10 +349,7 @@ impl RtcRoom {
             self.room_id,
             params.summary()
         );
-        let mut options = params.into_call().map_err(|error| {
-            log::warn!("room: join rejected before it started: {error}");
-            MatrixRtcFfiError::InvalidInput(error.to_string())
-        })?;
+        let mut options = params.into_call();
         options.join.keep_alive_interval_ms = interval.map(|interval| interval.as_millis() as u64);
         let room = self.open().await?;
         let joined = room.join_call(options).await.inspect_err(|error| {
@@ -839,12 +836,9 @@ mod tests {
         FfiJoinSessionParams {
             slot_id: SLOT.to_owned(),
             application: "m.call".to_owned(),
-            transport: Some(FfiTransportConfig {
-                r#type: "livekit".to_owned(),
-                livekit_service_url: Some(SFU.to_owned()),
-            }),
-            receive_only: false,
-            can_subscribe: Vec::new(),
+            transport: FfiJoinTransport::Publish {
+                livekit_service_url: SFU.to_owned(),
+            },
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
@@ -1108,7 +1102,7 @@ mod tests {
         let first = room
             .clone()
             .join_call(FfiJoinSessionParams {
-                transport: None,
+                transport: FfiJoinTransport::Advertised,
                 ..join_params()
             })
             .await
@@ -1134,6 +1128,31 @@ mod tests {
             first.member_id(),
             second.member_id(),
             "a rejoin must not reuse the member id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_receive_only_join_publishes_nothing_and_subscribes_to_livekit() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+
+        let _call = room
+            .clone()
+            .join_call(FfiJoinSessionParams {
+                transport: FfiJoinTransport::ReceiveOnly,
+                ..join_params()
+            })
+            .await
+            .expect("join");
+        let membership = mock
+            .sends()
+            .into_iter()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("the membership went out");
+        assert_eq!(
+            membership.content.pointer("/transports").unwrap(),
+            &serde_json::json!({ "can_subscribe": ["livekit"] }),
         );
     }
 

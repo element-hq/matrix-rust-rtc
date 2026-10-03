@@ -35,7 +35,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 use crate::notification::NotifyConfig;
 use crate::reactions::{RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction};
 use crate::room_state::{CallJoinParams, CallRoomState};
-use crate::transports;
+use crate::transports::{self, JoinTransport};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::feeder::RoomAlreadyOpen;
@@ -81,9 +81,8 @@ pub struct JoinOptions {
     /// Must start with `{application_type}#` (MSC4143).
     pub slot_id: String,
     pub application: ApplicationInfo,
-    /// `None` publishes on the first LiveKit transport the homeserver
-    /// advertises.
-    pub transport: Option<TransportIntent>,
+    /// Defaults to [`JoinTransport::Advertised`].
+    pub transport: JoinTransport,
     pub encryption_config: Option<EncryptionConfig>,
     pub keep_alive_timeout_ms: Option<u64>,
     /// How often the session restarts its delayed leave; `None` is
@@ -103,7 +102,7 @@ impl JoinOptions {
         Self {
             slot_id: slot_id_of(&application, ROOM_SLOT_NAME),
             application,
-            transport: None,
+            transport: JoinTransport::Advertised,
             encryption_config: None,
             keep_alive_timeout_ms: None,
             keep_alive_interval_ms: None,
@@ -118,10 +117,8 @@ impl JoinOptions {
         self
     }
 
-    /// Publishes on (or only receives from) `transport` instead of the
-    /// homeserver's first advertised LiveKit transport.
-    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
-        self.transport = Some(transport.into());
+    pub fn transport(mut self, transport: impl Into<JoinTransport>) -> Self {
+        self.transport = transport.into();
         self
     }
 
@@ -188,7 +185,7 @@ impl CallJoinOptions {
     }
 
     /// See [`JoinOptions::transport`].
-    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
+    pub fn transport(mut self, transport: impl Into<JoinTransport>) -> Self {
         self.join = self.join.transport(transport);
         self
     }
@@ -419,13 +416,10 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         self.detach();
     }
 
-    /// The join's own transport, else the first LiveKit one the homeserver
-    /// advertises. Asked before the room's lock is taken: it is a request to
-    /// the homeserver, and the feed would wait on it otherwise.
-    async fn transport(
-        &self,
-        chosen: Option<TransportIntent>,
-    ) -> Result<TransportIntent, RtcError> {
+    /// What the join's [`JoinTransport`] resolves to. Asked before the room's
+    /// lock is taken: it may be a request to the homeserver, and the feed would
+    /// wait on it otherwise.
+    async fn transport(&self, chosen: JoinTransport) -> Result<TransportIntent, RtcError> {
         Ok(transports::resolve(self.backend.as_ref(), chosen).await?)
     }
 

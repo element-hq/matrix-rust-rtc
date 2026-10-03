@@ -32,7 +32,7 @@ function getContentValue(content, key) {
 const joinParams = {
   slot_id: SLOT_ID,
   application: 'm.call',
-  transport: { type: 'livekit', livekit_service_url: SFU },
+  transport: { kind: 'publish', livekit_service_url: SFU },
 };
 
 describe('WASM bindings with a mock backend host', () => {

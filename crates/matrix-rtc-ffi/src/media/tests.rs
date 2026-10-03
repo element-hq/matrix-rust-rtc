@@ -10,7 +10,7 @@
 
 use crate::backend::test_support::MockHost;
 use crate::backend::{FfiEventEncryption, FfiEventIn};
-use crate::params::FfiTransportConfig;
+use crate::params::FfiJoinTransport;
 use crate::{
     FfiJoinSessionParams, FfiLeaveSessionParams, FfiRoomOptions, RtcCall, RtcClient, RtcRoom,
 };
@@ -77,12 +77,9 @@ fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
             .join_call(FfiJoinSessionParams {
                 slot_id: "m.call#ROOM".to_owned(),
                 application: "m.call".to_owned(),
-                transport: Some(FfiTransportConfig {
-                    r#type: "livekit".to_owned(),
-                    livekit_service_url: Some(DEAD_SFU_URL.to_owned()),
-                }),
-                receive_only: false,
-                can_subscribe: Vec::new(),
+                transport: FfiJoinTransport::Publish {
+                    livekit_service_url: DEAD_SFU_URL.to_owned(),
+                },
                 keep_alive_timeout_ms: None,
                 sticky_duration_ms: None,
                 degraded_lifetime_ms: None,

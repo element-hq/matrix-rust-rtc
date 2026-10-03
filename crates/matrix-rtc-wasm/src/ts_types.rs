@@ -188,15 +188,18 @@ export interface MediaDelegate {
     onEvent?(event: RtcCallEvent): void;
 }
 
+/** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */
+export type JoinTransportIn =
+    | { kind: 'advertised' }
+    | { kind: 'publish'; livekit_service_url: string }
+    | { kind: 'receive_only' };
+
 /** `joinCall`'s parameters. */
 export interface JoinParamsIn {
     slot_id: string;
     application: string;
-    /** Omit to take the first LiveKit transport the homeserver advertises (`rtcTransports`). */
-    transport?: { type: string; livekit_service_url?: string; [key: string]: unknown };
-    /** Join without publishing; `can_subscribe` then lists what this member can receive on. */
-    receive_only?: boolean;
-    can_subscribe?: string[];
+    /** What the join publishes on; omitted is `advertised`, the first LiveKit transport the homeserver advertises (`rtcTransports`). */
+    transport?: JoinTransportIn;
     keep_alive_timeout_ms?: number;
     sticky_duration_ms?: number;
     degraded_lifetime_ms?: number;
