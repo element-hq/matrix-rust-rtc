@@ -68,6 +68,10 @@ pub enum MatrixRtcFfiError {
     /// The host's backend failed a read.
     #[error("backend: {0}")]
     Backend(String),
+    /// The room's state holds no open slot of this id, so the join was
+    /// refused; somebody with the power level has to open it first.
+    #[error("slot '{0}' is not open in this room")]
+    SlotClosed(String),
 }
 
 impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
@@ -83,6 +87,9 @@ impl From<RtcError> for MatrixRtcFfiError {
             RtcError::Backend(error) => Self::Backend(error.to_string()),
             RtcError::Reaction(error) => Self::Reaction(error.to_string()),
             error @ RtcError::SessionOver => Self::CallOver(error.to_string()),
+            RtcError::Join(matrix_rtc_core::JoinError::SlotClosed { slot_id }) => {
+                Self::SlotClosed(slot_id)
+            }
             error => Self::InvalidInput(error.to_string()),
         }
     }
@@ -1175,7 +1182,10 @@ mod tests {
         let room = open(&client, &mock, None, false, Vec::new(), Vec::new()).await;
 
         let result = room.clone().join_call(join_params()).await;
-        assert!(result.is_err(), "no open slot, no join");
+        assert!(
+            matches!(result, Err(MatrixRtcFfiError::SlotClosed(ref slot_id)) if slot_id == SLOT),
+            "no open slot, no join"
+        );
         assert!(mock.sends().is_empty(), "nothing should have been sent");
     }
 

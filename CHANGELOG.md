@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- A join refused because its slot is not open fails with `MatrixRtcFfiError::SlotClosed` instead of `InvalidInput`.
 - A join's transport is one choice, `Advertised`, `Publish` on a LiveKit focus, or `ReceiveOnly`, replacing `transport`, `receive_only` and `can_subscribe` in the FFI and web join params.
 - The library keeps a joined session alive and performs its key rotations at their deadline itself; `heartbeat()`, `flushDueKeyRotation()`/`flush_due_key_rotation`, `keyRotationDueAtMs()`/`key_rotation_due_at_ms` and `HEARTBEAT_INTERVAL_MS` are gone, and `LiveKitCallOptions::heartbeat_interval` becomes `keep_alive_interval_ms` (default 10 s).
 - `RtcClient::room` spawns the room's feeds on `matrix_rtc_core::executor` and returns the room alone (`RoomRuns` is gone); natively it must be called within a tokio runtime, and `LiveKitCall::join` no longer needs a `LocalSet`.
