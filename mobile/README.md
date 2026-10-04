@@ -121,7 +121,7 @@ Shortening `stickyDurationMs` buys nothing but extra traffic — the refresh
 interval is derived from it. Values above one hour are clamped, because servers
 clamp them too and the refresh has to stay ahead of the real expiry.
 
-Two `CommandSenderCallback` methods are load-bearing here, and both are easy to
+Two `MatrixBackend` methods are load-bearing here, and both are easy to
 implement in a way that looks right and silently breaks the call:
 
 - **`sendStickyEvent(..., durationMs)`** — pass `durationMs` through verbatim;
@@ -208,7 +208,7 @@ when (val event = session.nextEvent()) {
 Element Call is the only other MatrixRTC implementation there is to test against,
 and it still speaks a pre-2026 wire format — two of them, in fact, which disagree
 about where a membership lives rather than merely what it says. Pass
-`elementCallCompat` on the join to speak one of them:
+`elementCallCompat` when you attach the room to speak one of them:
 
 | Mode | Element Call generation | Membership lives in |
 | --- | --- | --- |
@@ -218,8 +218,9 @@ about where a membership lives rather than merely what it says. Pass
 
 It is one decision, not a wire-format flag: it also fixes the `member.id` you
 join with, how an inbound media key is bound to a membership, your SFU
-participant identity, and which token endpoint mints your JWT. Choose it once, on
-the join — the media session reads it back from there. Getting a mode wrong
+participant identity, and which token endpoint mints your JWT. Choose it once,
+when attaching the room — the join and the media session read it back from
+there. Getting a mode wrong
 produces no error: the call connects, the roster may even fill in, and nothing
 decrypts.
 
@@ -227,41 +228,34 @@ Reading the 2025 sticky dialect needs no mode and is always on. What your host
 must do differently:
 
 ```kotlin
-manager.join(FfiJoinSessionParams(
-    // …
+manager.attachRoom(roomId, FfiAttachOptions(
     elementCallCompat = FfiElementCallCompat.STATE_EVENTS,
 ))
 ```
 
-- **Feed membership as raw content.** Use `setCurrentMembership(roomId,
-  memberEvents, legacyStateEvents)` instead of `setCurrentStickyState`: a legacy
-  content states its transports somewhere else and its membership nowhere at all,
-  and the typed `StickyEvent` has no room for either. Pass both lists in one
-  call — it replaces the room's whole membership, so feeding them separately
-  makes the roster flicker between the two halves of the call.
-  `legacyStateEvents` is the room's `org.matrix.msc3401.call.member` state, and
-  is empty except in `STATE_EVENTS`. Include each event's `originServerTs`: it is
-  the deadline base for a membership that states no `created_ts`, and `0` reads
-  as long expired.
-- **Feed legacy media keys.** `io.element.call.encryption_keys` to-device
-  messages go to `receiveLegacyEncryptionKey(...)`. Forget this and the roster
-  fills in, everything looks joined, and every remote tile stays black.
-- **In `STATE_EVENTS` only:** implement `sendDelayedStateEvent` — the dead man's
-  switch has to be a state event too.
+- **Nothing changes on the inbound side.** Your `MatrixBackend` delivers the
+  same raw events in every mode; the library subscribes to the room state the
+  mode needs (`org.matrix.msc3401.call.member` in `STATE_EVENTS`), translates
+  it, and reads that generation's `io.element.call.encryption_keys` to-device
+  messages through the same to-device subscription. Do set `originServerTs` on
+  every event: it is the deadline base for a membership that states no
+  `created_ts`, and `0` reads as long expired.
+- **In `STATE_EVENTS` only:** honour the `stateKey` of `sendDelayedEvent` — the
+  dead man's switch has to be a state event too.
 
 Slots need nothing from you. Both generations of Element Call publish no
-`m.rtc.slot`, so the truthful "no slots" you feed would resolve the session
-closed and drop every member, you included. In `STATE_EVENTS` the SDK absorbs
-that: the join forgets any slot state already supplied for the room (it usually
-arrives with sync, before the user joins) and later updates for that room are
-ignored, leaving the condition unenforced — that generation predates the concept
-entirely, so "unknowable" is the honest answer rather than "closed". Keep calling
-`onRoomSlotsReceived` unconditionally.
+`m.rtc.slot`, so the truthful "no slots" your backend reports would resolve the
+session closed and drop every member, you included. In `STATE_EVENTS` the SDK
+absorbs that: it does not subscribe to slot state for the room at all, leaving
+the condition unenforced — that generation predates the concept entirely, so
+"unknowable" is the honest answer rather than "closed".
 
 In `STICKY_EVENTS` the condition stays enforced, because those rooms are
-otherwise spec-shaped and a slot in one is meaningful. If you feed slot state
-there, someone has to open the slot — otherwise the room reads as all-closed and
-the call is empty. Element Call will not, so open it yourself:
+otherwise spec-shaped and a slot in one is meaningful. Someone has to open the
+slot — otherwise the room reads as all-closed, and `join` refuses with
+`SlotClosed`. Element Call will not, so open it yourself (it needs the power
+level for `m.rtc.slot` state; the room creator by default, or set it in the
+room's initial state):
 
 ```kotlin
 manager.openSlot(roomId, "m.call#ROOM", "m.call", FfiSlotEncryption.PerMember)

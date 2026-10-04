@@ -27,7 +27,7 @@ use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
     FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
     FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef, FfiStreamStats, FfiTileId,
-    FfiTileRoster, OpenIdTokenProvider, TokenProviderAdapter, zip_stream_stats,
+    FfiTileRoster, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcSessionManagerHandle;
@@ -52,20 +52,19 @@ pub struct MediaSessionConfig {
 /// start the engine (which connects to every peer's focus), and connect the
 /// own-focus SFU with per-participant frame E2EE.
 ///
-/// Preconditions: the manager has a command sender, the host feeds it sticky
-/// events/room state, and `join` succeeded for this room/slot. The `member.id`
-/// comes from that join — the host neither chooses nor passes it.
+/// Preconditions: the room is attached and `join` succeeded for this
+/// room/slot. The `member.id` comes from that join — the host neither chooses
+/// nor passes it. OpenID tokens for the SFU exchange come from the backend.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn connect_media_session(
     manager: Arc<RtcSessionManagerHandle>,
     config: MediaSessionConfig,
-    token_provider: Arc<dyn OpenIdTokenProvider>,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
     // Everything media lives on the dedicated runtime; hopping onto it here
     // means every internally spawned task (engine actor, pool, IO) inherits
     // the right context regardless of which thread the FFI call came in on.
     runtime()
-        .spawn(build_media_session(manager, config, token_provider))
+        .spawn(build_media_session(manager, config))
         .await
         .map_err(|error| MediaFfiError::Transport(format!("media task panicked: {error}")))?
 }
@@ -73,7 +72,6 @@ pub async fn connect_media_session(
 async fn build_media_session(
     manager: Arc<RtcSessionManagerHandle>,
     config: MediaSessionConfig,
-    token_provider: Arc<dyn OpenIdTokenProvider>,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
     log::info!(
         "media: connecting [{}/{}] user={} device={} focus={}",
@@ -171,21 +169,17 @@ async fn build_media_session(
     };
 
     let transport = Arc::new(
-        LiveKitMediaTransport::new(
-            reqwest::Client::new(),
-            Arc::new(TokenProviderAdapter(token_provider)),
-            provider,
-        )
-        // The same mapper the core got, so our own identity, the peers' and the
-        // key ring's all agree.
-        .with_identity_mapper(identity_mapper.clone())
-        .with_token_endpoint(match compat {
-            // Pre-MSC4195 `/sfu/get`, which is also where that generation's
-            // unhashed `{user}:{device}` identity comes from — the endpoint mints
-            // the identity, so the two are one decision, not two.
-            ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
-            _ => TokenEndpoint::Msc4195,
-        }),
+        LiveKitMediaTransport::new(reqwest::Client::new(), manager.backend(), provider)
+            // The same mapper the core got, so our own identity, the peers' and the
+            // key ring's all agree.
+            .with_identity_mapper(identity_mapper.clone())
+            .with_token_endpoint(match compat {
+                // Pre-MSC4195 `/sfu/get`, which is also where that generation's
+                // unhashed `{user}:{device}` identity comes from — the endpoint mints
+                // the identity, so the two are one decision, not two.
+                ElementCallCompat::StateEvents => TokenEndpoint::LegacyElementCall,
+                _ => TokenEndpoint::Msc4195,
+            }),
     );
     let ctx = ConnectionContext {
         room_id: config.room_id.clone(),

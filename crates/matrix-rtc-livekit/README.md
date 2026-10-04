@@ -52,7 +52,7 @@ async fn record_a_call() -> Result<(), Box<dyn std::error::Error>> {
 
 Two things the snippet glosses over:
 
-- **Runtime.** The core's command sender is `?Send`, so `Call::join` must run
+- **Runtime.** The core's backend futures are `?Send`, so `Call::join` must run
   inside a `tokio::task::LocalSet`:
 
   ```rust,no_run
@@ -270,9 +270,9 @@ hit deliberately:
 
 | Module | What it does |
 | --- | --- |
-| **`call`** *(feature `matrix-sdk`)* | The high-level facade: `Call::join`/`Call::leave`, `open_slot`, LiveKit transport discovery (MSC4143 `GET /rtc/transports` with fallback). Start here. |
-| **`matrix-rtc-bridge`** *(separate crate)* | Everything Matrix-side, with no LiveKit in it: `SdkCommandSender` turns core commands (sticky membership events, delayed leaves, slot state, encrypted to-device keys) into Client-Server API calls, `run_membership_bridge` feeds live sticky events and room state back into the core, and `compat` translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`, `SdkCommandSender`, …) so a host keeps one dependency. |
-| **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through `matrix-rtc-bridge`'s `OpenIdTokenSource` trait, so this layer is not hard-wired to a particular Matrix SDK. |
+| **`call`** *(feature `matrix-sdk`)* | The high-level facade: `Call::join`/`Call::leave`, `open_slot`. The transport comes from the homeserver's `GET /rtc/transports` unless `CallOptions::livekit_transport` pins one. Start here. |
+| **`matrix-rtc-bridge`** *(separate crate)* | Everything Matrix-side, with no LiveKit in it: `SdkBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`), the feeder subscribes through it and feeds the core, and `compat` translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`, `SdkBackend`, …) so a host keeps one dependency. |
+| **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the core's `MatrixBackend::openid_token`, so this layer is not hard-wired to a particular Matrix SDK. |
 | **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) picks the one a given compat generation's authorisation service issues. |
 | **`session`** | Connects to the SFU and exposes the LiveKit room + event stream. |
 | **`keys`** | Bridges `matrix-rtc-core` media keys into the LiveKit `KeyProvider` (`MediaKeyBridge`), keyed by pseudonymous identity — this is what makes frame E2EE per-participant. |
@@ -291,7 +291,7 @@ asserts a tone survives an encrypt→SFU→decrypt round trip.
 
 | Feature | Effect |
 | --- | --- |
-| `matrix-sdk` *(off by default)* | The `call` facade, `matrix-rtc-bridge`'s SDK half (command sender, membership bridge, an `OpenIdTokenSource` impl for `matrix_sdk::Client`), and the examples. Depends on upstream matrix-rust-sdk with its `unstable-msc4354` feature, for MSC4354 sticky events. |
+| `matrix-sdk` *(off by default)* | The `call` facade, `matrix-rtc-bridge`'s `SdkBackend`, and the examples. Depends on upstream matrix-rust-sdk with its `unstable-msc4354` feature, for MSC4354 sticky events. |
 | `testing` | Test-only parts of `media` (tone generator, Goertzel detector), used by the examples and the e2e test. |
 
 ## Examples & tests

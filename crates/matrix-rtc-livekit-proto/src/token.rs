@@ -15,9 +15,8 @@
 //! built request with reqwest, the web binding hands it to the browser's
 //! `fetch`. Both feed the raw response back through [`parse_sfu_token`], so
 //! the wire format has exactly one owner. Obtaining the OpenID token itself is
-//! a Client-Server API concern and belongs to [`matrix_rtc_bridge`]: the host
-//! supplies one through
-//! [`OpenIdTokenSource`](matrix_rtc_bridge::OpenIdTokenSource).
+//! a Client-Server API concern: the host supplies one through its
+//! `MatrixBackend::openid_token` (`matrix-rtc-core`).
 //!
 //! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 

@@ -24,15 +24,17 @@ on the bridge.
 | Module | What it does |
 | --- | --- |
 | **`compat`** | Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite (today: Element Call on the JS SDK), in two generations. `StickyEvents` is the 2025 format — MSC4354 stickies with pre-2026 field names; reading it is always on, writing it is opt-in. `StateEvents` is the format before MSC4354, with membership as `org.matrix.msc3401.call.member` **room state**; opt-in in both directions, and visible to nobody but that generation. Pure JSON in, pure JSON out — no Matrix SDK, no async runtime. Scaffolding, to be deleted once Element Call catches up. |
-| **`sdk`** *(feature `matrix-sdk`)* | `SdkCommandSender` implements the core's `RtcCommandSender`, turning outbound commands (join/leave stickies, dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key` to-device messages) into Client-Server requests. `run_membership_bridge` feeds the room's live membership — sticky events, and in the pre-sticky compat mode room state — back into an `RtcSessionManager`. |
-| **`OpenIdTokenSource`** *(crate root)* | The host's route to a Matrix OpenID token, which a transport exchanges for its own credentials. The trait is always available so a transport can name it; the `matrix_sdk::Client` impl is behind the feature. |
+| **`feeder`** | What turns a host's `MatrixBackend` into a fed `CallSessionManager`. `RoomFeeder::attach(backend, manager, room_id, options)` subscribes to what the room's compatibility mode needs, applies encryption, slot state and joined members before the first membership, translates the member events (client-reported decryption facts → `EventOrigin`; the pre-2026 funnels), feeds timeline events, redactions and `/relations`, and reports `seeded` once the current state is in. `SessionFeeder` does the same for the to-device key messages. The core spawns nothing; the caller runs each feeder's future where it likes. |
+| **`compat::dialect_backend`** | `DialectBackend<B>`: the one `MatrixBackend` wrapper applying a room's outbound dialect (member-event routing, legacy key type, pre-sticky leave as a delayed *state* event) before delegating. Registered at join, from the mode given at attach. |
+| **`transports`** | `choose(rtc_transports, override)`: the library's transport pick — the join's override, else the first LiveKit entry the homeserver advertises. |
+| **`sdk`** *(feature `matrix-sdk`)* | `SdkBackend` implements `MatrixBackend` over a `matrix_sdk::Client`: Client-Server requests for the sends, and for the reads a task per room subscription that delivers the complete current sets on subscribe and again on every sticky-store or room-state wake, plus the to-device handlers, `/relations`, the OpenID token and `GET /rtc/transports`. |
 
 ## Features
 
 | Feature | Effect |
 | --- | --- |
-| *(default)* | `compat` and the `OpenIdTokenSource` trait. Depends only on `matrix-rtc-core`, serde/serde_json, thiserror, async-trait and log — no Matrix SDK, no async runtime, no git dependencies. |
-| `matrix-sdk` *(off by default)* | `sdk`, plus the `OpenIdTokenSource` impl for `matrix_sdk::Client`. Depends on upstream matrix-rust-sdk (rev in the workspace manifest) with its `unstable-msc4354` feature, for the MSC4354 sticky carrier. |
+| *(default)* | `feeder`, `compat`, `transports`. Depends only on `matrix-rtc-core`, `matrix-rtc-call`, serde/serde_json, thiserror, async-trait, tokio's sync primitives and log — no Matrix SDK, no git dependencies; compiles for wasm32. |
+| `matrix-sdk` *(off by default)* | `sdk`. Depends on upstream matrix-rust-sdk (rev in the workspace manifest) with its `unstable-msc4354` feature, for the MSC4354 sticky carrier. |
 
 ## Testing
 
@@ -40,9 +42,12 @@ on the bridge.
 `serde_json`, which is why the SDK is optional at all:
 
 ```sh
-cargo test -p matrix-rtc-bridge                    # 48 tests, no git deps, no libwebrtc
-cargo test -p matrix-rtc-bridge --features matrix-sdk   # 50 (adds sdk.rs)
+cargo test -p matrix-rtc-bridge                         # compat + feeder, no git deps, no libwebrtc
+cargo test -p matrix-rtc-bridge --features matrix-sdk   # adds sdk.rs
 ```
+
+The feeder tests run over the core's `testing::MockBackend`: a test delivers
+sets into the sinks and reads what reached the manager.
 
 That first line is the reason this crate exists. All of these tests used to live
 inside `matrix-rtc-livekit`, where running them meant building `libwebrtc` and so
@@ -66,16 +71,12 @@ The boundary is load-bearing, so the exclusions are explicit:
 `compat` keeps its own notes on why compatibility is confined to JSON funnels at
 the edge — read the module docs before touching it.
 
-## Known follow-up
+## Who uses the feeder
 
-`matrix_rtc_livekit::call::Call::join` still interleaves the Matrix and media
-halves. Its transport-agnostic part (manager + command sender + membership bridge +
-to-device key handlers + key pump + heartbeat + join/leave) is what a second
-transport would actually want to reuse, and `matrix-rtc-ffi`'s `media/session.rs`
-plus `RtcSessionManagerHandle` is a parallel implementation of the same wiring.
-Extracting it here would let the two converge. The injection seam already exists:
-LiveKit's `MediaKeyBridge` implements the core's `EncryptionKeySignalHandler`, so
-the handler can be passed in rather than constructed in place.
-
-Also unmoved: `discover_livekit_transport`, which is really a
-`GET /rtc/transports` query (MSC4143) that happens to filter for LiveKit.
+Every entry point does the same three things before joining — wrap the backend
+in `DialectBackend`, start a `SessionFeeder`, attach rooms with `RoomFeeder` —
+and differs only in where the backend comes from and where the feeder's future
+runs: `matrix_rtc_livekit::Call::join` (`SdkBackend`, `spawn_local`),
+`matrix_rtc_ffi::RtcSessionManagerHandle` (the host's foreign trait, the FFI
+runtime) and `matrix_rtc_wasm::WasmRtcSessionManager` (the page's
+`MatrixBackendHost`, `spawn_local`).

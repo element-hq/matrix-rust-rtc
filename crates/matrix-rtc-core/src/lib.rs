@@ -32,7 +32,10 @@ pub use encryption::{
 };
 pub use error::{CommandError, JoinError, LeaveError};
 pub use host::application::ApplicationIntake;
-pub use host::commands::{RtcCommandSender, ToDeviceDelivery, ToDeviceRecipient};
+pub use host::backend::{
+    BackendError, EventEncryption, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
+    Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink,
+};
 pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     RawTimelineEvent, RelationsRequest, StickyEventsUpdate,
@@ -61,13 +64,13 @@ pub use wire::wire_event_type;
 /// Test doubles for crates built on the core, behind the `testing` feature.
 #[cfg(feature = "testing")]
 pub mod testing {
-    pub use crate::host::commands::MockCommandSender;
+    pub use crate::host::backend::{MockBackend, MockRoomSubscription, MockToDeviceSubscription};
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::commands::NoopCommandSender;
+    use crate::host::backend::NoopBackend;
     use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
@@ -160,7 +163,7 @@ mod tests {
     /// Joins as alice under an explicit `member_id`, so a leave/rejoin pair can
     /// be told apart in the assertions.
     async fn join_as(
-        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::backend::MockBackend>,
         member_id: &str,
     ) -> String {
         let mut params = JoinSessionParams::new(
@@ -179,7 +182,7 @@ mod tests {
 
     /// Feeds the current sticky state containing one peer, the way a host does.
     async fn admit_peer(
-        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::backend::MockBackend>,
         user_id: &str,
         device_id: &str,
         member_id: &str,
@@ -194,7 +197,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn leave_call(manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>) {
+    async fn leave_call(manager: &mut RtcSessionManager<crate::host::backend::MockBackend>) {
         manager
             .leave(
                 ROOM_ID.to_owned(),
@@ -206,7 +209,7 @@ mod tests {
     }
 
     fn joined_memberships(
-        manager: &RtcSessionManager<crate::host::commands::MockCommandSender>,
+        manager: &RtcSessionManager<crate::host::backend::MockBackend>,
     ) -> Vec<crate::session::JoinedMembership> {
         manager
             .subscribe_membership_snapshots(ROOM_ID, "m.call#ROOM")
@@ -216,9 +219,9 @@ mod tests {
     }
 
     async fn encrypted_call_manager(
-        sender: Arc<crate::host::commands::MockCommandSender>,
-    ) -> RtcSessionManager<crate::host::commands::MockCommandSender> {
-        let mut manager = RtcSessionManager::with_command_sender(sender);
+        sender: Arc<crate::host::backend::MockBackend>,
+    ) -> RtcSessionManager<crate::host::backend::MockBackend> {
+        let mut manager = RtcSessionManager::with_backend(sender);
         manager.on_room_encryption_received(ROOM_ID, true).await;
         manager
             .on_room_slots_received(ROOM_ID, vec![encrypted_call_slot()])
@@ -233,7 +236,7 @@ mod tests {
     /// pushed expiry detection onto every host.
     #[tokio::test]
     async fn a_member_whose_sticky_entry_expired_is_dropped() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let alice = joined_event("@alice:example.org", "m.call#ROOM", "alice-a");
         let bob = joined_event("@bob:example.org", "m.call#ROOM", "bob-a");
 
@@ -267,7 +270,7 @@ mod tests {
     /// replace has a hole exactly where the ghost would be.
     #[tokio::test]
     async fn a_slot_missing_from_the_current_state_is_cleared_too() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let in_call = joined_event("@alice:example.org", "m.call#ROOM", "alice-a");
         let in_other = joined_event("@bob:example.org", "m.call#OTHER", "bob-a");
 
@@ -304,7 +307,7 @@ mod tests {
     /// four.
     #[tokio::test]
     async fn a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         // First call: bob arrives after we joined, so the joined memberships change while we
@@ -355,7 +358,7 @@ mod tests {
     /// receive stream for and to expect a key from.
     #[tokio::test]
     async fn a_rejoin_does_not_advertise_the_previous_participation() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         join_as(&mut manager, "alice-a").await;
@@ -379,7 +382,7 @@ mod tests {
     /// application can relate its own events to it without asking again.
     #[tokio::test]
     async fn a_join_returns_its_membership_event_id() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         let event_id = join_as(&mut manager, "alice-a").await;
@@ -397,7 +400,7 @@ mod tests {
     /// future "just drop the session on leave" refactor has to argue with a test.
     #[tokio::test]
     async fn a_left_session_still_publishes_the_peer_memberships() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
         let mut manager = encrypted_call_manager(sender.clone()).await;
 
         join_as(&mut manager, "alice-a").await;
@@ -427,7 +430,7 @@ mod tests {
     /// to overflow the stack (it was misattributed to watch channels).
     #[tokio::test]
     async fn manager_routes_snapshot_and_diff_update_membership() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let joined = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
 
         manager
@@ -451,7 +454,7 @@ mod tests {
 
     #[tokio::test]
     async fn manager_accepts_stable_and_unstable_rtc_member_event_types() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         let stable = joined_event("@alice:example.org", "m.call#ROOM", "alice-device-a");
         let unstable = RawStickyEvent {
@@ -469,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn manager_ignores_non_membership_event_types() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         let event = RawStickyEvent {
             event_type: "m.not.rtc.member".to_owned(),
@@ -489,7 +492,7 @@ mod tests {
     /// silently see an empty session.
     #[tokio::test]
     async fn members_are_joined_while_slot_state_is_unsupplied() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .set_current_sticky_state(
@@ -518,7 +521,7 @@ mod tests {
     /// input publishes nothing" is the property that matters.
     #[tokio::test]
     async fn re_applying_the_same_sticky_state_publishes_nothing() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let members = || {
             vec![
                 joined_event("@alice:example.org", "m.call#ROOM", "alice-a"),
@@ -555,7 +558,7 @@ mod tests {
     /// Supplying room state with no slot in it means the slot is closed.
     #[tokio::test]
     async fn members_are_left_when_no_slot_is_open() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .set_current_sticky_state(
@@ -575,7 +578,7 @@ mod tests {
 
     #[tokio::test]
     async fn members_are_joined_against_an_open_slot() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
@@ -596,7 +599,7 @@ mod tests {
     /// brings back the members whose events are still sticky.
     #[tokio::test]
     async fn closing_and_reopening_a_slot_re_evaluates_members() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
@@ -627,7 +630,7 @@ mod tests {
     /// Slot state that arrives before the session exists still governs it.
     #[tokio::test]
     async fn slot_state_applies_to_sessions_created_later() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager.on_room_slots_received(ROOM_ID, Vec::new()).await;
         manager
@@ -649,7 +652,7 @@ mod tests {
     /// projected out for the rest of the process.
     #[tokio::test]
     async fn forgetting_a_room_s_slots_stops_the_condition_being_enforced() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         // No slot in the room: everyone is projected out.
         manager.on_room_slots_received(ROOM_ID, Vec::new()).await;
@@ -693,7 +696,7 @@ mod tests {
     #[tokio::test]
     async fn forgetting_slots_is_scoped_to_its_room() {
         const OTHER_ROOM: &str = "!other:example.org";
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
@@ -722,7 +725,7 @@ mod tests {
     #[tokio::test]
     async fn slot_state_is_scoped_to_its_room() {
         const OTHER_ROOM: &str = "!other:example.org";
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
@@ -736,7 +739,7 @@ mod tests {
     /// the room.
     #[tokio::test]
     async fn members_who_left_the_room_are_not_joined() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .set_current_sticky_state(
@@ -762,7 +765,7 @@ mod tests {
     /// "MUST be considered left".
     #[tokio::test]
     async fn cleartext_member_events_are_left_in_an_encrypted_room() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         let encrypted = RawStickyEvent {
             origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
@@ -787,7 +790,7 @@ mod tests {
     /// An unencrypted room imposes no such requirement.
     #[tokio::test]
     async fn cleartext_member_events_are_fine_in_an_unencrypted_room() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         let cleartext = RawStickyEvent {
             origin: EventOrigin::Cleartext,
@@ -806,7 +809,7 @@ mod tests {
     /// members are left even though everything else about them is valid.
     #[tokio::test]
     async fn unencrypted_slot_closes_in_an_encrypted_room() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
 
         manager
             .on_room_slots_received(ROOM_ID, vec![open_call_slot()])
@@ -843,14 +846,14 @@ mod tests {
         };
 
         // Encryption first, then the slot.
-        let mut a: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut a: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         a.on_room_encryption_received(ROOM_ID, true).await;
         a.on_room_slots_received(ROOM_ID, vec![encrypted_slot()])
             .await;
         assert!(a.slot_state(ROOM_ID, "m.call#ROOM").unwrap().is_open());
 
         // Slot first, then encryption.
-        let mut b: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut b: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         b.on_room_slots_received(ROOM_ID, vec![encrypted_slot()])
             .await;
         b.on_room_encryption_received(ROOM_ID, true).await;
@@ -863,8 +866,8 @@ mod tests {
     /// to-device traffic to the other member.
     #[tokio::test]
     async fn slot_encryption_turns_key_distribution_on() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
-        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut manager = RtcSessionManager::with_backend(sender.clone());
 
         manager.on_room_encryption_received(ROOM_ID, true).await;
         manager
@@ -892,8 +895,8 @@ mod tests {
     /// keys are distributed there however the client is configured.
     #[tokio::test]
     async fn absent_slot_encryption_turns_key_distribution_off() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
-        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut manager = RtcSessionManager::with_backend(sender.clone());
 
         manager.on_room_encryption_received(ROOM_ID, false).await;
         manager
@@ -913,7 +916,7 @@ mod tests {
     /// preference, then lets bob in so a membership change triggers key
     /// distribution (if it is enabled at all).
     async fn join_and_admit_a_peer(
-        manager: &mut RtcSessionManager<crate::host::commands::MockCommandSender>,
+        manager: &mut RtcSessionManager<crate::host::backend::MockBackend>,
         local_manage_media_keys: bool,
     ) {
         let mut params = JoinSessionParams::new(
@@ -948,8 +951,8 @@ mod tests {
     /// nothing is a legitimate choice rather than a broken join.
     #[tokio::test]
     async fn a_receive_only_member_joins_and_publishes_nothing() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
-        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut manager = RtcSessionManager::with_backend(sender.clone());
 
         let params = JoinSessionParams::with_transport_intent(
             "@recorder:example.org".to_owned(),
@@ -987,8 +990,8 @@ mod tests {
     /// rather than emitted empty.
     #[tokio::test]
     async fn a_receive_only_member_with_no_cue_omits_transports() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
-        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut manager = RtcSessionManager::with_backend(sender.clone());
 
         let params = JoinSessionParams::with_transport_intent(
             "@recorder:example.org".to_owned(),
@@ -1011,8 +1014,8 @@ mod tests {
     /// declares it can receive on that type too.
     #[tokio::test]
     async fn a_publishing_member_advertises_its_transport() {
-        let sender = Arc::new(crate::host::commands::MockCommandSender::new());
-        let mut manager = RtcSessionManager::with_command_sender(sender.clone());
+        let sender = Arc::new(crate::host::backend::MockBackend::new());
+        let mut manager = RtcSessionManager::with_backend(sender.clone());
 
         let params = JoinSessionParams::new(
             "@alice:example.org".to_owned(),

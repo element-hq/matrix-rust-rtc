@@ -439,7 +439,7 @@ pub(crate) struct OwnRaisedHand {
 /// Everything one session knows about reactions.
 ///
 /// Pure state: it never sends. The session decides *when* to send and feeds the
-/// outcome back in, which keeps this testable without a command sender and
+/// outcome back in, which keeps this testable without a backend and
 /// keeps the ordering rules (relate to the membership event id *as of now*) in
 /// one place, the session.
 pub(crate) struct ReactionsState {

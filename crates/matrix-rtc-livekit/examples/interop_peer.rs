@@ -75,7 +75,7 @@ use matrix_sdk_ui::sync_service::SyncService;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
-use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 use matrix_rtc_media::{
@@ -580,7 +580,11 @@ async fn join_call(
         room,
         CallOptions {
             slot_id: cfg.slot_id.clone(),
-            livekit_service_url_fallback: cfg.livekit_service_url.clone(),
+            livekit_transport: cfg.livekit_service_url.clone().map(|livekit_service_url| {
+                LiveKitTransport {
+                    livekit_service_url,
+                }
+            }),
             http: Some(http.clone()),
             element_call_compat: cfg.compat,
             ..CallOptions::default()

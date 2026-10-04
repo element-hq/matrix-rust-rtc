@@ -14,45 +14,65 @@ It does four things:
 - **Encryption.** It creates, distributes, rotates and checks per-member media keys.
 - **Slots.** It resolves `m.rtc.slot` state, and opens and closes slots.
 
-The core does no I/O. The host feeds it events (`RawStickyEvent`, slot and room state, decrypted
-key messages), and it sends through a host-implemented `RtcCommandSender`. It spawns no tasks and
-arms no timers: the host calls `heartbeat` periodically while joined.
+The core does no I/O. It sends through the host-implemented `MatrixBackend`, and it is fed —
+by the feeder in `matrix-rtc-bridge`, which subscribes through that same backend — the room's
+state and membership as `RawStickyEvent`s, slot and room state, and decrypted key messages. It
+spawns no tasks and arms no timers: the host calls `heartbeat` periodically while joined.
 
 ## Quick start: join a slot and follow its memberships
 
-```rust,no_run
-use std::sync::Arc;
+The core is **fed**, not polled: it spawns nothing and never reads from the backend itself. The
+feeder in `matrix-rtc-bridge` does that — it subscribes through the backend to what the room needs,
+applies the room's current state in the right order (encryption and slots and members before the
+first membership), translates the member events and keeps the manager current. So the entry point
+is the feeder, over the core manager:
 
+```rust,ignore
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+use matrix_rtc_bridge::{AttachOptions, RoomFeeder, RoomModes, SessionFeeder};
+use matrix_rtc_bridge::compat::DialectBackend;
 use matrix_rtc_core::{
-    JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, RawStickyEvent,
-    RtcCommandSender, RtcSessionManager, RtcTransport,
+    JoinSessionParams, JoinedMembership, LeaveSessionParams, LiveKitTransport, MatrixBackend,
+    RtcSessionManager, RtcTransport,
 };
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "org.example.board#ROOM";
 
 async fn run(
-    // The host's route to its Matrix client.
-    sender: Arc<impl RtcCommandSender + 'static>,
-    // The room's current sticky events, as the host's client reports them.
-    sticky_events: Vec<RawStickyEvent>,
+    // The host's Matrix client, behind the one trait the library knows.
+    backend: Arc<impl MatrixBackend + 'static>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut manager = RtcSessionManager::with_command_sender(sender);
+    // Every send renders in the room's dialect (a no-op in the spec-current mode).
+    let backend = Arc::new(DialectBackend::new(backend));
+    let manager = Arc::new(Mutex::new(RtcSessionManager::with_backend(backend.clone())));
 
     // Told of every change to a session's joined memberships.
-    manager.add_membership_listener(Arc::new(
+    manager.lock().await.add_membership_listener(Arc::new(
         |room_id: &str, slot_id: &str, members: &[JoinedMembership]| {
             println!("[{room_id}/{slot_id}] {} joined", members.len());
         },
     ));
 
-    // Hand over the complete current state, again each time it changes.
-    manager.set_current_sticky_state(ROOM, sticky_events).await?;
+    // Media keys for every attached room, then the room itself. Each feeder
+    // returns the future that applies what arrives; run it where you like
+    // (the futures are `!Send`: a `LocalSet`, or `spawn_local` on wasm).
+    let modes = RoomModes::default();
+    let (_keys, keys_run) = SessionFeeder::start(backend.clone(), manager.clone(), modes.clone()).await?;
+    tokio::task::spawn_local(keys_run.run());
+    let (attachment, room_run) = RoomFeeder::attach(
+        backend.clone(), manager.clone(), modes, ROOM.to_owned(), AttachOptions::default(),
+    ).await?;
+    tokio::task::spawn_local(room_run.run());
+    // Resolves once the room's current state has been applied.
+    attachment.seeded().await;
 
-    manager
+    manager.lock().await
         .join(JoinSessionParams::new(
-            "@alice:example.org".to_owned(),
-            "ALICEDEVICE".to_owned(),
+            backend.own_user_id(),
+            backend.own_device_id(),
             ROOM.to_owned(),
             SLOT.to_owned(),
             "org.example.board",
@@ -63,15 +83,25 @@ async fn run(
         .await?;
 
     // Periodically, while joined.
-    manager.heartbeat(ROOM, SLOT).await;
+    manager.lock().await.heartbeat(ROOM, SLOT).await;
 
-    manager
+    manager.lock().await
         .leave(ROOM.to_owned(), SLOT.to_owned(), LeaveSessionParams::new())
         .await?;
+    attachment.detach();
     Ok(())
 }
 ```
 
+`matrix_rtc_livekit::Call::join`, the FFI handle and the wasm manager are all this sequence with
+a different backend and a different place to run the feeder futures.
+
 The same memberships are also on a watch: `subscribe_membership_snapshots(room_id, slot_id)`.
+
+What the feeder calls on the manager — `set_current_sticky_state(room, Vec<RawStickyEvent>)`
+with the room's **complete** current membership, `on_room_slots_received`, `on_room_members_received`,
+`on_room_encryption_received`, `receive_encryption_key` — is public so the core can be driven by
+hand in a unit test over `testing::MockBackend`, which records every send and lets a test deliver
+sets into the sinks. Production code never calls them.
 
 For a call, use `matrix-rtc-call`'s `CallSessionManager`, which wraps this manager.

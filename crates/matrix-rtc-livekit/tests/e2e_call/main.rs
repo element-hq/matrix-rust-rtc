@@ -64,7 +64,7 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
-use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 use matrix_rtc_media::{
@@ -293,7 +293,9 @@ async fn open_call(
         room,
         CallOptions {
             slot_id: cfg.slot_id.clone(),
-            livekit_service_url_fallback: Some(livekit_service_url.to_owned()),
+            livekit_transport: Some(LiveKitTransport {
+                livekit_service_url: livekit_service_url.to_owned(),
+            }),
             http: Some(http),
             element_call_compat: compat,
             ..CallOptions::default()

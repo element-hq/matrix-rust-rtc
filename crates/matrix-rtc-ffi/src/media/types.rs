@@ -8,10 +8,6 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
-
-use super::MediaFfiError;
-
 /// The kind of media stream (mirrors `matrix_rtc_media::MediaStreamKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiStreamKind {
@@ -807,52 +803,5 @@ impl From<FfiPublishOptions> for matrix_rtc_media::PublishOptions {
             simulcast: options.simulcast,
             muted: options.muted,
         }
-    }
-}
-
-/// A Matrix OpenID token, as returned by
-/// `POST /_matrix/client/v3/user/{userId}/openid/request_token`.
-#[derive(Clone, Debug, uniffi::Record)]
-pub struct FfiOpenIdToken {
-    pub access_token: String,
-    pub token_type: String,
-    pub matrix_server_name: String,
-    pub expires_in_secs: u64,
-}
-
-/// Host-implemented source of Matrix OpenID tokens (MSC4195 token exchange).
-///
-/// Implement with the host's Matrix client; called whenever a focus
-/// connection needs a fresh SFU JWT — including connections to *peers'*
-/// foci, so expect more than one call per session.
-///
-/// (`async_trait` must sit *under* the uniffi attribute: uniffi parses the
-/// original `async fn` tokens, `async_trait` then makes the trait
-/// dyn-compatible for the Rust side.)
-#[uniffi::export(with_foreign)]
-#[async_trait]
-pub trait OpenIdTokenProvider: Send + Sync {
-    async fn get_open_id_token(&self) -> Result<FfiOpenIdToken, MediaFfiError>;
-}
-
-/// Adapts the host's provider to the transport's token source.
-pub(super) struct TokenProviderAdapter(pub(super) std::sync::Arc<dyn OpenIdTokenProvider>);
-
-#[async_trait]
-impl matrix_rtc_livekit::OpenIdTokenSource for TokenProviderAdapter {
-    async fn open_id_token(
-        &self,
-    ) -> Result<matrix_rtc_livekit::OpenIdToken, matrix_rtc_livekit::OpenIdTokenError> {
-        let token = self
-            .0
-            .get_open_id_token()
-            .await
-            .map_err(|error| matrix_rtc_livekit::OpenIdTokenError(error.to_string()))?;
-        Ok(matrix_rtc_livekit::OpenIdToken {
-            access_token: token.access_token,
-            token_type: token.token_type,
-            matrix_server_name: token.matrix_server_name,
-            expires_in: token.expires_in_secs,
-        })
     }
 }

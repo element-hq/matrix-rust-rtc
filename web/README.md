@@ -27,11 +27,10 @@ import { MatrixRtcCall } from 'matrix-rtc-wasm/call';
 import * as livekit from 'livekit-client';
 
 const call = new MatrixRtcCall({
-  manager,                 // WasmRtcSessionManager: command sender set up,
-                           // sticky state/room state being fed, slot joined
+  manager,                 // WasmRtcSessionManager over the host's
+                           // MatrixBackendHost, room attached, slot joined
   bindings,                // the wasm module
   livekit,
-  getOpenIdToken: () => matrixClient.getOpenIdToken(),
   roomOptions: { e2ee: { worker: e2eeWorker } }, // omit to run without frame E2EE
 });
 call.onParticipants = (roster) => render(roster);

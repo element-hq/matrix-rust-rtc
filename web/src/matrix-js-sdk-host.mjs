@@ -7,34 +7,25 @@ Please see LICENSE in the repository root for full details.
 
 /**
  * The Matrix side of a web call: matrix-js-sdk behind the wasm manager's
- * host contract.
- * Two halves:
- * - the command-sender object the manager dispatches on (`commandSender()`):
- *   sticky sends (MSC4354), delayed events (MSC4140 — restart is the restart
- *   action, never cancel+resend), state events, and Olm-encrypted per-device
- *   to-device messages;
- * - sync feeding (`attachRoom()`): complete per-room snapshots pushed in the
- *   same order the native bridge uses — encryption, slots, members, then the
- *   membership set through the raw funnel (replace, not merge) — plus inbound
- *   media-key to-device messages with their Olm decryption metadata and
- *   MSC4153 cross-signing status.
+ * `MatrixBackendHost` contract. One object, both halves:
+ * - sends: sticky (MSC4354), delayed events (MSC4140 — restart is the restart
+ *   action, never cancel+resend; a delayed STATE event when a state key is
+ *   given), state events, plain room events, redactions, and Olm-encrypted
+ *   per-device to-device messages;
+ * - reads: `subscribeRoom` delivers the room's complete current sets into the
+ *   sink the manager hands it — encryption, state events of the requested
+ *   types, joined members, the sticky set — first on subscribe and again on
+ *   every change, plus timeline events and redactions as they arrive;
+ *   `subscribeToDevice` delivers decrypted to-device messages with their Olm
+ *   decryption metadata and MSC4153 cross-signing status; `relations`,
+ *   `getOpenIdToken` and `rtcTransports` answer on request.
+ * The manager parses every MatrixRTC content and applies the compatibility
+ * dialects itself; this file hands events over verbatim.
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
  * the module is injected (`sdk`), keeping it an optional peer dependency and
  * this file testable against a mock. Requires v42+ (`_unstable_` sticky and
  * delayed-event APIs, rust-crypto).
- * Every manager call goes through the shared ManagerOpQueue: the wasm object
- * allows one in-flight call at a time.
  */
-
-const MEMBER_EVENT_TYPES = ['m.rtc.member', 'org.matrix.msc4143.rtc.member'];
-const SLOT_EVENT_TYPES = ['m.rtc.slot', 'org.matrix.msc4143.rtc.slot'];
-/// The pre-MSC4354 generation's membership carrier: room state.
-const LEGACY_STATE_MEMBER_EVENT_TYPE = 'org.matrix.msc3401.call.member';
-const KEY_MESSAGE_TYPES = ['m.rtc.encryption_key', 'org.matrix.msc4143.rtc.encryption_key'];
-/// The pre-2026 Element Call key type; bound per the room's compat mode.
-const LEGACY_KEY_MESSAGE_TYPE = 'io.element.call.encryption_keys';
-/** Element Call reactions and the raised-hand annotation; the core reads only these. */
-const REACTION_EVENT_TYPES = ['io.element.call.reaction', 'm.reaction'];
 
 /**
  * Log in (registering a throwaway user first when `user` is blank — dev
@@ -119,308 +110,373 @@ export async function createMatrixSession({
   return { client, userId: login.user_id, deviceId: login.device_id, password: pass };
 }
 
+/** How long a room subject whose read failed waits before reading again. */
+export const READ_RETRY_MS = 5000;
+
+/**
+ * The `MatrixBackendHost` the manager takes: `new WasmRtcSessionManager(host)`.
+ */
 export class MatrixHost {
   /**
    * @param {object} options
    * @param {object} options.sdk - the `matrix-js-sdk` module.
    * @param {object} options.client - a crypto-ready, syncing MatrixClient.
-   * @param {object} options.managerOps - the shared ManagerOpQueue.
    * @param {(line: string) => void} [options.log]
    */
-  constructor({ sdk, client, managerOps, log = () => {} }) {
+  constructor({ sdk, client, log = () => {} }) {
     this.sdk = sdk;
     this.client = client;
-    this.managerOps = managerOps;
     this.log = log;
     /** curve25519 sender key -> device id, per megolm-attributed sender. */
     this.senderDeviceCache = new Map();
-    this.detachers = [];
   }
 
-  /** The object `setup_command_sender` takes. */
-  commandSender() {
-    const client = this.client;
-    return {
-      sendStickyEvent: (roomId, eventType, content, durationMs) =>
-        // The manager chose the duration; pass it through verbatim.
-        client._unstable_sendStickyEvent(roomId, durationMs, null, eventType, content),
-      sendStateEvent: (roomId, eventType, stateKey, content) =>
-        client.sendStateEvent(roomId, eventType, content, stateKey),
-      sendDelayedEvent: async (roomId, eventType, content, delayMs) => {
-        const response = await client._unstable_sendDelayedEvent(
-          roomId,
-          { delay: delayMs },
-          null,
-          eventType,
-          content,
-        );
-        // The binding expects the bare MSC4140 delay id.
-        return response.delay_id;
-      },
-      // The pre-sticky dialect's delayed leave is a delayed STATE event; only
-      // rooms joined in state_events mode dispatch this.
-      sendDelayedStateEvent: async (roomId, eventType, stateKey, content, delayMs) => {
-        const response = await client._unstable_sendDelayedStateEvent(
-          roomId,
-          { delay: delayMs },
-          eventType,
-          content,
-          stateKey,
-        );
-        return response.delay_id;
-      },
-      restartDelayedEvent: (_roomId, delayId) =>
-        client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Restart),
-      cancelDelayedEvent: (_roomId, delayId) =>
-        client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Cancel),
-      sendToDeviceMessage: async (recipients, messageType, content) => {
-        // Olm-encrypted, per specific device — never `*`. Resolving with
-        // nothing reports every recipient as served; a throw reports the
-        // batch unattempted, and the core re-sends on the next rollout.
-        await client.encryptAndSendToDevice(messageType, recipients, content);
-      },
-      // Reactions and the raised hand: ordinary message-like sends, which
-      // js-sdk encrypts in an encrypted room on its own.
-      sendRoomEvent: (roomId, eventType, content) => client.sendEvent(roomId, eventType, content),
-      redactEvent: (roomId, eventId, reason) =>
-        client.redactEvent(roomId, eventId, undefined, reason === undefined ? undefined : { reason }),
-    };
+  // --- identity ----------------------------------------------------------
+
+  ownUserId() {
+    return this.client.getUserId();
   }
+
+  ownDeviceId() {
+    return this.client.getDeviceId();
+  }
+
+  // --- sends -------------------------------------------------------------
+
+  sendStickyEvent(roomId, eventType, content, durationMs) {
+    // The manager chose the duration; pass it through verbatim.
+    return this.client._unstable_sendStickyEvent(roomId, durationMs, null, eventType, content);
+  }
+
+  sendStateEvent(roomId, eventType, stateKey, content) {
+    return this.client.sendStateEvent(roomId, eventType, content, stateKey);
+  }
+
+  /** A delayed STATE event when `stateKey` is set (the pre-sticky dialect's leave). */
+  async sendDelayedEvent(roomId, eventType, stateKey, content, delayMs) {
+    const response =
+      stateKey === null || stateKey === undefined
+        ? await this.client._unstable_sendDelayedEvent(roomId, { delay: delayMs }, null, eventType, content)
+        : await this.client._unstable_sendDelayedStateEvent(
+            roomId,
+            { delay: delayMs },
+            eventType,
+            content,
+            stateKey,
+          );
+    // The manager expects the bare MSC4140 delay id.
+    return response.delay_id;
+  }
+
+  restartDelayedEvent(_roomId, delayId) {
+    return this.client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Restart);
+  }
+
+  cancelDelayedEvent(_roomId, delayId) {
+    return this.client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Cancel);
+  }
+
+  async sendToDeviceMessage(recipients, messageType, content) {
+    // Olm-encrypted, per specific device — never `*`. Resolving with nothing
+    // reports every recipient as served; a throw reports the batch
+    // unattempted, and the manager re-sends on the next rollout.
+    await this.client.encryptAndSendToDevice(messageType, recipients, content);
+  }
+
+  /** Reactions and the raised hand: js-sdk encrypts these in an encrypted room. */
+  sendRoomEvent(roomId, eventType, content) {
+    return this.client.sendEvent(roomId, eventType, content);
+  }
+
+  redactEvent(roomId, eventId, reason) {
+    return this.client.redactEvent(roomId, eventId, undefined, reason === undefined ? undefined : { reason });
+  }
+
+  // --- reads -------------------------------------------------------------
 
   /**
-   * Start feeding one room into the manager and route its inbound key
-   * messages. Resolves once the initial snapshot is fed.
-   *
-   * `readsStateMembership` mirrors the native bridge's gating: msc3401 room
-   * state is only membership in the pre-sticky mode — in any other, a room's
-   * stale state events from an old call must not resurrect as members.
+   * Deliver the room's subjects into `sink`: each subject's complete current
+   * set on subscribe (encryption, state, members, sticky, in that order), then
+   * again whenever that subject changes, coalesced per tick. Timeline events
+   * and redactions go as they arrive. Synchronous by contract: the listeners
+   * are registered here, the deliveries happen from them.
    */
-  async attachRoom(manager, roomId, { readsStateMembership = false } = {}) {
+  subscribeRoom(roomId, subjects, sink) {
     const room = this.client.getRoom(roomId);
     if (!room) throw new Error(`not joined to ${roomId}`);
-    this.room = room;
-    this.manager = manager;
-    this.readsStateMembership = readsStateMembership;
+    const detachers = [];
+    let cancelled = false;
 
-    const refeed = () => this.scheduleFeed();
-    room.on(this.sdk.RoomStickyEventsEvent.Update, refeed);
+    const subject = this.roomSubject(() => cancelled, detachers);
+    const encryption = subject(
+      'encryption',
+      () => Boolean(room.currentState.getStateEvents('m.room.encryption', '')),
+      (encrypted) => sink.onEncryption(encrypted),
+    );
+    const state = new Map(
+      subjects.state_event_types.map((type) => [
+        type,
+        subject(
+          `${type} state`,
+          () => this.stateEventsIn(room.currentState.getStateEvents(type)),
+          (events) => sink.onStateEvents(type, events),
+        ),
+      ]),
+    );
+    const members = subject(
+      'joined members',
+      () => room.getJoinedMembers().map((member) => member.userId),
+      (userIds) => sink.onJoinedMembers(userIds),
+    );
+    const sticky = subject(
+      'sticky events',
+      () => this.stickySnapshot(room),
+      (events) => sink.onStickyEvents(events),
+    );
+
+    room.on(this.sdk.RoomStickyEventsEvent.Update, sticky.schedule);
     // State listeners on the CLIENT, not the room: the room-level re-emit is
     // unreliable (it re-arms only when the RoomState instance is swapped, and
     // MSC4222 `state_after` sync churns those), while the client-level one is
-    // what js-sdk's own MatrixRTCSessionManager trusts. Empirically the
-    // room-level listener missed every msc3401 membership update.
+    // what js-sdk's own MatrixRTCSessionManager trusts.
     const onStateEvent = (event) => {
-      if (event.getRoomId() === roomId) refeed();
+      if (event.getRoomId() !== roomId) return;
+      const type = event.getType();
+      if (type === 'm.room.encryption') encryption.schedule();
+      state.get(type)?.schedule();
     };
     const onMembers = (_event, _state, member) => {
-      if (member.roomId === roomId) refeed();
+      if (member.roomId === roomId) members.schedule();
     };
     this.client.on(this.sdk.RoomStateEvent.Events, onStateEvent);
     this.client.on(this.sdk.RoomStateEvent.Members, onMembers);
-    this.detachers.push(() => {
-      room.off(this.sdk.RoomStickyEventsEvent.Update, refeed);
+    detachers.push(() => {
+      room.off(this.sdk.RoomStickyEventsEvent.Update, sticky.schedule);
       this.client.off(this.sdk.RoomStateEvent.Events, onStateEvent);
       this.client.off(this.sdk.RoomStateEvent.Members, onMembers);
     });
 
-    const onToDevice = (payload) => this.onToDeviceMessage(payload);
-    this.client.on(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice);
-    this.detachers.push(() => this.client.off(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice));
-
-    // Reactions and raised hands are ordinary timeline events (the sticky
-    // listeners above never see them), and in an encrypted room they arrive
-    // encrypted: the Timeline event fires before decryption, so the Decrypted
-    // one is what carries the readable content. Redactions lower hands.
+    // Reactions and raised hands are ordinary timeline events, and in an
+    // encrypted room they arrive encrypted: the Timeline event fires before
+    // decryption, so the Decrypted one is what carries the readable content.
     const { RoomEvent, MatrixEventEvent } = this.sdk;
-    if (RoomEvent && MatrixEventEvent) {
+    if (subjects.timeline_event_types.length > 0 && RoomEvent && MatrixEventEvent) {
+      const forward = (event) => {
+        if (event.getRoomId() !== roomId) return;
+        if (event.isSending?.() || event.isBeingDecrypted?.() || event.isDecryptionFailure?.()) return;
+        if (event.isEncrypted?.() && event.getClearContent?.() === undefined && event.getType() === 'm.room.encrypted') return;
+        if (!subjects.timeline_event_types.includes(event.getType())) return;
+        this.eventIn(event)
+          .then((payload) => sink.onTimelineEvents([payload]))
+          .catch((error) => this.log(`timeline event failed: ${error}`));
+      };
       const onTimeline = (event, _room, toStartOfTimeline, removed) => {
         if (toStartOfTimeline || removed) return;
-        this.onTimelineEvent(event).catch((error) => this.log(`timeline event failed: ${error}`));
-      };
-      const onDecrypted = (event) => {
-        if (event.getRoomId() !== roomId) return;
-        this.onTimelineEvent(event).catch((error) => this.log(`decrypted event failed: ${error}`));
+        forward(event);
       };
       const onRedaction = (event) => {
+        if (event.getRoomId() !== roomId) return;
         const target = event.event?.redacts ?? event.getContent()?.redacts;
-        if (!target) return;
-        this.managerOps
-          .enqueue(() => manager.onEventRedacted(roomId, target))
-          .catch((error) => this.log(`redaction failed: ${error}`));
+        if (target) sink.onRedaction(target);
       };
       room.on(RoomEvent.Timeline, onTimeline);
-      this.client.on(MatrixEventEvent.Decrypted, onDecrypted);
+      this.client.on(MatrixEventEvent.Decrypted, forward);
       room.on(RoomEvent.Redaction, onRedaction);
-      this.detachers.push(() => {
+      detachers.push(() => {
         room.off(RoomEvent.Timeline, onTimeline);
-        this.client.off(MatrixEventEvent.Decrypted, onDecrypted);
+        this.client.off(MatrixEventEvent.Decrypted, forward);
         room.off(RoomEvent.Redaction, onRedaction);
       });
-    } else {
-      this.log('sdk exposes no RoomEvent/MatrixEventEvent; reactions will not be read');
     }
 
-    await this.feed();
-  }
-
-  /**
-   * Forward one timeline event if it is a reaction or a raised hand. Skips
-   * events still being sent (their id is not final) and encrypted events
-   * that have not been decrypted yet (the Decrypted listener gets those).
-   */
-  async onTimelineEvent(event) {
-    if (event.getRoomId() !== this.room?.roomId) return;
-    if (event.isSending?.() || event.isBeingDecrypted?.() || event.isDecryptionFailure?.()) return;
-    if (event.isEncrypted?.() && event.getClearContent?.() === undefined && event.getType() === 'm.room.encrypted') return;
-    if (!REACTION_EVENT_TYPES.includes(event.getType())) return;
-    const payload = await this.timelinePayload(event);
-    await this.managerOps.enqueue(() => this.manager.onRoomTimelineEvents(this.room.roomId, [payload]));
-  }
-
-  /** A decrypted timeline event in the shape `onRoomTimelineEvents` takes. */
-  async timelinePayload(event) {
-    const wasEncrypted = event.isEncrypted();
+    encryption.run();
+    for (const type of state.values()) type.run();
+    members.run();
+    sticky.run();
     return {
-      room_id: this.room.roomId,
-      event_id: event.getId(),
-      sender: event.getSender(),
-      sender_device_id: wasEncrypted ? await this.senderDeviceOf(event) : undefined,
-      was_encrypted: wasEncrypted,
-      type: event.getType(),
-      origin_server_ts: event.getTs(),
-      content: event.getContent(),
+      cancel: () => {
+        cancelled = true;
+        for (const detach of detachers.splice(0)) detach();
+      },
     };
   }
 
   /**
-   * Hands raised before we joined live in the relations of each member's
-   * membership event, not in the timeline we see live. The manager lists the
-   * membership events it has not looked up yet; answer each with the
-   * `/relations` of that event. Asking marks an id as fetched, so a failed
-   * fetch is retried on the next feed.
+   * One subject of a room subscription: `read` its current set, `deliver` it.
+   * A synchronous read is delivered at once. An asynchronous one (the sticky
+   * set decrypts) is delivered only if no later read has started, so a slow
+   * read never lands over a newer set; a failed one is retried after
+   * `READ_RETRY_MS` unless a later read superseded it. `schedule` coalesces
+   * the changes of one tick into one read.
    */
-  async backfillRaisedHands() {
-    const { room, manager } = this;
-    if (typeof manager.pendingRelationLookups !== 'function') return;
-    const roomId = room.roomId;
-    const lookups = await this.managerOps.enqueue(() => manager.pendingRelationLookups(roomId));
-    for (const lookup of lookups) {
-      try {
-        const { events } = await this.client.relations(
-          roomId,
-          lookup.membership_event_id,
-          'm.annotation',
-          'm.reaction',
-        );
-        const payloads = [];
-        for (const event of events) {
-          await this.client.decryptEventIfNeeded(event);
-          if (event.isDecryptionFailure()) continue;
-          payloads.push(await this.timelinePayload(event));
+  roomSubject(isCancelled, detachers) {
+    return (name, read, deliver) => {
+      let generation = 0;
+      let queued = false;
+      let retry;
+      const run = () => {
+        if (isCancelled()) return;
+        clearTimeout(retry);
+        const mine = ++generation;
+        const current = () => !isCancelled() && mine === generation;
+        const fail = (error) => {
+          if (!current()) return;
+          this.log(`${name} read failed: ${error}; retrying`);
+          retry = setTimeout(run, READ_RETRY_MS);
+        };
+        let result;
+        try {
+          result = read();
+        } catch (error) {
+          fail(error);
+          return;
         }
-        await this.managerOps.enqueue(() =>
-          manager.onRelationsReceived(roomId, lookup.membership_event_id, payloads),
-        );
-      } catch (error) {
-        this.log(`relations of ${lookup.membership_event_id} failed: ${error}`);
-      }
+        if (result instanceof Promise) {
+          result.then((value) => current() && deliver(value), fail);
+        } else {
+          deliver(result);
+        }
+      };
+      const schedule = () => {
+        if (queued) return;
+        queued = true;
+        queueMicrotask(() => {
+          queued = false;
+          run();
+        });
+      };
+      detachers.push(() => clearTimeout(retry));
+      return { run, schedule };
+    };
+  }
+
+  /** Decrypted to-device messages of `eventTypes`, with their Olm metadata. */
+  subscribeToDevice(eventTypes, sink) {
+    const onToDevice = ({ message, encryptionInfo }) => {
+      if (!eventTypes.includes(message.type)) return;
+      this.toDeviceEncryption(encryptionInfo)
+        .then((encryption) =>
+          sink.onToDeviceMessage({
+            sender: encryptionInfo?.sender ?? message.sender,
+            event_type: message.type,
+            content: message.content ?? {},
+            encryption,
+          }),
+        )
+        .catch((error) => this.log(`to-device message failed: ${error}`));
+    };
+    this.client.on(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice);
+    return {
+      cancel: () => this.client.off(this.sdk.ClientEvent.ReceivedToDeviceMessage, onToDevice),
+    };
+  }
+
+  /** The `/relations` of one event, decrypted, in the `EventIn` shape. */
+  async relations(roomId, eventId, relType, eventType) {
+    const { events } = await this.client.relations(roomId, eventId, relType, eventType);
+    const payloads = [];
+    for (const event of events) {
+      await this.client.decryptEventIfNeeded(event);
+      if (event.isDecryptionFailure()) continue;
+      payloads.push(await this.eventIn(event));
+    }
+    return payloads;
+  }
+
+  getOpenIdToken() {
+    return this.client.getOpenIdToken();
+  }
+
+  /** `GET /_matrix/client/v1/rtc/transports`; `[]` where the homeserver lacks it. */
+  async rtcTransports() {
+    try {
+      const response = await this.client.http.authedRequest(
+        this.sdk.Method.Get,
+        '/rtc/transports',
+        undefined,
+        undefined,
+        { prefix: '/_matrix/client/v1' },
+      );
+      return response?.rtc_transports ?? [];
+    } catch (error) {
+      if (error?.httpStatus === 404) return [];
+      throw error;
     }
   }
 
-  detach() {
-    for (const detach of this.detachers.splice(0)) detach();
+  // --- shapes ------------------------------------------------------------
+
+  /** One event as the manager takes it: content verbatim, decryption info as reported. */
+  async eventIn(event) {
+    return this.eventShape(event, await this.eventEncryption(event));
   }
 
-  /** Coalesce bursts of room updates into one feed at a time. */
-  scheduleFeed() {
-    if (this.feedPending) return;
-    this.feedPending = true;
-    queueMicrotask(() => {
-      this.feedPending = false;
-      this.feed().catch((error) => this.log(`feed failed: ${error}`));
-    });
-  }
-
-  /**
-   * Push the room's complete current state, in the native bridge's order:
-   * encryption decides how slots resolve, slots decide whether members count,
-   * and the sticky set replaces the membership wholesale.
-   */
-  async feed() {
-    const { room, manager } = this;
-    const roomId = room.roomId;
-
-    const encrypted = Boolean(room.currentState.getStateEvents('m.room.encryption', ''));
-    const slots = SLOT_EVENT_TYPES.flatMap((type) =>
-      room.currentState.getStateEvents(type).map((ev) => ({
-        slot_id: ev.getStateKey(),
-        content: ev.getContent(),
-      })),
-    );
-    const members = room.getJoinedMembers().map((member) => member.userId);
-    const sticky = await this.stickySnapshot();
-    // The pre-sticky generation's membership: `org.matrix.msc3401.call.member`
-    // room state, only read in that mode. Its lifetime is stated in the
-    // content, which is why `origin_server_ts` rides along as the deadline
-    // base. In a mid-transition room the funnel dedupes it against the sticky
-    // set (sticky wins on a shared key).
-    const legacyState = this.readsStateMembership
-      ? room.currentState.getStateEvents(LEGACY_STATE_MEMBER_EVENT_TYPE).map((ev) => ({
-          event_id: ev.getId(),
-          sender: ev.getSender(),
-          state_key: ev.getStateKey(),
-          origin_server_ts: ev.getTs(),
-          content: ev.getContent(),
-        }))
-      : [];
-
-    await this.managerOps.enqueue(async () => {
-      await manager.on_room_encryption_received(roomId, encrypted);
-      await manager.on_room_slots_received(roomId, slots);
-      await manager.on_room_members_received(roomId, members);
-      // The raw funnel, in every mode: it normalises pre-2026 Element Call
-      // shapes (flat `rtc_transports`, membership-less `member`) and is a
-      // no-op on spec-current content.
-      await manager.setCurrentMembership(roomId, sticky, legacyState);
-    });
-
-    // After the membership, so the lookups are for the roster the core holds.
-    await this.backfillRaisedHands();
+  eventShape(event, encryption) {
+    return {
+      event_id: event.getId(),
+      sender: event.getSender(),
+      event_type: event.getType(),
+      state_key: event.getStateKey?.() ?? undefined,
+      origin_server_ts: event.getTs(),
+      content: event.getContent(),
+      encryption,
+    };
   }
 
   /**
-   * The room's active sticky membership events, decrypted, in the shape
-   * `set_current_sticky_state` takes. The sticky store does not decrypt and
-   * keys encrypted events under `m.room.encrypted`, so iterate everything,
-   * decrypt, then filter by the decrypted type.
+   * State events in the `EventIn` shape: synchronously when all are cleartext
+   * (room state in practice), so a state set is delivered the moment it changes.
    */
-  async stickySnapshot() {
+  stateEventsIn(events) {
+    if (events.some((event) => event.isEncrypted?.())) {
+      return Promise.all(events.map((event) => this.eventIn(event)));
+    }
+    return events.map((event) => this.eventShape(event, { kind: 'cleartext' }));
+  }
+
+  /** What js-sdk reports: encrypted or not, and the attributed device. */
+  async eventEncryption(event) {
+    if (!event.isEncrypted?.()) return { kind: 'cleartext' };
+    return { kind: 'encrypted', sender_device_id: await this.senderDeviceOf(event) };
+  }
+
+  /** Olm metadata plus MSC4153: the key is only accepted from a cross-signed device. */
+  async toDeviceEncryption(encryptionInfo) {
+    if (!encryptionInfo) return { kind: 'cleartext' };
+    let senderCrossSigned;
+    if (encryptionInfo.sender && encryptionInfo.senderDevice) {
+      const status = await this.client
+        .getCrypto()
+        .getDeviceVerificationStatus(encryptionInfo.sender, encryptionInfo.senderDevice);
+      senderCrossSigned = status?.signedByOwner ?? false;
+    }
+    return {
+      kind: 'encrypted',
+      sender_device_id: encryptionInfo.senderDevice,
+      sender_cross_signed: senderCrossSigned,
+    };
+  }
+
+  /**
+   * The room's active sticky events, decrypted. The sticky store does not
+   * decrypt and keys encrypted events under `m.room.encrypted`, so iterate
+   * everything and decrypt; the manager filters by type.
+   */
+  async stickySnapshot(room) {
     const events = [];
-    for (const event of this.room._unstable_getStickyEvents()) {
+    for (const event of room._unstable_getStickyEvents()) {
       await this.client.decryptEventIfNeeded(event);
       if (event.isDecryptionFailure()) {
         this.log(`sticky event ${event.getId()} failed to decrypt; skipping`);
         continue;
       }
-      const type = event.getType();
-      if (!MEMBER_EVENT_TYPES.includes(type)) continue;
-
-      const wasEncrypted = event.isEncrypted();
-      events.push({
-        room_id: this.room.roomId,
-        event_id: event.getId(),
-        sender: event.getSender(),
-        sender_device_id: wasEncrypted ? await this.senderDeviceOf(event) : undefined,
-        was_encrypted: wasEncrypted,
-        type,
-        content: event.getContent(),
-      });
+      events.push(await this.eventIn(event));
     }
     return events;
   }
 
   /**
-   * The device that megolm-encrypted `event`: js-sdk exposes the sender's
+   * The device that megalm-encrypted `event`: js-sdk exposes the sender's
    * curve25519 key, and the device list proves which device owns it.
    */
   async senderDeviceOf(event) {
@@ -439,50 +495,6 @@ export class MatrixHost {
     }
     this.log(`no device of ${sender} owns sender key ${senderKey}`);
     return undefined;
-  }
-
-  /** Route a decrypted media-key to-device message into the manager. */
-  async onToDeviceMessage({ message, encryptionInfo }) {
-    const legacy = message.type === LEGACY_KEY_MESSAGE_TYPE;
-    if (!legacy && !KEY_MESSAGE_TYPES.includes(message.type)) return;
-    const content = message.content ?? {};
-
-    // MSC4153: the key is only accepted from a cross-signed device.
-    let senderIsCrossSigned = false;
-    if (encryptionInfo?.sender && encryptionInfo.senderDevice) {
-      const status = await this.client
-        .getCrypto()
-        .getDeviceVerificationStatus(encryptionInfo.sender, encryptionInfo.senderDevice);
-      senderIsCrossSigned = status?.signedByOwner ?? false;
-    }
-
-    // The legacy type takes its content raw — the generations disagree about
-    // where the key, index and owning membership live, and the wasm side
-    // binds it per the mode the room was joined in.
-    const receive = legacy
-      ? () =>
-          this.manager.receiveLegacyEncryptionKey({
-            sender: encryptionInfo?.sender ?? message.sender,
-            content,
-            was_encrypted: encryptionInfo !== null,
-            sender_device_id: encryptionInfo?.senderDevice,
-            sender_is_cross_signed: senderIsCrossSigned,
-          })
-      : () =>
-          this.manager.receiveEncryptionKey({
-            room_id: content.room_id,
-            member_id: content.member_id,
-            key_b64: content.media_key?.key,
-            key_index: content.media_key?.index,
-            was_encrypted: encryptionInfo !== null,
-            sender_user_id: encryptionInfo?.sender,
-            sender_device_id: encryptionInfo?.senderDevice,
-            sender_is_cross_signed: senderIsCrossSigned,
-          });
-
-    this.managerOps
-      .enqueue(receive)
-      .catch((error) => this.log(`encryption key rejected: ${error}`));
   }
 
   /** The `livekit_service_url` the homeserver advertises, from well-known. */

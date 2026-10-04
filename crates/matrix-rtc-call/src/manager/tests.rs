@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use matrix_rtc_core::testing::MockCommandSender;
+use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     ApplicationInfo, EventOrigin, JoinSessionParams, LeaveSessionParams, LiveKitTransport,
     MemberInfo, Membership, RawSlotEvent, RawStickyEvent, RawStickyEventContent, RawTimelineEvent,
@@ -86,7 +86,7 @@ fn join_params() -> JoinSessionParams {
     )
 }
 
-type Manager = CallSessionManager<MockCommandSender>;
+type Manager = CallSessionManager<MockBackend>;
 
 async fn set_roster(manager: &mut Manager, events: Vec<RawStickyEvent>) {
     manager
@@ -98,9 +98,9 @@ async fn set_roster(manager: &mut Manager, events: Vec<RawStickyEvent>) {
 
 /// Alice joined (her membership event is `$sticky-1`), Bob in the roster with
 /// membership event `$bob-member-1`.
-async fn joined_call(mut params: CallJoinParams) -> (Manager, Arc<MockCommandSender>, String) {
-    let sender = Arc::new(MockCommandSender::new());
-    let mut manager = CallSessionManager::with_command_sender(sender.clone());
+async fn joined_call(mut params: CallJoinParams) -> (Manager, Arc<MockBackend>, String) {
+    let sender = Arc::new(MockBackend::new());
+    let mut manager = CallSessionManager::with_backend(sender.clone());
     let own_member_id = params.rtc.membership_id();
     params.rtc.membership_id = Some(own_member_id.clone());
     manager.join(params).await.expect("join succeeds");
@@ -575,8 +575,8 @@ async fn disabled_reactions_neither_send_nor_receive() {
 /// to both sessions and only the one holding the member keeps it.
 #[tokio::test]
 async fn a_rooms_reactions_reach_the_session_holding_the_member() {
-    let sender = Arc::new(MockCommandSender::new());
-    let mut manager = CallSessionManager::with_command_sender(sender);
+    let sender = Arc::new(MockBackend::new());
+    let mut manager = CallSessionManager::with_backend(sender);
     let other_slot = "m.call#OTHER";
 
     manager
@@ -677,8 +677,8 @@ fn open_slot(encryption: bool) -> RawSlotEvent {
     }
 }
 
-async fn encrypted_call_manager(sender: Arc<MockCommandSender>) -> Manager {
-    let mut manager = CallSessionManager::with_command_sender(sender);
+async fn encrypted_call_manager(sender: Arc<MockBackend>) -> Manager {
+    let mut manager = CallSessionManager::with_backend(sender);
     manager
         .rtc_mut()
         .on_room_encryption_received(ROOM, true)
@@ -702,7 +702,7 @@ async fn join_and_notify(manager: &mut Manager, member_id: &str, notify: Option<
 }
 
 /// Every sticky send of the notification type, as `(content, duration_ms)`.
-fn notifications_sent(sender: &MockCommandSender) -> Vec<(Value, u64)> {
+fn notifications_sent(sender: &MockBackend) -> Vec<(Value, u64)> {
     sender
         .sticky_events
         .lock()
@@ -718,7 +718,7 @@ fn notifications_sent(sender: &MockCommandSender) -> Vec<(Value, u64)> {
 /// join's sticky send reported has to come back out as the relation target.
 #[tokio::test]
 async fn starting_a_call_notifies_the_room() {
-    let sender = Arc::new(MockCommandSender::new());
+    let sender = Arc::new(MockBackend::new());
     let mut manager = encrypted_call_manager(sender.clone()).await;
 
     let mut notify = NotifyConfig::ring();
@@ -774,7 +774,7 @@ async fn starting_a_call_notifies_the_room() {
 /// hits "call" and nobody's phone rings.
 #[tokio::test]
 async fn our_own_membership_does_not_count_as_somebody_else() {
-    let sender = Arc::new(MockCommandSender::new());
+    let sender = Arc::new(MockBackend::new());
     let mut manager = encrypted_call_manager(sender.clone()).await;
 
     // The echo of our own membership, under the very id we are about to join
@@ -803,8 +803,8 @@ async fn our_own_membership_does_not_count_as_somebody_else() {
 /// subsequent call in the process until the app restarts.
 #[tokio::test]
 async fn a_stale_participation_of_ours_does_not_count_either() {
-    let sender = Arc::new(MockCommandSender::new());
-    let mut manager = CallSessionManager::with_command_sender(sender.clone());
+    let sender = Arc::new(MockBackend::new());
+    let mut manager = CallSessionManager::with_backend(sender.clone());
     manager
         .rtc_mut()
         .on_room_slots_received(ROOM, vec![open_slot(false)])
@@ -831,7 +831,7 @@ async fn a_stale_participation_of_ours_does_not_count_either() {
 /// ordinary peer, and one already in the call started it.
 #[tokio::test]
 async fn another_device_of_ours_already_in_the_call_counts() {
-    let sender = Arc::new(MockCommandSender::new());
+    let sender = Arc::new(MockBackend::new());
     let mut manager = encrypted_call_manager(sender.clone()).await;
 
     set_roster(
@@ -856,7 +856,7 @@ async fn another_device_of_ours_already_in_the_call_counts() {
 /// even if the host asked for a notification.
 #[tokio::test]
 async fn joining_an_occupied_session_notifies_nobody() {
-    let sender = Arc::new(MockCommandSender::new());
+    let sender = Arc::new(MockBackend::new());
     let mut manager = encrypted_call_manager(sender.clone()).await;
 
     set_roster(
@@ -874,7 +874,7 @@ async fn joining_an_occupied_session_notifies_nobody() {
 
 #[tokio::test]
 async fn joining_quietly_notifies_nobody() {
-    let sender = Arc::new(MockCommandSender::new());
+    let sender = Arc::new(MockBackend::new());
     let mut manager = encrypted_call_manager(sender.clone()).await;
 
     join_and_notify(&mut manager, "alice-a", None).await;
@@ -884,8 +884,8 @@ async fn joining_quietly_notifies_nobody() {
 
 #[tokio::test]
 async fn a_call_layer_over_an_existing_manager_sees_its_rosters() {
-    let sender = Arc::new(MockCommandSender::new());
-    let mut rtc = matrix_rtc_core::RtcSessionManager::with_command_sender(sender);
+    let sender = Arc::new(MockBackend::new());
+    let mut rtc = matrix_rtc_core::RtcSessionManager::with_backend(sender);
     rtc.set_current_sticky_state(
         ROOM,
         vec![member_event(

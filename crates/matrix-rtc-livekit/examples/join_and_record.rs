@@ -39,7 +39,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
-use matrix_rtc_core::SlotEncryption;
+use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
 use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
 use matrix_sdk::encryption::EncryptionSettings;
@@ -190,7 +190,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         &room,
         CallOptions {
             slot_id,
-            livekit_service_url_fallback: Some(livekit_service_url),
+            livekit_transport: Some(LiveKitTransport {
+                livekit_service_url,
+            }),
             http: Some(http),
             element_call_compat,
             ..CallOptions::default()

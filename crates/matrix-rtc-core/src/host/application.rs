@@ -6,12 +6,12 @@
 //! How a host that drives the stack feeds an application beyond membership,
 //! without knowing which application it is.
 
-use super::commands::RtcCommandSender;
+use super::backend::MatrixBackend;
 use super::event::{RawTimelineEvent, RelationsRequest};
 use crate::manager::RtcSessionManager;
 
 /// Every hook defaults to nothing; [`RtcSessionManager`] implements it that way.
-pub trait ApplicationIntake<T: RtcCommandSender> {
+pub trait ApplicationIntake<T: MatrixBackend> {
     fn rtc(&mut self) -> &mut RtcSessionManager<T>;
 
     /// The event types to forward to [`Self::on_room_timeline_events`].
@@ -37,7 +37,7 @@ pub trait ApplicationIntake<T: RtcCommandSender> {
     }
 }
 
-impl<T: RtcCommandSender + 'static> ApplicationIntake<T> for RtcSessionManager<T> {
+impl<T: MatrixBackend + 'static> ApplicationIntake<T> for RtcSessionManager<T> {
     fn rtc(&mut self) -> &mut RtcSessionManager<T> {
         self
     }

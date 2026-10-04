@@ -30,14 +30,12 @@ const KNOWN_KINDS = new Set([
 export class MatrixRtcCall {
   /**
    * @param {object} options
-   * @param {object} options.manager - a `WasmRtcSessionManager` whose command
-   *   sender is set up and which is being fed sticky events / room state.
+   * @param {object} options.manager - a `WasmRtcSessionManager` with the room
+   *   attached and the slot joined.
    * @param {object} options.bindings - the wasm module (for
    *   `HEARTBEAT_INTERVAL_MS`).
    * @param {object} options.livekit - the `livekit-client` module (peer
    *   dependency): `Room`, `RoomEvent`, `ExternalE2EEKeyProvider` are used.
-   * @param {() => Promise<object>} options.getOpenIdToken - resolves with a
-   *   Matrix OpenID token (`matrix-js-sdk`: `client.getOpenIdToken()`).
    * @param {(url: string, body: object) => Promise<{status: number, body: string}>}
    *   [options.fetchJson] - the token POST; defaults to global `fetch`.
    * @param {object} [options.roomOptions] - extra livekit-js `Room` options,
@@ -46,11 +44,10 @@ export class MatrixRtcCall {
    * @param {ManagerOpQueue} [options.managerOps] - the queue serializing every
    *   wasm-manager call; pass the app's own when it also calls the manager.
    */
-  constructor({ manager, bindings, livekit, getOpenIdToken, fetchJson, roomOptions, managerOps }) {
+  constructor({ manager, bindings, livekit, fetchJson, roomOptions, managerOps }) {
     this.manager = manager;
     this.bindings = bindings;
     this.livekit = livekit;
-    this.getOpenIdToken = getOpenIdToken;
     this.fetchJson = fetchJson ?? defaultFetchJson;
     this.roomOptions = roomOptions ?? {};
     /** connectionKey -> Room */
@@ -169,7 +166,6 @@ export class MatrixRtcCall {
   delegate() {
     const call = this;
     return {
-      getOpenIdToken: () => call.getOpenIdToken(),
       fetchJson: (url, body) => call.fetchJson(url, body),
       connect: (request, sink) => call.connectRoom(request, sink),
       setKey: (identity, index, key) =>

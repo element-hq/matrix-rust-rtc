@@ -65,7 +65,7 @@ impl MembershipScope {
 mod tests {
     use super::*;
     use crate::RtcSessionManager;
-    use crate::host::commands::NoopCommandSender;
+    use crate::host::backend::NoopBackend;
     use crate::host::event::{EventOrigin, RawStickyEvent, RawStickyEventContent};
     use crate::session::{ApplicationInfo, MemberInfo, Membership};
 
@@ -121,7 +121,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_published_membership_set_reaches_the_listener_with_its_session() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let (seen, listener) = recorder();
         manager.add_membership_listener(listener);
 
@@ -150,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_moved_event_id_alone_is_published_to_the_listener() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let (seen, listener) = recorder();
         manager.add_membership_listener(listener);
 
@@ -182,7 +182,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_late_listener_is_replayed_the_current_memberships() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         manager
             .set_current_sticky_state(
                 ROOM_ID,
@@ -210,7 +210,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_listener_hears_every_membership_change() {
-        let mut manager: RtcSessionManager<NoopCommandSender> = RtcSessionManager::new();
+        let mut manager: RtcSessionManager<NoopBackend> = RtcSessionManager::new();
         let (first, listener) = recorder();
         manager.add_membership_listener(listener);
         let (second, listener) = recorder();

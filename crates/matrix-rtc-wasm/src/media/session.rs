@@ -138,7 +138,7 @@ impl WasmRtcSessionManager {
     /// spawned pumps for the life of the call.
     #[wasm_bindgen(js_name = connectMedia)]
     pub async fn connect_media(
-        &mut self,
+        &self,
         #[wasm_bindgen(unchecked_param_type = "MediaSessionConfigIn")] config: JsValue,
         #[wasm_bindgen(unchecked_param_type = "MediaDelegate")] delegate: JsValue,
     ) -> Result<WasmMediaSession, JsError> {
@@ -201,8 +201,8 @@ impl WasmRtcSessionManager {
         // page: it is what our MSC4195 participant identity is derived from,
         // so a value that disagrees with the published membership would put
         // our media on an identity no peer holds a key for.
-        let member_id = self
-            .inner
+        let mut inner = self.inner.lock().await;
+        let member_id = inner
             .own_member_id(&config.room_id, &config.slot_id)
             .ok_or_else(|| {
                 log::warn!(
@@ -212,34 +212,25 @@ impl WasmRtcSessionManager {
                 );
                 JsError::new("the slot has not joined — join it before connecting media")
             })?;
-        let memberships = self
-            .inner
+        let memberships = inner
             .subscribe_membership_snapshots(&config.room_id, &config.slot_id)
             .ok_or_else(|| {
                 JsError::new("no session for the slot — join it before connecting media")
             })?;
-        let raised_hands = self
-            .inner
-            .subscribe_raised_hands(&config.room_id, &config.slot_id);
-        let reactions = self
-            .inner
-            .subscribe_reactions(&config.room_id, &config.slot_id);
+        let raised_hands = inner.subscribe_raised_hands(&config.room_id, &config.slot_id);
+        let reactions = inner.subscribe_reactions(&config.room_id, &config.slot_id);
 
         // Mapper before handler: the replay below derives identities through
         // it, and installing it second would replay peer keys under the raw
         // `member_id` fallback — an identity the SFU never uses, which is
         // indistinguishable from importing nothing.
-        self.inner
-            .set_encryption_identity_mapper(&config.room_id, &config.slot_id, mapper.clone());
-        if !self.inner.set_encryption_signal_handler(
-            &config.room_id,
-            &config.slot_id,
-            handler.clone(),
-        ) {
+        inner.set_encryption_identity_mapper(&config.room_id, &config.slot_id, mapper.clone());
+        if !inner.set_encryption_signal_handler(&config.room_id, &config.slot_id, handler.clone()) {
             return Err(JsError::new(
                 "the session has no encryption manager — join the slot first",
             ));
         }
+        drop(inner);
 
         // `allow`, not `expect`: whether clippy fires this depends on the
         // toolchain (1.98 no longer does), and an unfulfilled expectation is
@@ -247,6 +238,7 @@ impl WasmRtcSessionManager {
         #[allow(clippy::arc_with_non_send_sync)]
         let transport = Arc::new(JsMediaTransport::new(
             delegate.clone(),
+            self.backend(),
             mapper.clone(),
             match compat {
                 // Pre-MSC4195 `/sfu/get`, which is also where that
@@ -314,6 +306,8 @@ impl WasmRtcSessionManager {
         // the keys it is most likely to be missing), before the connect (so
         // the ring is populated before the first frame can arrive).
         self.inner
+            .lock()
+            .await
             .replay_encryption_keys(&config.room_id, &config.slot_id)
             .await;
 

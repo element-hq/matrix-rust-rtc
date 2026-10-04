@@ -10,7 +10,9 @@
 
 use thiserror::Error;
 
-/// Errors that can occur when executing commands via the `RtcCommandSender`.
+pub use crate::host::backend::BackendError;
+
+/// Errors that can occur when executing commands via the `MatrixBackend`.
 #[derive(Debug, Error)]
 pub enum CommandError {
     /// The command was rejected by the client SDK.
@@ -70,6 +72,12 @@ pub enum JoinError {
     /// Invalid transport configuration.
     #[error("invalid transport configuration")]
     InvalidTransport,
+
+    /// The room's slot state holds no open slot of this id, so a membership
+    /// would be one every client treats as left. Somebody with the power level
+    /// has to open the slot first.
+    #[error("slot '{slot_id}' is not open in this room")]
+    SlotClosed { slot_id: String },
 }
 
 /// Errors that can occur when attempting to leave an RTC session.
@@ -90,9 +98,62 @@ impl CommandError {
         CommandError::SendError(msg.into())
     }
 
+    /// Classifies a delayed-event send failure from what the homeserver said:
+    /// `M_UNRECOGNIZED`, or `M_FORBIDDEN` about delayed events, means it will
+    /// never accept one. The library decides this, not the host.
+    pub fn delayed_event_failure(
+        errcode: Option<&str>,
+        status: Option<u16>,
+        message: impl Into<String>,
+    ) -> Self {
+        let message = message.into();
+        let permanent = match errcode {
+            Some("M_UNRECOGNIZED") => true,
+            Some("M_FORBIDDEN") => message.to_ascii_lowercase().contains("delayed"),
+            _ => status == Some(404),
+        };
+        if permanent {
+            CommandError::DelayedEventsNotSupported(message)
+        } else {
+            CommandError::SchedulingError(message)
+        }
+    }
+
     /// Whether this rejection means the homeserver will never accept a delayed
     /// event, so a client should stop asking rather than retry.
     pub fn is_delayed_events_unsupported(&self) -> bool {
         matches!(self, CommandError::DelayedEventsNotSupported(_))
+    }
+}
+
+impl From<BackendError> for CommandError {
+    fn from(error: BackendError) -> Self {
+        CommandError::SendError(error.message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_delayed_event_refusal_is_permanent_only_for_the_known_answers() {
+        let forbidden = CommandError::delayed_event_failure(
+            Some("M_FORBIDDEN"),
+            Some(403),
+            "Sending delayed events has been disallowed",
+        );
+        assert!(forbidden.is_delayed_events_unsupported());
+
+        let unrecognized =
+            CommandError::delayed_event_failure(Some("M_UNRECOGNIZED"), Some(404), "Unrecognized");
+        assert!(unrecognized.is_delayed_events_unsupported());
+
+        let other_forbidden =
+            CommandError::delayed_event_failure(Some("M_FORBIDDEN"), Some(403), "not in room");
+        assert!(!other_forbidden.is_delayed_events_unsupported());
+
+        let transient = CommandError::delayed_event_failure(None, Some(502), "Bad Gateway");
+        assert!(!transient.is_delayed_events_unsupported());
     }
 }

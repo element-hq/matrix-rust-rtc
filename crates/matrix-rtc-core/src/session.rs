@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::host::commands::RtcCommandSender;
+use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::membership_listener::MembershipScope;
@@ -118,7 +118,7 @@ struct OwnParticipation {
 }
 
 /// Per-session MatrixRTC state machine and membership store.
-pub struct RtcSession<T: RtcCommandSender> {
+pub struct RtcSession<T: MatrixBackend> {
     /// Member events that are join-shaped and still sticky. These are
     /// candidates only: the remaining MSC4143 join conditions depend on room
     /// state, which can change under them at any time.
@@ -136,7 +136,7 @@ pub struct RtcSession<T: RtcCommandSender> {
     room_encryption: RoomEncryption,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Command sender for sending events to the Matrix room.
-    command_sender: Option<Arc<T>>,
+    backend: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
     own_membership_machine: Option<OwnMembershipMachine<T>>,
     /// Identity of the current join, or `None` while not joined.
@@ -154,7 +154,7 @@ pub struct RtcSession<T: RtcCommandSender> {
     log_tag: String,
 }
 
-impl<T: RtcCommandSender> Clone for RtcSession<T> {
+impl<T: MatrixBackend> Clone for RtcSession<T> {
     fn clone(&self) -> Self {
         Self {
             candidates: self.candidates.clone(),
@@ -163,7 +163,7 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
             room_members: self.room_members.clone(),
             room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
-            command_sender: self.command_sender.clone(),
+            backend: self.backend.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             encryption_manager: None,     // Don't clone the encryption manager
             own_participation: None,      // A clone holds no machine, so it is not joined
@@ -173,8 +173,8 @@ impl<T: RtcCommandSender> Clone for RtcSession<T> {
     }
 }
 
-impl<T: RtcCommandSender + 'static> RtcSession<T> {
-    /// Creates an empty session without a command sender.
+impl<T: MatrixBackend + 'static> RtcSession<T> {
+    /// Creates an empty session without a backend.
     pub fn new() -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
@@ -185,7 +185,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             room_members: None,
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
-            command_sender: None,
+            backend: None,
             own_membership_machine: None,
             encryption_manager: None,
             own_participation: None,
@@ -194,8 +194,8 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
     }
 
-    /// Creates an empty session with a command sender.
-    pub fn with_command_sender(command_sender: Arc<T>) -> Self {
+    /// Creates an empty session with a backend.
+    pub fn with_backend(backend: Arc<T>) -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
 
         Self {
@@ -205,7 +205,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             room_members: None,
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
-            command_sender: Some(command_sender),
+            backend: Some(backend),
             own_membership_machine: None,
             encryption_manager: None,
             own_participation: None,
@@ -232,14 +232,14 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         &self.members
     }
 
-    /// Sets the command sender for this session.
-    pub fn set_command_sender(&mut self, command_sender: Arc<T>) {
-        self.command_sender = Some(command_sender);
+    /// Sets the backend for this session.
+    pub fn set_backend(&mut self, backend: Arc<T>) {
+        self.backend = Some(backend);
     }
 
-    /// Returns true if this session has a command sender configured.
-    pub fn has_command_sender(&self) -> bool {
-        self.command_sender.is_some()
+    /// Returns true if this session has a backend configured.
+    pub fn has_backend(&self) -> bool {
+        self.backend.is_some()
     }
 
     /// Registers a handler that receives media key material signalled by this
@@ -337,7 +337,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
 
     /// Joins this RTC session with the given parameters.
     ///
-    /// This sends a membership event to the Matrix room via the command sender,
+    /// This sends a membership event to the Matrix room via the backend,
     /// and starts the keep-alive mechanism to ensure proper cleanup.
     ///
     /// The dead man's switch strategy is used:
@@ -355,20 +355,20 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     ///
     /// Returns the event id of the membership event this join sent, which an
     /// application relates its own events to (a call's MSC4075 notification).
-    /// Returns `Err(JoinError)` if validation fails, command sender not configured, or commands fail.
+    /// Returns `Err(JoinError)` if validation fails, backend not configured, or commands fail.
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
         params.validate().map_err(|missing| {
             log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
             JoinError::MissingParameter(missing)
         })?;
 
-        let command_sender = self.command_sender.as_ref().ok_or_else(|| {
+        let backend = self.backend.as_ref().ok_or_else(|| {
             log::warn!(
-                "[{}] join rejected: no command sender configured — the host must call \
-                 set_command_sender before joining",
+                "[{}] join rejected: no backend configured — the host must call \
+                 set_backend before joining",
                 self.log_tag,
             );
-            JoinError::CommandError(CommandError::from_message("no command sender configured"))
+            JoinError::CommandError(CommandError::from_message("no backend configured"))
         })?;
 
         let membership_id = params.membership_id();
@@ -402,7 +402,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             },
         };
         let machine = OwnMembershipMachine::new(
-            command_sender.clone(),
+            backend.clone(),
             params.room_id.clone(),
             params.slot_id.clone(),
             membership_id.clone(),
@@ -451,7 +451,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
         }
 
         let mut encryption_manager = EncryptionManager::new(
-            command_sender.clone(),
+            backend.clone(),
             params.user_id.clone(),
             params.device_id.clone(),
             membership_id.clone(),
@@ -546,7 +546,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
     /// # Returns
     ///
     /// Returns `Ok(())` if the leave completed successfully.
-    /// Returns `Err(LeaveError)` if not joined, command sender is not configured, or commands fail.
+    /// Returns `Err(LeaveError)` if not joined, backend is not configured, or commands fail.
     pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
         // Check if we have a membership machine (i.e., we've joined)
         let machine = self.own_membership_machine.take().ok_or_else(|| {
@@ -1072,7 +1072,7 @@ impl<T: RtcCommandSender + 'static> RtcSession<T> {
             "joined_count": self.members.len(),
             "joined": sticky_keys(&self.members),
             "candidates": candidates,
-            "has_command_sender": self.command_sender.is_some(),
+            "has_backend": self.backend.is_some(),
             "own_membership": self
                 .own_membership_machine
                 .as_ref()
@@ -1343,7 +1343,7 @@ pub struct LeftMembership {
     pub leave_reason: Option<LeaveReason>,
 }
 
-impl<T: RtcCommandSender + 'static> Default for RtcSession<T> {
+impl<T: MatrixBackend + 'static> Default for RtcSession<T> {
     fn default() -> Self {
         Self::new()
     }
