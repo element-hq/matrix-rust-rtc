@@ -19,6 +19,8 @@ thiserror.workspace = true
 # `sync` only, like the core: the call layer arms no timers either.
 tokio = { workspace = true }
 log.workspace = true
+# `DialectBackend` wraps the host's `MatrixBackend`, an async trait.
+async-trait.workspace = true
 # Element Call keeps only the first grapheme of a reaction's emoji; a grapheme
 # is not a `char` (one visible emoji can be several code points joined), so
 # this pure-Rust, wasm-safe segmenter does the split.
@@ -31,4 +33,4 @@ web-time = "1"
 
 [dev-dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }

@@ -17,12 +17,9 @@ crate-type = ["rlib"]
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
 matrix-rtc-call = { path = "../matrix-rtc-call" }
-# The Matrix side of the stack: `OpenIdTokenSource` (needed unconditionally, to
-# acquire the token the authorisation service wants) plus, under this crate's
-# `matrix-sdk` feature, the SDK-backed command sender / sticky bridge and the
-# pre-2026 Element Call wire compatibility `call` selects between. Nothing in it
-# knows about LiveKit, which is the point: a second transport reuses it as-is.
-matrix-rtc-bridge = { path = "../matrix-rtc-bridge" }
+# `SdkBackend`, the matrix-rust-sdk `MatrixBackend` that `call` drives. Behind
+# this crate's `matrix-sdk` feature. Nothing in it knows about LiveKit.
+matrix-rtc-matrix-sdk = { path = "../matrix-rtc-matrix-sdk", optional = true }
 # The pure MSC4195 control plane (identity derivations, token shapes, dialect
 # choices), shared with the web binding. This crate re-exports it and adds the
 # IO: reqwest for the token POST, livekit for the SFU itself.
@@ -73,7 +70,7 @@ livekit = { version = "0.7", features = [
 futures-util = "0.3"
 # `call` needs the SDK directly — `Client`, `Room`, the to-device event handlers
 # and ruma's `GET /rtc/transports` request type. Everything else Matrix-side is
-# `matrix-rtc-bridge`'s, and the rationale for the feature set (why room-key
+# `matrix-rtc-matrix-sdk`'s, and the rationale for the feature set (why room-key
 # forwarding stays on, what `experimental-send-custom-to-device` is for) lives
 # there, next to the code that depends on it. The rev is the workspace's, so the
 # two crates cannot drift onto two copies of matrix-sdk.
@@ -90,14 +87,13 @@ matrix-sdk-ui = { workspace = true, optional = true }
 jni = "0.21"
 
 [features]
-# Turns on the SDK-backed half: the bridge's command sender / membership bridge
-# and its default `OpenIdTokenSource` for `matrix_sdk::Client`, the `call::Call`
-# facade that composes them with this transport, and the examples / `e2e_call`.
+# Turns on the SDK-backed half: `matrix-rtc-matrix-sdk`'s `SdkBackend`, the
+# `call::Call` facade that composes it with this transport, and the examples / `e2e_call`.
 # Off by default to keep the base crate light and buildable without the git SDK.
 # `matrix-sdk-ui/unstable-msc4354` is what makes `SyncService` request sticky
 # events over sliding sync.
 matrix-sdk = [
-    "matrix-rtc-bridge/matrix-sdk",
+    "dep:matrix-rtc-matrix-sdk",
     "dep:matrix-sdk",
     "dep:matrix-sdk-ui",
     "matrix-sdk-ui/unstable-msc4354",

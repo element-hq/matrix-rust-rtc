@@ -66,7 +66,7 @@
 //! Membership changes that arrive *together* are cheaper still: a rollout sees a
 //! whole set of joined memberships, so any number of simultaneous changes cost one rotation between
 //! them. Hosts should feed complete state rather than event by event — see
-//! `RtcSessionManager::set_current_sticky_state`.
+//! `BaseRtcRoom::set_current_sticky_state`.
 //!
 //! `KEY_ROTATION.md` at the repository root states the whole trade, with the costs
 //! measured.

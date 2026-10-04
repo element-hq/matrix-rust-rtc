@@ -11,7 +11,7 @@
 //! Everything here exists for one reason: the only other MatrixRTC
 //! implementation available to test against — Element Call on the JS SDK — still
 //! speaks a pre-2026 wire format. Once it catches up, delete this directory, the
-//! call sites listed below, and `matrix_rtc_livekit::CallOptions::element_call_compat`.
+//! call sites listed below, and `matrix_rtc_livekit::LiveKitCallOptions::element_call_compat`.
 //! Nothing else should ever grow a dependency on it.
 //!
 //! # Two generations, not one
@@ -74,18 +74,18 @@
 //!    parses legacy to-device keys, all from the mode the room was attached in.
 //! 2. `dialect_backend::DialectBackend` — the outbound half for every host:
 //!    routes and rewrites the sends of the one `MatrixBackend` wrapper the
-//!    bindings and the `Call` facade all use.
+//!    bindings and the `LiveKitCall` facade all use.
 //!
 //! In `matrix-rtc-livekit`:
 //!
-//! 3. `call::Call::join` — mode selection and the member id.
+//! 3. `call::LiveKitCall::join` — mode selection and the member id.
 //! 4. `identity_mapper` — the participant-identity derivation (see above).
 //! 5. `transport_impl` + `token` — `/sfu/get`.
 //!
 //! In `matrix-rtc-ffi` and `matrix-rtc-wasm`, which reach the same dialects from
 //! a host that owns its own Matrix stack:
 //!
-//! 6. `compat` — the binding-shaped mode vocabulary, given at `attach_room`.
+//! 6. `compat` — the binding-shaped mode vocabulary, given at `RtcClient::room`.
 //! 7. `media::session` — the identity derivation and token endpoint again.
 
 use serde_json::Value;

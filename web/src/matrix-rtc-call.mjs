@@ -6,8 +6,8 @@ Please see LICENSE in the repository root for full details.
 */
 
 /**
- * The call model for web apps: the wasm session manager's roster and
- * connection lifecycle, joined with livekit-js participants.
+ * The call model for web apps: a joined wasm call's roster and connection
+ * lifecycle, joined with livekit-js participants.
  * This is the thin JS half of the web media session. Rust owns the protocol
  * (membership reconciliation, the multi-focus pool, MSC4195 identities, token
  * request shapes, key bookkeeping); this wrapper owns what only JS can:
@@ -30,8 +30,8 @@ const KNOWN_KINDS = new Set([
 export class MatrixRtcCall {
   /**
    * @param {object} options
-   * @param {object} options.manager - a `WasmRtcSessionManager` with the room
-   *   attached and the slot joined.
+   * @param {object} options.call - the `WasmRtcCall` that `room.joinCall`
+   *   returned.
    * @param {object} options.bindings - the wasm module (for
    *   `HEARTBEAT_INTERVAL_MS`).
    * @param {object} options.livekit - the `livekit-client` module (peer
@@ -41,11 +41,9 @@ export class MatrixRtcCall {
    * @param {object} [options.roomOptions] - extra livekit-js `Room` options,
    *   merged under the E2EE ones (pass `e2ee.worker` here to enable frame
    *   encryption).
-   * @param {ManagerOpQueue} [options.managerOps] - the queue serializing every
-   *   wasm-manager call; pass the app's own when it also calls the manager.
    */
-  constructor({ manager, bindings, livekit, fetchJson, roomOptions, managerOps }) {
-    this.manager = manager;
+  constructor({ call, bindings, livekit, fetchJson, roomOptions }) {
+    this.call = call;
     this.bindings = bindings;
     this.livekit = livekit;
     this.fetchJson = fetchJson ?? defaultFetchJson;
@@ -55,15 +53,6 @@ export class MatrixRtcCall {
     this.keyProvider = null;
     this.session = null;
     this.heartbeatTimer = null;
-    /**
-     * Serializes every manager call: the wasm object allows one in-flight
-     * call at a time (a second one throws "recursive use of an object"), and
-     * both the heartbeat and the rotation flush await the app's Matrix client
-     * mid-call. An app that calls the manager itself (feeding sync state,
-     * join/leave) must pass ONE shared queue here and route its own calls
-     * through it too.
-     */
-    this.managerOps = managerOps ?? new ManagerOpQueue();
     /** @type {(participants: object[]) => void} */
     this.onParticipants = () => {};
     /** @type {(event: object) => void} */
@@ -78,38 +67,34 @@ export class MatrixRtcCall {
   }
 
   /**
-   * Attach media to a slot this manager has already joined. Resolves once the
-   * own-focus room is connected; roster changes then arrive via
-   * `onParticipants` and call events via `onEvent`.
+   * Attach media to the joined call. Resolves once the own-focus room is
+   * connected; roster changes then arrive via `onParticipants` and call
+   * events via `onEvent`.
    *
-   * @param {object} config - `{ roomId, slotId, userId, deviceId,
-   *   livekitServiceUrl, keyRingSize?, elementCallCompat? }`
+   * @param {object} config - `{ userId, deviceId, livekitServiceUrl,
+   *   keyRingSize?, elementCallCompat? }`
    */
   async connect(config) {
     if (this.session) throw new Error('already connected');
     this.config = config;
     this.keyProvider = makePerParticipantKeyProvider(this.livekit);
 
-    this.session = await this.managerOps.enqueue(() =>
-      this.manager.connectMedia(
-        {
-          room_id: config.roomId,
-          slot_id: config.slotId,
-          user_id: config.userId,
-          device_id: config.deviceId,
-          livekit_service_url: config.livekitServiceUrl,
-          key_ring_size: config.keyRingSize,
-          element_call_compat: config.elementCallCompat,
-        },
-        this.delegate(),
-      ),
+    this.session = await this.call.connectMedia(
+      {
+        user_id: config.userId,
+        device_id: config.deviceId,
+        livekit_service_url: config.livekitServiceUrl,
+        key_ring_size: config.keyRingSize,
+        element_call_compat: config.elementCallCompat,
+      },
+      this.delegate(),
     );
 
     // The page owns the keep-alive clock.
     const interval = this.bindings.HEARTBEAT_INTERVAL_MS();
     this.heartbeatTimer = setInterval(() => {
-      this.managerOps
-        .enqueue(() => this.manager.heartbeat(config.roomId, config.slotId))
+      this.call
+        .heartbeat()
         .catch((error) => console.warn('matrix-rtc: heartbeat failed:', error));
     }, interval);
 
@@ -122,24 +107,22 @@ export class MatrixRtcCall {
    * is sent. Resolves with the event id; rejects inside the send cooldown.
    */
   sendReaction(emoji, name) {
-    return this.managerOps.enqueue(() =>
-      this.manager.sendReaction(this.config.roomId, this.config.slotId, emoji, name),
-    );
+    return this.call.sendReaction(emoji, name);
   }
 
   /** Raise our hand (idempotent while it is up). Shows on our roster entry at once. */
   raiseHand() {
-    return this.managerOps.enqueue(() => this.manager.raiseHand(this.config.roomId, this.config.slotId));
+    return this.call.raiseHand();
   }
 
   /** Lower our hand (a no-op when it is down). */
   lowerHand() {
-    return this.managerOps.enqueue(() => this.manager.lowerHand(this.config.roomId, this.config.slotId));
+    return this.call.lowerHand();
   }
 
   /** The raised hands right now, oldest first (`RaisedHand[]`). */
   raisedHands() {
-    return this.managerOps.enqueue(() => this.manager.raisedHands(this.config.roomId, this.config.slotId));
+    return this.call.raisedHands();
   }
 
   /** The current roster, each entry with its `livekitParticipant` when live. */
@@ -147,7 +130,10 @@ export class MatrixRtcCall {
     return this.withLivekitParticipants(this.session.participants());
   }
 
-  /** Close every room, stop the timers, and shut the session down. */
+  /**
+   * Close every room, stop the timers, and shut the media session down.
+   * Leaving the slot is the call's (`call.leave`).
+   */
   async disconnect() {
     if (this.heartbeatTimer !== null) {
       clearInterval(this.heartbeatTimer);
@@ -164,13 +150,13 @@ export class MatrixRtcCall {
 
   /** The delegate the wasm transport drives (see the transport module docs). */
   delegate() {
-    const call = this;
+    const wrapper = this;
     return {
-      fetchJson: (url, body) => call.fetchJson(url, body),
-      connect: (request, sink) => call.connectRoom(request, sink),
+      fetchJson: (url, body) => wrapper.fetchJson(url, body),
+      connect: (request, sink) => wrapper.connectRoom(request, sink),
       setKey: (identity, index, key) =>
         // livekit-js's provider: material, participant identity, key index.
-        Promise.resolve(call.keyProvider.setKey(key, identity, index)).then(
+        Promise.resolve(wrapper.keyProvider.setKey(key, identity, index)).then(
           (accepted) => accepted ?? true,
         ),
       // livekit-js moves the local sender with `setKey` for the local
@@ -180,13 +166,11 @@ export class MatrixRtcCall {
       // The push half: roster changes, call events, and the moment a key's
       // delayBeforeUse window closes (when a coalesced rotation falls due).
       onParticipants: (roster) =>
-        call.onParticipants(call.withLivekitParticipants(roster)),
-      onEvent: (event) => call.onEvent(event),
+        wrapper.onParticipants(wrapper.withLivekitParticipants(roster)),
+      onEvent: (event) => wrapper.onEvent(event),
       onSwitchComplete: () =>
-        call.managerOps
-          .enqueue(() =>
-            call.manager.flushDueKeyRotation(call.config.roomId, call.config.slotId),
-          )
+        wrapper.call
+          .flushDueKeyRotation()
           .catch((error) => console.warn('matrix-rtc: rotation flush failed:', error)),
     };
   }
@@ -322,30 +306,6 @@ function makePerParticipantKeyProvider(livekit) {
     }
   }
   return new PerParticipantKeyProvider();
-}
-
-/**
- * Serializes calls into the wasm manager: it allows one in-flight call at a
- * time (a second concurrent call throws "recursive use of an object"), and
- * several of its methods await the app's Matrix client mid-call. Everything
- * that touches the manager — this wrapper, the app's sync feeding, join/leave —
- * must go through one shared instance.
- */
-export class ManagerOpQueue {
-  constructor() {
-    this.queue = Promise.resolve();
-  }
-
-  /** Run `op` once every earlier op has settled; resolves/rejects as `op` does. */
-  enqueue(op) {
-    const result = this.queue.then(op);
-    // The chain itself never rejects; each caller handles its own result.
-    this.queue = result.then(
-      () => {},
-      () => {},
-    );
-    return result;
-  }
 }
 
 async function defaultFetchJson(url, body) {

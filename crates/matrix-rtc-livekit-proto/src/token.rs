@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use matrix_rtc_bridge::OpenIdToken;
+use matrix_rtc_core::OpenIdToken;
 
 /// Contents of the `member` field of the `m.rtc.member` event, identifying the
 /// joining membership to the authorisation service.
@@ -122,7 +122,7 @@ struct LegacyGetTokenRequest<'a> {
 /// which nothing decrypts and nobody appears, and peer foci retry connects
 /// indefinitely, so a wrong guess would never surface. A 404 stays loud.
 ///
-/// Temporary; see the bridge's `compat`.
+/// Temporary; see `matrix_rtc_call::compat`.
 pub fn legacy_token_request(
     livekit_service_url: &str,
     room: &str,

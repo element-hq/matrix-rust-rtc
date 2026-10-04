@@ -107,7 +107,7 @@ pub type KeyDiscardListener = Box<dyn Fn(DiscardedKey)>;
 /// arrive during a rotation's window are coalesced into one rotation at the end
 /// of it, and the core owns no timer to reach that instant with; this handler
 /// already schedules exactly it. Wire this to
-/// `RtcSessionManager::flush_due_key_rotation`.
+/// `RtcSession::flush_due_key_rotation`.
 ///
 /// Runs on the scheduled task, so it must not block. Sending on a channel is the
 /// intended shape — the core is often `!Send` and cannot be touched from here.

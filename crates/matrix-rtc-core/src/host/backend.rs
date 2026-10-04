@@ -630,6 +630,8 @@ pub struct MockBackend {
     pub transports: std::sync::Mutex<Result<Value, BackendError>>,
     /// How many times `rtc_transports` was asked.
     pub transports_requests: std::sync::atomic::AtomicUsize,
+    /// When set, `subscribe_room` fails with it.
+    pub room_subscription_error: std::sync::Mutex<Option<BackendError>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -652,6 +654,7 @@ impl Default for MockBackend {
             relations_answers: Default::default(),
             transports: std::sync::Mutex::new(Ok(Value::Array(Vec::new()))),
             transports_requests: Default::default(),
+            room_subscription_error: Default::default(),
         }
     }
 }
@@ -851,6 +854,9 @@ impl MatrixBackend for MockBackend {
         subjects: RoomSubjects,
         sink: Arc<dyn RoomSink>,
     ) -> Result<Arc<dyn Subscription>, BackendError> {
+        if let Some(error) = self.room_subscription_error.lock().unwrap().clone() {
+            return Err(error);
+        }
         let subscription = Arc::new(MockRoomSubscription {
             subjects,
             sink,

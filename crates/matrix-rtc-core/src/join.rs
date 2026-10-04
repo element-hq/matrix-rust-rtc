@@ -117,9 +117,6 @@ pub struct JoinSessionParams {
     /// is generated per call to [`JoinSessionParams::membership_id`].
     pub membership_id: Option<String>,
 
-    /// The room ID where the session is taking place.
-    pub room_id: String,
-
     /// The slot ID for the session (e.g., "m.call#ROOM").
     pub slot_id: String,
 
@@ -165,7 +162,6 @@ impl JoinSessionParams {
     pub fn new(
         user_id: String,
         device_id: String,
-        room_id: String,
         slot_id: String,
         application: impl Into<ApplicationInfo>,
         transport: RtcTransport,
@@ -174,7 +170,6 @@ impl JoinSessionParams {
             user_id,
             device_id,
             membership_id: None,
-            room_id,
             slot_id,
             application: application.into(),
             transport: TransportIntent::Publish(transport),
@@ -189,7 +184,6 @@ impl JoinSessionParams {
     pub fn with_transport_intent(
         user_id: String,
         device_id: String,
-        room_id: String,
         slot_id: String,
         application: impl Into<ApplicationInfo>,
         transport: TransportIntent,
@@ -198,7 +192,6 @@ impl JoinSessionParams {
             user_id,
             device_id,
             membership_id: None,
-            room_id,
             slot_id,
             application: application.into(),
             transport,
@@ -276,9 +269,6 @@ impl JoinSessionParams {
         if self.device_id.is_empty() {
             return Err("device_id is required");
         }
-        if self.room_id.is_empty() {
-            return Err("room_id is required");
-        }
         if self.slot_id.is_empty() {
             return Err("slot_id is required");
         }
@@ -327,7 +317,6 @@ mod tests {
         let params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
-            "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
@@ -349,7 +338,6 @@ mod tests {
         let mut params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
-            "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
@@ -366,7 +354,6 @@ mod tests {
         let params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
-            "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
@@ -385,7 +372,6 @@ mod tests {
         let mut params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
-            "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
@@ -402,7 +388,6 @@ mod tests {
         let params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
-            "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
@@ -418,7 +403,6 @@ mod tests {
         let params = JoinSessionParams::new(
             "".to_string(),
             "device123".to_string(),
-            "!room:example.org".to_string(),
             "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
@@ -430,18 +414,17 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_empty_room_id() {
+    fn test_validate_empty_slot_id() {
         let params = JoinSessionParams::new(
             "@alice:example.org".to_string(),
             "device123".to_string(),
             "".to_string(),
-            "m.call#ROOM".to_string(),
             "m.call".to_string(),
             RtcTransport::LiveKit(LiveKitTransport {
                 livekit_service_url: "https://example.com".to_string(),
             }),
         );
 
-        assert_eq!(params.validate(), Err("room_id is required"));
+        assert_eq!(params.validate(), Err("slot_id is required"));
     }
 }

@@ -49,7 +49,7 @@
 //! | `ELEMENT_CALL_COMPAT` | `state` (also: `sticky`, `off`) |
 //! | `INVITE_USER` | *required* — the Matrix ID Element Call will log in as |
 //! | `DISPLAY_NAME` | `Rust Peer` — what the browser asserts it can see |
-//! | `ROOM_NAME` | `Interop Call` |
+//! | `ROOM_NAME` | `Interop LiveKitCall` |
 //! | `SLOT_ID` | `m.call#ROOM` |
 //! | `LIVEKIT_SERVICE_URL` | unset — only a fallback when the homeserver advertises no focus |
 //! | `RECORD_SECS` | `3` |
@@ -77,7 +77,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
-use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
+use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_rtc_media::{
     CallEvent, I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
 };
@@ -154,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `Call::join` drives `!Send` futures, so everything runs on a `LocalSet`.
+    // `LiveKitCall::join` drives `!Send` futures, so everything runs on a `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -229,7 +229,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let cfg = Config::from_env()?;
     let invitee = UserId::parse(&cfg.invite_user)?;
 
-    // This client is used for registration and handed to `Call::join` for the
+    // This client is used for registration and handed to `LiveKitCall::join` for the
     // MSC4195 token exchange. Its roots come from `SSL_CERT_FILE` via
     // rustls-native-certs, but add the certificate explicitly too rather than
     // depend on which root-store features the graph happens to unify on.
@@ -368,7 +368,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 /// A live call plus the publishers that have to outlive the `join` call —
 /// dropping either handle stops the media Element Call is rendering.
 struct Joined {
-    call: Call,
+    call: LiveKitCall,
     /// The unified call event stream, for Element Call's reactions and raised
     /// hands; subscribed at join so nothing is missed.
     events: broadcast::Receiver<CallEvent>,
@@ -576,9 +576,9 @@ async fn join_call(
         eprintln!("[peer] opened slot {}", cfg.slot_id);
     }
 
-    let call = Call::join(
+    let call = LiveKitCall::join(
         room,
-        CallOptions {
+        LiveKitCallOptions {
             slot_id: cfg.slot_id.clone(),
             livekit_transport: cfg.livekit_service_url.clone().map(|livekit_service_url| {
                 LiveKitTransport {
@@ -587,7 +587,7 @@ async fn join_call(
             }),
             http: Some(http.clone()),
             element_call_compat: cfg.compat,
-            ..CallOptions::default()
+            ..LiveKitCallOptions::default()
         },
     )
     .await?;
@@ -613,7 +613,9 @@ async fn join_call(
 }
 
 /// Publish the pattern as a camera track at ~15 fps.
-async fn publish_pattern_video(call: &Call) -> Result<tokio::task::JoinHandle<()>, Box<dyn Error>> {
+async fn publish_pattern_video(
+    call: &LiveKitCall,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn Error>> {
     let track = call
         .publish(PublishOptions::camera(VideoSourceConfig {
             width: PATTERN_WIDTH,

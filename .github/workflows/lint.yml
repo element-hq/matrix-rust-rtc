@@ -67,8 +67,8 @@ jobs:
       # JS-backed futures are !Send, so it cannot compile on a host target) —
       # the `wasm` job below is what checks it.
       #
-      # `matrix-sdk` + `testing` so the SDK-backed half (`call`, the bridge's
-      # `sdk`) is type-checked on every PR; without them those modules are not
+      # `matrix-sdk` + `testing` so the SDK-backed half (`call`, and
+      # matrix-rtc-matrix-sdk through it) is type-checked on every PR; without them those modules are not
       # compiled at all.
       - name: Run clippy
         run: >
@@ -102,7 +102,7 @@ jobs:
       # and neither builds nor runs on wasm32.
       - name: Run clippy (shared crates)
         run: >
-          cargo clippy -p matrix-rtc-media -p matrix-rtc-bridge
+          cargo clippy -p matrix-rtc-media -p matrix-rtc-call
           -p matrix-rtc-livekit-proto
           --target wasm32-unknown-unknown -- -D warnings
 

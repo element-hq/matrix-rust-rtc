@@ -15,7 +15,7 @@ Please see LICENSE in the repository root for full details.
  */
 
 import type {
-  AttachOptionsIn,
+  RoomOptionsIn,
   BackendSubscription,
   EventIn,
   JoinParamsIn,
@@ -26,7 +26,9 @@ import type {
   RtcParticipant,
   WasmMediaSession,
   WasmRoomSink,
-  WasmRtcSessionManager,
+  WasmRtcCall,
+  WasmRtcClient,
+  WasmRtcRoom,
   WasmToDeviceSink,
 } from '../pkg/browser/matrix_rtc_wasm';
 
@@ -78,23 +80,21 @@ export function host(client: {
 }
 
 export async function smoke(
-  manager: WasmRtcSessionManager,
+  client: WasmRtcClient,
   delegate: MediaDelegate,
 ): Promise<void> {
-  const options: AttachOptionsIn = { element_call_compat: 'sticky_events' };
-  await manager.attachRoom('!r:hs', options);
+  const options: RoomOptionsIn = { element_call_compat: 'sticky_events' };
+  const room: WasmRtcRoom = await client.room('!r:hs', options);
 
   const params: JoinParamsIn = {
-    room_id: '!r:hs',
     slot_id: 'm.call#ROOM',
     application: 'm.call',
   };
-  const memberId: string = await manager.join(params);
+  const call: WasmRtcCall = await room.joinCall(params);
+  const memberId: string = call.memberId;
 
-  const session: WasmMediaSession = await manager.connectMedia(
+  const session: WasmMediaSession = await call.connectMedia(
     {
-      room_id: '!r:hs',
-      slot_id: 'm.call#ROOM',
       user_id: '@a:hs',
       device_id: 'DEV',
       livekit_service_url: 'https://sfu',
@@ -125,5 +125,6 @@ export async function smoke(
   void handle;
   void memberId;
 
-  await manager.detachRoom('!r:hs');
+  await call.leave({ leave_reason: { code: 'leave' } });
+  await room.close();
 }

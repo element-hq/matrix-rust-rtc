@@ -7,8 +7,9 @@ This document explains the initial architecture of the Matrix RTC Rust workspace
 The goal is to keep protocol logic in one Rust core crate and make all platform adaptation explicit at the edges.
 
 - `matrix-rtc-core` owns MSC4143, for any application.
-- `matrix-rtc-call` owns the call application on top of it.
-- `matrix-rtc-bridge` owns how that behavior reaches a Matrix homeserver.
+- `matrix-rtc-call` owns the call application on top of it, and how a host's
+  `MatrixBackend` feeds it (the feeder, the pre-2026 dialects).
+- `matrix-rtc-matrix-sdk` owns the matrix-rust-sdk implementation of that backend.
 - `matrix-rtc-wasm` owns JavaScript-facing conversion and wasm export details.
 - `matrix-rtc-ffi` owns native binding-facing conversion and UniFFI boundary types.
 - `matrix-rtc-livekit-proto` owns the pure MSC4195 control plane (identity
@@ -16,33 +17,36 @@ The goal is to keep protocol logic in one Rust core crate and make all platform 
   and the web binding.
 
 Three axes, kept separate on purpose: the core answers *what the protocol says*,
-`matrix-rtc-bridge` *how it reaches a homeserver*, and `matrix-rtc-media` +
-a transport crate *how bytes flow*. Only the top-level facade
-(`matrix_rtc_livekit::call::Call`) knows all three.
+`matrix-rtc-call` and a backend (`matrix-rtc-matrix-sdk`'s, or the host's) *how it
+reaches a homeserver*, and `matrix-rtc-media` + a transport crate *how bytes
+flow*. Only the top-level facade
+(`matrix_rtc_livekit::call::LiveKitCall`) knows all three.
 
 Arrows point at what a crate depends on:
 
 ```
- matrix-rtc-wasm ─────────────────┐       matrix-rtc-ffi
-   │     │                        │            │      ╎
-   │     │                        │            │      ╎ feature "media"
-   │     ▼                        │            ▼      ▼
-   │   matrix-rtc-livekit-proto   │         matrix-rtc-livekit ──┐
-   │     │        │               │            │                 │
-   │     │        ▼               ▼            ▼                 ▼
-   │     │      matrix-rtc-bridge ◀────────────┤   ┌─▶ matrix-rtc-media
-   │     │        │                            │   │      │
-   ▼     ▼        ▼                            ▼   │      ▼
+ matrix-rtc-wasm              matrix-rtc-ffi
+   │   │                        │      ╎ feature "media"
+   │   │                        │      ▼
+   │   │                        │   matrix-rtc-livekit ──▶ matrix-rtc-matrix-sdk
+   │   ▼                        │      │                      │
+   │ matrix-rtc-livekit-proto ◀─┼──────┤                      │
+   │   │                        │      │                      │
+   ▼   │                        │      ▼                      │
+ matrix-rtc-media ─────────┐    │                             │
+                           ▼    ▼                             ▼
 ┌────────────────────────────────────────────────────────────────────┐
+│     matrix-rtc-call   (the call, the feeder, the dialects)         │
+├────────────────────────────────────────────────────────────────────┤
 │                          matrix-rtc-core                           │
 └────────────────────────────────────────────────────────────────────┘
-   (matrix-rtc-wasm and matrix-rtc-livekit both take the ─▶ edge to
-    matrix-rtc-media; the ffi takes it only under "media")
+   (every crate above also depends on matrix-rtc-core directly; the
+    ffi takes matrix-rtc-media and matrix-rtc-livekit only under "media")
 ```
 
-Two things that shape reveals. **`matrix-rtc-bridge` and `matrix-rtc-media` are
-siblings, not layers** — the control plane and the media plane both sit on the
-core, neither knows the other exists, and `matrix-rtc-livekit` is the first crate
+Two things that shape reveals. **`matrix-rtc-matrix-sdk` and `matrix-rtc-media` are
+siblings, not layers** — the SDK backend and the media plane both sit on the
+call layer, neither knows the other exists, and `matrix-rtc-livekit` is the first crate
 that needs both. And **the media plane splits by what owns the bytes**:
 `matrix-rtc-media` (the roster/pool engine) and `matrix-rtc-livekit-proto` (the
 pure MSC4195 control plane) compile for wasm32 and are shared by both bindings,
@@ -62,13 +66,13 @@ MSC4143 is application-agnostic; a call (`m.call`) is one application, and a
 shared board would be a sibling of `matrix-rtc-call` on the same core:
 
 ```
-   bindings (ffi, wasm) · matrix-rtc-livekit's Call facade
+   bindings (ffi, wasm) · matrix-rtc-livekit's LiveKitCall facade
                  │
                  ▼
           matrix-rtc-media   engine, pool, tiles (still imports call types)
                  │
                  ▼
-          matrix-rtc-call    reactions, raised hand, MSC4075; CallSessionManager
+          matrix-rtc-call    RtcClient → RtcRoom → RtcSession/RtcCall; reactions, MSC4075
                  │
                  ▼
           matrix-rtc-core    MSC4143: membership, slots, encryption; host vocabulary
@@ -79,19 +83,21 @@ until the call-side roster and tiles move above the call crate.
 
 What lets an application sit on the core without the core knowing it:
 
-- **`MembershipListener`**: told synchronously of every change to a session's
-  joined memberships, since the core spawns nothing to await the watch.
+- **`MembershipListener`**: told synchronously of every change to a slot's
+  joined memberships in a `BaseRtcRoom`, since the core spawns nothing to await
+  the watch.
 - **`host/`**: `send_room_event`, `redact_event` and `RawTimelineEvent` exist for
   applications; the core uses none of them.
-- **`ApplicationIntake`**: how the bridge's feeder feeds an application
+- **`ApplicationIntake`**: how the call crate's feeder feeds an application
   timeline events and relations without knowing which application it is.
 
 ## Who drives the call
 
 The DAG above never mentions a Matrix SDK. That is not because there is only one
 place it could go — it is because there are **two**, and neither is on a default
-dependency path. `matrix-sdk` enters the workspace only through the `matrix-sdk`
-feature of `matrix-rtc-bridge` and `matrix-rtc-livekit`, which is off by default.
+dependency path. `matrix-sdk` enters the workspace only through
+`matrix-rtc-matrix-sdk`, which nothing depends on but `matrix-rtc-livekit`'s
+`matrix-sdk` feature, off by default.
 
 `MatrixBackend` (defined in `matrix-rtc-core`) is the seam that makes both
 topologies work. It is the library's one view of a Matrix client, in both
@@ -101,16 +107,16 @@ delivers the room's *complete current* sticky set, the state events of the
 requested types, its joined members and its encryption flag — first on
 subscribe, again on every change — plus to-device messages, `/relations`, the
 OpenID token and `GET /rtc/transports`). The host's app (through the FFI or
-wasm trait) and `matrix_rtc_bridge::SdkBackend` (a real `matrix_sdk::Client`)
+wasm trait) and `matrix_rtc_matrix_sdk::SdkMatrixBackend` (a real `matrix_sdk::Client`)
 are two implementations, and the core cannot tell them apart.
 
 The core does nothing with the read half itself — it spawns no tasks. The
-**feeder** in `matrix-rtc-bridge` (`RoomFeeder`, `SessionFeeder`) subscribes
+**feeder** in `matrix-rtc-call` (`RoomFeeder`, `ToDeviceFeeder`) subscribes
 through the backend, orders what arrives (encryption and slots and members
 before the first membership, so nobody is briefly joined to a closed slot),
 derives `EventOrigin`/`KeyOrigin` from the decryption facts the client
 reported, applies the pre-2026 compatibility funnels for the mode the room was
-attached in, and feeds `CallSessionManager`. One copy, for every host.
+opened in, and feeds that room. One copy, for every host.
 
 ### Host-driven — production mobile and web
 
@@ -131,7 +137,7 @@ consumer, not a dependency:
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-bridge feeder ──▶ matrix-rtc-core  (+ media / livekit under "media")
+   matrix-rtc-call feeder ──▶ matrix-rtc-core  (+ media / livekit under "media")
 ```
 
 The bindings carry no Matrix SDK at all — not even transitively, and not even
@@ -153,37 +159,39 @@ below**. This is the topology of the e2e call test, `join_and_record`,
                               │
                               ▼
 ┌────────────────────────────────────────────────────────┐
-│ matrix_rtc_livekit::call::Call                         │
-│ matrix_rtc_bridge::SdkBackend ──▶ matrix_sdk           │
+│ matrix_rtc_livekit::call::LiveKitCall                  │
+│ matrix_rtc_matrix_sdk::SdkMatrixBackend ──▶ matrix_sdk │
 │ both behind feature "matrix-sdk", off by default       │
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-bridge feeder ──▶ matrix-rtc-core
+   matrix-rtc-call feeder ──▶ matrix-rtc-core
 ```
 
 ### What the two topologies share
 
-`call::Call` still exists only in the Rust-driven topology — it owns a
+`call::LiveKitCall` still exists only in the Rust-driven topology — it owns a
 `matrix_sdk::Client`, so it is gated on `matrix-sdk`. But the wiring under it
-is no longer its own: `Call::join`, the FFI's `RtcSessionManagerHandle` and the
-wasm `WasmRtcSessionManager` all do the same three things — wrap the backend in
-`DialectBackend`, start the `SessionFeeder`, attach rooms through `RoomFeeder`
-— and then join. What differs between them is only where the backend comes
-from and how the feeder's run loop is spawned (`tokio::spawn`, the FFI runtime,
-`spawn_local`).
+is no longer its own: `LiveKitCall::join`, the FFI's `RtcClient` and the wasm
+`WasmRtcClient` all open rooms through `matrix_rtc_call::RtcClient` — which wraps
+the backend in `DialectBackend`, runs the `ToDeviceFeeder` while any room is
+open and attaches each room through `RoomFeeder` — and then join. What differs
+between them is only where the backend comes from and how the feed futures are
+spawned (`spawn_local`, the FFI runtime).
 
 ## High-level data flow
 
 This is the host-driven topology above, in detail.
 
-1. The host attaches a room (`attach_room` / `attachRoom`), naming its compatibility mode.
+1. The host opens a room (`RtcClient::room`), naming its compatibility mode.
 2. The feeder asks the backend to `subscribe_room` for what that mode needs; the host's client
    delivers the current sets into the `RoomSink` and keeps delivering them as they change.
 3. The feeder applies encryption, slot state and joined members first, then translates the
    sticky (or, pre-sticky, state) member events — content verbatim plus the client's decryption
-   facts — into `RawStickyEvent`s and hands the whole set to `RtcSessionManager`.
-4. The manager groups events by `(room_id, slot_id)` and forwards each batch once to a single-session `RtcSession`.
+   facts — into `RawStickyEvent`s and hands the whole set to the room's `BaseRtcRoom`.
+4. The room groups events by `slot_id` and forwards each batch once to that slot's `SlotSession`.
+5. The host joins a slot on the room (`join` / `join_call`) and gets back an `RtcSession` /
+   `RtcCall`: our participation, with its heartbeat, keys and leave.
 
 Membership is always applied as a complete set: a member whose event is absent from the set has left.
 
@@ -193,7 +201,8 @@ Membership is always applied as a complete set: a member whose event is absent f
 
 - MSC4143 only: membership, slots and their join conditions, per-member
   encryption, our own membership's lifecycle.
-- `RtcSessionManager` owns `RtcSession`s keyed by `(room_id, slot_id)`.
+- `BaseRtcRoom` is one room: its slots, members, encryption, and a `SlotSession`
+  per observed or joined slot. Events and keys for another room are dropped.
 - `ApplicationInfo` carries the whole `application` object both ways; the core
   reads only `type`.
 - `MatrixBackend`, the host's contract (`host/backend.rs`), with the `EventIn`
@@ -202,41 +211,37 @@ Membership is always applied as a complete set: a member whose event is absent f
 
 ## `crates/matrix-rtc-call`
 
-- Reactions and the raised hand (Element Call, unspecced), MSC4075 notifications,
-  and `CallSessionManager`.
-- `CallSessionManager` owns the core manager (reached via `Deref`) and wraps
-  `join` (rings the room if we started), `leave` (lowers our hand first) and
-  `heartbeat` (moves our hand onto the refreshed membership).
+- The host-facing objects: `RtcClient` (one per backend, no I/O) opens an
+  `RtcRoom` (one live object per room; a second is refused), whose `join`
+  returns an `RtcSession` and `join_call` an `RtcCall` (a session plus
+  reactions, the raised hand and the ring). `close`/`leave` are the clean
+  paths; dropping sends no leave, and the delayed leave expires the
+  membership.
+- Reactions and the raised hand (Element Call, unspecced) and MSC4075
+  notifications, in `CallRoomState` over the room's `BaseRtcRoom`: `join` rings
+  the room if we started, `leave` lowers our hand first, `heartbeat` moves our
+  hand onto the refreshed membership.
+- The library does not detect incoming calls: MSC4075 is send-only here, and a
+  host learns of a ring through its own SDK or push path.
 - Depends on the core alone; arms no timers; compiles for wasm32.
-
-## `crates/matrix-rtc-bridge`
-
-- The Matrix side of the stack, and deliberately transport-free — nothing in it
-  knows what a LiveKit SFU is, so a second transport reuses it unchanged.
-- `feeder` (always available): `RoomFeeder::attach` subscribes a room through
+- `feeder`: `RoomFeeder::attach` subscribes a room through
   the backend and runs the routing described under "Who drives the call";
-  `SessionFeeder` does the same for to-device keys. `RoomAttachment::seeded`
-  resolves once the room's current state has been applied, which is what the
-  bindings' `attach_room` awaits.
-- `compat::dialect_backend::DialectBackend` (always available): the one
+  `ToDeviceFeeder` routes to-device keys to the open room they are for
+  (`RoomRegistry`) and drops those for a room that is not open.
+  `RtcRoom::seeded` resolves once the room's current state has been applied,
+  which is what the bindings' `room` awaits.
+- `compat::dialect_backend::DialectBackend`: the one
   `MatrixBackend` wrapper that applies the outbound half of a room's dialect
   (member-event routing, legacy key type, pre-sticky leave) before delegating.
   Every binding wraps its backend in it; nothing else rewrites outbound JSON.
 - `transports::choose`: the library's transport choice (first LiveKit entry of
   the backend's `rtc_transports()`, unless the join names one).
-- `sdk` (behind the **`matrix-sdk` feature**): `SdkBackend` implements
-  `MatrixBackend` over a `matrix_sdk::Client` — Client-Server requests for the
-  sends, and for the reads one task per room subscription that re-emits the
-  complete sets on sticky-store and room-state wakes. It reads MSC4354 sticky
-  events (the SDK's `unstable-msc4354`) and, when asked for the type,
-  `org.matrix.msc3401.call.member` room state as well.
-- `compat` (always available): interop with MatrixRTC implementations that predate
+- `compat`: interop with MatrixRTC implementations that predate
   the 2026 MSC4143 rewrite — today only Element Call on the JS SDK, the sole other
   implementation available to test against. Pure JSON translation with no Matrix
-  SDK and no async runtime, which is the reason the `matrix-sdk` feature is
-  optional at all: its ~50 unit tests build in seconds against no git
+  SDK and no async runtime: its ~50 unit tests build in seconds against no git
   dependencies. Scaffolding with a delete-by date, selected per call by
-  `matrix_rtc_livekit::CallOptions::element_call_compat`, covering two
+  `matrix_rtc_livekit::LiveKitCallOptions::element_call_compat`, covering two
   generations:
   - **`StickyEvents`**, the 2025 format: already MSC4354 sticky-based, differing
     only in the fields inside the member content. Confined to JSON funnels at the
@@ -251,10 +256,23 @@ Membership is always applied as a complete set: a member whose event is absent f
     and to nobody else. The core still sees only MSC4143: the state events are
     translated into synthetic sticky memberships in the feeder, and the slot
     condition is left unenforced because that generation has no slot concept.
-  - Three things refuse to be JSON and so live outside `compat` as one `match`
-    each: the ruma request type (`sdk`), and — in `matrix-rtc-livekit`, because
-    both are MSC4195 rather than Matrix concerns — the token endpoint and the
-    identity derivation.
+  - Two things refuse to be JSON and so live outside `compat` as one `match`
+    each, in `matrix-rtc-livekit` because both are MSC4195 rather than Matrix
+    concerns: the token endpoint and the identity derivation. The backend knows
+    no dialect: it delivers whatever state types the feeder asks for.
+
+## `crates/matrix-rtc-matrix-sdk`
+
+- The matrix-rust-sdk backend, and deliberately transport-free — nothing in it
+  knows what a LiveKit SFU is, so a second transport reuses it unchanged.
+- `sdk`: `SdkMatrixBackend` implements
+  `MatrixBackend` over a `matrix_sdk::Client` — Client-Server requests for the
+  sends, and for the reads one task per room subscription that re-emits the
+  complete sets on sticky-store and room-state wakes. It reads MSC4354 sticky
+  events (the SDK's `unstable-msc4354`) and the state types the feeder asks
+  for: from the SDK store for a type sliding sync keeps there (the pre-sticky
+  `m.call.member`, which it recognises through ruma), and from one `/state`
+  fetch for the rest. Depends on the core alone.
 
 ## `crates/matrix-rtc-media`
 
@@ -311,14 +329,16 @@ Membership is always applied as a complete set: a member whose event is absent f
 
 ## `crates/matrix-rtc-wasm`
 
-- Exposes `WasmRtcSessionManager` to JavaScript, constructed over the page's
-  `MatrixBackendHost` (`backend.rs`: `JsBackend` adapts the JS object to the
-  core trait; `WasmRoomSink`/`WasmToDeviceSink` are the sinks the host pushes
-  into). `attachRoom`/`detachRoom` run the bridge feeder on `spawn_local`.
-- Host-driven hooks the page must call: `heartbeat` on an interval while
-  joined (`HEARTBEAT_INTERVAL_MS`), `flushDueKeyRotation` when told a switch
-  completed; plus `openSlot`/`closeSlot`.
-- `media/`: `connectMedia` attaches media to a joined slot — the shared
+- Exposes `WasmRtcClient` → `WasmRtcRoom` → `WasmRtcCall` to JavaScript, the
+  client constructed over the page's `MatrixBackendHost` (`backend.rs`:
+  `JsBackend` adapts the JS object to the core trait;
+  `WasmRoomSink`/`WasmToDeviceSink` are the sinks the host pushes into).
+  `client.room` runs the room's feed on `spawn_local`; `room.close` leaves and
+  unsubscribes. The room has `openSlot`/`closeSlot` and `joinCall`.
+- Host-driven hooks the page must call on the call: `heartbeat` on an interval
+  while joined (`HEARTBEAT_INTERVAL_MS`), `flushDueKeyRotation` when told a
+  switch completed.
+- `media/`: `call.connectMedia` attaches media to the joined call — the shared
   `CallEngine` (roster + multi-focus pool) over `JsMediaTransport`, a JS
   delegate driving livekit-js. Rust owns the protocol (token requests via
   `-proto`, identities, pool policy, key bookkeeping via the shared
@@ -350,15 +370,17 @@ Membership is always applied as a complete set: a member whose event is absent f
 - Keeps FFI DTOs local to the crate and converts them into core DTOs.
 - Preserves session subscription semantics through a polling subscription object.
 - The host implements the `MatrixBackend` foreign trait (`backend.rs`) and
-  constructs `RtcSessionManagerHandle` over it; `attach_room(room_id, options)`
-  subscribes through it and resolves once the room's current state is applied,
-  `detach_room` leaves and unsubscribes. Inbound events reach the library only
-  through the `RoomSink`/`ToDeviceSink` objects the subscriptions hand the host
-  — there are no feed methods on the handle.
+  constructs `RtcClient` over it; `room(room_id, FfiRoomOptions)` subscribes
+  through it and resolves to an `RtcRoom` once the room's current state is
+  applied, and `RtcRoom::shutdown` leaves and unsubscribes (not `close`, which
+  Kotlin's `AutoCloseable` owns). `join_call` returns an `RtcCall` whose 10 s
+  keep-alive driver runs until it leaves or is dropped. Inbound events reach
+  the library only through the `RoomSink`/`ToDeviceSink` objects the
+  subscriptions hand the host — there are no feed methods on the objects.
 - Behind the **`media` cargo feature** (default off — pulls the LiveKit
   client and libwebrtc, ~8–15 MB per ABI): `src/media/` exposes the
   transport-agnostic media model to mobile. The host joins the slot through
-  the manager as usual, then `connect_media_session` attaches media (E2EE
+  the room as usual, then `connect_media_session(call, config)` attaches media (E2EE
   key bridge into the core, the `CallEngine` with its multi-focus pool, the
   own-focus SFU connection). `MediaSession` surfaces `next_event()` (async
   pull → Kotlin `Flow` / Swift `AsyncStream`), the participant roster,
@@ -366,7 +388,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   objects with safe copies *and* zero-copy plane pointers), and local
   publications the host pushes captured PCM/I420 into. OpenID tokens and
   outbound keys go through the same `MatrixBackend`. All media work
-  runs on a dedicated multithreaded tokio runtime — the manager's `?Send`
+  runs on a dedicated multithreaded tokio runtime — the core's `?Send`
   futures never touch it. Android gets a `JNI_OnLoad` that initialises
   libwebrtc.
 
@@ -388,17 +410,17 @@ Membership is always applied as a complete set: a member whose event is absent f
   identity = MSC4195 pseudonymous identity, `RoomEvent` → `ConnectionEvent`
   translation, and `NativeAudioStream` → owned PCM frame streams behind
   `RemoteTrackHandle`.
-- Behind `matrix-sdk` it ships `call` — a `Call::join`/`Call::leave` facade that
-  composes `matrix-rtc-bridge`'s signalling (`SdkBackend` + the feeder) with
+- Behind `matrix-sdk` it ships `call` — a `LiveKitCall::join`/`LiveKitCall::leave` facade that
+  composes `matrix-rtc-matrix-sdk`'s `SdkMatrixBackend` and `matrix-rtc-call`'s feeder with
   this transport: membership, key exchange, the library's transport choice, the
   E2EE SFU connection, and a `CallEngine` in one handle (the crate README's
   quick start; also what the e2e test drives).
-  `Call::subscribe_call_events`/`Call::participants` are the transport-agnostic
-  surface; the raw `Call::events`/`Call::session` accessors remain during the
+  `LiveKitCall::subscribe_call_events`/`LiveKitCall::participants` are the transport-agnostic
+  surface; the raw `LiveKitCall::events`/`LiveKitCall::session` accessors remain during the
   transition.
 - Selects the pre-2026 compatibility mode per call via
-  `CallOptions::element_call_compat`, and owns the two parts of it that refuse to
-  be JSON and so cannot live in `matrix-rtc-bridge`'s `compat`: the token endpoint
+  `LiveKitCallOptions::element_call_compat`, and owns the two parts of it that refuse to
+  be JSON and so cannot live in `matrix-rtc-call`'s `compat`: the token endpoint
   (`TokenEndpoint`, `token`/`lib`) and the participant-identity derivation
   (`identity_mapper`, which hashes per MSC4195 — a LiveKit document).
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
@@ -412,7 +434,7 @@ Membership is always applied as a complete set: a member whose event is absent f
 The core uses the stable ids (`m.rtc.member`, `m.rtc.slot`) internally, but the
 deployed ecosystem still matches on the unstable `org.matrix.msc4143.*` ones, so
 bindings translate on the way out: the `matrix-sdk` host via ruma's alias table
-(`matrix-rtc-bridge`'s `sdk::wire_event_type`), the FFI and wasm bindings — which hand the
+(`matrix-rtc-matrix-sdk`'s `sdk::wire_event_type`), the FFI and wasm bindings — which hand the
 type to an SDK that puts the string on the wire verbatim — via
 `matrix_rtc_core::wire_event_type`. Inbound, both spellings are accepted.
 
@@ -468,7 +490,7 @@ The outgoing key message declares `format: 0` as the spec requires.
 Membership says who is *in* a session, never who should be *summoned* to one, so
 a mobile client had nothing to raise an incoming call from. `matrix-rtc-call`'s
 `notification.rs` builds the `m.rtc.notification` that fills the gap;
-`CallSessionManager::join` sends it when the host set `CallJoinParams::notify`.
+`RtcRoom::join_call` sends it when the host set `CallJoinOptions::notify`.
 Three decisions are worth knowing:
 
 - **The relation is what forced a breaking host change.** MSC4075 requires an
@@ -518,8 +540,8 @@ with an `m.reference` and `emoji` / `name` fields, a raised hand is an
 `m.reaction` annotation with key `🖐️`, lowered by redacting it. Nothing in the
 content is trusted beyond that relation — the receiver checks that the reaction's
 sender is the membership's sender, which the homeserver authenticated. The
-protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven by
-`CallSessionManager`; the decisions worth knowing:
+protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven per room by
+`CallRoomState`; the decisions worth knowing:
 
 - **Only the protocol is in the SDK; sound and display are the host's.** The
   media crate has no playout path, and capture and render are platform-side by
@@ -534,7 +556,7 @@ protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven by
   matrix-js-sdk's `CallMembership.eventId` follows it, and Element Call drops a
   raised hand whose membership event has moved on, re-querying the new event's
   relations. So `OwnMembershipMachine` now tracks the latest event id, and
-  `CallSessionManager::heartbeat` re-annotates our hand onto the new event (redacting the old
+  `RtcCall::heartbeat` re-annotates our hand onto the new event (redacting the old
   annotation) whenever it has moved — every 30 minutes at the default lifetime.
   Peers may see the hand drop for one round trip in between; that is the
   protocol's, not ours. As a *receiver* we are more lenient: a hand stays up for
@@ -554,12 +576,13 @@ protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven by
   The feeder does this for every host after each membership apply, one
   `MatrixBackend::relations` request per new membership event id.
 - **Inbound needed a new intake.** The core only ever saw sticky, slot and
-  to-device traffic. `CallSessionManager::on_room_timeline_events` and
-  `on_event_redacted` route by *room* — a reaction names no slot — to every
-  session of the room, each keeping what relates to its own members. They arrive
+  to-device traffic. `CallRoomState::on_timeline_events` and
+  `on_event_redacted` take the room's events — a reaction names no slot — and
+  hand them to every joined slot of the room, each keeping what relates to its
+  own members. They arrive
   through the room subscription's `on_timeline_events`/`on_redaction`, which the
   feeder subscribes to for the application's `timeline_event_types`
-  (`SdkBackend` from a room event handler; the web host from `RoomEvent.Timeline`,
+  (`SdkMatrixBackend` from a room event handler; the web host from `RoomEvent.Timeline`,
   `MatrixEventEvent.Decrypted` and `RoomEvent.Redaction`).
 - **Outbound needed two sends.** `MatrixBackend::send_room_event` (a plain
   message-like send, encrypted by the client SDK in an encrypted room) and
@@ -584,13 +607,13 @@ distribution, so a member who drops out of the joined set stops receiving keys.
 
 The two room-state conditions are only enforced once a host supplies the state:
 
-- `RtcSessionManager::on_room_slots_received` takes a room's complete slot state.
+- `BaseRtcRoom::on_slots_received` takes the room's complete slot state.
   Calling it is what switches the room from "unknown" (condition unevaluable, so
   unenforced) to enforcing; a slot absent from that call is closed, not unknown.
-- `RtcSessionManager::on_room_members_received` supplies the room's joined users.
+- `BaseRtcRoom::on_members_received` supplies the room's joined users.
 
 This is deliberate: enforcing an unevaluable condition would silently empty every
-session for hosts that do not yet feed room state. The Matrix bridge feeds both.
+session for hosts that do not yet feed room state. The feeder feeds both.
 
 `open_slot` / `close_slot` send the state event through the command sender's new
 `send_state_event`.
@@ -635,7 +658,7 @@ sender_cross_signed }}` on each `EventIn` — and the feeder derives the origin
 
 The core has no HTTP of its own; `GET /_matrix/client/v1/rtc/transports` is
 the backend's `rtc_transports()`, returned raw. The **library** then chooses
-(`matrix_rtc_bridge::transports::choose`): the first LiveKit entry the
+(`matrix_rtc_call::transports::choose`): the first LiveKit entry the
 homeserver advertises, unless the join names a transport — kept as an override
 for tests, debugging and pinning a specific focus. A homeserver without the
 endpoint reports `[]`, and a join with no override then fails with a clear
@@ -655,7 +678,7 @@ Still outstanding:
 
 1. **Mid-session renegotiation** — a slot that changes its encryption mechanism
    while a session is live keeps the mechanism negotiated at join.
-2. **Slot state comes from a server fetch, not the store** (`SdkBackend`) —
+2. **Slot state comes from a server fetch, not the store** (`SdkMatrixBackend`) —
    sliding sync only delivers state types listed in `required_state`, and the
    SDK's room-list defaults do not include the MSC4143 slot type, so the local
    store reports every room as slotless (which the core reads as "slot closed,
@@ -663,11 +686,11 @@ Still outstanding:
    each wake and skips the set when the fetch fails. The real fix is adding the
    slot type to the SDK's sliding sync `required_state`, then reading the state
    store.
-3. **A unified `CallEvent` stream on the `Call` facade** — landed as
-   `matrix-rtc-media::CallEvent` via `Call::subscribe_call_events` (peer
+3. **A unified `CallEvent` stream on the `LiveKitCall` facade** — landed as
+   `matrix-rtc-media::CallEvent` via `LiveKitCall::subscribe_call_events` (peer
    joined/left, stream started/stopped, key imported, connection health,
    ended-with-reason). Remaining: migrate the e2e test and examples off the
-   raw `Call::events`/`Call::session` accessors and delete them, and surface
+   raw `LiveKitCall::events`/`LiveKitCall::session` accessors and delete them, and surface
    slot-close as `CallEvent::Ended`.
 
 ## Logging
@@ -692,9 +715,8 @@ timeline, and dump current state with `debug_snapshot()` / `debugSnapshot()`.
 - **Targets are module paths** (the `log` default — no explicit `target:`). The filterable
   roots are `matrix_rtc_core`, `matrix_rtc_media`, `matrix_rtc_livekit`, `matrix_rtc_ffi`,
   plus third-party `livekit` and `webrtc_sys`.
-- **Session-scoped lines are prefixed `[{room_id}/{slot_id}]`.** `RtcSession` carries a
-  pre-formatted `log_tag` for this, set by `RtcSessionManager` from its `SessionKey` — a
-  session does not otherwise know which slot it belongs to.
+- **Session-scoped lines are prefixed `[{room_id}/{slot_id}]`.** `SlotSession` carries a
+  pre-formatted `log_tag` for this, built from the room and slot it was created for.
 - **Levels.** `error` = broken invariant. `warn` = recoverable or protocol-deviant.
   `info` = lifecycle milestones only (a whole call should produce a few dozen). `debug` =
   one line per decision: sticky event ingested, membership diff, slot resolved, key

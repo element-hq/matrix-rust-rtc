@@ -9,10 +9,12 @@ The idea is to provide a core RTC SDK in Rust that can be used across multiple p
 for web (via WebAssembly) and native mobile platforms (via FFI).
 This allows us to maintain a single codebase for the core RTC functionality while enabling broad platform support.
 
-At the higher level, the rtc-sdk is fed events from the Matrix client (e.g., incoming call, call state changes)
-and provides an API for managing RTC sessions, like membership management, call control.
-The rtc-sdk will itself send commands back to the Matrix client to perform actions like accepting/declining a call,
-updating call state, sending reactions, raising hand, handling key distribution for E2EE calls, etc.
+At the higher level, the rtc-sdk is fed a room's state and membership through the Matrix client
+(the `MatrixBackend` the host implements), and provides an API for joining an RTC session in that room:
+client → room → session, with membership management and call control on the session.
+The rtc-sdk sends commands back through the Matrix client to perform actions like publishing our
+membership, ringing a room, sending reactions, raising hand, handling key distribution for E2EE calls, etc.
+It does not detect incoming calls: a host learns of a ring through its own Matrix SDK or push path.
 
 The project provides clean interfaces for the Matrix client to interact with the RTC functionality, while abstracting away platform-specific details.
 It can then be used in web in conjunction with the matrix-js-sdk and in mobile with the matrix-rust-sdk bindings.

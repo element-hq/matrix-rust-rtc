@@ -27,7 +27,7 @@ use std::error::Error;
 
 use livekit::RoomEvent;
 use matrix_rtc_livekit::{
-    LiveKitTransportConfig, MemberClaims, SdkBackend, TokenEndpoint, connect,
+    LiveKitTransportConfig, MemberClaims, SdkMatrixBackend, TokenEndpoint, connect,
 };
 
 fn required(name: &str) -> Result<String, Box<dyn Error>> {
@@ -88,13 +88,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .danger_accept_invalid_certs(insecure_tls)
         .build()?;
 
-    // 4. Token exchange + SFU connect (subscribe-only). `SdkBackend` over the
+    // 4. Token exchange + SFU connect (subscribe-only). `SdkMatrixBackend` over the
     //    `matrix_sdk::Client` supplies the OpenID token.
     println!(
         "connecting to the SFU for room {} slot {}...",
         config.room_id, config.slot_id
     );
-    let connection = connect(&http, &config, &SdkBackend::new(client.clone())).await?;
+    let connection = connect(&http, &config, &SdkMatrixBackend::new(client.clone())).await?;
     println!("connected to the SFU; waiting for tracks (join the call from another client)...");
 
     // 5. Log room events, highlighting subscribed remote tracks.

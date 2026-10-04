@@ -16,7 +16,7 @@
 //!    membership has settled.
 //! 4. `alice` **opens the slot** with an `m.rtc.slot` state event; MSC4143
 //!    only counts members as joined against an open slot.
-//! 5. Only then do both peers join the call through the [`Call`] facade, which
+//! 5. Only then do both peers join the call through the [`LiveKitCall`] facade, which
 //!    publishes each side's `m.rtc.member` membership as an MSC4354 sticky
 //!    event (plus a dead man's switch delayed leave), exchanges media keys,
 //!    and connects to the SFU with frame E2EE.
@@ -66,7 +66,7 @@ use matrix_sdk_ui::sync_service::SyncService;
 
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
-use matrix_rtc_livekit::{Call, CallOptions, media, open_slot};
+use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_rtc_media::{
     CallEvent, I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant,
     PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
@@ -87,7 +87,7 @@ struct SyncedClient {
 /// A participant on a live call. The sync service is kept alive alongside the
 /// call (dropping it stops the membership/key traffic the call depends on).
 struct Participant {
-    call: Call,
+    call: LiveKitCall,
     _sync: SyncService,
 }
 
@@ -134,7 +134,7 @@ enum Scenario {
     /// tone must be audible on bob's *second* call.
     ///
     /// What this exercises is the **incumbent** side of a redial. Alice never
-    /// leaves, so her `RtcSessionManager` is the long-lived one and has to carry
+    /// leaves, so her call is the long-lived one and has to carry
     /// the whole transition: retire the key bob's first participation held, then
     /// hand his *new* participation — a fresh `member_id`, holding nothing, on a
     /// brand-new frame cryptor — a key it can decrypt the very next frame with.
@@ -142,10 +142,10 @@ enum Scenario {
     /// media actually resumes.
     ///
     /// It deliberately does **not** claim to cover the joiner half.
-    /// [`Call::join`] builds a fresh `RtcSessionManager` per call, so bob starts
-    /// from pristine state here and cannot reproduce a bug that needs a manager
-    /// carried across calls. That path belongs to hosts holding one
-    /// `RtcSessionManagerHandle` for the whole Matrix session, and is covered
+    /// [`LiveKitCall::join`] builds a fresh client and room per call, so bob starts
+    /// from pristine state here and cannot reproduce a bug that needs a room
+    /// carried across calls. That path belongs to hosts that keep a room open
+    /// while rejoining its slot, and is covered
     /// in-process by `a_rejoin_in_the_same_process_distributes_a_key_to_the_incumbent`
     /// (matrix-rtc-core) and `a_rejoin_distributes_keys_without_new_sticky_events`
     /// (matrix-rtc-ffi).
@@ -179,7 +179,7 @@ async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn
 
 /// Log in and start the sync service. Sliding sync enables the sticky-events
 /// extension, so `m.rtc.member` stickies flow into the base room's sticky map
-/// (see `matrix_rtc_bridge::sdk`); it also delivers the
+/// (see `matrix_rtc_matrix_sdk::sdk`); it also delivers the
 /// `org.matrix.msc3401.call.member` room state the `state_events` compat mode
 /// reads.
 ///
@@ -262,7 +262,7 @@ async fn create_encrypted_room(
     Ok(room.room_id().to_owned())
 }
 
-/// Join the call through the [`Call`] facade — the very wiring the facade
+/// Join the call through the [`LiveKitCall`] facade — the very wiring the facade
 /// exists to absorb, so this is deliberately thin.
 async fn join_call(
     cfg: &Config,
@@ -277,7 +277,7 @@ async fn join_call(
     Ok(Participant { call, _sync: sync })
 }
 
-/// The `Call::join` half of [`join_call`], reusable on its own so a participant
+/// The `LiveKitCall::join` half of [`join_call`], reusable on its own so a participant
 /// can redial on a client that is already logged in and syncing.
 async fn open_call(
     cfg: &Config,
@@ -285,20 +285,20 @@ async fn open_call(
     user: &str,
     livekit_service_url: &str,
     compat: ElementCallCompat,
-) -> Result<Call, Box<dyn Error>> {
+) -> Result<LiveKitCall, Box<dyn Error>> {
     let http = reqwest::Client::builder()
         .danger_accept_invalid_certs(cfg.insecure_tls)
         .build()?;
-    let call = Call::join(
+    let call = LiveKitCall::join(
         room,
-        CallOptions {
+        LiveKitCallOptions {
             slot_id: cfg.slot_id.clone(),
             livekit_transport: Some(LiveKitTransport {
                 livekit_service_url: livekit_service_url.to_owned(),
             }),
             http: Some(http),
             element_call_compat: compat,
-            ..CallOptions::default()
+            ..LiveKitCallOptions::default()
         },
     )
     .await?;
@@ -347,7 +347,7 @@ async fn wait_for_joined_members(
 }
 
 /// Poll a call's member count until it reaches `target`, or time out.
-async fn wait_for_members(call: &Call, target: usize, label: &str) -> bool {
+async fn wait_for_members(call: &LiveKitCall, target: usize, label: &str) -> bool {
     let mut last_count = 0;
     for _ in 0..60 {
         last_count = call.member_count().await;
@@ -370,7 +370,7 @@ async fn wait_for_members(call: &Call, target: usize, label: &str) -> bool {
 /// trip, this one proves the *key* round trip, which is a separate hop
 /// (to-device, via the homeserver) and completes later. Anything that reads
 /// media before this holds is measuring key latency rather than media.
-async fn wait_for_key(call: &Call, peer_identity: &str, label: &str) -> bool {
+async fn wait_for_key(call: &LiveKitCall, peer_identity: &str, label: &str) -> bool {
     for _ in 0..60 {
         if call.imported_key_for(peer_identity) {
             println!("[{label}] imported the peer's media key");
@@ -424,7 +424,7 @@ fn harness(scenario: Scenario, compat: ElementCallCompat) {
     init_test_process();
     let cfg = Config::from_env();
 
-    // The futures behind `Call::join` are `!Send` (the core command sender is
+    // The futures behind `LiveKitCall::join` are `!Send` (the core command sender is
     // `?Send`), so the whole flow runs on a single-thread `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -609,12 +609,12 @@ async fn run(
         (true, true)
     };
 
-    // Tear down both peers cleanly and symmetrically: `Call::leave` stops the
+    // Tear down both peers cleanly and symmetrically: `LiveKitCall::leave` stops the
     // heartbeat, sends the leave event (cancelling the delayed leave), shuts
     // the media engine down (closing peer-focus connections), and closes the
     // own SFU connection. A per-leave timeout keeps a wedged teardown from
     // eating the overall deadline; failures are logged rather than aborting
-    // teardown of the other peer, but they fail the test. `Call::leave` logs
+    // teardown of the other peer, but they fail the test. `LiveKitCall::leave` logs
     // each step at debug level (RUST_LOG=matrix_rtc_livekit=debug) so a
     // timeout here pinpoints which await wedged.
     let mut teardown_ok = true;
@@ -672,9 +672,9 @@ async fn run(
 /// Alice raises her hand, lowers it, and reacts; bob must see each step on his
 /// call event stream and roster, and alice's second reaction inside the cooldown
 /// must be refused locally.
-async fn verify_reactions(alice: &Call, bob: &Call) -> Result<bool, Box<dyn Error>> {
+async fn verify_reactions(alice: &LiveKitCall, bob: &LiveKitCall) -> Result<bool, Box<dyn Error>> {
     use matrix_rtc_call::ReactionError;
-    use matrix_rtc_livekit::CallError;
+    use matrix_rtc_livekit::LiveKitCallError;
 
     const DEADLINE: Duration = Duration::from_secs(60);
     let alice_member = alice.membership_id().to_owned();
@@ -746,7 +746,7 @@ async fn verify_reactions(alice: &Call, bob: &Call) -> Result<bool, Box<dyn Erro
     // peer, so the SDK refuses it before it reaches the homeserver.
     let cooldown_ok = matches!(
         alice.send_reaction("🎉", "party").await,
-        Err(CallError::Reaction(ReactionError::Cooldown { .. }))
+        Err(LiveKitCallError::Reaction(ReactionError::Cooldown { .. }))
     );
     println!("[alice] second reaction refused by the cooldown: {cooldown_ok}");
 
@@ -754,7 +754,10 @@ async fn verify_reactions(alice: &Call, bob: &Call) -> Result<bool, Box<dyn Erro
 }
 
 /// Poll until the roster shows a remote participant, or `deadline`.
-async fn wait_for_peer(call: &Call, deadline: tokio::time::Instant) -> Option<MediaParticipant> {
+async fn wait_for_peer(
+    call: &LiveKitCall,
+    deadline: tokio::time::Instant,
+) -> Option<MediaParticipant> {
     loop {
         if let Some(peer) = call.participants().into_iter().find(|p| !p.is_local) {
             return Some(peer);
@@ -768,7 +771,7 @@ async fn wait_for_peer(call: &Call, deadline: tokio::time::Instant) -> Option<Me
 
 /// Poll until the peer's stream of `kind` is subscribed, or `deadline`.
 async fn wait_for_remote_track(
-    call: &Call,
+    call: &LiveKitCall,
     member_id: &str,
     kind: MediaStreamKind,
     deadline: tokio::time::Instant,
@@ -831,7 +834,7 @@ fn pattern_frame() -> VideoFrame {
 
 /// Publish the pattern as a camera track at ~15 fps through the
 /// transport-agnostic publish path.
-async fn publish_pattern_video(call: &Call) -> Result<VideoPublisher, Box<dyn Error>> {
+async fn publish_pattern_video(call: &LiveKitCall) -> Result<VideoPublisher, Box<dyn Error>> {
     let track = call
         .publish(PublishOptions::camera(VideoSourceConfig {
             width: PATTERN_WIDTH,
@@ -874,7 +877,7 @@ fn halves_mean_luma(buffer: &I420Buffer) -> (f64, f64) {
 
 /// Receive the peer's camera stream through the media API and verify the
 /// half-bright/half-dark pattern.
-async fn verify_video_pattern(call: &Call, label: &str) -> Result<bool, Box<dyn Error>> {
+async fn verify_video_pattern(call: &LiveKitCall, label: &str) -> Result<bool, Box<dyn Error>> {
     use futures_util::StreamExt;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -932,7 +935,10 @@ async fn verify_video_pattern(call: &Call, label: &str) -> Result<bool, Box<dyn 
 ///    resubscribe is unreliable at 0.7.48), then `enabled = true` brings
 ///    frames back — the closed-tile case. The re-fetch loop below stays
 ///    valid for transports whose `Off` really unsubscribes (new track).
-async fn verify_constraints_toggle(call: &Call, label: &str) -> Result<bool, Box<dyn Error>> {
+async fn verify_constraints_toggle(
+    call: &LiveKitCall,
+    label: &str,
+) -> Result<bool, Box<dyn Error>> {
     use futures_util::StreamExt;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
@@ -1041,7 +1047,11 @@ async fn verify_constraints_toggle(call: &Call, label: &str) -> Result<bool, Box
 /// remote participant on the roster, wait for their microphone stream (in
 /// two-foci mode this only appears once the engine has connected to *their*
 /// focus), pull ~2s of PCM off the frame stream, and verify the frequency.
-async fn record_peer_tone(call: &Call, label: &str, freq: f64) -> Result<bool, Box<dyn Error>> {
+async fn record_peer_tone(
+    call: &LiveKitCall,
+    label: &str,
+    freq: f64,
+) -> Result<bool, Box<dyn Error>> {
     use futures_util::StreamExt;
     use matrix_rtc_media::MediaStreamKind;
 
@@ -1132,7 +1142,10 @@ fn artifact_dir() -> PathBuf {
 /// `label` names the recording, so a scenario that records more than once (the
 /// redial) keeps both files instead of overwriting the first — the two are
 /// different evidence when only the second one fails.
-async fn record_and_verify_tone(call: &mut Call, label: &str) -> Result<bool, Box<dyn Error>> {
+async fn record_and_verify_tone(
+    call: &mut LiveKitCall,
+    label: &str,
+) -> Result<bool, Box<dyn Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
 
     loop {

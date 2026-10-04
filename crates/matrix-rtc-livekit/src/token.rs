@@ -8,14 +8,14 @@
 //! The endpoint URLs, request bodies, and response decoding live in
 //! [`matrix_rtc_livekit_proto::token`], where the web binding shares them; this
 //! module only POSTs what that one builds. Obtaining the OpenID token itself is
-//! a Client-Server API concern and belongs to [`matrix_rtc_bridge`]: the host
+//! a Client-Server API concern and belongs to the backend: the host
 //! supplies one through
 //! [`MatrixBackend`](matrix_rtc_core::MatrixBackend), so nothing here
 //! is wired to a particular Matrix SDK.
 //!
 //! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
-use matrix_rtc_bridge::OpenIdToken;
+use matrix_rtc_core::OpenIdToken;
 pub use matrix_rtc_livekit_proto::token::{MemberClaims, SfuToken};
 use matrix_rtc_livekit_proto::token::{get_token_request, legacy_token_request, parse_sfu_token};
 

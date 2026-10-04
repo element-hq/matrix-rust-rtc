@@ -10,7 +10,7 @@ package org.matrix.rtc
  *
  * Nothing the SDK logs is visible until one of these is called: the Rust side
  * uses the `log` facade, which discards everything until an implementation is
- * installed. Call this once, before creating an `RtcSessionManagerHandle`.
+ * installed. Call this once, before creating an `RtcClient`.
  *
  * This is a thin convenience wrapper over the generated
  * `org.matrix.rtc.setupLogging`; use that directly if you need the full

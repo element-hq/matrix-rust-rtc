@@ -5,16 +5,16 @@
 
 //! High-level "join a call" facade over the whole stack.
 //!
-//! [`Call::join`] wires together everything a MatrixRTC participant needs —
-//! the manager over a [`SdkBackend`], the feeder that subscribes to the room
-//! and to media keys, the MSC4195 token exchange, and an E2EE-enabled SFU
+//! [`LiveKitCall::join`] wires together everything a MatrixRTC participant needs —
+//! an [`RtcClient`] over a [`SdkMatrixBackend`], the room it opens and the call
+//! joined in it, the MSC4195 token exchange, and an E2EE-enabled SFU
 //! connection driven through the transport-agnostic [`matrix_rtc_media`]
-//! layer. [`Call::leave`] tears
+//! layer. [`LiveKitCall::leave`] tears
 //! all of it down in the right order.
 //!
 //! Consume the call through the unified stream
-//! ([`Call::subscribe_call_events`]) and the [`Call::participants`] roster;
-//! the raw LiveKit accessors ([`Call::events`], [`Call::session`]) remain for
+//! ([`LiveKitCall::subscribe_call_events`]) and the [`LiveKitCall::participants`] roster;
+//! the raw LiveKit accessors ([`LiveKitCall::events`], [`LiveKitCall::session`]) remain for
 //! the transition and will go away once frame streams cover their uses.
 //!
 //! Requires the `matrix-sdk` feature.
@@ -22,7 +22,7 @@
 //! # Runtime requirements
 //!
 //! The backend's futures are `?Send`, so the futures driving the session
-//! are `!Send`: **[`Call::join`] must be called from within a
+//! are `!Send`: **[`LiveKitCall::join`] must be called from within a
 //! [`tokio::task::LocalSet`]** (it uses `spawn_local` internally) and panics
 //! outside one. See `examples/join_and_record.rs` for the runtime skeleton.
 //!
@@ -41,22 +41,20 @@ use std::time::Duration;
 use livekit::RoomEvent;
 use matrix_sdk::{Client, Room};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use matrix_rtc_bridge::compat::ingest::outbound_dialect;
-use matrix_rtc_bridge::compat::{self, DialectBackend, ElementCallCompat};
-use matrix_rtc_bridge::feeder::{
-    AttachOptions, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
-};
-use matrix_rtc_bridge::{SdkBackend, transports};
+use matrix_rtc_call::compat::{self, ElementCallCompat};
+use matrix_rtc_call::transports;
 use matrix_rtc_call::{
-    CallJoinParams, CallSessionManager, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
+    CallJoinOptions, JoinOptions, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
+    RoomOptions, RtcCall, RtcClient, RtcError, RtcRoom,
 };
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, LiveKitTransport, MatrixBackend, RtcSessionManager,
-    RtcTransport, SlotEncryption, TransportIntent, generate_member_id,
+    BaseRtcRoom, EncryptionConfig, LiveKitTransport, MatrixBackend, RtcTransport, SlotEncryption,
+    TransportIntent,
 };
+use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
     MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
@@ -69,11 +67,9 @@ use crate::{
     MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 
-type Manager = Arc<Mutex<CallSessionManager<DialectBackend<SdkBackend>>>>;
-
-/// Errors produced when joining, operating, or leaving a [`Call`].
+/// Errors produced when joining, operating, or leaving a [`LiveKitCall`].
 #[derive(Debug, thiserror::Error)]
-pub enum CallError {
+pub enum LiveKitCallError {
     /// A Matrix client error (login state, room access, ...).
     #[error(transparent)]
     Sdk(#[from] matrix_sdk::Error),
@@ -96,15 +92,24 @@ pub enum CallError {
     Reaction(#[from] ReactionError),
 }
 
-fn signalling_error(error: impl std::fmt::Display) -> CallError {
-    CallError::Signalling(error.to_string())
+fn signalling_error(error: impl std::fmt::Display) -> LiveKitCallError {
+    LiveKitCallError::Signalling(error.to_string())
 }
 
-/// Options for [`Call::join`]. `CallOptions::default()` matches the common
+impl From<RtcError> for LiveKitCallError {
+    fn from(error: RtcError) -> Self {
+        match error {
+            RtcError::Reaction(error) => LiveKitCallError::Reaction(error),
+            error => signalling_error(error),
+        }
+    }
+}
+
+/// Options for [`LiveKitCall::join`]. `LiveKitCallOptions::default()` matches the common
 /// case: the `m.call#ROOM` slot of the `m.call` application, transport
 /// discovery via the homeserver, and the core's default encryption policy.
 #[derive(Clone, Debug)]
-pub struct CallOptions {
+pub struct LiveKitCallOptions {
     /// MatrixRTC slot to join.
     pub slot_id: String,
     /// MatrixRTC application of the slot.
@@ -150,7 +155,7 @@ pub struct CallOptions {
     /// Whether to subscribe to peers' media. `false` joins publish-only: the
     /// roster still fills from membership signalling, but no remote track is
     /// ever subscribed, so [`CallEvent::StreamStarted`] and
-    /// [`Call::remote_track`] never produce anything. Only a load generator
+    /// [`LiveKitCall::remote_track`] never produce anything. Only a load generator
     /// wants this.
     pub auto_subscribe: bool,
     /// Render this call for an older MatrixRTC generation, for interoperating
@@ -188,8 +193,8 @@ pub struct CallOptions {
     /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
     /// Element Call's three-second window. Reactions arrive as
     /// [`CallEvent::Reaction`], hands as [`CallEvent::HandRaised`] and on the
-    /// roster; send with [`Call::send_reaction`], [`Call::raise_hand`] and
-    /// [`Call::lower_hand`].
+    /// roster; send with [`LiveKitCall::send_reaction`], [`LiveKitCall::raise_hand`] and
+    /// [`LiveKitCall::lower_hand`].
     pub reactions: Option<ReactionsConfig>,
     /// How much the tile order is damped: how long sustained voice must last
     /// to count as speaking, how long silence must last to stop, and the
@@ -198,7 +203,7 @@ pub struct CallOptions {
     pub stability: StabilityConfig,
 }
 
-impl Default for CallOptions {
+impl Default for LiveKitCallOptions {
     fn default() -> Self {
         Self {
             slot_id: "m.call#ROOM".to_owned(),
@@ -218,7 +223,7 @@ impl Default for CallOptions {
     }
 }
 
-/// Aborts the wrapped task when dropped, so a [`Call`] going out of scope
+/// Aborts the wrapped task when dropped, so a [`LiveKitCall`] going out of scope
 /// never leaks its background loops.
 struct AbortOnDrop(JoinHandle<()>);
 
@@ -231,29 +236,27 @@ impl Drop for AbortOnDrop {
 /// A joined MatrixRTC call: live membership signalling plus an E2EE SFU
 /// connection.
 ///
-/// Obtained from [`Call::join`]; end it with [`Call::leave`]. Dropping a
-/// `Call` without leaving stops the background tasks and the sync-side key
+/// Obtained from [`LiveKitCall::join`]; end it with [`LiveKitCall::leave`]. Dropping a
+/// `LiveKitCall` without leaving stops the background tasks and the sync-side key
 /// handler, but sends no leave event — peers then see this member disappear
 /// only when the dead man's switch fires.
-pub struct Call {
-    manager: Manager,
+pub struct LiveKitCall {
+    /// Shared with the heartbeat and rotation pumps.
+    call: Arc<RtcCall<SdkMatrixBackend>>,
+    /// Holds the room's subscription; dropping it detaches.
+    room: RtcRoom<SdkMatrixBackend>,
     engine: CallEngine,
     connection: LiveKitTransportConnection,
     raw_events: UnboundedReceiver<RoomEvent>,
     bridge: Arc<MediaKeyBridge>,
     own_identity: String,
-    membership_id: String,
-    room_id: String,
-    slot_id: String,
     heartbeat: AbortOnDrop,
     rotation_pump: AbortOnDrop,
-    attachment: RoomAttachment,
-    session_feeder: SessionFeeder,
     _room_feed: AbortOnDrop,
-    _session_feed: AbortOnDrop,
+    _to_device_feed: Option<AbortOnDrop>,
 }
 
-impl Call {
+impl LiveKitCall {
     /// Join the MatrixRTC call on `room` and connect to the SFU with
     /// per-participant frame E2EE.
     ///
@@ -264,23 +267,25 @@ impl Call {
     ///
     /// Must run inside a [`tokio::task::LocalSet`]; see the module docs for
     /// this and the other preconditions.
-    pub async fn join(room: &Room, options: CallOptions) -> Result<Call, CallError> {
+    pub async fn join(
+        room: &Room,
+        options: LiveKitCallOptions,
+    ) -> Result<LiveKitCall, LiveKitCallError> {
         let client = room.client();
         let user_id = client
             .user_id()
-            .ok_or_else(|| CallError::Signalling("client has no user id (not logged in)".into()))?
+            .ok_or_else(|| {
+                LiveKitCallError::Signalling("client has no user id (not logged in)".into())
+            })?
             .to_string();
         let device_id = client
             .device_id()
-            .ok_or_else(|| CallError::Signalling("client has no device id (not logged in)".into()))?
+            .ok_or_else(|| {
+                LiveKitCallError::Signalling("client has no device id (not logged in)".into())
+            })?
             .to_string();
         let room_id = room.room_id().to_string();
 
-        // The backend, wrapped so every send renders in the room's dialect,
-        // and the manager over it.
-        let backend = Arc::new(DialectBackend::new(Arc::new(SdkBackend::new(
-            client.clone(),
-        ))));
         match options.element_call_compat {
             ElementCallCompat::Off => {}
             ElementCallCompat::StickyEvents => log::warn!(
@@ -298,42 +303,23 @@ impl Call {
                 compat::STATE_MEMBER_EVENT_TYPE,
             ),
         }
-        backend.set_dialect(
-            &room_id,
-            outbound_dialect(
-                options.element_call_compat,
-                &user_id,
-                &device_id,
-                &room_id,
-                &options.slot_id,
-            ),
-        );
-        let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_backend(
-            backend.clone(),
-        )));
 
-        // Media keys of both generations, then the room: the feeder subscribes
-        // to what the mode needs, seeds room state before membership and
-        // funnels the dialects. Both run on this `LocalSet`.
-        let modes = RoomModes::default();
-        let (session_feeder, session_run) =
-            SessionFeeder::start(backend.clone(), manager.clone(), modes.clone())
-                .await
-                .map_err(signalling_error)?;
-        let session_feed = AbortOnDrop(tokio::task::spawn_local(session_run.run()));
-        let (attachment, room_run) = RoomFeeder::attach(
-            backend.clone(),
-            manager.clone(),
-            modes,
-            room_id.clone(),
-            AttachOptions {
-                element_call_compat: options.element_call_compat,
-            },
-        )
-        .await
-        .map_err(signalling_error)?;
-        let room_feed = AbortOnDrop(tokio::task::spawn_local(room_run.run()));
-        attachment.seeded().await;
+        // One client for this call: it opens the room (the feeder subscribes to
+        // what the mode needs and seeds room state before membership) and the
+        // to-device key subscription. Both feeds run on this `LocalSet`.
+        let client = RtcClient::new(Arc::new(SdkMatrixBackend::new(client.clone())));
+        let (room, runs) = client
+            .room(
+                room_id.clone(),
+                RoomOptions {
+                    element_call_compat: options.element_call_compat,
+                },
+            )
+            .await?;
+        let (feed, to_device) = runs.into_futures();
+        let room_feed = AbortOnDrop(tokio::task::spawn_local(feed));
+        let to_device_feed = to_device.map(|run| AbortOnDrop(tokio::task::spawn_local(run)));
+        room.seeded().await;
 
         // Frame encryption: a single shared KeyProvider handle feeds both the
         // LiveKit room (which encrypts our frames and decrypts peers') and the
@@ -341,46 +327,21 @@ impl Call {
         // per-participant HKDF mode.
         let provider = msc4195_key_provider();
         let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
-
-        // MSC4143 requires a fresh `member.id` on every join, so this must not
-        // be derived from the (stable) user and device IDs.
-        //
-        // The pre-sticky Element Call generation is the one exception, and it is
-        // not optional: there the member id *is* the legacy `membershipID`, which
-        // is also the SFU participant identity, and both are
-        // `{user}:{device}` by definition of that generation's authorisation
-        // service. Using a random id instead would leave our own state event —
-        // echoed back to us through sync — failing
-        // `JoinCondition::SupersededOwnParticipation`, which drops a candidate
-        // from our own device whose member id is not the one we joined with. We
-        // would mark ourselves departed on our own join.
         let identity_mapper = identity_mapper(options.element_call_compat);
-        let membership_id = match options.element_call_compat {
-            ElementCallCompat::StateEvents => {
-                compat::element_call_state::participant_identity(&user_id, &device_id)
-            }
-            _ => generate_member_id(),
-        };
-        let own_identity = identity_mapper(&user_id, &device_id, &membership_id);
 
-        log::info!(
-            "[{room_id}/{}] join: user={user_id} device={device_id} member={membership_id} \
-             identity={own_identity}",
-            options.slot_id,
-        );
-
-        // The transport: the join's own choice, else the first LiveKit one the
-        // homeserver advertises.
+        // The transport is resolved here rather than by the join, because the
+        // SFU connection below needs the LiveKit focus it names: the join's own
+        // choice, else the first LiveKit one the homeserver advertises.
         let chosen = options
             .livekit_transport
             .clone()
             .map(|transport| TransportIntent::Publish(RtcTransport::LiveKit(transport)));
         let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
-            transports::resolve(&*backend, chosen)
+            transports::resolve(room.backend().as_ref(), chosen)
                 .await
                 .map_err(signalling_error)?
         else {
-            return Err(CallError::Signalling(
+            return Err(LiveKitCallError::Signalling(
                 "the chosen transport is not a LiveKit one".into(),
             ));
         };
@@ -390,68 +351,65 @@ impl Call {
             livekit.livekit_service_url,
         );
 
-        // Join the RTC session, then — still holding the manager lock so no
-        // sticky update can interleave — wire the encryption manager to our
-        // bridge and to the MSC4195 pseudonymous-identity derivation, and
-        // take the membership snapshot channel the media engine consumes.
-        let mut params = JoinSessionParams::new(
-            user_id.clone(),
-            device_id.clone(),
-            room_id.clone(),
-            options.slot_id.clone(),
-            options.application.clone(),
-            RtcTransport::LiveKit(livekit.clone()),
+        // The join picks the `member.id` this mode joins with (a fresh one per
+        // join, except in the pre-sticky generation; see
+        // `compat::ingest::member_id`) and renders our sends in the room's
+        // dialect.
+        let mut join = JoinOptions::new(options.slot_id.clone(), options.application.clone());
+        join.transport = Some(TransportIntent::Publish(RtcTransport::LiveKit(
+            livekit.clone(),
+        )));
+        join.encryption_config = options.encryption_config.clone();
+        join.sticky_duration_ms = options.sticky_duration_ms;
+        join.degraded_lifetime_ms = options.degraded_lifetime_ms;
+        let call = Arc::new(
+            room.join_call(CallJoinOptions {
+                join,
+                notify: options.notify.clone(),
+                reactions: options.reactions.clone(),
+            })
+            .await?,
         );
-        params.membership_id = Some(membership_id.clone());
-        params.encryption_config = options.encryption_config.clone();
-        params.sticky_duration_ms = options.sticky_duration_ms;
-        params.degraded_lifetime_ms = options.degraded_lifetime_ms;
-        let params = CallJoinParams {
-            rtc: params,
-            notify: options.notify.clone(),
-            reactions: options.reactions.clone(),
-        };
-        let (memberships, raised_hands, reactions) = {
-            let mut mgr = manager.lock().await;
-            mgr.join(params).await.map_err(signalling_error)?;
-            // The same `Arc` that produced `own_identity` above and that the
-            // media transport is given below. One value for all of them, so the
-            // four derivation sites cannot skew — a divergence there is not an
-            // error but a silence: peers sit in the roster with no media, their
-            // keys land under an identity the SFU never assigned, and nothing
-            // logs a problem.
-            let identity_mapper = identity_mapper.clone();
-            // The mapper goes in *before* the signal handler. Identities are
-            // derived at signal time, so a key signalled in between would be
-            // imported under the fallback `user:device` identity — one the SFU
-            // never uses, which looks exactly like the key never arriving. The
-            // join itself now drives the first distribution, so that window is no
-            // longer theoretical.
-            mgr.set_encryption_identity_mapper(&room_id, &options.slot_id, identity_mapper);
-            if !mgr.set_encryption_signal_handler(&room_id, &options.slot_id, bridge.clone()) {
-                log::warn!(
-                    "[{room_id}/{}] join: the joined session has no encryption manager",
-                    options.slot_id,
-                );
-                return Err(CallError::Signalling(
-                    "failed to register encryption signal handler".into(),
-                ));
-            }
-            let raised_hands = mgr.subscribe_raised_hands(&room_id, &options.slot_id);
-            let reactions = mgr.subscribe_reactions(&room_id, &options.slot_id);
-            let memberships = mgr
-                .subscribe_membership_snapshots(&room_id, &options.slot_id)
-                .ok_or_else(|| {
-                    CallError::Signalling("joined session is not tracked by the manager".into())
-                })?;
-            (memberships, raised_hands, reactions)
-        };
+        let membership_id = call.member_id().to_owned();
+        let own_identity = identity_mapper(&user_id, &device_id, &membership_id);
+        log::info!(
+            "[{room_id}/{}] join: user={user_id} device={device_id} member={membership_id} \
+             identity={own_identity}",
+            options.slot_id,
+        );
+
+        // Wire the encryption manager to the MSC4195 pseudonymous-identity
+        // derivation and to our bridge. The same `Arc` that produced
+        // `own_identity` above and that the media transport is given below: one
+        // value for all of them, so the derivation sites cannot skew — a
+        // divergence there is not an error but a silence: peers sit in the
+        // roster with no media, their keys land under an identity the SFU never
+        // assigned, and nothing logs a problem.
+        //
+        // The mapper goes in *before* the signal handler. Identities are derived
+        // at signal time, so a key signalled in between would be imported under
+        // the fallback `user:device` identity. Keys that arrive before the
+        // handler are held and replayed below.
+        call.set_encryption_identity_mapper(identity_mapper.clone())
+            .await;
+        if !call.set_encryption_signal_handler(bridge.clone()).await {
+            log::warn!(
+                "[{room_id}/{}] join: the joined session has no encryption manager",
+                options.slot_id,
+            );
+            return Err(LiveKitCallError::Signalling(
+                "failed to register encryption signal handler".into(),
+            ));
+        }
+        let raised_hands = call.subscribe_raised_hands().await;
+        let reactions = call.subscribe_reactions().await;
+        let memberships = call.subscribe_memberships().await;
 
         // Rotations the core coalesced into a key's `delayBeforeUse` window fall
         // due the moment that window closes, and the bridge's scheduled
         // installation is the only thing that knows when that is. Route it back:
         // the bridge notifies from a plain `tokio` task, which cannot touch the
-        // `!Send` manager, so it sends on a channel that a `spawn_local` pump
+        // `!Send` call, so it sends on a channel that a `spawn_local` pump
         // drains — the same shape the receive path uses.
         //
         // Without this the rotation still happens, on the next heartbeat; the
@@ -461,19 +419,9 @@ impl Call {
         bridge.set_switch_complete_listener(Box::new(move || {
             let _ = switch_tx.send(());
         }));
-        let rotation_pump = AbortOnDrop(spawn_rotation_pump(
-            manager.clone(),
-            room_id.clone(),
-            options.slot_id.clone(),
-            switch_rx,
-        ));
+        let rotation_pump = AbortOnDrop(spawn_rotation_pump(call.clone(), switch_rx));
 
-        let heartbeat = AbortOnDrop(spawn_heartbeat(
-            manager.clone(),
-            room_id.clone(),
-            options.slot_id.clone(),
-            options.heartbeat_interval,
-        ));
+        let heartbeat = AbortOnDrop(spawn_heartbeat(call.clone(), options.heartbeat_interval));
 
         // The media layer: a LiveKit transport sharing the E2EE key provider,
         // and the engine reconciling memberships with connection events. The
@@ -482,7 +430,7 @@ impl Call {
             Some(http) => http,
             None => reqwest::Client::new(),
         };
-        let token_backend: Arc<dyn MatrixBackend> = backend.clone();
+        let token_backend: Arc<dyn MatrixBackend> = room.backend().clone();
         let transport = Arc::new(
             LiveKitMediaTransport::new(http, token_backend, provider)
                 .with_auto_subscribe(options.auto_subscribe)
@@ -546,12 +494,7 @@ impl Call {
         //
         // It runs before `connect_livekit` so the key ring is populated before the
         // first frame can arrive.
-        if !manager
-            .lock()
-            .await
-            .replay_encryption_keys(&room_id, &options.slot_id)
-            .await
-        {
+        if !call.replay_encryption_keys().await {
             log::warn!(
                 "[{room_id}/{}] join: could not replay held keys; peers may stay undecryptable \
                  until the next rotation",
@@ -579,14 +522,8 @@ impl Call {
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
                 drop(heartbeat);
-                attachment.detach();
-                session_feeder.stop();
-                if let Err(leave_error) = manager
-                    .lock()
-                    .await
-                    .leave(room_id, options.slot_id, Default::default())
-                    .await
-                {
+                drop(rotation_pump);
+                if let Err(leave_error) = call.leave(Default::default()).await {
                     log::warn!("leave after failed SFU connect also failed: {leave_error}");
                 }
                 return Err(error.into());
@@ -623,22 +560,18 @@ impl Call {
         // so only events racing the connect itself can be missed here.
         let raw_events = connection.session().room().subscribe();
 
-        Ok(Call {
-            manager,
+        Ok(LiveKitCall {
+            call,
+            room,
             engine,
             connection,
             raw_events,
             bridge,
             own_identity,
-            membership_id,
-            room_id,
-            slot_id: options.slot_id,
             heartbeat,
             rotation_pump,
-            attachment,
-            session_feeder,
             _room_feed: room_feed,
-            _session_feed: session_feed,
+            _to_device_feed: to_device_feed,
         })
     }
 
@@ -648,54 +581,35 @@ impl Call {
     ///
     /// Fails with [`ReactionError::Cooldown`] inside the send cooldown, since
     /// peers would drop the reaction anyway.
-    pub async fn send_reaction(&self, emoji: &str, name: &str) -> Result<String, CallError> {
-        Ok(self
-            .manager
-            .lock()
-            .await
-            .send_reaction(&self.room_id, &self.slot_id, emoji, name)
-            .await?)
+    pub async fn send_reaction(&self, emoji: &str, name: &str) -> Result<String, LiveKitCallError> {
+        Ok(self.call.send_reaction(emoji, name).await?)
     }
 
     /// Raises our hand. Idempotent while it is up; it follows our membership
     /// across sticky refreshes on its own. Shows on our roster entry at once.
-    pub async fn raise_hand(&self) -> Result<(), CallError> {
-        Ok(self
-            .manager
-            .lock()
-            .await
-            .raise_hand(&self.room_id, &self.slot_id)
-            .await?)
+    pub async fn raise_hand(&self) -> Result<(), LiveKitCallError> {
+        Ok(self.call.raise_hand().await?)
     }
 
     /// Lowers our hand by redacting the annotation. A no-op when it is down.
-    pub async fn lower_hand(&self) -> Result<(), CallError> {
-        Ok(self
-            .manager
-            .lock()
-            .await
-            .lower_hand(&self.room_id, &self.slot_id)
-            .await?)
+    pub async fn lower_hand(&self) -> Result<(), LiveKitCallError> {
+        Ok(self.call.lower_hand().await?)
     }
 
     /// The raised hands right now, oldest first. The same information is on
     /// each [`Participant::hand_raised_at_ms`] and arrives as
     /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`].
     pub async fn raised_hands(&self) -> Vec<RaisedHand> {
-        self.manager
-            .lock()
-            .await
-            .raised_hands(&self.room_id, &self.slot_id)
-            .unwrap_or_default()
+        self.call.raised_hands().await
     }
 
     /// The unified call event stream: membership changes, media streams
     /// starting/stopping, key imports, connection health, call end.
     ///
-    /// This is the transport-agnostic replacement for [`Call::events`]. Any
+    /// This is the transport-agnostic replacement for [`LiveKitCall::events`]. Any
     /// number of subscribers may exist; a subscriber that falls far behind
     /// observes a `Lagged` error and should resynchronise from
-    /// [`Call::participants`].
+    /// [`LiveKitCall::participants`].
     pub fn subscribe_call_events(&self) -> broadcast::Receiver<CallEvent> {
         self.engine.subscribe_events()
     }
@@ -741,7 +655,7 @@ impl Call {
     pub async fn publish(
         &self,
         options: PublishOptions,
-    ) -> Result<Arc<dyn LocalTrackHandle>, CallError> {
+    ) -> Result<Arc<dyn LocalTrackHandle>, LiveKitCallError> {
         Ok(self.engine.publish(options).await?)
     }
 
@@ -765,11 +679,11 @@ impl Call {
     /// The raw LiveKit room event stream (participants joining, tracks
     /// subscribed, disconnects, ...).
     ///
-    /// Transition API: prefer [`Call::subscribe_call_events`]; this accessor
-    /// goes away once frame-level consumers are served by [`Call::remote_track`].
+    /// Transition API: prefer [`LiveKitCall::subscribe_call_events`]; this accessor
+    /// goes away once frame-level consumers are served by [`LiveKitCall::remote_track`].
     ///
     /// The stream ending (`recv()` returning `None`) means the call is over:
-    /// the room closes its event channel on [`Call::leave`] and after any
+    /// the room closes its event channel on [`LiveKitCall::leave`] and after any
     /// unrecoverable disconnect (server eviction, reconnects exhausted, ...) —
     /// in the latter case a [`RoomEvent::Disconnected`] carrying the reason is
     /// delivered first, so match it only if the reason matters. Transient
@@ -783,7 +697,7 @@ impl Call {
 
     /// The connected SFU session (access the LiveKit room to publish, ...).
     ///
-    /// Transition API: media access moves behind [`Call::remote_track`] and
+    /// Transition API: media access moves behind [`LiveKitCall::remote_track`] and
     /// the upcoming publish surface.
     pub fn session(&self) -> &LiveKitSession {
         self.connection.session()
@@ -797,22 +711,18 @@ impl Call {
 
     /// The `m.rtc.member` membership id of this join.
     pub fn membership_id(&self) -> &str {
-        &self.membership_id
+        self.call.member_id()
     }
 
     /// Number of members (including ourselves) currently joined to the slot,
     /// as signalled over sticky membership events.
     pub async fn member_count(&self) -> usize {
-        self.manager
-            .lock()
-            .await
-            .member_count(&self.room_id, &self.slot_id)
-            .unwrap_or(0)
+        self.call.member_count().await
     }
 
     /// Whether a media key for the given MSC4195 participant identity has been
     /// received and imported into this call's frame decryptor. See
-    /// [`Call::local_identity`] for the identity peers know us by.
+    /// [`LiveKitCall::local_identity`] for the identity peers know us by.
     pub fn imported_key_for(&self, identity: &str) -> bool {
         self.bridge.key_for(identity).is_some()
     }
@@ -823,36 +733,31 @@ impl Call {
     /// The heartbeat stops first so it cannot re-arm a delayed leave after
     /// `leave` cancels the current one. The SFU connection is closed even if
     /// the Matrix-side leave fails; the first error wins.
-    pub async fn leave(self) -> Result<(), CallError> {
-        let Call {
-            manager,
+    pub async fn leave(self) -> Result<(), LiveKitCallError> {
+        let LiveKitCall {
+            call,
+            room,
             engine,
             connection,
             heartbeat,
             rotation_pump,
-            attachment,
-            session_feeder,
-            room_id,
-            slot_id,
             ..
         } = self;
         drop(heartbeat);
         // Nothing left to rotate for once we are leaving, and the core drops its
         // encryption manager as part of the leave below.
         drop(rotation_pump);
+        let room_id = room.room_id().to_owned();
 
         // Step logs bracket every await so a wedged teardown pinpoints itself.
         log::debug!("[{room_id}] leave: sending matrix leave (membership + delayed-event cancel)");
-        let leave_result = manager
-            .lock()
+        let leave_result = call
+            .leave(Default::default())
             .await
-            .leave(room_id.clone(), slot_id, Default::default())
-            .await
-            .map_err(signalling_error);
+            .map_err(LiveKitCallError::from);
         // After the leave, whose cancel of the delayed event still goes through
-        // the backend; the feeders are not needed for that.
-        attachment.detach();
-        session_feeder.stop();
+        // the backend; the subscriptions are not needed for that.
+        drop(room);
         log::debug!(
             "[{room_id}] leave: matrix leave {}; shutting down the media engine",
             if leave_result.is_ok() {
@@ -866,7 +771,7 @@ impl Call {
         engine.shutdown().await;
         log::debug!("[{room_id}] leave: media engine down; closing own SFU connection");
         use matrix_rtc_media::TransportConnection as _;
-        let close_result = connection.close().await.map_err(CallError::from);
+        let close_result = connection.close().await.map_err(LiveKitCallError::from);
         log::debug!("[{room_id}] leave: complete");
         leave_result.and(close_result)
     }
@@ -883,14 +788,9 @@ pub async fn open_slot(
     slot_id: &str,
     application: &str,
     encryption: Option<SlotEncryption>,
-) -> Result<(), CallError> {
-    RtcSessionManager::with_backend(Arc::new(SdkBackend::new(client.clone())))
-        .open_slot(
-            room_id.to_owned(),
-            slot_id.to_owned(),
-            application.to_owned(),
-            encryption,
-        )
+) -> Result<(), LiveKitCallError> {
+    BaseRtcRoom::with_backend(room_id, Arc::new(SdkMatrixBackend::new(client.clone())))
+        .open_slot(slot_id.to_owned(), application.to_owned(), encryption)
         .await
         .map_err(signalling_error)
 }
@@ -910,9 +810,7 @@ pub async fn open_slot(
 /// lock and a comparison. `RtcSession::heartbeat` flushes too, so a stall here
 /// makes the rotation late rather than lost.
 fn spawn_rotation_pump(
-    manager: Manager,
-    room_id: String,
-    slot_id: String,
+    call: Arc<RtcCall<SdkMatrixBackend>>,
     mut switch_rx: UnboundedReceiver<()>,
 ) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
@@ -920,12 +818,10 @@ fn spawn_rotation_pump(
             // How long until the next owed rotation, if any. Recomputed on every
             // pass: the flush below may itself mint a key whose window a later
             // change gets coalesced into.
-            let due_in = {
-                let manager = manager.lock().await;
-                manager
-                    .key_rotation_due_at_ms(&room_id, &slot_id)
-                    .map(|due_at| Duration::from_millis(due_at.saturating_sub(matrix_rtc_now_ms())))
-            };
+            let due_in = call
+                .key_rotation_due_at_ms()
+                .await
+                .map(|due_at| Duration::from_millis(due_at.saturating_sub(matrix_rtc_now_ms())));
 
             match due_in {
                 // Nothing owed: wait for the bridge to tell us a key came into use,
@@ -949,11 +845,7 @@ fn spawn_rotation_pump(
                 }
             }
 
-            manager
-                .lock()
-                .await
-                .flush_due_key_rotation(&room_id, &slot_id)
-                .await;
+            call.flush_due_key_rotation().await;
         }
     })
 }
@@ -970,17 +862,14 @@ fn matrix_rtc_now_ms() -> u64 {
 }
 
 /// Keep pushing the dead man's switch delayed leave back while joined.
-fn spawn_heartbeat(
-    manager: Manager,
-    room_id: String,
-    slot_id: String,
-    interval: Duration,
-) -> JoinHandle<()> {
+fn spawn_heartbeat(call: Arc<RtcCall<SdkMatrixBackend>>, interval: Duration) -> JoinHandle<()> {
     tokio::task::spawn_local(async move {
         let mut ticker = tokio::time::interval(interval);
         loop {
             ticker.tick().await;
-            manager.lock().await.heartbeat(&room_id, &slot_id).await;
+            if !call.heartbeat().await {
+                return;
+            }
         }
     })
 }

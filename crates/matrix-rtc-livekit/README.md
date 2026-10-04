@@ -10,7 +10,7 @@ never targets wasm. Building it requires a C++ toolchain.
 
 ## Quick start: join a call and record
 
-With the `matrix-sdk` feature, [`Call::join`](src/call.rs) wraps the whole
+With the `matrix-sdk` feature, [`LiveKitCall::join`](src/call.rs) wraps the whole
 stack — MSC4143 membership signalling (via MSC4354 sticky events), media-key
 exchange over Olm-encrypted to-device messages, the MSC4195 token exchange,
 and an E2EE-enabled SFU connection — in one handle:
@@ -18,7 +18,7 @@ and an E2EE-enabled SFU connection — in one handle:
 ```rust,no_run
 use std::time::Duration;
 use livekit::{RoomEvent, track::RemoteTrack};
-use matrix_rtc_livekit::{Call, CallOptions, media};
+use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media};
 use matrix_sdk_ui::sync_service::SyncService;
 
 async fn record_a_call() -> Result<(), Box<dyn std::error::Error>> {
@@ -34,7 +34,7 @@ async fn record_a_call() -> Result<(), Box<dyn std::error::Error>> {
     let room = client.get_room("!room:example.org".try_into()?).unwrap();
 
     // Join: membership + key exchange + E2EE SFU connection.
-    let mut call = Call::join(&room, CallOptions::default()).await?;
+    let mut call = LiveKitCall::join(&room, LiveKitCallOptions::default()).await?;
 
     // React to the LiveKit event stream: record the first audio track.
     while let Some(event) = call.events().recv().await {
@@ -52,7 +52,7 @@ async fn record_a_call() -> Result<(), Box<dyn std::error::Error>> {
 
 Two things the snippet glosses over:
 
-- **Runtime.** The core's backend futures are `?Send`, so `Call::join` must run
+- **Runtime.** The core's backend futures are `?Send`, so `LiveKitCall::join` must run
   inside a `tokio::task::LocalSet`:
 
   ```rust,no_run
@@ -173,7 +173,7 @@ Notes:
   between beats.
 - **Scale is bounded by your machine, not the SFU** — see
   [How many devices?](#how-many-devices) below.
-- Devices join publish-only by default (`CallOptions::auto_subscribe = false`).
+- Devices join publish-only by default (`LiveKitCallOptions::auto_subscribe = false`).
   `--subscribe` makes them decode every peer as a real client would, at N×N
   cost.
 - **Keep simulcast on when a real client is watching.** `--no-simulcast`
@@ -270,8 +270,9 @@ hit deliberately:
 
 | Module | What it does |
 | --- | --- |
-| **`call`** *(feature `matrix-sdk`)* | The high-level facade: `Call::join`/`Call::leave`, `open_slot`. The transport comes from the homeserver's `GET /rtc/transports` unless `CallOptions::livekit_transport` pins one. Start here. |
-| **`matrix-rtc-bridge`** *(separate crate)* | Everything Matrix-side, with no LiveKit in it: `SdkBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`), the feeder subscribes through it and feeds the core, and `compat` translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`, `SdkBackend`, …) so a host keeps one dependency. |
+| **`call`** *(feature `matrix-sdk`)* | The high-level facade: `LiveKitCall::join`/`LiveKitCall::leave`, `open_slot`. The transport comes from the homeserver's `GET /rtc/transports` unless `LiveKitCallOptions::livekit_transport` pins one. Start here. |
+| **`matrix-rtc-matrix-sdk`** *(separate crate)* | `SdkMatrixBackend` implements the core's `MatrixBackend` over a `matrix_sdk::Client` (sends, room and to-device subscriptions, `/relations`, the OpenID token, `/rtc/transports`). No LiveKit in it. Re-exported here (`SdkMatrixBackend`) so a host keeps one dependency. |
+| **`matrix-rtc-call`** *(separate crate)* | The feeder that subscribes through the backend and feeds the core, and `compat`, which translates the pre-2026 Element Call wire dialects. Re-exported here (`matrix_rtc_livekit::compat`). |
 | **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the core's `MatrixBackend::openid_token`, so this layer is not hard-wired to a particular Matrix SDK. |
 | **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) picks the one a given compat generation's authorisation service issues. |
 | **`session`** | Connects to the SFU and exposes the LiveKit room + event stream. |
@@ -284,14 +285,14 @@ Frame E2EE **is wired**: the core generates a per-participant media key,
 distributes it as an Olm-encrypted `m.rtc.encryption_key` to-device message,
 and `MediaKeyBridge` imports received keys into the LiveKit `KeyProvider`
 (MSC4195 per-participant HKDF mode, GCM frames). Use `connect_e2ee` — or
-`Call::join`, which does — rather than plain `connect`. The end-to-end test
+`LiveKitCall::join`, which does — rather than plain `connect`. The end-to-end test
 asserts a tone survives an encrypt→SFU→decrypt round trip.
 
 ## Features
 
 | Feature | Effect |
 | --- | --- |
-| `matrix-sdk` *(off by default)* | The `call` facade, `matrix-rtc-bridge`'s `SdkBackend`, and the examples. Depends on upstream matrix-rust-sdk with its `unstable-msc4354` feature, for MSC4354 sticky events. |
+| `matrix-sdk` *(off by default)* | The `call` facade, `matrix-rtc-matrix-sdk`'s `SdkMatrixBackend`, and the examples. Depends on upstream matrix-rust-sdk with its `unstable-msc4354` feature, for MSC4354 sticky events. |
 | `testing` | Test-only parts of `media` (tone generator, Goertzel detector), used by the examples and the e2e test. |
 
 ## Examples & tests
@@ -304,4 +305,4 @@ asserts a tone survives an encrypt→SFU→decrypt round trip.
   token exchange + subscribe-only SFU connect, no membership signalling, no
   E2EE. Useful for poking at an authorisation service.
 - [`tests/e2e_call`](tests/E2E_CALL.md) — the full two-client end-to-end test
-  (runs in CI on every PR), built on `Call`.
+  (runs in CI on every PR), built on `LiveKitCall`.

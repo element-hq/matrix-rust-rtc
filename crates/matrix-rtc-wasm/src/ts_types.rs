@@ -62,13 +62,13 @@ export interface BackendSubscription {
     cancel(): void;
 }
 
-/** `attachRoom`'s options. */
-export interface AttachOptionsIn {
+/** `WasmRtcClient.room`'s options. */
+export interface RoomOptionsIn {
     element_call_compat?: ElementCallCompatMode;
 }
 
 /**
- * The page's Matrix backend: the one object `WasmRtcSessionManager` takes.
+ * The page's Matrix backend: the one object `WasmRtcClient` takes.
  * Sends take the event type already in its wire spelling. The read half
  * delivers into the sink classes (`WasmRoomSink`, `WasmToDeviceSink`): for
  * sticky events, state events and joined members every call carries the
@@ -78,7 +78,7 @@ export interface AttachOptionsIn {
 export interface MatrixBackendHost {
     ownUserId(): string;
     ownDeviceId(): string;
-    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room attached in `state_events` mode, so a host without sticky support may reject it there. */
+    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room opened in `state_events` mode, so a host without sticky support may reject it there. */
     sendStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, durationMs: number): Promise<{ event_id: string } | { eventId: string } | string>;
     sendStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
     /** MSC4140 delayed send — a delayed STATE event when `stateKey` is set; resolves with the bare delay id. A rejection carrying `errcode` lets the library tell a homeserver without delayed events apart. */
@@ -144,17 +144,15 @@ export type RtcCallEvent =
     | { type: "media_connection_state"; degraded: boolean }
     | { type: "ended"; reason: string };
 
-/** `connectMedia`'s configuration. */
+/** `connectMedia`'s configuration; the room and slot are the call's. */
 export interface MediaSessionConfigIn {
-    room_id: string;
-    slot_id: string;
     user_id: string;
     device_id: string;
     /** The MSC4195 authorisation-service URL of the focus we publish on. */
     livekit_service_url: string;
     /** livekit-js key-provider ring size when configured away from its default of 16. */
     key_ring_size?: number;
-    /** Cross-check only: the mode comes from the join. */
+    /** Cross-check only: the mode comes from the room. */
     element_call_compat?: ElementCallCompatMode;
     /** How much the tile order is damped; omitted fields take the defaults. */
     stability?: StabilityConfigIn;
@@ -192,10 +190,8 @@ export interface MediaDelegate {
     onSwitchComplete?(): void;
 }
 
-/** `join`'s parameters. */
+/** `joinCall`'s parameters. */
 export interface JoinParamsIn {
-    /** The room must be attached first. */
-    room_id: string;
     slot_id: string;
     application: string;
     /** Omit to take the first LiveKit transport the homeserver advertises (`rtcTransports`). */
@@ -214,7 +210,6 @@ export interface JoinParamsIn {
         require_cross_signed_sender?: boolean;
     };
     notify?: { notification_type?: string; mentions?: Record<string, unknown>; lifetime_ms?: number };
-    element_call_compat?: ElementCallCompatMode;
     /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */
     reactions?: { enabled?: boolean; active_window_ms?: number; send_cooldown_ms?: number };
 }

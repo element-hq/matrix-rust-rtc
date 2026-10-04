@@ -6,8 +6,9 @@
 //! WebAssembly bindings for the MatrixRTC core.
 //!
 //! The page implements one `MatrixBackendHost` object (sends and
-//! subscriptions) over its Matrix client; the manager attaches rooms and the
-//! library feeds itself. JS-shaped payloads are converted into core DTOs here
+//! subscriptions) over its Matrix client. A `WasmRtcClient` over it opens a
+//! `WasmRtcRoom` per room, which the library feeds itself, and joining a slot
+//! returns a `WasmRtcCall`. JS-shaped payloads are converted into core DTOs here
 //! so the core stays independent from wasm/JS types.
 //!
 //! # Only built for `wasm32`
@@ -25,20 +26,15 @@
 //! ```
 #![cfg(target_arch = "wasm32")]
 
-use std::cell::RefCell;
 use std::sync::Arc;
 
-use matrix_rtc_bridge::compat::{DialectBackend, ElementCallCompat, ingest};
-use matrix_rtc_bridge::feeder::{
-    AttachOptions, AttachedRooms, RoomAttachment, RoomFeeder, RoomModes, SessionFeeder,
-};
-use matrix_rtc_bridge::transports;
+use matrix_rtc_call::compat::{DialectBackend, ElementCallCompat};
 use matrix_rtc_call::{
-    CallJoinParams, CallSessionManager, Mentions, NotificationType, NotifyConfig,
+    CallJoinOptions, JoinOptions, Mentions, NotificationType, NotifyConfig, RoomOptions,
 };
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, LeaveSessionParams, MatrixBackend, RtcSessionManager,
-    RtcTransport, SlotEncryption, TransportIntent,
+    EncryptionConfig, LeaveSessionParams, MatrixBackend, RtcTransport, SlotEncryption,
+    TransportIntent,
 };
 
 mod backend;
@@ -50,149 +46,124 @@ pub use backend::{JsBackend, WasmRoomSink, WasmToDeviceSink};
 pub use logging::{init_logging, log_event};
 pub use media::{WasmConnectionEventSink, WasmMediaSession};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use wasm_bindgen::prelude::*;
 
-type Backend = DialectBackend<JsBackend>;
-type Manager = Arc<Mutex<CallSessionManager<Backend>>>;
+type Room = matrix_rtc_call::RtcRoom<JsBackend>;
+type Call = matrix_rtc_call::RtcCall<JsBackend>;
 
-#[wasm_bindgen]
-/// WebAssembly-facing wrapper around the call layer's `CallSessionManager`,
-/// fed from the page's `MatrixBackendHost`.
-pub struct WasmRtcSessionManager {
-    inner: Manager,
-    /// The page's backend behind the dialect wrapper; the manager holds the
-    /// same `Arc`.
-    backend: Arc<Backend>,
-    /// Which generation each attached room is read and written for.
-    modes: RoomModes,
-    /// The attached rooms, by room id. Freeing the manager detaches them.
-    rooms: AttachedRooms<RoomAttachment>,
-    /// The session-wide to-device subscription, started by the first attach.
-    session_feeder: RefCell<Option<SessionFeeder>>,
+fn js_error(error: impl std::fmt::Display) -> JsError {
+    JsError::new(&error.to_string())
 }
 
 #[wasm_bindgen]
-impl WasmRtcSessionManager {
+/// One per Matrix session, over the page's `MatrixBackendHost`. Creating it
+/// does no I/O; [`Self::room`] opens the rooms the page has calls in.
+pub struct WasmRtcClient {
+    client: matrix_rtc_call::RtcClient<JsBackend>,
+}
+
+#[wasm_bindgen]
+impl WasmRtcClient {
     #[wasm_bindgen(constructor)]
-    /// One manager per Matrix session, over the page's backend object (see
-    /// `MatrixBackendHost`).
     pub fn new(#[wasm_bindgen(unchecked_param_type = "MatrixBackendHost")] host: JsValue) -> Self {
-        log::info!("manager: created over the host backend");
+        log::info!("client: created over the host backend");
         // `Rc` is not an option: the core takes `Arc<T>` on every target.
         #[allow(clippy::arc_with_non_send_sync)]
-        let backend = Arc::new(DialectBackend::new(Arc::new(JsBackend::new(host))));
-        #[allow(clippy::arc_with_non_send_sync)]
-        let inner = Arc::new(Mutex::new(CallSessionManager::new(
-            RtcSessionManager::with_backend(backend.clone()),
-        )));
+        let backend = Arc::new(JsBackend::new(host));
         Self {
-            inner,
-            backend,
-            modes: RoomModes::default(),
-            rooms: AttachedRooms::default(),
-            session_feeder: RefCell::new(None),
+            client: matrix_rtc_call::RtcClient::new(backend),
         }
     }
 
-    /// Attaches a room: the library subscribes to what the room needs in the
-    /// given mode and applies the current state. Resolves once that state is
-    /// applied, so a `join` issued afterwards sees it. Attaching a room that
-    /// is attached, or still being attached, rejects. Wait for the attach
-    /// before detaching the room.
+    /// Opens a room: the library subscribes to what the room needs in the
+    /// given mode and applies its current state. Resolves once that state is
+    /// applied, so a `joinCall` issued afterwards sees it.
+    ///
+    /// Opening a room that already has a live room object rejects. Freeing the
+    /// returned room ends its subscriptions without leaving; `close` leaves
+    /// first.
     ///
     /// `options` is `{ element_call_compat?: "off" | "sticky_events" | "state_events" }`.
-    #[wasm_bindgen(js_name = attachRoom)]
-    pub async fn attach_room(
+    pub async fn room(
         &self,
         room_id: String,
-        #[wasm_bindgen(unchecked_param_type = "AttachOptionsIn | null | undefined")]
-        options: JsValue,
-    ) -> Result<(), JsError> {
-        let Some(reservation) = self.rooms.reserve(&room_id) else {
-            return Err(JsError::new(&format!("{room_id} is already attached")));
-        };
-        let options: Option<WasmAttachOptions> = serde_wasm_bindgen::from_value(options)
-            .map_err(|err| JsError::new(&format!("invalid attach options: {err}")))?;
+        #[wasm_bindgen(unchecked_param_type = "RoomOptionsIn | null | undefined")] options: JsValue,
+    ) -> Result<WasmRtcRoom, JsError> {
+        let options: Option<WasmRoomOptions> = serde_wasm_bindgen::from_value(options)
+            .map_err(|err| JsError::new(&format!("invalid room options: {err}")))?;
         let compat = compat::parse_compat(
             options
                 .as_ref()
                 .and_then(|options| options.element_call_compat.as_deref()),
         )?;
-        log::info!("manager: [{room_id}] attaching in {compat:?} mode");
-
-        self.ensure_session_feeder().await?;
-
-        let (attachment, run) = RoomFeeder::attach(
-            self.backend.clone(),
-            self.inner.clone(),
-            self.modes.clone(),
-            room_id.clone(),
-            AttachOptions {
-                element_call_compat: compat,
-            },
-        )
-        .await
-        .map_err(|err| JsError::new(&err.to_string()))?;
-        wasm_bindgen_futures::spawn_local(run.run());
-        attachment.seeded().await;
-        log::info!("manager: [{room_id}] attached and seeded");
-        reservation.fill(attachment);
-        Ok(())
-    }
-
-    /// Detaches a room: leaves any session joined in it, then ends the
-    /// subscription. Nothing delivered afterwards is applied. Detaching an
-    /// unattached room is a no-op.
-    #[wasm_bindgen(js_name = detachRoom)]
-    pub async fn detach_room(&self, room_id: String) -> Result<(), JsError> {
-        let joined = self.inner.lock().await.joined_slots(&room_id);
-        for slot_id in joined {
-            log::info!("manager: [{room_id}/{slot_id}] leaving before detaching");
-            if let Err(error) = self
-                .inner
-                .lock()
-                .await
-                .leave(room_id.clone(), slot_id, LeaveSessionParams::default())
-                .await
-            {
-                log::warn!("manager: leave before detach failed: {error}");
-            }
-        }
-        let attached = self.rooms.remove(&room_id);
-        match attached {
-            Some(attachment) => {
-                attachment.detach();
-                self.backend.clear_dialect(&room_id);
-                log::info!("manager: [{room_id}] detached");
-            }
-            None => log::debug!("manager: [{room_id}] detach of a room that is not attached"),
-        }
-        Ok(())
-    }
-
-    /// Everything the manager and its sessions believe, as a JSON string.
-    #[wasm_bindgen(js_name = debugSnapshot)]
-    pub async fn debug_snapshot(&self) -> String {
-        self.inner.lock().await.debug_snapshot().to_string()
-    }
-
-    pub async fn session_count(&self) -> u32 {
-        self.inner.lock().await.session_count() as u32
-    }
-
-    pub async fn member_count(&self, room_id: String, slot_id: String) -> Option<u32> {
-        self.inner
-            .lock()
+        log::info!("client: [{room_id}] opening in {compat:?} mode");
+        let (room, runs) = self
+            .client
+            .room(
+                room_id.clone(),
+                RoomOptions {
+                    element_call_compat: compat,
+                },
+            )
             .await
-            .member_count(&room_id, &slot_id)
-            .map(|count| count as u32)
+            .map_err(js_error)?;
+        // Both feeds end on their own — the room's when the room goes, the
+        // to-device one when the last room does.
+        let (feed, to_device) = runs.into_futures();
+        wasm_bindgen_futures::spawn_local(feed);
+        if let Some(to_device) = to_device {
+            wasm_bindgen_futures::spawn_local(to_device);
+        }
+        room.seeded().await;
+        log::info!("client: [{room_id}] open and seeded");
+        Ok(WasmRtcRoom {
+            room_id,
+            room: RwLock::new(Some(room)),
+        })
+    }
+}
+
+#[wasm_bindgen]
+/// One open room. Everything room-scoped is here; our own participation is on
+/// the [`WasmRtcCall`] that `joinCall` returns.
+pub struct WasmRtcRoom {
+    room_id: String,
+    /// `None` once closed.
+    room: RwLock<Option<Room>>,
+}
+
+impl WasmRtcRoom {
+    async fn open(&self) -> Result<RwLockReadGuard<'_, Room>, JsError> {
+        RwLockReadGuard::try_map(self.room.read().await, Option::as_ref)
+            .map_err(|_| JsError::new(&format!("{} has been closed", self.room_id)))
+    }
+}
+
+#[wasm_bindgen]
+impl WasmRtcRoom {
+    #[wasm_bindgen(getter, js_name = roomId)]
+    pub fn room_id(&self) -> String {
+        self.room_id.clone()
     }
 
-    /// Joins an RTC session in an attached room.
+    /// Everything the room believes — its state, and every candidate member
+    /// of each slot with why it is or is not joined — as a JSON string.
+    #[wasm_bindgen(js_name = debugSnapshot)]
+    pub async fn debug_snapshot(&self) -> Result<String, JsError> {
+        Ok(self.open().await?.debug_snapshot().await.to_string())
+    }
+
+    /// How many members are joined to a slot, without joining it.
+    #[wasm_bindgen(js_name = memberCount)]
+    pub async fn member_count(&self, slot_id: String) -> Result<u32, JsError> {
+        Ok(self.open().await?.member_count(&slot_id).await as u32)
+    }
+
+    /// Joins a call slot, returning our participation in it.
     ///
     /// `params`:
-    ///   - `room_id`, `slot_id` (e.g. "m.call#ROOM"), `application` (e.g. "m.call")
+    ///   - `slot_id` (e.g. "m.call#ROOM"), `application` (e.g. "m.call")
     ///   - `transport`: the transport to publish on; omit to take the first
     ///     LiveKit one the homeserver advertises (the host's `rtcTransports`)
     ///   - `receive_only`: join without publishing; `can_subscribe` then lists
@@ -201,241 +172,44 @@ impl WasmRtcSessionManager {
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
     ///
-    /// Refreshing the keep-alive is the page's job: call [`Self::heartbeat`]
-    /// on an interval while joined. Resolves to the `member.id` this join used;
-    /// the SDK generates it (MSC4143 requires a fresh one per join). Rejects
-    /// when the room is not attached or its state holds no open slot of this
-    /// id.
-    pub async fn join(
+    /// Refreshing the keep-alive is the page's job: call
+    /// [`WasmRtcCall::heartbeat`] on an interval while joined. The SDK
+    /// generates the `member.id` (MSC4143 requires a fresh one per join).
+    /// Rejects when the slot is already joined, or the room's state holds no
+    /// open slot of this id.
+    #[wasm_bindgen(js_name = joinCall)]
+    pub async fn join_call(
         &self,
         #[wasm_bindgen(unchecked_param_type = "JoinParamsIn")] params: JsValue,
-    ) -> Result<String, JsError> {
+    ) -> Result<WasmRtcCall, JsError> {
         let params: WasmJoinSessionParams =
             serde_wasm_bindgen::from_value(params).map_err(|err| {
-                log::warn!("manager: invalid join params: {err}");
+                log::warn!("room: invalid join params: {err}");
                 JsError::new(&format!("invalid join params: {err}"))
             })?;
-        let room_id = params.room_id.clone();
-        let slot_id = params.slot_id.clone();
-        if !self.modes.is_attached(&room_id) {
-            return Err(JsError::new(&format!(
-                "{room_id} is not attached; attach the room before joining"
-            )));
-        }
-        let mode = self.modes.mode(&room_id);
-        let user_id = self.backend.own_user_id();
-        let device_id = self.backend.own_device_id();
-
         log::info!(
-            "manager: join requested [{room_id}/{slot_id}] user={user_id} device={device_id} \
-             application={} compat={mode:?}",
+            "room: [{}/{}] join requested application={}",
+            self.room_id,
+            params.slot_id,
             params.application,
         );
-
-        // The join's own choice, else the first LiveKit transport the
-        // homeserver advertises.
-        let transport = match params.transport_intent()? {
-            Some(chosen) => chosen,
-            None => {
-                let advertised = self
-                    .backend
-                    .rtc_transports()
-                    .await
-                    .map_err(|err| JsError::new(&err.to_string()))?;
-                transports::choose(&advertised, None)
-                    .map_err(|err| JsError::new(&err.to_string()))?
-            }
-        };
-
-        let mut core_params = params.into_core(user_id.clone(), device_id.clone(), transport)?;
-        // Not always a fresh id: see `ingest::member_id` for the one generation
-        // where a fresh one makes us mark ourselves departed on our own join.
-        let member_id = ingest::member_id(mode, &user_id, &device_id);
-        core_params.rtc.membership_id = Some(member_id.clone());
-
-        // Before the join, not after: the join itself sends the membership
-        // (and arms the delayed leave), so a dialect registered afterwards
-        // would let exactly the two events that announce us go out
-        // spec-current.
-        self.backend.set_dialect(
-            &room_id,
-            ingest::outbound_dialect(mode, &user_id, &device_id, &room_id, &slot_id),
-        );
-
-        let result = self
-            .inner
-            .lock()
-            .await
-            .join(core_params)
-            .await
-            .map_err(|err| JsError::new(&err.to_string()));
-
-        match &result {
-            Ok(_) => log::info!("manager: join succeeded as {member_id}"),
-            Err(_) => log::warn!("manager: join failed"),
-        }
-
-        result.map(|_| member_id)
-    }
-
-    /// Our `member.id` in one session, or `undefined` if there is no such
-    /// session or it has not joined. Changes on every join, so read it when
-    /// needed rather than caching what `join` returned.
-    #[wasm_bindgen(js_name = ownMemberId)]
-    pub async fn own_member_id(&self, room_id: String, slot_id: String) -> Option<String> {
-        self.inner.lock().await.own_member_id(&room_id, &slot_id)
-    }
-
-    /// The event id of our current membership event in one session, or
-    /// `undefined` if there is no such session or it has not joined. Moves on
-    /// every sticky refresh, so read it at the moment of use.
-    #[wasm_bindgen(js_name = ownMembershipEventId)]
-    pub async fn own_membership_event_id(
-        &self,
-        room_id: String,
-        slot_id: String,
-    ) -> Option<String> {
-        self.inner
-            .lock()
-            .await
-            .own_membership_event_id(&room_id, &slot_id)
-    }
-
-    // ---- Reactions and raised hands ----
-    //
-    // Element Call's reactions are ordinary room events relating to the
-    // reacting member's membership event. The library reads them from the
-    // attached room (timeline events, redactions and the relations of each
-    // membership event); the page plays any sound. Results surface on the
-    // media session as `hand_raised` / `hand_lowered` / `reaction` events, on
-    // `rtc_participant.hand_raised_at_ms`, and here as `raisedHands`.
-
-    /// Sends an Element Call emoji reaction in one session. `name` is what
-    /// peers pick a sound by (see [`reaction_catalog`]); only the first
-    /// grapheme of `emoji` is sent. Resolves to the event id; rejects inside
-    /// the send cooldown.
-    #[wasm_bindgen(js_name = sendReaction)]
-    pub async fn send_reaction(
-        &self,
-        room_id: String,
-        slot_id: String,
-        emoji: String,
-        name: String,
-    ) -> Result<String, JsError> {
-        self.inner
-            .lock()
-            .await
-            .send_reaction(&room_id, &slot_id, &emoji, &name)
-            .await
-            .map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// Raises our hand in one session. Idempotent while it is up.
-    #[wasm_bindgen(js_name = raiseHand)]
-    pub async fn raise_hand(&self, room_id: String, slot_id: String) -> Result<(), JsError> {
-        self.inner
-            .lock()
-            .await
-            .raise_hand(&room_id, &slot_id)
-            .await
-            .map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// Lowers our hand in one session. A no-op when it is down.
-    #[wasm_bindgen(js_name = lowerHand)]
-    pub async fn lower_hand(&self, room_id: String, slot_id: String) -> Result<(), JsError> {
-        self.inner
-            .lock()
-            .await
-            .lower_hand(&room_id, &slot_id)
-            .await
-            .map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// The raised hands of one session, oldest first, as `RaisedHand[]`.
-    #[wasm_bindgen(js_name = raisedHands, unchecked_return_type = "RaisedHand[]")]
-    pub async fn raised_hands(&self, room_id: String, slot_id: String) -> Result<JsValue, JsError> {
-        let hands = self
-            .inner
-            .lock()
-            .await
-            .raised_hands(&room_id, &slot_id)
-            .unwrap_or_default();
-        serde_wasm_bindgen::to_value(&hands).map_err(|err| JsError::new(&err.to_string()))
-    }
-
-    /// Leaves an RTC session.
-    ///
-    /// `params` is `{ leave_reason?: { code, reason? } }` — e.g.
-    /// `{ code: "leave" }` for an intentional hang-up. Defaults to that.
-    pub async fn leave(
-        &self,
-        room_id: String,
-        slot_id: String,
-        #[wasm_bindgen(unchecked_param_type = "LeaveParamsIn")] params: JsValue,
-    ) -> Result<(), JsError> {
-        let params: WasmLeaveSessionParams = serde_wasm_bindgen::from_value(params)
-            .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
-
+        let options = params.into_call()?;
+        let room = self.open().await?;
+        let call = room.join_call(options).await.map_err(|err| {
+            log::warn!("room: [{}] join failed: {err}", self.room_id);
+            js_error(err)
+        })?;
         log::info!(
-            "manager: leave requested [{room_id}/{slot_id}] reason={:?}",
-            params.leave_reason,
+            "room: [{}/{}] joined as {}",
+            self.room_id,
+            call.slot_id(),
+            call.member_id()
         );
-
-        let result = self
-            .inner
-            .lock()
-            .await
-            .leave(room_id, slot_id, params.into_core())
-            .await
-            .map_err(|err| JsError::new(&err.to_string()));
-
-        match &result {
-            Ok(()) => log::info!("manager: leave succeeded"),
-            Err(_) => log::warn!("manager: leave failed"),
-        }
-        // The dialect stays registered: the room is still attached in its
-        // mode. Detaching clears it.
-        result
-    }
-
-    /// Restarts the keep-alive for one session: reschedules the delayed leave,
-    /// and re-sends the membership if its sticky entry is halfway to expiring.
-    /// Also flushes a key rotation that has come due.
-    ///
-    /// The core arms no timers and this binding starts no driver — **the page
-    /// must call this on an interval while joined** (`setInterval`,
-    /// [`HEARTBEAT_INTERVAL_MS`]), or the dead man's switch fires and peers see
-    /// us depart mid-call.
-    ///
-    /// Resolves to `false` if there is no joined session for
-    /// `(room_id, slot_id)`, which means there is nothing to keep alive.
-    pub async fn heartbeat(&self, room_id: String, slot_id: String) -> bool {
-        self.inner.lock().await.heartbeat(&room_id, &slot_id).await
-    }
-
-    /// When the session's next key rotation falls due, in epoch milliseconds,
-    /// or `undefined` when none is owed. Diagnostics: the rotation itself is
-    /// performed by [`Self::heartbeat`] and by the media layer's
-    /// switch-complete signal, not by polling this.
-    #[wasm_bindgen(js_name = keyRotationDueAtMs)]
-    pub async fn key_rotation_due_at_ms(&self, room_id: String, slot_id: String) -> Option<f64> {
-        self.inner
-            .lock()
-            .await
-            .key_rotation_due_at_ms(&room_id, &slot_id)
-            .map(|at| at as f64)
-    }
-
-    /// Performs the session's key rotation if one has come due; a no-op
-    /// otherwise. Resolves to whether a rotation ran.
-    #[wasm_bindgen(js_name = flushDueKeyRotation)]
-    pub async fn flush_due_key_rotation(&self, room_id: String, slot_id: String) -> bool {
-        self.inner
-            .lock()
-            .await
-            .flush_due_key_rotation(&room_id, &slot_id)
-            .await
+        Ok(WasmRtcCall {
+            compat: room.element_call_compat(),
+            backend: room.backend().clone(),
+            call,
+        })
     }
 
     /// Opens a slot by publishing its `m.rtc.slot` state event.
@@ -453,7 +227,6 @@ impl WasmRtcSessionManager {
     #[wasm_bindgen(js_name = openSlot)]
     pub async fn open_slot(
         &self,
-        room_id: String,
         slot_id: String,
         application_type: String,
         #[wasm_bindgen(unchecked_param_type = "SlotEncryptionIn | null | undefined")]
@@ -461,20 +234,18 @@ impl WasmRtcSessionManager {
     ) -> Result<(), JsError> {
         let encryption: Option<SlotEncryption> = serde_wasm_bindgen::from_value(encryption)
             .map_err(|err| JsError::new(&format!("invalid slot encryption payload: {err}")))?;
-
         log::info!(
-            "manager: [{room_id}/{slot_id}] opening slot: application={application_type} \
+            "room: [{}/{slot_id}] opening slot: application={application_type} \
              encryption={encryption:?}",
+            self.room_id,
         );
-
-        self.inner
-            .lock()
-            .await
-            .open_slot(room_id, slot_id, application_type, encryption)
+        self.open()
+            .await?
+            .open_slot(slot_id, application_type, encryption)
             .await
             .map_err(|err| {
-                log::warn!("manager: could not open the slot: {err}");
-                JsError::new(&err.to_string())
+                log::warn!("room: could not open the slot: {err}");
+                js_error(err)
             })
     }
 
@@ -482,42 +253,51 @@ impl WasmRtcSessionManager {
     ///
     /// Every member of it becomes left as soon as clients apply the new state —
     /// this ends the call for everyone, not just for us. Leaving is
-    /// [`Self::leave`].
+    /// [`WasmRtcCall::leave`].
     #[wasm_bindgen(js_name = closeSlot)]
-    pub async fn close_slot(&self, room_id: String, slot_id: String) -> Result<(), JsError> {
-        log::info!("manager: [{room_id}/{slot_id}] closing slot");
+    pub async fn close_slot(&self, slot_id: String) -> Result<(), JsError> {
+        log::info!("room: [{}/{slot_id}] closing slot", self.room_id);
+        self.open().await?.close_slot(slot_id).await.map_err(|err| {
+            log::warn!("room: could not close the slot: {err}");
+            js_error(err)
+        })
+    }
 
-        self.inner
-            .lock()
-            .await
-            .close_slot(room_id, slot_id)
-            .await
-            .map_err(|err| {
-                log::warn!("manager: could not close the slot: {err}");
-                JsError::new(&err.to_string())
-            })
+    /// Leaves every call joined through this room, then ends its
+    /// subscriptions. Every call of the room is over afterwards, and the room
+    /// can be opened again. Closing a closed room is a no-op.
+    pub async fn close(&self) {
+        let room = self.room.write().await.take();
+        match room {
+            Some(room) => {
+                room.close().await;
+                log::info!("room: [{}] closed", self.room_id);
+            }
+            None => log::debug!("room: [{}] already closed", self.room_id),
+        }
     }
 }
 
-impl WasmRtcSessionManager {
-    /// The session-wide to-device subscription, started once.
-    async fn ensure_session_feeder(&self) -> Result<(), JsError> {
-        if self.session_feeder.borrow().is_some() {
-            return Ok(());
-        }
-        let (feeder, run) =
-            SessionFeeder::start(self.backend.clone(), self.inner.clone(), self.modes.clone())
-                .await
-                .map_err(|err| JsError::new(&err.to_string()))?;
-        wasm_bindgen_futures::spawn_local(run.run());
-        *self.session_feeder.borrow_mut() = Some(feeder);
-        log::info!("manager: to-device subscription started");
-        Ok(())
+#[wasm_bindgen]
+/// Our participation in one call slot. Over after `leave`, or once its room is
+/// closed: calls then reject or report nothing to do, and joining again yields
+/// a new call. Freeing it sends no leave; the membership expires through its
+/// delayed leave unless the slot is joined again, which leaves it first.
+pub struct WasmRtcCall {
+    call: Call,
+    /// The mode the room was opened in, for the media layer's identity and
+    /// token endpoint.
+    compat: ElementCallCompat,
+    backend: Arc<DialectBackend<JsBackend>>,
+}
+
+impl WasmRtcCall {
+    pub(crate) fn inner(&self) -> &Call {
+        &self.call
     }
 
-    /// The mode `room_id` was attached in; an unattached room is spec-current.
-    pub(crate) fn element_call_compat_for(&self, room_id: &str) -> ElementCallCompat {
-        self.modes.mode(room_id)
+    pub(crate) fn element_call_compat(&self) -> ElementCallCompat {
+        self.compat
     }
 
     /// The page's backend, for the media layer's token exchange.
@@ -526,9 +306,143 @@ impl WasmRtcSessionManager {
     }
 }
 
-/// How a room is attached.
+#[wasm_bindgen]
+impl WasmRtcCall {
+    #[wasm_bindgen(getter, js_name = roomId)]
+    pub fn room_id(&self) -> String {
+        self.call.room_id().to_owned()
+    }
+
+    #[wasm_bindgen(getter, js_name = slotId)]
+    pub fn slot_id(&self) -> String {
+        self.call.slot_id().to_owned()
+    }
+
+    /// Our `member.id` in this participation.
+    #[wasm_bindgen(getter, js_name = memberId)]
+    pub fn member_id(&self) -> String {
+        self.call.member_id().to_owned()
+    }
+
+    /// `false` once left, or once the room is closed.
+    #[wasm_bindgen(getter, js_name = isLive)]
+    pub fn is_live(&self) -> bool {
+        self.call.is_live()
+    }
+
+    /// The event id of our current membership event, or `undefined` once the
+    /// call is over. Moves on every sticky refresh, so read it at the moment
+    /// of use.
+    #[wasm_bindgen(js_name = membershipEventId)]
+    pub async fn membership_event_id(&self) -> Option<String> {
+        self.call.membership_event_id().await
+    }
+
+    /// How many members are joined to this call's slot.
+    #[wasm_bindgen(js_name = memberCount)]
+    pub async fn member_count(&self) -> u32 {
+        self.call.member_count().await as u32
+    }
+
+    /// Restarts the keep-alive: reschedules the delayed leave, and re-sends
+    /// the membership if its sticky entry is halfway to expiring. Also
+    /// flushes a key rotation that has come due.
+    ///
+    /// The core arms no timers and this binding starts no driver — **the page
+    /// must call this on an interval while joined** (`setInterval`,
+    /// [`HEARTBEAT_INTERVAL_MS`]), or the dead man's switch fires and peers see
+    /// us depart mid-call. Resolves to `false` once there is nothing left to
+    /// keep alive.
+    pub async fn heartbeat(&self) -> bool {
+        self.call.heartbeat().await
+    }
+
+    /// When the next key rotation falls due, in epoch milliseconds, or
+    /// `undefined` when none is owed. Diagnostics: the rotation itself is
+    /// performed by [`Self::heartbeat`] and by the media layer's
+    /// switch-complete signal, not by polling this.
+    #[wasm_bindgen(js_name = keyRotationDueAtMs)]
+    pub async fn key_rotation_due_at_ms(&self) -> Option<f64> {
+        self.call.key_rotation_due_at_ms().await.map(|at| at as f64)
+    }
+
+    /// Performs the key rotation if one has come due; a no-op otherwise.
+    /// Resolves to whether a rotation ran.
+    #[wasm_bindgen(js_name = flushDueKeyRotation)]
+    pub async fn flush_due_key_rotation(&self) -> bool {
+        self.call.flush_due_key_rotation().await
+    }
+
+    // ---- Reactions and raised hands ----
+    //
+    // Element Call's reactions are ordinary room events relating to the
+    // reacting member's membership event. The library reads them from the
+    // open room (timeline events, redactions and the relations of each
+    // membership event); the page plays any sound. Results surface on the
+    // media session as `hand_raised` / `hand_lowered` / `reaction` events, on
+    // `rtc_participant.hand_raised_at_ms`, and here as `raisedHands`.
+
+    /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
+    /// by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
+    /// sent. Resolves to the event id; rejects inside the send cooldown.
+    #[wasm_bindgen(js_name = sendReaction)]
+    pub async fn send_reaction(&self, emoji: String, name: String) -> Result<String, JsError> {
+        self.call
+            .send_reaction(&emoji, &name)
+            .await
+            .map_err(js_error)
+    }
+
+    /// Raises our hand. Idempotent while it is up.
+    #[wasm_bindgen(js_name = raiseHand)]
+    pub async fn raise_hand(&self) -> Result<(), JsError> {
+        self.call.raise_hand().await.map_err(js_error)
+    }
+
+    /// Lowers our hand. A no-op when it is down.
+    #[wasm_bindgen(js_name = lowerHand)]
+    pub async fn lower_hand(&self) -> Result<(), JsError> {
+        self.call.lower_hand().await.map_err(js_error)
+    }
+
+    /// The raised hands, oldest first, as `RaisedHand[]`.
+    #[wasm_bindgen(js_name = raisedHands, unchecked_return_type = "RaisedHand[]")]
+    pub async fn raised_hands(&self) -> Result<JsValue, JsError> {
+        serde_wasm_bindgen::to_value(&self.call.raised_hands().await).map_err(js_error)
+    }
+
+    /// Leaves the slot; the call is over afterwards. A failed leave leaves it
+    /// live, so it can be retried.
+    ///
+    /// `params` is `{ leave_reason?: { code, reason? } }` — e.g.
+    /// `{ code: "leave" }` for an intentional hang-up. Defaults to that.
+    pub async fn leave(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "LeaveParamsIn | null | undefined")] params: JsValue,
+    ) -> Result<(), JsError> {
+        let params: Option<WasmLeaveSessionParams> = serde_wasm_bindgen::from_value(params)
+            .map_err(|err| JsError::new(&format!("invalid leave params: {err}")))?;
+        let params = params.unwrap_or_default();
+        log::info!(
+            "call: [{}/{}] leave requested reason={:?}",
+            self.call.room_id(),
+            self.call.slot_id(),
+            params.leave_reason,
+        );
+        self.call
+            .leave(params.into_core())
+            .await
+            .inspect(|()| log::info!("call: leave succeeded"))
+            .map_err(|err| {
+                log::warn!("call: leave failed: {err}");
+                js_error(err)
+            })
+    }
+}
+
+/// How a room is opened.
 #[derive(Debug, Default, Deserialize)]
-pub struct WasmAttachOptions {
+pub struct WasmRoomOptions {
     /// `"off"` (the default), `"sticky_events"` or `"state_events"`. One
     /// decision for the room: what the library subscribes to, how it renders
     /// our sends, the `member.id` we join with, how an inbound media key is
@@ -537,7 +451,7 @@ pub struct WasmAttachOptions {
     pub element_call_compat: Option<String>,
 }
 
-/// How often a page should call [`WasmRtcSessionManager::heartbeat`] while
+/// How often a page should call [`WasmRtcCall::heartbeat`] while
 /// joined. Matches the FFI's keep-alive driver interval.
 #[wasm_bindgen(js_name = HEARTBEAT_INTERVAL_MS)]
 pub fn heartbeat_interval_ms() -> u32 {
@@ -579,7 +493,6 @@ pub fn reaction_sound_for(name: String) -> Option<String> {
 /// WASM-friendly join session parameters.
 #[derive(Debug, Deserialize)]
 pub struct WasmJoinSessionParams {
-    pub room_id: String,
     pub slot_id: String,
     pub application: String,
     /// The transport to publish on. Omit to take the first LiveKit transport
@@ -733,30 +646,18 @@ impl WasmJoinSessionParams {
             .transpose()
     }
 
-    pub fn into_core(
-        self,
-        user_id: String,
-        device_id: String,
-        transport: TransportIntent,
-    ) -> Result<CallJoinParams, JsError> {
-        let encryption_config = self.encryption_config.map(Into::into);
-        let rtc = JoinSessionParams {
-            user_id,
-            device_id,
-            // Filled in by the join entry point, which generates a fresh id per
-            // join and returns it.
-            membership_id: None,
-            room_id: self.room_id,
-            slot_id: self.slot_id,
-            application: self.application.into(),
-            transport,
-            keep_alive_timeout_ms: self.keep_alive_timeout_ms,
-            sticky_duration_ms: self.sticky_duration_ms,
-            degraded_lifetime_ms: self.degraded_lifetime_ms,
-            encryption_config,
-        };
-        Ok(CallJoinParams {
-            rtc,
+    /// The SDK generates the `member.id`: MSC4143 requires a fresh one per
+    /// join.
+    fn into_call(self) -> Result<CallJoinOptions, JsError> {
+        let transport = self.transport_intent()?;
+        let mut join = JoinOptions::new(self.slot_id, self.application);
+        join.transport = transport;
+        join.encryption_config = self.encryption_config.map(Into::into);
+        join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
+        join.sticky_duration_ms = self.sticky_duration_ms;
+        join.degraded_lifetime_ms = self.degraded_lifetime_ms;
+        Ok(CallJoinOptions {
+            join,
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
             reactions: self.reactions.map(Into::into),
         })
@@ -848,7 +749,7 @@ mod tests {
 
     /// A JS stand-in for the page's backend: every send resolves, the room
     /// subscription delivers one open slot, an unencrypted room, ourselves as
-    /// the only joined member and an empty sticky set, so `attachRoom` seeds.
+    /// the only joined member and an empty sticky set, so opening the room seeds.
     fn mock_host(sticky_check: &str) -> JsValue {
         let host = js_sys::Object::new();
         let set = |name: &str, args: &str, body: &str| {
@@ -936,7 +837,7 @@ mod tests {
         host.into()
     }
 
-    async fn attach(manager: &WasmRtcSessionManager, compat: Option<&str>) {
+    async fn open(client: &WasmRtcClient, compat: Option<&str>) -> WasmRtcRoom {
         // A plain object, as a page passes: the default serializer turns a
         // `json!` map into an ES `Map`, which reads back as no options at all.
         let options = match compat {
@@ -945,10 +846,21 @@ mod tests {
                 .unwrap(),
             None => JsValue::UNDEFINED,
         };
-        manager
-            .attach_room(ROOM.to_owned(), options)
-            .await
-            .expect("attach");
+        client.room(ROOM.to_owned(), options).await.expect("open")
+    }
+
+    #[derive(Serialize)]
+    struct TestJoinParams {
+        slot_id: &'static str,
+        application: &'static str,
+    }
+
+    fn join_params() -> JsValue {
+        serde_wasm_bindgen::to_value(&TestJoinParams {
+            slot_id: SLOT,
+            application: "m.call",
+        })
+        .unwrap()
     }
 
     /// A full join on the wasm target, with the transport taken from the
@@ -956,50 +868,28 @@ mod tests {
     /// which on wasm32-unknown-unknown must come from `Date.now()`.
     #[wasm_bindgen_test]
     async fn a_join_succeeds_on_wasm() {
-        #[derive(Serialize)]
-        struct TestJoinParams {
-            room_id: &'static str,
-            slot_id: &'static str,
-            application: &'static str,
-        }
+        let client = WasmRtcClient::new(mock_host(""));
+        let room = open(&client, None).await;
 
-        let manager = WasmRtcSessionManager::new(mock_host(""));
-        attach(&manager, None).await;
-
-        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            room_id: ROOM,
-            slot_id: SLOT,
-            application: "m.call",
-        })
-        .unwrap();
-
-        let member_id = manager.join(params).await.expect("join should succeed");
-        assert!(!member_id.is_empty());
-        assert_eq!(
-            manager
-                .own_member_id(ROOM.to_owned(), SLOT.to_owned())
-                .await,
-            Some(member_id),
-        );
-        assert!(manager.heartbeat(ROOM.to_owned(), SLOT.to_owned()).await);
+        let call = room
+            .join_call(join_params())
+            .await
+            .expect("join should succeed");
+        assert!(!call.member_id().is_empty());
+        assert!(call.is_live());
+        assert!(call.heartbeat().await);
     }
 
     #[wasm_bindgen_test]
-    async fn a_join_needs_an_attached_room() {
-        #[derive(Serialize)]
-        struct TestJoinParams {
-            room_id: &'static str,
-            slot_id: &'static str,
-            application: &'static str,
-        }
-        let manager = WasmRtcSessionManager::new(mock_host(""));
-        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            room_id: ROOM,
-            slot_id: SLOT,
-            application: "m.call",
-        })
-        .unwrap();
-        assert!(manager.join(params).await.is_err());
+    async fn a_room_is_opened_once() {
+        let client = WasmRtcClient::new(mock_host(""));
+        let _room = open(&client, None).await;
+        assert!(
+            client
+                .room(ROOM.to_owned(), JsValue::UNDEFINED)
+                .await
+                .is_err()
+        );
     }
 
     /// The sticky dialect's outbound rewrite, through the real send path: a
@@ -1015,22 +905,20 @@ mod tests {
         }
         #[derive(Serialize)]
         struct TestJoinParams {
-            room_id: &'static str,
             slot_id: &'static str,
             application: &'static str,
             transport: TestTransport,
         }
 
-        let manager = WasmRtcSessionManager::new(mock_host(
+        let client = WasmRtcClient::new(mock_host(
             "if (!Array.isArray(content.rtc_transports) \
                  || !Array.isArray(content.versions) \
                  || !content.member || content.member.user_id === undefined \
                  || content.member.device_id === undefined) \
                  return Promise.reject(new Error('legacy mirror fields missing: ' + JSON.stringify(content)));",
         ));
-        attach(&manager, Some("sticky_events")).await;
+        let room = open(&client, Some("sticky_events")).await;
         let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            room_id: ROOM,
             slot_id: SLOT,
             application: "m.call",
             transport: TestTransport {
@@ -1040,15 +928,18 @@ mod tests {
         })
         .unwrap();
 
-        manager
-            .join(params)
+        room.join_call(params)
             .await
             .expect("the rewritten membership should satisfy the strict mock");
     }
 
     #[wasm_bindgen_test]
-    async fn heartbeat_without_a_session_reports_nothing_to_keep_alive() {
-        let manager = WasmRtcSessionManager::new(mock_host(""));
-        assert!(!manager.heartbeat(ROOM.to_owned(), SLOT.to_owned()).await);
+    async fn a_left_call_has_nothing_to_keep_alive() {
+        let client = WasmRtcClient::new(mock_host(""));
+        let room = open(&client, None).await;
+        let call = room.join_call(join_params()).await.expect("join");
+        call.leave(JsValue::UNDEFINED).await.expect("leave");
+        assert!(!call.is_live());
+        assert!(!call.heartbeat().await);
     }
 }

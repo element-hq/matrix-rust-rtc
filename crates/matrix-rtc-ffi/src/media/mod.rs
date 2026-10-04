@@ -9,13 +9,14 @@
 //! client and therefore libwebrtc — roughly 8–15 MB per ABI). The slim
 //! signalling-only artifact stays available without it.
 //!
-//! The shape mirrors the native `Call` facade, adapted to an FFI host that
+//! The shape mirrors the native `LiveKitCall` facade, adapted to an FFI host that
 //! owns its own Matrix stack:
 //!
-//! 1. The host attaches the room on the
-//!    [`RtcSessionManagerHandle`](crate::RtcSessionManagerHandle) and `join`s
-//!    the slot; the library feeds itself from the host's backend.
-//! 2. [`connect_media_session`] then attaches media: it wires the E2EE key
+//! 1. The host opens the room on its [`RtcClient`](crate::RtcClient) and
+//!    joins the slot ([`RtcRoom::join_call`](crate::RtcRoom::join_call)); the
+//!    library feeds itself from the host's backend.
+//! 2. [`connect_media_session`] then attaches media to that
+//!    [`RtcCall`](crate::RtcCall): it wires the E2EE key
 //!    bridge into the core, starts the transport-agnostic `CallEngine`
 //!    (which opens connections to every peer's focus — MSC4195 multi-SFU),
 //!    and connects the own-focus SFU with per-participant frame encryption.
@@ -32,7 +33,7 @@
 //!    OpenID token for the SFU exchange comes from the same backend.
 //!
 //! Everything media runs on a dedicated multithreaded tokio runtime
-//! ([`runtime`]); the manager's `?Send` futures never touch it.
+//! ([`runtime`]); the signalling's `?Send` futures never touch it.
 
 mod frames;
 mod session;

@@ -53,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::ElementCallCompat;
-use matrix_rtc_livekit::{Call, CallOptions, open_slot};
+use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, open_slot};
 use matrix_rtc_media::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
     VideoRotation, VideoSourceConfig,
@@ -299,7 +299,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let args = Args::parse();
-    // `Call::join` drives `!Send` futures, so it must run inside a `LocalSet`.
+    // `LiveKitCall::join` drives `!Send` futures, so it must run inside a `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -491,7 +491,7 @@ struct Device {
     client: Client,
     device_id: OwnedDeviceId,
     sync: Option<SyncService>,
-    call: Option<Call>,
+    call: Option<LiveKitCall>,
     captured: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
     pumps: Vec<AbortOnDrop>,
@@ -594,9 +594,9 @@ impl Fleet {
             if index > 0 {
                 tokio::time::sleep(Duration::from_millis(args.ramp_ms)).await;
             }
-            let call = Call::join(
+            let call = LiveKitCall::join(
                 room,
-                CallOptions {
+                LiveKitCallOptions {
                     slot_id: args.slot_id.clone(),
                     application: args.application.clone(),
                     livekit_transport: Some(LiveKitTransport {
@@ -606,7 +606,7 @@ impl Fleet {
                     auto_subscribe: args.subscribe,
                     element_call_compat: args.element_call_compat.into(),
                     sticky_duration_ms: Some(args.sticky_duration_ms),
-                    ..CallOptions::default()
+                    ..LiveKitCallOptions::default()
                 },
             )
             .await?;
@@ -1052,7 +1052,7 @@ async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dy
 /// not run in lockstep, and the tiles are visibly distinct in the observing
 /// client.
 async fn spawn_video_pump(
-    call: &Call,
+    call: &LiveKitCall,
     args: &Args,
     clip: Arc<Clip>,
     index: usize,
@@ -1094,7 +1094,7 @@ async fn spawn_video_pump(
 
 /// Publish a per-device sine tone, so the audio path carries load too.
 async fn spawn_audio_pump(
-    call: &Call,
+    call: &LiveKitCall,
     args: &Args,
     index: usize,
     errors: Arc<AtomicU64>,

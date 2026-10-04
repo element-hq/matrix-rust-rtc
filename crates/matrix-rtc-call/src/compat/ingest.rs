@@ -130,7 +130,7 @@ pub fn member_id(compat: ElementCallCompat, user_id: &str, device_id: &str) -> S
 /// Normalise and parse one raw member event, or explain in the log why it
 /// contributes no membership.
 ///
-/// Mirrors [`crate::sdk`]'s snapshot handling, which does the same job for the
+/// Mirrors `matrix_rtc_matrix_sdk::sdk`'s snapshot handling, which does the same job for the
 /// Rust-native path — including the origin ranking, which is the subtle half.
 pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<RawStickyEvent> {
     let mut value = event.content;
