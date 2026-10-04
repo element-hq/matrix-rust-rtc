@@ -434,3 +434,22 @@ async fn dropping_the_to_device_feeder_ends_its_subscription() {
     drop(feeder);
     assert!(subscription.cancelled.load(Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn a_stalled_seeding_names_the_deliveries_it_waits_on() {
+    let mock = Arc::new(MockBackend::new());
+    let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
+    let (_attachment, mut run) =
+        RoomFeeder::attach(mock.clone(), manager, Arc::new(MembershipFormat::Current))
+            .await
+            .expect("attach");
+    assert_eq!(run.missing_subjects().len(), 4);
+
+    run.state.seen_encryption = true;
+    run.state.seen_slots = true;
+    run.state.sticky = Some(Vec::new());
+    assert_eq!(
+        run.missing_subjects(),
+        ["on_joined_members (including our own user)"]
+    );
+}

@@ -37,6 +37,7 @@ log only.
 
 ### Added
 
+- A room still waiting on its first deliveries logs which `RoomSink` calls are missing every 5 s, so a host that never delivers one sees why `room()` has not returned.
 - `BaseRtcClient` opens a core room that subscribes through the backend and feeds itself, so a host of the core alone feeds and ticks nothing.
 - A core room opens in a `MembershipFormat` (`BaseRtcClient::room(room_id, RoomOptions)`) and renders its joins in it, so a host of the core alone can join in the 2025 sticky or the pre-sticky room-state format.
 - `BaseRtcRoom::join` starts the slot's upkeep (keep-alive, sticky refresh, key rotations at their deadline) until the leave, so a host on the core alone ticks nothing either; `upkeep_abort_handle` stops it for an owner that drops the join without leaving.

@@ -36,6 +36,11 @@ const MEMBER_EVENT_TYPES: [&str; 2] = ["m.rtc.member", "org.matrix.msc4143.rtc.m
 const SLOT_EVENT_TYPES: [&str; 2] = [SLOT_EVENT_TYPE, "org.matrix.msc4143.rtc.slot"];
 const KEY_EVENT_TYPES: [&str; 2] = ["m.rtc.encryption_key", KEY_MESSAGE_TYPE];
 
+/// How long an unseeded room waits on a delivery before the feeder names what
+/// it is still waiting on; repeated while nothing arrives. A host that never
+/// delivers a subject leaves the open pending, and this says which one.
+const SEEDING_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The rooms a client holds, by room id: each one's dialect, which reads a
 /// media key of a type beyond the spec's, and a weak handle the to-device
 /// feeder routes keys to. Holding no strong reference is what lets a dropped room stop receiving
@@ -387,7 +392,24 @@ where
     M: ApplicationIntake<B>,
 {
     pub async fn run(mut self) {
-        while let Some(input) = self.rx.recv().await {
+        loop {
+            let input = if *self.seeded.borrow() {
+                self.rx.recv().await
+            } else {
+                tokio::select! {
+                    input = self.rx.recv() => input,
+                    () = crate::executor::sleep(SEEDING_WARN_AFTER) => {
+                        log::warn!(
+                            "[{}] not seeded: nothing delivered for {}s, still waiting on {}",
+                            self.room_id,
+                            SEEDING_WARN_AFTER.as_secs(),
+                            self.missing_subjects().join(", "),
+                        );
+                        continue;
+                    }
+                }
+            };
+            let Some(input) = input else { break };
             match input {
                 RoomInput::Stop => break,
                 RoomInput::Encryption(encrypted) => {
@@ -478,6 +500,35 @@ where
             .on_members_received(user_ids)
             .await;
         self.state.seen_members = true;
+    }
+
+    /// The `RoomSink` deliveries seeding still waits on, as the host would
+    /// name them.
+    fn missing_subjects(&self) -> Vec<String> {
+        let mut missing = Vec::new();
+        if !self.state.seen_encryption {
+            missing.push("on_encryption".to_owned());
+        }
+        if !self.state.seen_members {
+            missing.push("on_joined_members (including our own user)".to_owned());
+        }
+        if self.dialect.reads_slots() && !self.state.seen_slots {
+            missing.push(format!(
+                "on_state_events({})",
+                SLOT_EVENT_TYPES.join(" or ")
+            ));
+        }
+        if self.state.sticky.is_none() && self.state.membership_state.is_empty() {
+            let mut membership = vec!["on_sticky_events".to_owned()];
+            membership.extend(
+                self.dialect
+                    .membership_state_event_types()
+                    .into_iter()
+                    .map(|event_type| format!("on_state_events({event_type})")),
+            );
+            missing.push(membership.join(" or "));
+        }
+        missing
     }
 
     /// Room state before membership: a member is never briefly joined to a
