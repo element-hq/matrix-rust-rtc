@@ -12,8 +12,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::session::{
-    ApplicationInfo, CallMembershipEvent, JoinedMembership, LeaveReason, LeftMembership,
-    MemberInfo, Membership,
+    ApplicationInfo, JoinedMembership, LeaveReason, LeftMembership, MemberInfo, Membership,
+    RtcMembershipEvent,
 };
 use crate::transport::MemberTransports;
 use thiserror::Error;
@@ -117,11 +117,9 @@ pub struct RawStickyEvent {
     pub room_id: String,
     /// The event's id, when the host reports it.
     ///
-    /// Element Call's reactions and raised hand relate to the *membership
-    /// event* of the reacting member, so a member whose event id is unknown can
-    /// neither be reacted for nor have their reactions validated. Optional only
-    /// because a host may feed memberships it did not receive as events (a
-    /// translated pre-sticky state map, say); every real Matrix event has one.
+    /// Applications relate their events to it. Optional only because a host may
+    /// feed memberships it did not receive as events (a translated pre-sticky
+    /// state map); every real Matrix event has one.
     pub event_id: Option<String>,
     /// Sender user ID of the event.
     pub sender: String,
@@ -196,6 +194,39 @@ pub struct StickyEventsUpdate {
     pub removed: Vec<RawStickyEvent>,
 }
 
+/// A message-like room event, for applications; the core reads none. A
+/// redaction is not one of these: consumers take it as the redacted event's id.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RawTimelineEvent {
+    /// Room the event was sent to.
+    pub room_id: String,
+    /// The event's id.
+    pub event_id: String,
+    /// The event's sender.
+    pub sender: String,
+    /// How the event reached us.
+    #[serde(default)]
+    pub origin: EventOrigin,
+    /// The event type, verbatim.
+    pub event_type: String,
+    /// The event's `origin_server_ts`.
+    pub origin_server_ts: u64,
+    /// The event's whole `content` object, decrypted.
+    pub content: serde_json::Value,
+}
+
+/// Relations of one event an application wants the host to fetch
+/// (`GET /rooms/{room}/relations/{event_id}/{rel_type}/{event_type}`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationsRequest {
+    /// The event whose relations to fetch.
+    pub event_id: String,
+    /// The relation type, e.g. `m.annotation`.
+    pub rel_type: String,
+    /// The type of the relating events, e.g. `m.reaction`.
+    pub event_type: String,
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 /// Conversion errors while mapping transport DTOs into domain membership events.
 pub enum EventConversionError {
@@ -237,21 +268,18 @@ impl RawStickyEvent {
     /// The remaining MSC4143 join conditions (an open `m.rtc.slot`, the sender
     /// still being joined to the room, and the event still being sticky) depend
     /// on state this layer does not see; they are applied by the session.
-    pub fn try_into_call_membership_event(
-        self,
-    ) -> Result<CallMembershipEvent, EventConversionError> {
+    pub fn try_into_membership_event(self) -> Result<RtcMembershipEvent, EventConversionError> {
         self.check_convertible()?;
 
-        let application_type = self.content.application.application_type.clone();
         let member_id = self.content.member.id.clone();
 
         // `join` also requires an application type: MSC4143 makes the application
         // object REQUIRED on a joining member event.
-        let joined = self.content.member.is_join()
-            && application_type.as_deref().is_some_and(|t| !t.is_empty());
+        let joined =
+            self.content.member.is_join() && self.content.application.application_type().is_some();
 
         if !joined {
-            return Ok(CallMembershipEvent::Left(self.into_left(member_id)));
+            return Ok(RtcMembershipEvent::Left(self.into_left(member_id)));
         }
 
         let member_id = member_id.expect("is_join() guarantees a non-empty member.id");
@@ -269,7 +297,7 @@ impl RawStickyEvent {
 
         let transports = self.content.transports.unwrap_or_default();
 
-        Ok(CallMembershipEvent::Joined(JoinedMembership {
+        Ok(RtcMembershipEvent::Joined(JoinedMembership {
             room_id: self.room_id,
             slot_id: self.content.slot_id,
             sender: self.sender,
@@ -278,7 +306,7 @@ impl RawStickyEvent {
             member_id,
             membership_event_id: self.event_id,
             membership_ts: self.content.created_ts,
-            application: application_type,
+            application: self.content.application,
             transports: transports
                 .published
                 .into_iter()
@@ -294,10 +322,10 @@ impl RawStickyEvent {
     /// be interpreted as a left membership regardless of its content shape.
     pub fn try_into_left_membership_event(
         self,
-    ) -> Result<CallMembershipEvent, EventConversionError> {
+    ) -> Result<RtcMembershipEvent, EventConversionError> {
         self.check_convertible()?;
         let member_id = self.content.member.id.clone();
-        Ok(CallMembershipEvent::Left(self.into_left(member_id)))
+        Ok(RtcMembershipEvent::Left(self.into_left(member_id)))
     }
 
     fn into_left(self, member_id: Option<String>) -> LeftMembership {
@@ -324,15 +352,12 @@ impl RawStickyEventContent {
     pub(crate) fn for_join(
         slot_id: String,
         member_id: String,
-        application_type: String,
+        application: ApplicationInfo,
         transports: MemberTransports,
     ) -> Self {
         Self {
             slot_id,
-            application: ApplicationInfo {
-                application_type: Some(application_type),
-                ..ApplicationInfo::default()
-            },
+            application,
             member: MemberInfo {
                 id: Some(member_id.clone()),
                 membership: Some(Membership::Join),
@@ -402,9 +427,9 @@ mod tests {
         }
     }
 
-    fn parse(json: &str) -> CallMembershipEvent {
+    fn parse(json: &str) -> RtcMembershipEvent {
         event(serde_json::from_str(json).expect("content must parse"))
-            .try_into_call_membership_event()
+            .try_into_membership_event()
             .expect("conversion must succeed")
     }
 
@@ -445,10 +470,14 @@ mod tests {
     #[test]
     fn spec_shaped_join_event_parses() {
         match parse(JOIN_JSON) {
-            CallMembershipEvent::Joined(joined) => {
+            RtcMembershipEvent::Joined(joined) => {
                 assert_eq!(joined.member_id, "xyzABCDEF0123");
                 assert_eq!(joined.sticky_key, "xyzABCDEF0123");
-                assert_eq!(joined.application.as_deref(), Some("m.call"));
+                assert_eq!(joined.application.application_type(), Some("m.call"));
+                assert_eq!(
+                    joined.application.extra.get("m.call.voice_only"),
+                    Some(&serde_json::json!(true)),
+                );
                 assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
                 assert_eq!(joined.origin.sender_device_id(), Some("DEVICEID"));
                 match &joined.transports[..] {
@@ -458,7 +487,7 @@ mod tests {
                     other => panic!("expected one livekit transport, got {other:?}"),
                 }
             }
-            CallMembershipEvent::Left(_) => panic!("expected a joined membership"),
+            RtcMembershipEvent::Left(_) => panic!("expected a joined membership"),
         }
     }
 
@@ -468,10 +497,10 @@ mod tests {
     fn membership_leave_wins_over_join_shaped_content() {
         let json = JOIN_JSON.replace(r#""membership": "join""#, r#""membership": "leave""#);
         match parse(&json) {
-            CallMembershipEvent::Left(left) => {
+            RtcMembershipEvent::Left(left) => {
                 assert_eq!(left.member_id.as_deref(), Some("xyzABCDEF0123"));
             }
-            CallMembershipEvent::Joined(_) => panic!("membership=leave must not count as joined"),
+            RtcMembershipEvent::Joined(_) => panic!("membership=leave must not count as joined"),
         }
     }
 
@@ -487,8 +516,8 @@ mod tests {
             Some(Membership::Unknown("lurking".to_owned()))
         );
         assert!(matches!(
-            event(content).try_into_call_membership_event().unwrap(),
-            CallMembershipEvent::Left(_)
+            event(content).try_into_membership_event().unwrap(),
+            RtcMembershipEvent::Left(_)
         ));
     }
 
@@ -499,7 +528,7 @@ mod tests {
             r#""application": { "type": "m.call", "m.call.voice_only": true },"#,
             "",
         );
-        assert!(matches!(parse(&json), CallMembershipEvent::Left(_)));
+        assert!(matches!(parse(&json), RtcMembershipEvent::Left(_)));
     }
 
     #[test]
@@ -512,8 +541,8 @@ mod tests {
                       "msc4354_sticky_key": "abc" }}"#
             );
             match parse(&json) {
-                CallMembershipEvent::Left(left) => left.leave_reason.expect("leave_reason"),
-                CallMembershipEvent::Joined(_) => panic!("expected left"),
+                RtcMembershipEvent::Left(left) => left.leave_reason.expect("leave_reason"),
+                RtcMembershipEvent::Joined(_) => panic!("expected left"),
             }
         };
 
@@ -534,7 +563,7 @@ mod tests {
         let content: RawStickyEventContent = serde_json::from_str(JOIN_JSON).unwrap();
         assert!(matches!(
             event(content).try_into_left_membership_event().unwrap(),
-            CallMembershipEvent::Left(_)
+            RtcMembershipEvent::Left(_)
         ));
     }
 
@@ -544,7 +573,7 @@ mod tests {
         let built = RawStickyEventContent::for_join(
             "m.call#ROOM".to_owned(),
             "xyzABCDEF0123".to_owned(),
-            "m.call".to_owned(),
+            "m.call".into(),
             MemberTransports::publishing(RawRtcTransport {
                 transport_type: "livekit".to_owned(),
                 extra_fields: Default::default(),
@@ -563,6 +592,23 @@ mod tests {
         assert_eq!(
             parsed.transports.unwrap().can_subscribe,
             vec!["livekit".to_owned()]
+        );
+    }
+
+    #[test]
+    fn built_join_content_carries_application_properties() {
+        let built = RawStickyEventContent::for_join(
+            "org.example.board#ROOM".to_owned(),
+            "xyzABCDEF0123".to_owned(),
+            ApplicationInfo::new("org.example.board")
+                .with_extra("board_id", serde_json::json!("b1")),
+            MemberTransports::default(),
+        );
+
+        let json = serde_json::to_value(&built).unwrap();
+        assert_eq!(
+            json.pointer("/application"),
+            Some(&serde_json::json!({ "type": "org.example.board", "board_id": "b1" })),
         );
     }
 }

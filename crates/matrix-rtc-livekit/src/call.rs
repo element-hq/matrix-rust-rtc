@@ -58,10 +58,13 @@ use matrix_rtc_bridge::{
     SdkCommandSender, TimelineIngest, register_timeline_receiver, run_membership_bridge,
     run_timeline_bridge,
 };
+use matrix_rtc_call::{
+    CallJoinParams, CallSessionManager, NotifyConfig, RaisedHand, ReactionError, ReactionsConfig,
+};
 use matrix_rtc_core::{
-    EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin, LiveKitTransport,
-    NotifyConfig, RaisedHand, ReactionError, ReactionsConfig, ReceivedEncryptionKey,
-    RtcSessionManager, RtcTransport, SlotEncryption, generate_member_id,
+    ApplicationIntake, EncryptionConfig, JoinSessionParams, KEY_MESSAGE_TYPE, KeyOrigin,
+    LiveKitTransport, ReceivedEncryptionKey, RtcSessionManager, RtcTransport, SlotEncryption,
+    generate_member_id,
 };
 use matrix_rtc_media::{
     CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
@@ -75,7 +78,7 @@ use crate::{
     MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 
-type Manager = Arc<Mutex<RtcSessionManager<SdkCommandSender>>>;
+type Manager = Arc<Mutex<CallSessionManager<SdkCommandSender>>>;
 
 /// Errors produced when joining, operating, or leaving a [`Call`].
 #[derive(Debug, thiserror::Error)]
@@ -97,7 +100,7 @@ pub enum CallError {
     Signalling(String),
 
     /// A reaction or raised hand could not be sent (see
-    /// [`matrix_rtc_core::reactions`]).
+    /// [`matrix_rtc_call::reactions`]).
     #[error(transparent)]
     Reaction(#[from] ReactionError),
 }
@@ -328,7 +331,7 @@ impl Call {
                 ))
             }
         };
-        let manager: Manager = Arc::new(Mutex::new(RtcSessionManager::with_command_sender(
+        let manager: Manager = Arc::new(Mutex::new(CallSessionManager::with_command_sender(
             Arc::new(SdkCommandSender::with_compat(client.clone(), dialect)),
         )));
         let sticky_bridge = AbortOnDrop(tokio::task::spawn_local(run_membership_bridge(
@@ -342,8 +345,12 @@ impl Call {
         // handler forwards over a channel to a `spawn_local` pump that drives
         // the `!Send` manager.
         let (timeline_tx, timeline_rx) = unbounded_channel::<TimelineIngest>();
-        let timeline_handler =
-            client.event_handler_drop_guard(register_timeline_receiver(room, timeline_tx));
+        let timeline_types = manager.lock().await.timeline_event_types();
+        let timeline_handler = client.event_handler_drop_guard(register_timeline_receiver(
+            room,
+            timeline_tx,
+            timeline_types,
+        ));
         let timeline_bridge = AbortOnDrop(tokio::task::spawn_local(run_timeline_bridge(
             room_id.clone(),
             manager.clone(),
@@ -432,8 +439,11 @@ impl Call {
         params.encryption_config = options.encryption_config.clone();
         params.sticky_duration_ms = options.sticky_duration_ms;
         params.degraded_lifetime_ms = options.degraded_lifetime_ms;
-        params.notify = options.notify.clone();
-        params.reactions = options.reactions.clone();
+        let params = CallJoinParams {
+            rtc: params,
+            notify: options.notify.clone(),
+            reactions: options.reactions.clone(),
+        };
         let (memberships, raised_hands, reactions) = {
             let mut mgr = manager.lock().await;
             mgr.join(params).await.map_err(signalling_error)?;
@@ -667,7 +677,7 @@ impl Call {
     }
 
     /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
-    /// by (see [`matrix_rtc_core::KNOWN_REACTIONS`]); only the first grapheme
+    /// by (see [`matrix_rtc_call::KNOWN_REACTIONS`]); only the first grapheme
     /// of `emoji` is sent. Returns the event id.
     ///
     /// Fails with [`ReactionError::Cooldown`] inside the send cooldown, since

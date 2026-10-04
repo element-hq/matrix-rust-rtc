@@ -6,7 +6,8 @@ This document explains the initial architecture of the Matrix RTC Rust workspace
 
 The goal is to keep protocol logic in one Rust core crate and make all platform adaptation explicit at the edges.
 
-- `matrix-rtc-core` owns RTC domain behavior.
+- `matrix-rtc-core` owns MSC4143, for any application.
+- `matrix-rtc-call` owns the call application on top of it.
 - `matrix-rtc-bridge` owns how that behavior reaches a Matrix homeserver.
 - `matrix-rtc-wasm` owns JavaScript-facing conversion and wasm export details.
 - `matrix-rtc-ffi` owns native binding-facing conversion and UniFFI boundary types.
@@ -54,6 +55,36 @@ only under its `media` feature, which is what keeps that mobile artifact free of
 the transport.
 
 This keeps the core reusable and testable while avoiding platform-specific dependencies in core.
+
+### Applications on the core
+
+MSC4143 is application-agnostic; a call (`m.call`) is one application, and a
+shared board would be a sibling of `matrix-rtc-call` on the same core:
+
+```
+   bindings (ffi, wasm) · matrix-rtc-livekit's Call facade
+                 │
+                 ▼
+          matrix-rtc-media   engine, pool, tiles (still imports call types)
+                 │
+                 ▼
+          matrix-rtc-call    reactions, raised hand, MSC4075; CallSessionManager
+                 │
+                 ▼
+          matrix-rtc-core    MSC4143: membership, slots, encryption; host vocabulary
+```
+
+The dependency diagram at the top omits `matrix-rtc-call`. The media → call edge is temporary,
+until the call-side roster and tiles move above the call crate.
+
+What lets an application sit on the core without the core knowing it:
+
+- **`MembershipListener`**: told synchronously of every change to a session's
+  joined memberships, since the core spawns nothing to await the watch.
+- **`host/`**: `send_room_event`, `redact_event` and `RawTimelineEvent` exist for
+  applications; the core uses none of them.
+- **`ApplicationIntake`**: how the matrix-sdk bridge feeds an application
+  timeline events and relations without knowing which application it is.
 
 ## Who drives the call
 
@@ -146,23 +177,21 @@ At this stage there is no persistence, network transport, or encryption key dist
 
 ## `crates/matrix-rtc-core`
 
-- Public API:
-  - `RtcSession::new` (single session)
-  - `RtcSession::initial_events` (single session)
-  - `RtcSession::handle_update` (single session)
-  - `RtcSessionManager::on_sticky_events_snapshot_received` (multi session)
-  - `RtcSessionManager::on_sticky_events_update_received` (multi session)
-  - `RtcSessionManager::initial_sticky_for_room` (room-scoped)
-  - `RtcSessionManager::sticky_update_for_room` (room-scoped)
-- Input boundary:
-  - `RawStickyEvent`, `RawStickyEventUpdate`, and `StickyEventsUpdate` represent SDK-provided sticky snapshot/diff data.
-- Conversion:
-  - Converts only RTC membership event types (`m.rtc.member` and `org.matrix.msc4143.rtc.member`) into `CallMembershipEvent`.
-- Session state:
-  - In-memory membership is owned directly by `RtcSession`.
-  - `RtcSessionManager` owns multiple `RtcSession` instances keyed by `(room_id, slot_id)`.
-  - `RtcSession` exposes reactive membership snapshot subscriptions for a single session.
-  - TODO: add a manager-level lifecycle subscription API for session added/removed events.
+- MSC4143 only: membership, slots and their join conditions, per-member
+  encryption, our own membership's lifecycle.
+- `RtcSessionManager` owns `RtcSession`s keyed by `(room_id, slot_id)`.
+- `ApplicationInfo` carries the whole `application` object both ways; the core
+  reads only `type`.
+- `testing::MockCommandSender` under the `testing` feature.
+
+## `crates/matrix-rtc-call`
+
+- Reactions and the raised hand (Element Call, unspecced), MSC4075 notifications,
+  and `CallSessionManager`.
+- `CallSessionManager` owns the core manager (reached via `Deref`) and wraps
+  `join` (rings the room if we started), `leave` (lowers our hand first) and
+  `heartbeat` (moves our hand onto the refreshed membership).
+- Depends on the core alone; arms no timers; compiles for wasm32.
 
 ## `crates/matrix-rtc-bridge`
 
@@ -172,7 +201,8 @@ At this stage there is no persistence, network transport, or encryption key dist
   core's `RtcCommandSender`, turning outbound commands (join/leave sticky events,
   the dead man's switch delayed events, Olm-encrypted `m.rtc.encryption_key`
   to-device messages) into Client-Server requests; `run_membership_bridge` feeds
-  the room's live membership back into an `RtcSessionManager`. It reads MSC4354
+  the room's live membership, and the timeline events and relations it asks
+  for, into an `ApplicationIntake`. It reads MSC4354
   sticky events (the SDK's `unstable-msc4354`) and, in the pre-sticky
   `ElementCallCompat::StateEvents` mode, `org.matrix.msc3401.call.member` room
   state as well.
@@ -233,7 +263,8 @@ At this stage there is no persistence, network transport, or encryption key dist
   Only the *own* focus — established synchronously by the caller so join can
   fail fast, then handed over via `adopt_own_connection` — ends the call
   when it dies.
-- Depends only on `matrix-rtc-core` + tokio/futures — no LiveKit, no
+- Depends only on `matrix-rtc-core`, `matrix-rtc-call` (temporarily, for hand and
+  reaction types) + tokio/futures — no LiveKit, no
   libwebrtc, fully unit-testable (`FakeTransport`). Compiles for wasm32:
   the transport traits are `Send + Sync` off wasm (via `MaybeSend`) and
   unconstrained on it, and tasks/timers go through the `rt` seam (tokio
@@ -413,9 +444,10 @@ The outgoing key message declares `format: 0` as the spec requires.
 ### Notifications and ringing (MSC4075)
 
 Membership says who is *in* a session, never who should be *summoned* to one, so
-a mobile client had nothing to raise an incoming call from. `notification.rs`
-builds the `m.rtc.notification` that fills the gap; `RtcSession::join` sends it
-when the host set `JoinSessionParams::notify`. Three decisions are worth knowing:
+a mobile client had nothing to raise an incoming call from. `matrix-rtc-call`'s
+`notification.rs` builds the `m.rtc.notification` that fills the gap;
+`CallSessionManager::join` sends it when the host set `CallJoinParams::notify`.
+Three decisions are worth knowing:
 
 - **The relation is what forced a breaking host change.** MSC4075 requires an
   `m.reference` to the sender's own `m.rtc.member` event, and nothing in this
@@ -464,8 +496,8 @@ with an `m.reference` and `emoji` / `name` fields, a raised hand is an
 `m.reaction` annotation with key `🖐️`, lowered by redacting it. Nothing in the
 content is trusted beyond that relation — the receiver checks that the reaction's
 sender is the membership's sender, which the homeserver authenticated. The
-protocol lives in `reactions.rs` and is exercised through `RtcSession`; the
-decisions worth knowing:
+protocol lives in `matrix-rtc-call`'s `reactions.rs` and is driven by
+`CallSessionManager`; the decisions worth knowing:
 
 - **Only the protocol is in the SDK; sound and display are the host's.** The
   media crate has no playout path, and capture and render are platform-side by
@@ -479,8 +511,8 @@ decisions worth knowing:
   re-sends the membership and the new event replaces the old in the sticky map;
   matrix-js-sdk's `CallMembership.eventId` follows it, and Element Call drops a
   raised hand whose membership event has moved on, re-querying the new event's
-  relations. So `OwnMembershipMachine` now tracks the latest event id, and the
-  heartbeat re-annotates our hand onto the new event (redacting the old
+  relations. So `OwnMembershipMachine` now tracks the latest event id, and
+  `CallSessionManager::heartbeat` re-annotates our hand onto the new event (redacting the old
   annotation) whenever it has moved — every 30 minutes at the default lifetime.
   Peers may see the hand drop for one round trip in between; that is the
   protocol's, not ours. As a *receiver* we are more lenient: a hand stays up for
@@ -493,15 +525,15 @@ decisions worth knowing:
   the media engine and key distribution diff by `member_id` and `membership_ts`.
 - **Hands raised before we joined come from `/relations`.** The timeline we see
   live starts at our join; the annotation lives in the relations of the member's
-  membership event. The session lists membership events whose relations it has
-  not seen (`pending_relation_lookups`), the host answers each with
+  membership event. The call layer lists membership events whose relations it
+  has not seen (`pending_relation_lookups`), the host answers each with
   `rel_type=m.annotation`, `event_type=m.reaction` (`on_relations_received`), and
   only hands are taken from the answer — an hour-old applause is not replayed.
   The matrix-sdk bridge and the `matrix-js-sdk` host module do this on every
   tick; an FFI host does it itself, one request per new membership event id.
 - **Inbound needed a new intake.** The core only ever saw sticky, slot and
-  to-device traffic. `RawTimelineEvent` (`on_room_timeline_events`) and
-  `on_event_redacted` are routed by *room* — a reaction names no slot — to every
+  to-device traffic. `CallSessionManager::on_room_timeline_events` and
+  `on_event_redacted` route by *room* — a reaction names no slot — to every
   session of the room, each keeping what relates to its own members. The matrix-sdk
   bridge feeds them from a room event handler (`register_timeline_receiver` →
   `run_timeline_bridge`, the same `Send`-handler-to-`spawn_local`-pump shape as

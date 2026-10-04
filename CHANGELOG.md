@@ -8,6 +8,20 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- Call features (reactions, raised hand, MSC4075 notify) moved from `matrix-rtc-core` to the new `matrix-rtc-call` crate, driven by `CallSessionManager` and joined with `CallJoinParams`.
+- `CallMembershipEvent` is renamed `RtcMembershipEvent`, and `try_into_call_membership_event` is renamed `try_into_membership_event`.
+- `JoinSessionParams.application` and `JoinedMembership.application` are the whole MSC4143 `ApplicationInfo`, and the wasm roster serializes it as an object.
+- `RtcSessionManager::join`, `RtcSession::join` and `CallSessionManager::join` return the event id of the membership they sent.
+- The matrix-sdk bridge feeds any `ApplicationIntake`, and its timeline receiver takes the event types to forward.
+
+### Added
+
+- `RtcSessionManager::add_membership_listener`: synchronous notice of every change to a session's joined memberships, for applications built on the core.
+- `ApplicationIntake` and `RelationsRequest`, how a host feeds an application beyond membership.
+- `RtcSessionManager::command_sender()`, and a core `testing` feature exposing `MockCommandSender`.
+
 ## v0.4.0-rc.1 - 2026-09-25
 
 ### Added

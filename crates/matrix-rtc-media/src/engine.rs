@@ -40,7 +40,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::{DiscardedKey, JoinedMembership, RaisedHand, ReceivedReaction};
+use matrix_rtc_call::{RaisedHand, ReceivedReaction};
+use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::constraints::MediaConstraints;
@@ -146,13 +147,14 @@ pub struct EngineConfig {
     /// one itself — the caller establishes it (so join can fail fast) and
     /// hands it over via [`CallEngine::adopt_own_connection`].
     pub own_connection_key: Option<String>,
-    /// The core's raised-hand snapshots
-    /// (`RtcSession::subscribe_raised_hands`), merged onto the roster as
+    /// The call layer's raised-hand snapshots
+    /// (`CallSessionManager::subscribe_raised_hands`), merged onto the roster as
     /// [`Participant::hand_raised_at_ms`] and reported as
     /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`]. `None` leaves
     /// every hand down.
     pub raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
-    /// The core's emoji reactions (`RtcSession::subscribe_reactions`),
+    /// The call layer's emoji reactions
+    /// (`CallSessionManager::subscribe_reactions`),
     /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
     /// reports no reactions.
     pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,
@@ -2440,7 +2442,7 @@ mod tests {
             member_id: member_id.to_owned(),
             membership_event_id: None,
             membership_ts: None,
-            application: Some("m.call".to_owned()),
+            application: "m.call".into(),
             transports: vec![RtcTransport::LiveKit(LiveKitTransport {
                 livekit_service_url: focus.to_owned(),
             })],
@@ -2548,7 +2550,7 @@ mod tests {
                 sender: "@bob:example.org".to_owned(),
                 emoji: "👏".to_owned(),
                 name: "clapping".to_owned(),
-                sound: matrix_rtc_core::ReactionSound::Named("clap".to_owned()),
+                sound: matrix_rtc_call::ReactionSound::Named("clap".to_owned()),
             })
             .unwrap();
         assert_eq!(

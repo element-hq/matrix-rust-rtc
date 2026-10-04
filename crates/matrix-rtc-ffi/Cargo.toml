@@ -15,6 +15,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-rtc-call = { path = "../matrix-rtc-call" }
 # Deliberately WITHOUT the `matrix-sdk` feature — only `compat`, which is pure
 # JSON translation with no git dependencies and no async runtime. That is the
 # whole of what an FFI host needs from this crate: the host owns its Matrix

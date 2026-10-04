@@ -5,7 +5,7 @@
 
 //! Key rotation as timed multi-party scenarios.
 //!
-//! Rotation is a *policy*, and its inputs are a roster and a clock: how many
+//! Rotation is a *policy*, and its inputs are the joined memberships and a clock: how many
 //! keys a call burns through depends entirely on when people arrive and leave
 //! relative to `key_rotation_grace_period_ms` and `delay_before_use_ms`. A
 //! single manager checked against a hand-written membership list cannot say
@@ -388,7 +388,7 @@ impl Peer {
             member_id: self.member_id.clone(),
             membership_event_id: None,
             membership_ts: None,
-            application: Some("m.call".to_owned()),
+            application: "m.call".into(),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
         }
@@ -413,16 +413,16 @@ fn device_id_of(name: &str) -> String {
 // The call
 // ---------------------------------------------------------------------------
 
-/// One call: a shared roster, a shared clock, a to-device bus, and every
+/// One call: shared joined memberships, a shared clock, a to-device bus, and every
 /// participant's real encryption manager.
 ///
-/// The roster is shared rather than per-peer on purpose: everybody sees every
+/// The joined memberships are shared rather than per-peer on purpose: everybody sees every
 /// membership change instantly, which is the friendliest input the policy can
 /// get. Anything that goes wrong here is not the network's fault.
 struct Call {
     clock: TestClock,
     bus: Arc<Bus>,
-    roster: Arc<Mutex<Vec<JoinedMembership>>>,
+    joined: Arc<Mutex<Vec<JoinedMembership>>>,
     peers: Vec<Peer>,
     config: EncryptionConfig,
     /// Bumped per join so a rejoining device gets a fresh `member_id`.
@@ -434,7 +434,7 @@ impl Call {
         Self {
             clock: TestClock::new(),
             bus: Arc::new(Bus::default()),
-            roster: Arc::new(Mutex::new(Vec::new())),
+            joined: Arc::new(Mutex::new(Vec::new())),
             peers: Vec::new(),
             config,
             joins: 0,
@@ -468,7 +468,7 @@ impl Call {
             identity_of(&user_id, &device_id),
             self.clock.clone(),
         ));
-        let roster = self.roster.clone();
+        let joined = self.joined.clone();
         let mut manager = EncryptionManager::new(
             Arc::new(PeerSender {
                 bus: self.bus.clone(),
@@ -479,7 +479,7 @@ impl Call {
             member_id.clone(),
             ROOM_ID.to_owned(),
             SLOT_ID.to_owned(),
-            move || roster.lock().unwrap().clone(),
+            move || joined.lock().unwrap().clone(),
         );
         manager.set_config(self.config.clone());
         manager.set_clock({
@@ -501,7 +501,7 @@ impl Call {
             media,
             in_call: true,
         };
-        self.roster.lock().unwrap().push(peer.membership());
+        self.joined.lock().unwrap().push(peer.membership());
         self.peers.push(peer);
 
         self.settle().await;
@@ -519,7 +519,7 @@ impl Call {
             peer.manager.leave();
             peer.member_id.clone()
         };
-        self.roster
+        self.joined
             .lock()
             .unwrap()
             .retain(|membership| membership.member_id != member_id);
@@ -527,7 +527,7 @@ impl Call {
         self.settle().await;
     }
 
-    /// Several people leave and the roster moves once, which is what a host that
+    /// Several people leave and the joined memberships change once, which is what a host that
     /// feeds whole sticky-state snapshots produces (`RtcSession::set_current_state`
     /// rebuilds the candidate set and refreshes once).
     async fn leave_together(&mut self, names: &[&str]) {
@@ -542,7 +542,7 @@ impl Call {
                 peer.manager.leave();
                 peer.member_id.clone()
             };
-            self.roster
+            self.joined
                 .lock()
                 .unwrap()
                 .retain(|membership| membership.member_id != member_id);
@@ -568,7 +568,7 @@ impl Call {
             .remove(&(user_id_of(name), device_id_of(name)));
     }
 
-    /// Time passes with nothing happening to the roster.
+    /// Time passes with nothing happening to the joined memberships.
     ///
     /// A rotation coalesced into a switch window falls due at some point during
     /// this, and something has to collect it — in a real client whatever drives
@@ -586,7 +586,7 @@ impl Call {
         self.deliver_all().await;
     }
 
-    /// One roster change, delivered to everyone: each participant is told the
+    /// One membership change, delivered to everyone: each participant is told the
     /// memberships moved, and every key message that produces is routed.
     ///
     /// This is exactly one `on_memberships_update()` per participant, which is
@@ -907,7 +907,7 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
     );
 }
 
-/// Three people hang up together, seen as one roster move.
+/// Three people hang up together, seen as one membership change.
 ///
 /// This is the shape the real ingestion path produces:
 /// `RtcSessionManager::set_current_sticky_state` takes the **whole** sticky state
@@ -916,7 +916,7 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
 /// reach the policy as a single change and must cost a single key — which is also
 /// what makes a debounce unnecessary for this case.
 #[tokio::test]
-async fn departures_in_one_roster_move_cost_one_rotation() {
+async fn departures_in_one_membership_change_cost_one_rotation() {
     let mut call = Call::with_defaults();
 
     for name in ["alice", "bob", "carol", "dave", "erin"] {
@@ -927,11 +927,11 @@ async fn departures_in_one_roster_move_cost_one_rotation() {
 
     call.leave_together(&["bob", "carol", "dave"]).await;
 
-    call.assert_media_flows("three departures in one roster move");
+    call.assert_media_flows("three departures in one membership change");
     assert_eq!(
         call.rotations("alice"),
         1,
-        "one roster move, one new key — {}",
+        "one membership change, one new key — {}",
         call.cost(),
     );
     assert_eq!(
@@ -942,7 +942,7 @@ async fn departures_in_one_roster_move_cost_one_rotation() {
     );
 }
 
-/// Three departures, each arriving as its own roster move, while the key is fresh.
+/// Three departures, each arriving as its own membership change, while the key is fresh.
 ///
 /// The first rotates, because the call had settled. That makes a fresh key, and the
 /// two departures landing during its freshness do not each mint one of their own —
@@ -1164,7 +1164,7 @@ async fn an_arrival_during_a_switch_window_can_decrypt_immediately() {
 
 /// A long, quiet call still replaces its key.
 ///
-/// Nothing about the roster asks for a rotation, so without a lifetime cap one key
+/// Nothing in the joined memberships asks for a rotation, so without a lifetime cap one key
 /// would encrypt the whole meeting — and anything that later recovered it would
 /// recover all of it. The cap bounds that to `max_key_lifetime_ms`, at one rotation
 /// per period.
@@ -1194,7 +1194,7 @@ async fn a_key_expires_even_when_nothing_happens() {
     );
 }
 
-/// A call whose roster never stops moving still spends only one key per grace
+/// A call whose joined memberships never stop changing still spends only one key per grace
 /// period.
 ///
 /// This is not a separate rate limit; it falls out of anchoring the deferral to the
@@ -1324,7 +1324,7 @@ async fn a_retry_after_a_failed_delivery_reuses_the_key() {
         "sanity check on the scenario: bob was unreachable, so alice's key never got to him",
     );
 
-    // The rate limit clears, and something moves the roster again.
+    // The rate limit clears, and something changes the joined memberships again.
     call.unblock_device("bob");
     call.advance(30_000).await;
     call.join("carol").await;
@@ -1356,7 +1356,7 @@ async fn an_unreachable_member_adds_no_rotations() {
         }
         call.join("bob").await;
 
-        // Roster churn a real call has plenty of, each move well outside the
+        // Membership churn a real call has plenty of, each move well outside the
         // grace period.
         for _ in 0..3 {
             call.advance(30_000).await;
@@ -1521,8 +1521,8 @@ async fn documented_costs() {
         (36, 28, 195)
     );
 
-    // -- 3 leave in one roster update ---------------------------------------
-    println!("\n## 5-member call, 3 leave in one roster update");
+    // -- 3 leave in one membership change ---------------------------------------
+    println!("\n## 5-member call, 3 leave in one membership change");
     let mut call = Call::with_defaults();
     for name in five {
         call.join(name).await;

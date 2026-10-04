@@ -129,18 +129,18 @@ pub struct FfiNotifyConfig {
     pub mention_room: bool,
 }
 
-impl From<FfiNotifyConfig> for matrix_rtc_core::NotifyConfig {
+impl From<FfiNotifyConfig> for matrix_rtc_call::NotifyConfig {
     fn from(value: FfiNotifyConfig) -> Self {
-        matrix_rtc_core::NotifyConfig {
+        matrix_rtc_call::NotifyConfig {
             notification_type: match value.notification_type {
-                FfiNotificationType::Ring => matrix_rtc_core::NotificationType::Ring,
+                FfiNotificationType::Ring => matrix_rtc_call::NotificationType::Ring,
                 FfiNotificationType::Notification => {
-                    matrix_rtc_core::NotificationType::Notification
+                    matrix_rtc_call::NotificationType::Notification
                 }
             },
             intent: value.intent,
             lifetime_ms: value.lifetime_ms,
-            mentions: matrix_rtc_core::Mentions {
+            mentions: matrix_rtc_call::Mentions {
                 user_ids: value.mention_user_ids,
                 room: value.mention_room,
             },
@@ -224,7 +224,7 @@ pub struct FfiJoinSessionParams {
 }
 
 /// FFI-friendly reactions configuration (mirrors
-/// `matrix_rtc_core::ReactionsConfig`).
+/// `matrix_rtc_call::ReactionsConfig`).
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiReactionsConfig {
     /// Whether reactions are handled at all. Off, inbound reactions and raised
@@ -242,9 +242,9 @@ pub struct FfiReactionsConfig {
     pub send_cooldown_ms: u64,
 }
 
-impl From<FfiReactionsConfig> for matrix_rtc_core::ReactionsConfig {
+impl From<FfiReactionsConfig> for matrix_rtc_call::ReactionsConfig {
     fn from(value: FfiReactionsConfig) -> Self {
-        matrix_rtc_core::ReactionsConfig {
+        matrix_rtc_call::ReactionsConfig {
             enabled: value.enabled,
             active_window_ms: value.active_window_ms,
             send_cooldown_ms: value.send_cooldown_ms,
@@ -340,7 +340,7 @@ impl FfiJoinSessionParams {
 
     pub fn into_core(
         self,
-    ) -> Result<matrix_rtc_core::JoinSessionParams, matrix_rtc_core::CommandError> {
+    ) -> Result<matrix_rtc_call::CallJoinParams, matrix_rtc_core::CommandError> {
         let transport = match self.transport {
             Some(transport) => matrix_rtc_core::TransportIntent::Publish(transport.into_core()?),
             None => matrix_rtc_core::TransportIntent::ReceiveOnly {
@@ -348,7 +348,7 @@ impl FfiJoinSessionParams {
             },
         };
         let encryption_config = self.encryption_config.map(Into::into);
-        Ok(matrix_rtc_core::JoinSessionParams {
+        let rtc = matrix_rtc_core::JoinSessionParams {
             user_id: self.user_id,
             device_id: self.device_id,
             // Filled in by the join entry points, which generate a fresh id per
@@ -359,12 +359,15 @@ impl FfiJoinSessionParams {
             membership_id: None,
             room_id: self.room_id,
             slot_id: self.slot_id,
-            application: self.application,
+            application: self.application.into(),
             transport,
             keep_alive_timeout_ms: self.keep_alive_timeout_ms,
             sticky_duration_ms: self.sticky_duration_ms,
             degraded_lifetime_ms: self.degraded_lifetime_ms,
             encryption_config,
+        };
+        Ok(matrix_rtc_call::CallJoinParams {
+            rtc,
             notify: self.notify.map(Into::into),
             reactions: self.reactions.map(Into::into),
         })

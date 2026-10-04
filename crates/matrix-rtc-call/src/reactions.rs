@@ -32,7 +32,7 @@
 //!
 //! - Our own raised hand is re-annotated onto the new membership event after
 //!   every refresh (and the old annotation redacted), or Element Call peers
-//!   would lower it for us. See [`crate::RtcSession::heartbeat`].
+//!   would lower it for us. See [`crate::CallSessionManager::heartbeat`].
 //! - As a receiver we are more lenient than Element Call: a hand stays raised
 //!   for as long as the member is in the call, whichever of their membership
 //!   events it was annotated on. A member's reaction is validated against every
@@ -47,15 +47,16 @@ use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::error::CommandError;
-use crate::event::EventOrigin;
-use crate::session::JoinedMembership;
+use matrix_rtc_core::{CommandError, JoinedMembership, RawTimelineEvent};
 
 /// Event type of an Element Call emoji reaction.
 pub const REACTION_EVENT_TYPE: &str = "io.element.call.reaction";
 
 /// Event type of the raised-hand annotation: the ordinary Matrix reaction.
 pub const ANNOTATION_EVENT_TYPE: &str = "m.reaction";
+
+/// Relation type of the raised-hand annotation.
+pub const ANNOTATION_RELATION_TYPE: &str = "m.annotation";
 
 /// The annotation key Element Call uses for a raised hand: U+1F590 U+FE0F,
 /// "raised hand with fingers splayed" with the emoji presentation selector.
@@ -256,34 +257,6 @@ impl Default for ReactionsConfig {
     }
 }
 
-/// One message-like room event, as a host hands it to the core.
-///
-/// The reactions intake takes every event the host cares to forward and picks
-/// out the two types it reads; anything else is ignored. Redactions are not
-/// events here — a redaction only names its target, and hosts already resolve
-/// that per room version — so they arrive through
-/// [`crate::RtcSessionManager::on_event_redacted`] instead.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RawTimelineEvent {
-    /// Room the event was sent to.
-    pub room_id: String,
-    /// The event's id.
-    pub event_id: String,
-    /// The event's sender.
-    pub sender: String,
-    /// How the event reached us. Compared against the membership's origin: a
-    /// reaction from a different device than the membership's is logged, and
-    /// accepted, as Element Call accepts it.
-    #[serde(default)]
-    pub origin: EventOrigin,
-    /// The event type: [`REACTION_EVENT_TYPE`] or [`ANNOTATION_EVENT_TYPE`].
-    pub event_type: String,
-    /// The event's `origin_server_ts`, which is when a hand counts as raised.
-    pub origin_server_ts: u64,
-    /// The event's whole `content` object, decrypted.
-    pub content: Value,
-}
-
 /// Content of an `io.element.call.reaction` event.
 pub fn build_reaction_content(membership_event_id: &str, emoji: &str, name: &str) -> Value {
     json!({
@@ -300,7 +273,7 @@ pub fn build_reaction_content(membership_event_id: &str, emoji: &str, name: &str
 pub fn build_raised_hand_content(membership_event_id: &str) -> Value {
     json!({
         "m.relates_to": {
-            "rel_type": "m.annotation",
+            "rel_type": ANNOTATION_RELATION_TYPE,
             "event_id": membership_event_id,
             "key": RAISED_HAND_KEY,
         },
@@ -362,7 +335,7 @@ pub(crate) fn parse_timeline_event(event: &RawTimelineEvent) -> ParsedTimelineEv
                 .and_then(|relation| relation.get("key"))
                 .and_then(Value::as_str);
             match (rel_type, target, key) {
-                (Some("m.annotation"), Some(target), Some(RAISED_HAND_KEY)) => {
+                (Some(ANNOTATION_RELATION_TYPE), Some(target), Some(RAISED_HAND_KEY)) => {
                     ParsedTimelineEvent::RaisedHand {
                         target: target.to_owned(),
                     }
@@ -415,7 +388,7 @@ pub struct ReceivedReaction {
 /// lists what it has not looked up yet, the host answers each with the
 /// `/relations` of that event (`rel_type=m.annotation`,
 /// `event_type=m.reaction`), fed back through
-/// [`crate::RtcSessionManager::on_relations_received`].
+/// [`crate::CallSessionManager::on_relations_received`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationLookup {
     /// The member whose event it is.
@@ -501,7 +474,7 @@ impl ReactionsState {
         let (reactions_tx, _) = broadcast::channel(REACTIONS_CHANNEL_CAPACITY);
         Self {
             config: ReactionsConfig::default(),
-            clock: Arc::new(crate::own_membership::now_ms),
+            clock: Arc::new(crate::now_ms),
             raised_hands: BTreeMap::new(),
             raised_hands_tx,
             reactions_tx,
@@ -521,7 +494,6 @@ impl ReactionsState {
         &self.config
     }
 
-    #[cfg(test)]
     pub(crate) fn set_clock(&mut self, clock: Clock) {
         self.clock = clock;
     }
@@ -878,6 +850,7 @@ impl ReactionsState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_rtc_core::EventOrigin;
 
     fn event(event_type: &str, sender: &str, content: Value) -> RawTimelineEvent {
         RawTimelineEvent {
@@ -1042,592 +1015,6 @@ mod tests {
         assert_eq!(sound_for(""), ReactionSound::Generic);
         assert_eq!(ReactionSound::Generic.asset_name(), Some("generic"));
         assert_eq!(ReactionSound::None.asset_name(), None);
-    }
-
-    // ---- Through the session ----
-
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    use tokio::sync::broadcast::error::TryRecvError;
-
-    use crate::commands::MockCommandSender;
-    use crate::event::{RawStickyEvent, RawStickyEventContent};
-    use crate::join::{JoinSessionParams, LeaveSessionParams};
-    use crate::session::{CallMembershipEvent, MemberInfo, Membership, RtcSession};
-    use crate::transport::{LiveKitTransport, RtcTransport};
-
-    const ROOM: &str = "!room:example.org";
-    const SLOT: &str = "m.call#ROOM";
-    const ALICE: &str = "@alice:example.org";
-    const BOB: &str = "@bob:example.org";
-    const BOB_MEMBER: &str = "bob-member-1";
-
-    /// A clock the test moves by hand.
-    struct TestClock(Arc<AtomicU64>);
-
-    impl TestClock {
-        fn new(start: u64) -> Self {
-            Self(Arc::new(AtomicU64::new(start)))
-        }
-
-        fn clock(&self) -> Clock {
-            let time = self.0.clone();
-            Arc::new(move || time.load(Ordering::SeqCst))
-        }
-
-        fn advance(&self, ms: u64) {
-            self.0.fetch_add(ms, Ordering::SeqCst);
-        }
-    }
-
-    fn member_event(
-        sender: &str,
-        device: &str,
-        member_id: &str,
-        event_id: &str,
-    ) -> CallMembershipEvent {
-        RawStickyEvent {
-            room_id: ROOM.to_owned(),
-            event_id: Some(event_id.to_owned()),
-            sender: sender.to_owned(),
-            origin: EventOrigin::encrypted(Some(device.to_owned())),
-            event_type: "m.rtc.member".to_owned(),
-            content: RawStickyEventContent {
-                slot_id: SLOT.to_owned(),
-                sticky_key: member_id.to_owned(),
-                member: MemberInfo {
-                    id: Some(member_id.to_owned()),
-                    membership: Some(Membership::Join),
-                },
-                application: crate::session::ApplicationInfo {
-                    application_type: Some("m.call".to_owned()),
-                    extra: Default::default(),
-                },
-                transports: None,
-                leave_reason: None,
-                created_ts: None,
-            },
-        }
-        .try_into_call_membership_event()
-        .expect("a join-shaped event converts")
-    }
-
-    fn join_params() -> JoinSessionParams {
-        JoinSessionParams::new(
-            ALICE.to_owned(),
-            "ALICEDEV".to_owned(),
-            ROOM.to_owned(),
-            SLOT.to_owned(),
-            "m.call".to_owned(),
-            RtcTransport::LiveKit(LiveKitTransport {
-                livekit_service_url: "https://sfu.example.org".to_owned(),
-            }),
-        )
-    }
-
-    /// Alice joined (her membership event is `$sticky-1`), Bob in the roster
-    /// with membership event `$bob-member-1`.
-    async fn joined_session(
-        params: JoinSessionParams,
-    ) -> (RtcSession<MockCommandSender>, Arc<MockCommandSender>) {
-        let sender = Arc::new(MockCommandSender::new());
-        let mut session = RtcSession::with_command_sender(sender.clone());
-        let own_member_id = params.membership_id();
-        let params = JoinSessionParams {
-            membership_id: Some(own_member_id.clone()),
-            ..params
-        };
-        session.join(params).await.expect("join succeeds");
-        assert_eq!(
-            session.own_membership_event_id().as_deref(),
-            Some("$sticky-1")
-        );
-        session
-            .set_current_state(vec![
-                member_event(ALICE, "ALICEDEV", &own_member_id, "$sticky-1"),
-                member_event(BOB, "BOBDEV", BOB_MEMBER, "$bob-member-1"),
-            ])
-            .await;
-        assert_eq!(session.member_count(), 2);
-        (session, sender)
-    }
-
-    fn timeline_event(
-        event_id: &str,
-        sender: &str,
-        event_type: &str,
-        ts: u64,
-        content: Value,
-    ) -> RawTimelineEvent {
-        RawTimelineEvent {
-            room_id: ROOM.to_owned(),
-            event_id: event_id.to_owned(),
-            sender: sender.to_owned(),
-            origin: EventOrigin::Unknown,
-            event_type: event_type.to_owned(),
-            origin_server_ts: ts,
-            content,
-        }
-    }
-
-    fn bob_reacts(event_id: &str, target: &str, emoji: &str, name: &str) -> RawTimelineEvent {
-        timeline_event(
-            event_id,
-            BOB,
-            REACTION_EVENT_TYPE,
-            1_000,
-            build_reaction_content(target, emoji, name),
-        )
-    }
-
-    fn bob_raises(event_id: &str, target: &str, ts: u64) -> RawTimelineEvent {
-        timeline_event(
-            event_id,
-            BOB,
-            ANNOTATION_EVENT_TYPE,
-            ts,
-            build_raised_hand_content(target),
-        )
-    }
-
-    fn hands(session: &RtcSession<MockCommandSender>) -> Vec<(&'static str, String)> {
-        session
-            .raised_hands()
-            .into_iter()
-            .map(|hand| {
-                let who = if hand.sender == BOB { "bob" } else { "alice" };
-                (who, hand.reaction_event_id)
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn a_peers_reaction_is_surfaced_with_its_sound() {
-        let (mut session, _) = joined_session(join_params()).await;
-        let mut reactions = session.subscribe_reactions();
-
-        session.on_timeline_event(&bob_reacts("$r1", "$bob-member-1", "👏", "clapping"));
-
-        let received = reactions.try_recv().expect("one reaction");
-        assert_eq!(received.member_id, BOB_MEMBER);
-        assert_eq!(received.sender, BOB);
-        assert_eq!(received.emoji, "👏");
-        assert_eq!(received.name, "clapping");
-        assert_eq!(received.sound, ReactionSound::Named("clap".to_owned()));
-    }
-
-    #[tokio::test]
-    async fn a_reaction_is_only_accepted_from_the_member_it_relates_to() {
-        let (mut session, _) = joined_session(join_params()).await;
-        let mut reactions = session.subscribe_reactions();
-
-        // Carol reacting "as" Bob.
-        let mut forged = bob_reacts("$r1", "$bob-member-1", "👏", "clapping");
-        forged.sender = "@carol:example.org".to_owned();
-        session.on_timeline_event(&forged);
-        // Bob relating to an event that is nobody's membership.
-        session.on_timeline_event(&bob_reacts("$r2", "$not-a-membership", "👏", "clapping"));
-        // Bob raising a hand on Alice's membership.
-        session.on_timeline_event(&bob_raises("$h1", "$sticky-1", 5));
-
-        assert_eq!(reactions.try_recv().unwrap_err(), TryRecvError::Empty);
-        assert!(session.raised_hands().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_repeat_inside_the_active_window_is_dropped() {
-        let (mut session, _) = joined_session(join_params()).await;
-        let clock = TestClock::new(10_000);
-        session.set_reactions_clock(clock.clock());
-        let mut reactions = session.subscribe_reactions();
-
-        session.on_timeline_event(&bob_reacts("$r1", "$bob-member-1", "👏", "clapping"));
-        clock.advance(1_000);
-        session.on_timeline_event(&bob_reacts("$r2", "$bob-member-1", "🎉", "party"));
-        assert_eq!(reactions.try_recv().unwrap().emoji, "👏");
-        assert_eq!(reactions.try_recv().unwrap_err(), TryRecvError::Empty);
-
-        clock.advance(2_000);
-        session.on_timeline_event(&bob_reacts("$r3", "$bob-member-1", "🎉", "party"));
-        assert_eq!(reactions.try_recv().unwrap().emoji, "🎉");
-    }
-
-    #[tokio::test]
-    async fn sending_relates_to_our_membership_and_honours_the_cooldown() {
-        let (mut session, sender) = joined_session(join_params()).await;
-        let clock = TestClock::new(10_000);
-        session.set_reactions_clock(clock.clock());
-
-        let event_id = session
-            .send_reaction("🎉 and more", "party")
-            .await
-            .expect("first reaction goes out");
-        assert_eq!(event_id, "$room-1");
-        let sent = sender.room_events.lock().unwrap().clone();
-        assert_eq!(
-            sent,
-            vec![(
-                ROOM.to_owned(),
-                REACTION_EVENT_TYPE.to_owned(),
-                build_reaction_content("$sticky-1", "🎉", "party"),
-            )]
-        );
-
-        clock.advance(1_000);
-        match session.send_reaction("👏", "clapping").await {
-            Err(ReactionError::Cooldown { remaining_ms }) => assert_eq!(remaining_ms, 2_000),
-            other => panic!("expected a cooldown, got {other:?}"),
-        }
-        assert_eq!(sender.room_events.lock().unwrap().len(), 1);
-
-        clock.advance(2_000);
-        session
-            .send_reaction("👏", "clapping")
-            .await
-            .expect("the cooldown has passed");
-        assert_eq!(sender.room_events.lock().unwrap().len(), 2);
-
-        assert!(matches!(
-            session.send_reaction("   ", "nothing").await,
-            Err(ReactionError::EmptyEmoji)
-        ));
-    }
-
-    #[tokio::test]
-    async fn raising_is_idempotent_and_lowering_redacts_the_annotation() {
-        let (mut session, sender) = joined_session(join_params()).await;
-        let mut watch = session.subscribe_raised_hands();
-
-        session.raise_hand().await.expect("raise");
-        let sent = sender.room_events.lock().unwrap().clone();
-        assert_eq!(
-            sent,
-            vec![(
-                ROOM.to_owned(),
-                ANNOTATION_EVENT_TYPE.to_owned(),
-                build_raised_hand_content("$sticky-1"),
-            )]
-        );
-        // Shown locally at once, before any echo.
-        assert_eq!(hands(&session), vec![("alice", "$room-1".to_owned())]);
-        assert!(watch.has_changed().unwrap());
-        assert_eq!(watch.borrow_and_update().len(), 1);
-
-        session.raise_hand().await.expect("raise again");
-        assert_eq!(
-            sender.room_events.lock().unwrap().len(),
-            1,
-            "nothing re-sent"
-        );
-
-        // The echo of our own annotation changes nothing.
-        session.on_timeline_event(&timeline_event(
-            "$room-1",
-            ALICE,
-            ANNOTATION_EVENT_TYPE,
-            2_000,
-            build_raised_hand_content("$sticky-1"),
-        ));
-        assert_eq!(hands(&session), vec![("alice", "$room-1".to_owned())]);
-        assert!(!watch.has_changed().unwrap());
-
-        session.lower_hand().await.expect("lower");
-        assert_eq!(
-            sender.redactions.lock().unwrap().clone(),
-            vec![(ROOM.to_owned(), "$room-1".to_owned(), None)]
-        );
-        assert!(session.raised_hands().is_empty());
-
-        session.lower_hand().await.expect("lowering twice is fine");
-        assert_eq!(sender.redactions.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_peers_hand_stays_across_their_refresh_and_goes_with_them() {
-        let (mut session, _) = joined_session(join_params()).await;
-        let own_member_id = session.own_member_id().unwrap().to_owned();
-
-        // Before anything was fetched, Bob's membership event wants a lookup
-        // and ours does not.
-        assert_eq!(
-            session.pending_relation_lookups(),
-            vec![RelationLookup {
-                member_id: BOB_MEMBER.to_owned(),
-                membership_event_id: "$bob-member-1".to_owned(),
-            }]
-        );
-        session.on_relations_received("$bob-member-1", &[]);
-        assert!(session.pending_relation_lookups().is_empty());
-
-        session.on_timeline_event(&bob_raises("$h1", "$bob-member-1", 5_000));
-        assert_eq!(hands(&session), vec![("bob", "$h1".to_owned())]);
-
-        // Bob's sticky refresh moves his membership event on.
-        session
-            .set_current_state(vec![
-                member_event(ALICE, "ALICEDEV", &own_member_id, "$sticky-1"),
-                member_event(BOB, "BOBDEV", BOB_MEMBER, "$bob-member-2"),
-            ])
-            .await;
-        assert_eq!(
-            hands(&session),
-            vec![("bob", "$h1".to_owned())],
-            "a hand outlives a refresh"
-        );
-        assert_eq!(
-            session.pending_relation_lookups(),
-            vec![RelationLookup {
-                member_id: BOB_MEMBER.to_owned(),
-                membership_event_id: "$bob-member-2".to_owned(),
-            }],
-            "the new event's annotations are looked up"
-        );
-
-        // A reaction relating to the previous event is still his.
-        let mut reactions = session.subscribe_reactions();
-        session.on_timeline_event(&bob_reacts("$r1", "$bob-member-1", "🐶", "dog"));
-        assert_eq!(reactions.try_recv().unwrap().member_id, BOB_MEMBER);
-
-        // Bob leaves: hand gone.
-        session
-            .set_current_state(vec![member_event(
-                ALICE,
-                "ALICEDEV",
-                &own_member_id,
-                "$sticky-1",
-            )])
-            .await;
-        assert!(session.raised_hands().is_empty());
-    }
-
-    #[tokio::test]
-    async fn backfill_restores_hands_but_never_replays_reactions() {
-        let (mut session, _) = joined_session(join_params()).await;
-        let mut reactions = session.subscribe_reactions();
-
-        session.on_relations_received(
-            "$bob-member-1",
-            &[
-                bob_reacts("$old-reaction", "$bob-member-1", "👏", "clapping"),
-                bob_raises("$old-hand", "$bob-member-1", 100),
-            ],
-        );
-
-        assert_eq!(hands(&session), vec![("bob", "$old-hand".to_owned())]);
-        assert_eq!(reactions.try_recv().unwrap_err(), TryRecvError::Empty);
-    }
-
-    #[tokio::test]
-    async fn a_redaction_lowers_the_hand_it_raised() {
-        let (mut session, _) = joined_session(join_params()).await;
-        session.on_timeline_event(&bob_raises("$h1", "$bob-member-1", 5_000));
-        assert_eq!(hands(&session).len(), 1);
-
-        session.on_event_redacted("$something-else");
-        assert_eq!(hands(&session).len(), 1);
-
-        session.on_event_redacted("$h1");
-        assert!(session.raised_hands().is_empty());
-    }
-
-    #[tokio::test]
-    async fn hands_are_ordered_by_when_they_were_raised() {
-        let (mut session, _) = joined_session(join_params()).await;
-        session.raise_hand().await.expect("raise");
-        // Bob's hand went up before ours, by the server's clock.
-        session.on_timeline_event(&bob_raises("$h1", "$bob-member-1", 1));
-
-        let order: Vec<&str> = hands(&session).iter().map(|(who, _)| *who).collect();
-        assert_eq!(order, vec!["bob", "alice"]);
-    }
-
-    #[tokio::test]
-    async fn the_hand_follows_our_membership_event_across_a_refresh() {
-        // A zero lifetime makes every heartbeat refresh the sticky membership.
-        let params = JoinSessionParams {
-            sticky_duration_ms: Some(0),
-            ..join_params()
-        };
-        let (mut session, sender) = joined_session(params).await;
-        session.raise_hand().await.expect("raise");
-        assert_eq!(
-            session
-                .own_raised_hand()
-                .unwrap()
-                .annotated_membership_event_id,
-            "$sticky-1"
-        );
-
-        assert!(session.heartbeat().await);
-
-        assert_eq!(
-            session.own_membership_event_id().as_deref(),
-            Some("$sticky-2"),
-            "the heartbeat refreshed the membership"
-        );
-        let sent = sender.room_events.lock().unwrap().clone();
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[1].2, build_raised_hand_content("$sticky-2"));
-        assert_eq!(
-            sender.redactions.lock().unwrap().clone(),
-            vec![(ROOM.to_owned(), "$room-1".to_owned(), None)],
-            "the annotation on the old membership event is redacted"
-        );
-        assert_eq!(hands(&session), vec![("alice", "$room-2".to_owned())]);
-        let own = session.own_raised_hand().unwrap();
-        assert_eq!(own.annotated_membership_event_id, "$sticky-2");
-        assert_eq!(own.reaction_event_id, "$room-2");
-
-        // Lowering redacts the current annotation, not the superseded one.
-        session.lower_hand().await.expect("lower");
-        assert_eq!(sender.redactions.lock().unwrap()[1].1, "$room-2");
-    }
-
-    #[tokio::test]
-    async fn leaving_lowers_our_hand_first() {
-        let (mut session, sender) = joined_session(join_params()).await;
-        session.raise_hand().await.expect("raise");
-
-        session
-            .leave(LeaveSessionParams::new())
-            .await
-            .expect("leave");
-
-        assert_eq!(
-            sender.redactions.lock().unwrap().clone(),
-            vec![(ROOM.to_owned(), "$room-1".to_owned(), None)]
-        );
-        assert!(session.own_raised_hand().is_none());
-        assert!(matches!(
-            session.raise_hand().await,
-            Err(ReactionError::NotJoined)
-        ));
-    }
-
-    #[tokio::test]
-    async fn disabled_reactions_neither_send_nor_receive() {
-        let params = JoinSessionParams {
-            reactions: Some(ReactionsConfig {
-                enabled: false,
-                ..ReactionsConfig::default()
-            }),
-            ..join_params()
-        };
-        let (mut session, sender) = joined_session(params).await;
-        let mut reactions = session.subscribe_reactions();
-
-        assert!(matches!(
-            session.send_reaction("👏", "clapping").await,
-            Err(ReactionError::Disabled)
-        ));
-        assert!(matches!(
-            session.raise_hand().await,
-            Err(ReactionError::Disabled)
-        ));
-        assert!(sender.room_events.lock().unwrap().is_empty());
-
-        session.on_timeline_event(&bob_reacts("$r1", "$bob-member-1", "👏", "clapping"));
-        session.on_timeline_event(&bob_raises("$h1", "$bob-member-1", 5_000));
-        assert_eq!(reactions.try_recv().unwrap_err(), TryRecvError::Empty);
-        assert!(session.raised_hands().is_empty());
-        assert!(session.pending_relation_lookups().is_empty());
-    }
-
-    /// Two slots in one room: a reaction names no slot, so the manager offers
-    /// it to both sessions and only the one holding the member keeps it.
-    #[tokio::test]
-    async fn the_manager_routes_a_rooms_reactions_to_the_session_holding_the_member() {
-        use crate::manager::RtcSessionManager;
-
-        let sender = Arc::new(MockCommandSender::new());
-        let mut manager = RtcSessionManager::with_command_sender(sender);
-        let other_slot = "m.call#OTHER";
-
-        let in_room_slot = join_params();
-        let in_other_slot = JoinSessionParams {
-            slot_id: other_slot.to_owned(),
-            ..join_params()
-        };
-        let alice_a = in_room_slot.membership_id();
-        let alice_b = in_other_slot.membership_id();
-        manager
-            .join(JoinSessionParams {
-                membership_id: Some(alice_a.clone()),
-                ..in_room_slot
-            })
-            .await
-            .expect("join slot A");
-        manager
-            .join(JoinSessionParams {
-                membership_id: Some(alice_b.clone()),
-                ..in_other_slot
-            })
-            .await
-            .expect("join slot B");
-
-        let mut bob_in_a = member_event(BOB, "BOBDEV", BOB_MEMBER, "$bob-member-1");
-        let CallMembershipEvent::Joined(joined) = &mut bob_in_a else {
-            unreachable!()
-        };
-        let bob_raw = RawStickyEvent {
-            room_id: ROOM.to_owned(),
-            event_id: joined.membership_event_id.clone(),
-            sender: BOB.to_owned(),
-            origin: joined.origin.clone(),
-            event_type: "m.rtc.member".to_owned(),
-            content: RawStickyEventContent {
-                slot_id: SLOT.to_owned(),
-                sticky_key: BOB_MEMBER.to_owned(),
-                member: MemberInfo {
-                    id: Some(BOB_MEMBER.to_owned()),
-                    membership: Some(Membership::Join),
-                },
-                application: crate::session::ApplicationInfo {
-                    application_type: Some("m.call".to_owned()),
-                    extra: Default::default(),
-                },
-                transports: None,
-                leave_reason: None,
-                created_ts: None,
-            },
-        };
-        manager
-            .set_current_sticky_state(ROOM, vec![bob_raw])
-            .await
-            .expect("state applies");
-        assert_eq!(manager.member_count(ROOM, SLOT), Some(1));
-        assert_eq!(manager.member_count(ROOM, other_slot), Some(0));
-
-        let mut slot_a = manager.subscribe_reactions(ROOM, SLOT).unwrap();
-        let mut slot_b = manager.subscribe_reactions(ROOM, other_slot).unwrap();
-
-        manager.on_room_timeline_events(
-            ROOM,
-            &[
-                bob_reacts("$r1", "$bob-member-1", "👏", "clapping"),
-                bob_raises("$h1", "$bob-member-1", 5_000),
-            ],
-        );
-
-        assert_eq!(slot_a.try_recv().unwrap().member_id, BOB_MEMBER);
-        assert_eq!(slot_b.try_recv().unwrap_err(), TryRecvError::Empty);
-        assert_eq!(manager.raised_hands(ROOM, SLOT).unwrap().len(), 1);
-        assert!(manager.raised_hands(ROOM, other_slot).unwrap().is_empty());
-        assert_eq!(
-            manager.pending_relation_lookups(ROOM),
-            vec![RelationLookup {
-                member_id: BOB_MEMBER.to_owned(),
-                membership_event_id: "$bob-member-1".to_owned(),
-            }]
-        );
-
-        manager.on_event_redacted(ROOM, "$h1");
-        assert!(manager.raised_hands(ROOM, SLOT).unwrap().is_empty());
-
-        assert!(matches!(
-            manager.raise_hand(ROOM, "m.call#NOWHERE").await,
-            Err(ReactionError::NoSession)
-        ));
     }
 
     #[test]

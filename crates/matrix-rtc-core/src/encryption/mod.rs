@@ -64,7 +64,7 @@
 //! consumer has to drive it, because the core owns no timer.
 //!
 //! Membership changes that arrive *together* are cheaper still: a rollout sees a
-//! whole roster, so any number of simultaneous changes cost one rotation between
+//! whole set of joined memberships, so any number of simultaneous changes cost one rotation between
 //! them. Hosts should feed complete state rather than event by event — see
 //! `RtcSessionManager::set_current_sticky_state`.
 //!
@@ -84,7 +84,7 @@
 //! oversight: switching the moment somebody hangs up freezes video for everyone
 //! still in the call while the replacement key travels, and a few seconds
 //! readable to someone who has already left costs less than a call that stutters
-//! whenever the roster moves.
+//! whenever the joined memberships change.
 //!
 //! Whoever *arrives* at a rotation is handed the outgoing key as well as its
 //! replacement. Without it the wait would blind them completely — they hold
@@ -243,9 +243,9 @@ fn system_clock() -> u64 {
 /// time. See [`EncryptionManager::set_clock`].
 pub type RtcClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 
-use crate::commands::{RtcCommandSender, ToDeviceRecipient};
 use crate::error::CommandError;
-use crate::event::EventOrigin;
+use crate::host::commands::{RtcCommandSender, ToDeviceRecipient};
+use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
 
@@ -1373,7 +1373,7 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
     /// (see [`Self::rollout_outbound_key`]). Something has to come back for it:
     /// the deferral is what keeps a burst of departures from costing a key each,
     /// and if nothing ever collected on it, a member who left during the window
-    /// would keep the key they hold until the roster happened to move again.
+    /// would keep the key they hold until the joined memberships happened to change again.
     ///
     /// A no-op when nothing is owed or the window has not closed, so it is safe to
     /// call on any tick a consumer already has.
@@ -1985,8 +1985,8 @@ impl<T: RtcCommandSender + 'static> EncryptionManager<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
-    use crate::event::EventOrigin;
+    use crate::host::commands::{MockCommandSender, NoopCommandSender, ToDeviceDelivery};
+    use crate::host::event::EventOrigin;
     use crate::session::JoinedMembership;
     use std::sync::Arc;
 
@@ -2030,7 +2030,7 @@ mod tests {
             member_id: "bob-device456-uuid".to_string(),
             membership_event_id: None,
             membership_ts: None,
-            application: Some("m.call".to_string()),
+            application: "m.call".into(),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
         }
@@ -2440,7 +2440,7 @@ mod tests {
     ///
     /// Deferring is what keeps a burst of departures from costing a key each, but it
     /// only holds together if something comes back when the expiry arrives. If a
-    /// quiet roster meant the rotation never happened, the members who left would
+    /// quiet membership meant the rotation never happened, the members who left would
     /// keep the key they hold indefinitely — strictly worse than rotating per
     /// departure.
     #[tokio::test]
@@ -2526,7 +2526,7 @@ mod tests {
             manager.get_outbound_key().map(|key| key.key_index),
             Some(held),
             "the owed rotation must happen once the expiry arrives, or carol keeps the key she \
-             holds for as long as the roster stays still"
+             holds for as long as the joined memberships stay still"
         );
         assert_eq!(
             manager.rotation_due_at_ms(),

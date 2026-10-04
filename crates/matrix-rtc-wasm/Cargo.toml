@@ -15,6 +15,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
+matrix-rtc-call = { path = "../matrix-rtc-call" }
 # The media roster/pool engine (its actor runs on `spawn_local` here) and the
 # shared key handler; `bridge` for the compat dialects and `OpenIdToken`;
 # `proto` for the MSC4195 identity derivation and token shapes. None of these

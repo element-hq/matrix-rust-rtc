@@ -39,7 +39,7 @@ pub fn wire_event_type(event_type: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KEY_MESSAGE_TYPE, NOTIFICATION_EVENT_TYPE, SLOT_EVENT_TYPE};
+    use crate::{KEY_MESSAGE_TYPE, SLOT_EVENT_TYPE};
 
     #[test]
     fn maps_the_types_the_core_sends() {
@@ -53,7 +53,7 @@ mod tests {
         );
         // MSC4075, not MSC4143: notifications are their own proposal.
         assert_eq!(
-            wire_event_type(NOTIFICATION_EVENT_TYPE),
+            wire_event_type("m.rtc.notification"),
             "org.matrix.msc4075.rtc.notification"
         );
         // Already unstable in the core; must survive a round through the table.
@@ -71,7 +71,7 @@ mod tests {
             "m.rtc.member",
             SLOT_EVENT_TYPE,
             KEY_MESSAGE_TYPE,
-            NOTIFICATION_EVENT_TYPE,
+            "m.rtc.notification",
         ] {
             let once = wire_event_type(stable);
             assert_eq!(wire_event_type(once), once);
