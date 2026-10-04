@@ -12,7 +12,7 @@
 //! This module defines the UniFFI-facing DTOs and object wrappers and converts
 //! them into core DTOs so `matrix-rtc-core` stays decoupled from FFI types.
 
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock as TokioRwLock;
 use tokio::sync::watch;
@@ -440,9 +440,9 @@ impl RtcRoom {
 
     /// Observe a slot's joined roster, without joining it.
     ///
-    /// The subscription yields the current roster on its first
-    /// `nextSnapshot()` and then only on change, so a host can attach at any
-    /// point without missing the state it attached to.
+    /// The subscription yields the current roster on its first `next()` and
+    /// then only on change, so a host can attach at any point without missing
+    /// the state it attached to.
     pub async fn subscribe_membership_snapshots(
         &self,
         slot_id: String,
@@ -628,48 +628,32 @@ impl RtcCall {
     }
 }
 
-struct SubscriptionState {
-    receiver: watch::Receiver<Vec<CoreJoinedMembership>>,
-    initial_pending: bool,
-}
-
+/// A slot's joined roster, pulled with an async [`Self::next`] like the media
+/// frame streams.
 #[derive(uniffi::Object)]
 pub struct MembershipSnapshotSubscription {
-    state: Mutex<SubscriptionState>,
+    receiver: tokio::sync::Mutex<watch::Receiver<Vec<CoreJoinedMembership>>>,
 }
 
 impl MembershipSnapshotSubscription {
-    fn new(receiver: watch::Receiver<Vec<CoreJoinedMembership>>) -> Arc<Self> {
+    fn new(mut receiver: watch::Receiver<Vec<CoreJoinedMembership>>) -> Arc<Self> {
+        // The first `next` yields the roster as it is now.
+        receiver.mark_changed();
         Arc::new(Self {
-            state: Mutex::new(SubscriptionState {
-                receiver,
-                initial_pending: true,
-            }),
+            receiver: tokio::sync::Mutex::new(receiver),
         })
     }
 }
 
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl MembershipSnapshotSubscription {
-    pub fn next_snapshot(&self) -> Result<Option<Vec<JoinedMembership>>, MatrixRtcFfiError> {
-        let mut state = lock_mutex(&self.state)?;
-
-        let snapshot = if state.initial_pending {
-            state.initial_pending = false;
-            Some(state.receiver.borrow().clone())
-        } else {
-            match state.receiver.has_changed() {
-                Ok(true) => Some(state.receiver.borrow_and_update().clone()),
-                Ok(false) | Err(_) => None,
-            }
-        };
-
-        Ok(snapshot.map(|members| {
-            members
-                .into_iter()
-                .map(to_ffi_joined_membership)
-                .collect::<Vec<_>>()
-        }))
+    /// The current roster on the first call, then the next one that differs.
+    /// `None` once the room is shut down or dropped.
+    pub async fn next(&self) -> Option<Vec<JoinedMembership>> {
+        let mut receiver = self.receiver.lock().await;
+        receiver.changed().await.ok()?;
+        let members = receiver.borrow_and_update().clone();
+        Some(members.into_iter().map(to_ffi_joined_membership).collect())
     }
 }
 
@@ -685,36 +669,6 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         application: member.application.application_type,
         transports: member.transports.iter().map(Into::into).collect(),
         can_subscribe: member.can_subscribe,
-    }
-}
-
-/// Locks `mutex`, recovering from poisoning rather than propagating it.
-///
-/// A panic anywhere inside a handle method used to poison the handle for the
-/// rest of the process: every later call — `member_count`, and critically
-/// `leave` — returned [`MatrixRtcFfiError::InternalLockPoisoned`] forever, so
-/// the host could not even depart the session and its membership stayed live
-/// until the dead man's switch expired. One panic permanently disabling the
-/// manager, including the ability to leave it, is worse than the panic.
-///
-/// So we take the guard anyway and clear the flag. The state behind it may have
-/// been mid-mutation when the panic unwound, which is why this logs at error
-/// level: it is a bug worth reporting, not a condition to handle silently.
-///
-/// Still returns `Result` — the signature is what ~20 call sites and the
-/// `media` module expect, and it keeps room for a future fallible lock — but
-/// the error path is now unreachable.
-fn lock_mutex<T>(mutex: &Mutex<T>) -> Result<MutexGuard<'_, T>, MatrixRtcFfiError> {
-    match mutex.lock() {
-        Ok(guard) => Ok(guard),
-        Err(poisoned) => {
-            log::error!(
-                "recovering a poisoned lock: an earlier call panicked and its state may be \
-                 inconsistent. Please report this with the panic that preceded it."
-            );
-            mutex.clear_poison();
-            Ok(poisoned.into_inner())
-        }
     }
 }
 
@@ -932,7 +886,7 @@ mod tests {
             .subscribe_membership_snapshots(SLOT.to_owned())
             .await
             .unwrap();
-        let joined = subscription.next_snapshot().unwrap().unwrap();
+        let joined = subscription.next().await.unwrap();
         assert_eq!(joined.len(), 1);
         assert_eq!(joined[0].sender, "@bob:example.org");
         assert_eq!(joined[0].sender_device_id.as_deref(), Some("BOBDEV"));
@@ -944,11 +898,15 @@ mod tests {
             }]
         );
         assert_eq!(joined[0].can_subscribe, vec!["livekit".to_owned()]);
-        assert_eq!(
-            subscription.next_snapshot().unwrap(),
-            None,
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), subscription.next())
+                .await
+                .is_err(),
             "and then only on change"
         );
+
+        room.shutdown().await;
+        assert_eq!(subscription.next().await, None, "the room's end ends it");
     }
 
     #[tokio::test]
@@ -1078,7 +1036,7 @@ mod tests {
             .subscribe_membership_snapshots(SLOT.to_owned())
             .await
             .unwrap();
-        let mut joined = subscription.next_snapshot().unwrap().unwrap();
+        let mut joined = subscription.next().await.unwrap();
         joined.sort_by(|a, b| a.sender.cmp(&b.sender));
         assert_eq!(
             joined
@@ -1552,24 +1510,5 @@ mod tests {
                     && send.event_type == "org.matrix.msc4143.rtc.member"),
             "a spec-current rejoin goes back to a sticky membership",
         );
-    }
-
-    /// A panic inside one method must not disable an object forever.
-    #[test]
-    fn a_poisoned_lock_is_recovered_rather_than_propagated() {
-        let mutex = Mutex::new(0_u32);
-
-        let panicked = std::panic::catch_unwind(|| {
-            let mut guard = mutex.lock().unwrap();
-            *guard = 1;
-            panic!("simulates a panic while the guard is held");
-        });
-        assert!(panicked.is_err());
-        assert!(mutex.is_poisoned());
-
-        let guard = lock_mutex(&mutex).expect("a poisoned lock must still be usable");
-        assert_eq!(*guard, 1);
-        drop(guard);
-        assert!(!mutex.is_poisoned());
     }
 }

@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- `MembershipSnapshotSubscription::next_snapshot()`, which polled, becomes an async `next()` that waits for the next roster and returns `None` once the room is gone.
 - FFI and web `joinCall` take an optional `application_slot_id` (`m.call#{application_slot_id}`, `room` when omitted) instead of `slot_id` and `application`.
 - The room-wide slot is `{application}#room`, as MSC4143 spells it, instead of `{application}#ROOM`, so it no longer meets clients still on `m.call#ROOM`; `ROOM_SLOT_NAME` becomes `ROOM_APPLICATION_SLOT_ID`.
 - A join refused because its slot is not open fails with `MatrixRtcFfiError::SlotClosed` instead of `InvalidInput`.
