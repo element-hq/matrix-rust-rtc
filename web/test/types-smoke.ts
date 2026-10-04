@@ -92,14 +92,7 @@ export async function smoke(
   const call: WasmRtcCall = await room.joinCall(params);
   const memberId: string = call.memberId;
 
-  const session: WasmMediaSession = await call.connectMedia(
-    {
-      user_id: '@a:hs',
-      device_id: 'DEV',
-      livekit_service_url: 'https://sfu',
-    },
-    delegate,
-  );
+  const session: WasmMediaSession = await call.connectMedia({}, delegate);
 
   const roster: RtcParticipant[] = session.participants();
   for (const participant of roster) {

@@ -126,14 +126,7 @@ describe('web media roster over a fake transport delegate', () => {
     ]);
 
     const { delegate, log } = fakeDelegate();
-    const session = await call.connectMedia(
-      {
-        user_id: USER_ID,
-        device_id: DEVICE_ID,
-        livekit_service_url: OWN_FOCUS,
-      },
-      delegate,
-    );
+    const session = await call.connectMedia({}, delegate);
 
     // The own focus was connected through the token exchange Rust built and
     // the delegate fetched. (No ordering with the pooled connect below: the

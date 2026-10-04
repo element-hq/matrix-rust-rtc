@@ -32,7 +32,7 @@ const call = new MatrixRtcCall({
   roomOptions: { e2ee: { worker: e2eeWorker } }, // omit to run without frame E2EE
 });
 call.onParticipants = (roster) => render(roster);
-await call.connect({ userId, deviceId, livekitServiceUrl });
+await call.connect(); // the focus is the join's, the account the backend's
 ```
 
 Every roster entry is the Rust participant (`member_id`, `user_id`,

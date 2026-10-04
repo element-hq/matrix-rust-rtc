@@ -554,3 +554,27 @@ fn a_call_join_names_only_its_slot() {
         "org.example.board#planning"
     );
 }
+
+#[tokio::test]
+async fn a_call_knows_the_transport_its_join_resolved() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    assert!(matches!(
+        call.transport(),
+        TransportIntent::Publish(matrix_rtc_core::RtcTransport::LiveKit(livekit))
+            if livekit.livekit_service_url == "https://sfu.example.org"
+    ));
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+
+    let call = room
+        .join_call(CallJoinOptions::new().transport(JoinTransport::ReceiveOnly))
+        .await
+        .expect("rejoin");
+    assert!(matches!(
+        call.transport(),
+        TransportIntent::ReceiveOnly { .. }
+    ));
+}

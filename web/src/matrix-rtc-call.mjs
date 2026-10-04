@@ -67,19 +67,18 @@ export class MatrixRtcCall {
    * connected; roster changes then arrive via `onParticipants` and call
    * events via `onEvent`.
    *
-   * @param {object} config - `{ userId, deviceId, livekitServiceUrl,
-   *   keyRingSize?, format? }`
+   * The own focus is the one the join publishes on (none for a receive-only
+   * call) and the account is the backend's.
+   *
+   * @param {object} [config] - `{ keyRingSize?, format? }`
    */
-  async connect(config) {
+  async connect(config = {}) {
     if (this.session) throw new Error('already connected');
     this.config = config;
     this.keyProvider = makePerParticipantKeyProvider(this.livekit);
 
     this.session = await this.call.connectMedia(
       {
-        user_id: config.userId,
-        device_id: config.deviceId,
-        livekit_service_url: config.livekitServiceUrl,
         key_ring_size: config.keyRingSize,
         format: config.format,
       },

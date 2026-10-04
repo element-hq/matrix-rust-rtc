@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_core::compat::MembershipFormat;
+use matrix_rtc_core::{RtcTransport, TransportIntent};
 use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
@@ -34,15 +35,11 @@ use crate::WasmRtcCall;
 /// livekit-js's `ExternalE2EEKeyProvider` default `keyringSize`.
 const LIVEKIT_JS_DEFAULT_KEY_RING_SIZE: u16 = 16;
 
-/// How to reach the SFU for the call media attaches to.
-#[derive(Debug, Deserialize)]
+/// Tuning for a media session. The call says the rest: its room, slot and
+/// `member.id`, the focus its join publishes on, and — through the backend —
+/// who we are.
+#[derive(Debug, Default, Deserialize)]
 struct WasmMediaSessionConfig {
-    user_id: String,
-    device_id: String,
-    /// The MSC4195 authorisation-service URL of the focus we publish on —
-    /// the same URL announced in our membership's transport. (Peers' foci
-    /// are discovered from their memberships automatically.)
-    livekit_service_url: String,
     /// livekit-js key-provider ring size, when configured away from its
     /// default of 16 (`keyringSize`). Keys at or past it are rejected.
     #[serde(default)]
@@ -123,7 +120,9 @@ impl WasmRtcCall {
     /// the own-focus livekit-js room. The `member.id` comes from the join —
     /// the page neither chooses nor passes it.
     ///
-    /// `config` is `{ user_id, device_id, livekit_service_url, key_ring_size?, format?, stability? }`;
+    /// `config` is `{ key_ring_size?, format?, stability? }`, and may be
+    /// omitted; the focus is the one the join publishes on, none for a
+    /// receive-only call;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
     /// implement `onParticipants(roster)` and `onEvent(event)` — the push
@@ -135,16 +134,33 @@ impl WasmRtcCall {
         #[wasm_bindgen(unchecked_param_type = "MediaSessionConfigIn")] config: JsValue,
         #[wasm_bindgen(unchecked_param_type = "MediaDelegate")] delegate: JsValue,
     ) -> Result<WasmMediaSession, JsError> {
-        let config: WasmMediaSessionConfig = serde_wasm_bindgen::from_value(config)
-            .map_err(|err| JsError::new(&format!("invalid media session config: {err}")))?;
+        let config: WasmMediaSessionConfig = if config.is_undefined() || config.is_null() {
+            WasmMediaSessionConfig::default()
+        } else {
+            serde_wasm_bindgen::from_value(config)
+                .map_err(|err| JsError::new(&format!("invalid media session config: {err}")))?
+        };
 
         let room_id = self.inner().room_id().to_owned();
         let slot_id = self.inner().slot_id().to_owned();
+        let backend = self.backend();
+        let (user_id, device_id) = (backend.own_user_id(), backend.own_device_id());
+        // The focus our membership announces; a receive-only call has none and
+        // only connects to its peers' foci.
+        let own_focus = match self.inner().transport() {
+            TransportIntent::Publish(RtcTransport::LiveKit(livekit)) => {
+                Some(livekit.livekit_service_url.clone())
+            }
+            TransportIntent::Publish(other) => {
+                return Err(JsError::new(&format!(
+                    "the call publishes on {other:?}, which is not a LiveKit transport"
+                )));
+            }
+            TransportIntent::ReceiveOnly { .. } => None,
+        };
         log::info!(
-            "media: connecting [{room_id}/{slot_id}] user={} device={} focus={}",
-            config.user_id,
-            config.device_id,
-            config.livekit_service_url,
+            "media: connecting [{room_id}/{slot_id}] user={user_id} device={device_id} focus={}",
+            own_focus.as_deref().unwrap_or("none (receive only)"),
         );
 
         // Which MatrixRTC generation this room was joined for, read back from
@@ -237,8 +253,8 @@ impl WasmRtcCall {
             slot_id,
             member: OwnMemberClaims {
                 member_id: member_id.clone(),
-                user_id: config.user_id.clone(),
-                device_id: config.device_id.clone(),
+                user_id: user_id.clone(),
+                device_id: device_id.clone(),
             },
         };
         let engine = CallEngine::new(
@@ -246,7 +262,7 @@ impl WasmRtcCall {
                 transports: vec![transport.clone()],
                 own_member_id: member_id.clone(),
                 ctx: ctx.clone(),
-                own_connection_key: Some(config.livekit_service_url.clone()),
+                own_connection_key: own_focus.clone(),
                 raised_hands,
                 reactions,
                 stability: config
@@ -282,19 +298,22 @@ impl WasmRtcCall {
 
         // Own focus connects synchronously so a broken SFU fails this call
         // instead of surfacing later as a dead session.
-        let (connection, connection_events) = transport
-            .connect_js(&config.livekit_service_url, &ctx)
-            .await
-            .map_err(|error| {
-                log::warn!(
-                    "media: own focus {} refused the connection: {error}",
-                    config.livekit_service_url,
-                );
-                JsError::new(&error.to_string())
-            })?;
-        engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+        let connection = match &own_focus {
+            Some(own_focus) => {
+                let (connection, connection_events) = transport
+                    .connect_js(own_focus, &ctx)
+                    .await
+                    .map_err(|error| {
+                    log::warn!("media: own focus {own_focus} refused the connection: {error}");
+                    JsError::new(&error.to_string())
+                })?;
+                engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+                Some(connection)
+            }
+            None => None,
+        };
 
-        let own_identity = mapper(&config.user_id, &config.device_id, &member_id);
+        let own_identity = mapper(&user_id, &device_id, &member_id);
 
         // Roster, event, and switch-complete delivery run as spawned pumps
         // owning their receivers, invoking the delegate's optional callbacks.
@@ -392,7 +411,8 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 #[wasm_bindgen]
 pub struct WasmMediaSession {
     engine: CallEngine,
-    own_connection: JsTransportConnection,
+    /// The own-focus connection; `None` for a receive-only call.
+    own_connection: Option<JsTransportConnection>,
     /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _handler: Arc<MediaKeyHandler>,
@@ -423,11 +443,14 @@ impl WasmMediaSession {
     }
 
     /// Shut the media session down: stop the engine (closing peer-focus
-    /// connections) and close the own-focus room through the delegate.
-    /// Leaving the slot is separate ([`WasmRtcCall::leave`]).
+    /// connections) and close the own-focus room, if any, through the
+    /// delegate. Leaving the slot is separate ([`WasmRtcCall::leave`]).
     pub async fn disconnect(&mut self) -> Result<(), JsError> {
         self.engine.shutdown().await;
-        self.own_connection
+        let Some(connection) = &self.own_connection else {
+            return Ok(());
+        };
+        connection
             .close()
             .await
             .map_err(|error| JsError::new(&error.to_string()))

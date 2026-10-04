@@ -356,12 +356,14 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let slot_id = options.slot_id.clone();
         let transport = self.transport(options.transport.clone()).await?;
         let mut state = self.state.lock().await;
-        let params = self.prepare_join(&mut state, options, transport).await?;
+        let params = self
+            .prepare_join(&mut state, options, transport.clone())
+            .await?;
         let member_id = params.membership_id();
         state.rtc_mut().join(params).await?;
         let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         drop(state);
-        Ok(self.session(slot_id, member_id, upkeep))
+        Ok(self.session(slot_id, member_id, transport, upkeep))
     }
 
     /// Joins a call slot: the generic join, then the call layer — reactions
@@ -375,7 +377,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone()).await?;
         let mut state = self.state.lock().await;
-        let rtc = self.prepare_join(&mut state, join, transport).await?;
+        let rtc = self
+            .prepare_join(&mut state, join, transport.clone())
+            .await?;
         let member_id = rtc.membership_id();
         state
             .join(CallJoinParams {
@@ -389,7 +393,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         drop(state);
         Ok(RtcCall {
             _hand: event_moves.map(|moves| self.follow_hand(slot_id.clone(), moves)),
-            session: self.session(slot_id, member_id, upkeep),
+            session: self.session(slot_id, member_id, transport, upkeep),
         })
     }
 
@@ -507,6 +511,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         &self,
         slot_id: String,
         member_id: String,
+        transport: TransportIntent,
         upkeep: Option<AbortHandle>,
     ) -> RtcSession<B> {
         let live = Arc::new(AtomicBool::new(true));
@@ -515,6 +520,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             room_id: self.room_id.clone(),
             slot_id,
             member_id,
+            transport,
             state: self.state.clone(),
             live,
             upkeep,
@@ -570,6 +576,7 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     room_id: String,
     slot_id: String,
     member_id: String,
+    transport: TransportIntent,
     state: SharedState<B>,
     live: Arc<AtomicBool>,
     /// The core's upkeep for this join, aborted when the session object
@@ -589,6 +596,11 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     /// Our `member.id` in this participation.
     pub fn member_id(&self) -> &str {
         &self.member_id
+    }
+
+    /// What this participation publishes on, as its join resolved it.
+    pub fn transport(&self) -> &TransportIntent {
+        &self.transport
     }
 
     pub fn is_live(&self) -> bool {

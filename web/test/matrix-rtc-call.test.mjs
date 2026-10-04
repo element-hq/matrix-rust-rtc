@@ -146,11 +146,7 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     });
     call.onParticipants = (roster) => rosterUpdates.push(roster);
 
-    await call.connect({
-      userId: USER_ID,
-      deviceId: DEVICE_ID,
-      livekitServiceUrl: OWN_FOCUS,
-    });
+    await call.connect();
 
     // One focus in play, so one Room, connected with what the token fetch
     // returned.

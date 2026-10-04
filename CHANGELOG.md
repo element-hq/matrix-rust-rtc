@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- `connect_media_session`/`connectMedia` take the own focus from the call and the account from the backend: `MediaSessionConfig` loses `livekit_service_url`, `user_id` and `device_id`, and a receive-only call connects only to its peers' foci.
 - `MembershipSnapshotSubscription::next_snapshot()`, which polled, becomes an async `next()` that waits for the next roster and returns `None` once the room is gone.
 - FFI and web `joinCall` take an optional `application_slot_id` (`m.call#{application_slot_id}`, `room` when omitted) instead of `slot_id` and `application`.
 - The room-wide slot is `{application}#room`, as MSC4143 spells it, instead of `{application}#ROOM`, so it no longer meets clients still on `m.call#ROOM`; `ROOM_SLOT_NAME` becomes `ROOM_APPLICATION_SLOT_ID`.

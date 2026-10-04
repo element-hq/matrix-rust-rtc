@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 use tokio::sync::watch;
 
 use matrix_rtc_core::compat::MembershipFormat;
+use matrix_rtc_core::{RtcTransport, TransportIntent};
 use matrix_rtc_livekit::{
     LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
     identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
@@ -32,16 +33,11 @@ use super::types::{
 use super::{MediaFfiError, runtime};
 use crate::RtcCall;
 
-/// How to reach the SFU for a joined call. The call itself says which room and
-/// slot.
-#[derive(Clone, Debug, uniffi::Record)]
+/// Tuning for a media session. The call says the rest: its room, slot and
+/// `member.id`, the focus its join publishes on, and — through the backend —
+/// who we are.
+#[derive(Clone, Debug, Default, uniffi::Record)]
 pub struct MediaSessionConfig {
-    pub user_id: String,
-    pub device_id: String,
-    /// The MSC4195 authorisation-service URL of the focus we publish on —
-    /// the same URL announced in our membership's transport. (Peers' foci
-    /// are discovered from their memberships automatically.)
-    pub livekit_service_url: String,
     /// How much the tile order is damped. `None` takes the defaults.
     #[uniffi(default = None)]
     pub stability: Option<FfiStabilityConfig>,
@@ -72,11 +68,24 @@ async fn build_media_session(
     config: MediaSessionConfig,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
     let (room_id, slot_id) = (call.room_id(), call.slot_id());
+    let backend = call.backend();
+    let (user_id, device_id) = (backend.own_user_id(), backend.own_device_id());
+    // The focus our membership announces; a receive-only call has none and
+    // only connects to its peers' foci.
+    let own_focus = match call.inner().transport() {
+        TransportIntent::Publish(RtcTransport::LiveKit(livekit)) => {
+            Some(livekit.livekit_service_url.clone())
+        }
+        TransportIntent::Publish(other) => {
+            return Err(MediaFfiError::Transport(format!(
+                "the call publishes on {other:?}, which is not a LiveKit transport"
+            )));
+        }
+        TransportIntent::ReceiveOnly { .. } => None,
+    };
     log::info!(
-        "media: connecting [{room_id}/{slot_id}] user={} device={} focus={}",
-        config.user_id,
-        config.device_id,
-        config.livekit_service_url,
+        "media: connecting [{room_id}/{slot_id}] user={user_id} device={device_id} focus={}",
+        own_focus.as_deref().unwrap_or("none (receive only)"),
     );
 
     // Which MatrixRTC generation this room was joined for, read back from the
@@ -153,8 +162,8 @@ async fn build_media_session(
         slot_id: slot_id.clone(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
-            user_id: config.user_id.clone(),
-            device_id: config.device_id.clone(),
+            user_id: user_id.clone(),
+            device_id: device_id.clone(),
         },
     };
     let engine = CallEngine::new(
@@ -162,7 +171,7 @@ async fn build_media_session(
             transports: vec![transport.clone()],
             own_member_id: member_id.clone(),
             ctx: ctx.clone(),
-            own_connection_key: Some(config.livekit_service_url.clone()),
+            own_connection_key: own_focus.clone(),
             raised_hands,
             reactions,
             stability: config.stability.clone().map(Into::into).unwrap_or_default(),
@@ -198,38 +207,42 @@ async fn build_media_session(
     //
     joined.replay_encryption_keys().await;
 
+    let events = engine.subscribe_events();
+    let own_identity = identity_mapper(&user_id, &device_id, &member_id);
+
     // Own focus connects synchronously so a broken SFU fails this call
     // instead of surfacing later as a dead session.
-    let (connection, connection_events) = transport
-        .connect_livekit(&config.livekit_service_url, &ctx)
-        .await
-        .map_err(|error| {
-            log::warn!(
-                "media: own focus {} refused the connection: {error}",
-                config.livekit_service_url,
+    let connection = match &own_focus {
+        Some(own_focus) => {
+            let (connection, connection_events) = transport
+                .connect_livekit(own_focus, &ctx)
+                .await
+                .map_err(|error| {
+                    log::warn!("media: own focus {own_focus} refused the connection: {error}");
+                    MediaFfiError::Transport(error.to_string())
+                })?;
+            engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+
+            // Move our sender onto each key we rotate to. Importing a key only
+            // fills the provider's ring; the index our frames actually carry
+            // lives on the frame cryptor. Without this we advertise a rotation
+            // to peers and carry on encrypting with the previous key, so anyone
+            // joining after it decrypts nothing — and the forward secrecy the
+            // rotation exists for is not delivered.
+            let connection_for_keys = connection.clone();
+            bridge.set_local_sender(
+                own_identity.clone(),
+                Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
             );
-            MediaFfiError::Transport(error.to_string())
-        })?;
-    engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
-
-    let events = engine.subscribe_events();
-    let own_identity = identity_mapper(&config.user_id, &config.device_id, &member_id);
-
-    // Move our sender onto each key we rotate to. Importing a key only fills the
-    // provider's ring; the index our frames actually carry lives on the frame
-    // cryptor. Without this we advertise a rotation to peers and carry on
-    // encrypting with the previous key, so anyone joining after it decrypts
-    // nothing — and the forward secrecy the rotation exists for is not delivered.
-    let connection_for_keys = connection.clone();
-    bridge.set_local_sender(
-        own_identity.clone(),
-        Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
-    );
-    // Adopt the index we are already on rather than assuming 0, and record it for
-    // tracks published later.
-    if let Some(own_key) = bridge.key_for(&own_identity) {
-        connection.set_local_key_index(own_key.key_index);
-    }
+            // Adopt the index we are already on rather than assuming 0, and
+            // record it for tracks published later.
+            if let Some(own_key) = bridge.key_for(&own_identity) {
+                connection.set_local_key_index(own_key.key_index);
+            }
+            Some(connection)
+        }
+        None => None,
+    };
 
     log::info!("media: connected as member {member_id}, local identity {own_identity}");
 
@@ -255,7 +268,8 @@ async fn build_media_session(
 #[derive(uniffi::Object)]
 pub struct MediaSession {
     engine: CallEngine,
-    connection: LiveKitTransportConnection,
+    /// The own-focus connection; `None` for a receive-only call.
+    connection: Option<LiveKitTransportConnection>,
     /// Keeps the key bridge alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _bridge: Arc<MediaKeyBridge>,
@@ -500,8 +514,8 @@ impl MediaSession {
     }
 
     /// End the media session: emits `Ended { Left }`, closes every
-    /// peer-focus connection, then the own-focus one. Leave the slot via the
-    /// call separately.
+    /// peer-focus connection, then the own-focus one if any. Leave the slot via
+    /// the call separately.
     ///
     /// (Named `disconnect` rather than `close`: uniffi already gives every
     /// Kotlin object an `AutoCloseable.close()` for handle disposal, and a
@@ -509,7 +523,10 @@ impl MediaSession {
     pub async fn disconnect(&self) -> Result<(), MediaFfiError> {
         log::info!("media: disconnecting");
         self.engine.shutdown().await;
-        self.connection.close().await.map_err(|error| {
+        let Some(connection) = &self.connection else {
+            return Ok(());
+        };
+        connection.close().await.map_err(|error| {
             log::warn!("media: own focus did not close cleanly: {error}");
             MediaFfiError::Transport(error.to_string())
         })

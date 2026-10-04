@@ -144,12 +144,8 @@ export type RtcCallEvent =
     | { type: "media_connection_state"; degraded: boolean }
     | { type: "ended"; reason: string };
 
-/** `connectMedia`'s configuration; the room and slot are the call's. */
+/** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
 export interface MediaSessionConfigIn {
-    user_id: string;
-    device_id: string;
-    /** The MSC4195 authorisation-service URL of the focus we publish on. */
-    livekit_service_url: string;
     /** livekit-js key-provider ring size when configured away from its default of 16. */
     key_ring_size?: number;
     /** Cross-check only: the mode comes from the room. */

@@ -161,9 +161,6 @@ export class WebPeerApp {
     this.call.onRoomCreated = (room, key) => this.onRoomCreated(room, key);
 
     await this.call.connect({
-      userId: this.userId,
-      deviceId: this.deviceId,
-      livekitServiceUrl: focusUrl,
       format: compat === 'current' ? undefined : compat,
     });
 

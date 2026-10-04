@@ -28,17 +28,19 @@ use super::{MediaFfiError, runtime};
 const DEAD_SFU_URL: &str = "http://127.0.0.1:9";
 
 fn config() -> MediaSessionConfig {
-    MediaSessionConfig {
-        user_id: "@alice:example.org".to_owned(),
-        device_id: "DEVICE".to_owned(),
+    MediaSessionConfig::default()
+}
+
+fn dead_sfu() -> FfiJoinTransport {
+    FfiJoinTransport::Publish {
         livekit_service_url: DEAD_SFU_URL.to_owned(),
-        stability: None,
     }
 }
 
 /// Opens the room with an open slot, the way a host does on subscribe, and
-/// joins it. The room comes back too: dropping it would end the subscription.
-fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
+/// joins it with `transport`. The room comes back too: dropping it would end
+/// the subscription.
+fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoom>, Arc<RtcCall>) {
     let client = RtcClient::new(mock.clone());
     runtime().block_on(async {
         let open = client
@@ -75,11 +77,8 @@ fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
         let call = room
             .clone()
             .join_call(FfiJoinSessionParams {
-                slot_id: "m.call#room".to_owned(),
-                application: "m.call".to_owned(),
-                transport: FfiJoinTransport::Publish {
-                    livekit_service_url: DEAD_SFU_URL.to_owned(),
-                },
+                application_slot_id: None,
+                transport,
                 keep_alive_timeout_ms: None,
                 sticky_duration_ms: None,
                 degraded_lifetime_ms: None,
@@ -96,7 +95,7 @@ fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
 #[test]
 fn connect_requires_a_live_call() {
     let mock = MockHost::new();
-    let (_room, call) = joined_call(&mock);
+    let (_room, call) = joined_call(&mock, dead_sfu());
     runtime()
         .block_on(call.leave(FfiLeaveSessionParams { leave_reason: None }))
         .unwrap();
@@ -110,7 +109,7 @@ fn connect_requires_a_live_call() {
 #[test]
 fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
     let mock = MockHost::new();
-    let (_room, call) = joined_call(&mock);
+    let (_room, call) = joined_call(&mock, dead_sfu());
 
     // Everything up to the SFU works — key bridge registration, engine
     // startup, and the (Rust-implemented) backend's token call — and the dead
@@ -121,6 +120,35 @@ fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
         "expected a Transport error from the dead SFU endpoint, got {:?}",
         result.as_ref().err(),
     );
+}
+
+#[test]
+fn an_advertised_join_connects_to_the_advertised_focus() {
+    let mock = MockHost::new();
+    *mock.transports_json.lock().unwrap() =
+        serde_json::json!([{ "type": "livekit", "livekit_service_url": DEAD_SFU_URL }]).to_string();
+    let (_room, call) = joined_call(&mock, FfiJoinTransport::Advertised);
+
+    // The host passed no focus: reaching the dead one means it came from the call.
+    let result = runtime().block_on(connect_media_session(call, config()));
+    assert!(
+        matches!(result, Err(MediaFfiError::Transport(_))),
+        "expected a Transport error from the advertised dead SFU, got {:?}",
+        result.as_ref().err(),
+    );
+}
+
+#[test]
+fn a_receive_only_call_connects_without_a_focus_of_its_own() {
+    let mock = MockHost::new();
+    let (_room, call) = joined_call(&mock, FfiJoinTransport::ReceiveOnly);
+
+    let session = runtime()
+        .block_on(connect_media_session(call, config()))
+        .expect("no own focus to connect to");
+    runtime()
+        .block_on(session.disconnect())
+        .expect("disconnect");
 }
 
 #[test]
