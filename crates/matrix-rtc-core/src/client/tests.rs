@@ -18,7 +18,7 @@ use crate::{
 
 const ROOM: &str = "!room:example.org";
 const OTHER_ROOM: &str = "!other:example.org";
-const SLOT: &str = "m.call#ROOM";
+const SLOT: &str = "m.call#room";
 const BOB: &str = "@bob:example.org";
 
 /// What a homeserver delivers for a room: an open slot with Bob in it.

@@ -63,7 +63,7 @@ async fn run(
     // Who joins is the backend's account. The transport is the application's
     // choice (`matrix-rtc-call` takes the homeserver's first LiveKit one).
     // Without `.slot`, the application's room-wide slot,
-    // `org.example.board#ROOM`; other setters override one default each
+    // `org.example.board#room`; other setters override one default each
     // (`.keep_alive_interval_ms(..)`, `.member_id(..)`, …). The joined slot
     // keeps itself alive until it leaves.
     let join = JoinSessionParams::application("org.example.board")

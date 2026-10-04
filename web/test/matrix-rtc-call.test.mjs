@@ -17,7 +17,8 @@ import { MatrixRtcCall } from '../src/matrix-rtc-call.mjs';
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
 const ROOM_ID = '!call:example.org';
-const SLOT_ID = 'm.call#CALL';
+const APPLICATION_SLOT_ID = 'CALL';
+const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@me:example.org';
 const DEVICE_ID = 'MYDEVICE';
 const OWN_FOCUS = 'https://rtc.example.org/livekit/jwt';
@@ -116,8 +117,7 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     const rtcRoom = await client.room(ROOM_ID, undefined);
 
     const rtcCall = await rtcRoom.joinCall({
-      slot_id: SLOT_ID,
-      application: 'm.call',
+      application_slot_id: APPLICATION_SLOT_ID,
       transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
     });
     const memberId = rtcCall.memberId;

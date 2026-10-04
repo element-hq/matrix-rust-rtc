@@ -66,13 +66,14 @@ pub const MAX_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 /// in the sticky dialect however often we refresh.
 pub const DEFAULT_DEGRADED_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
-/// The name of an application's room-wide slot (`m.call#ROOM`).
-pub const ROOM_SLOT_NAME: &str = "ROOM";
+/// The MSC4143 `application_slot_id` of an application's room-wide slot
+/// (`m.call#room`).
+pub const ROOM_APPLICATION_SLOT_ID: &str = "room";
 
-/// `{application}#{name}`, MSC4143's slot id.
-fn slot_id_of(application: &ApplicationInfo, name: &str) -> String {
+/// `{application_type}#{application_slot_id}`, MSC4143's slot id.
+fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
     format!(
-        "{}#{name}",
+        "{}#{application_slot_id}",
         application.application_type().unwrap_or_default()
     )
 }
@@ -130,7 +131,7 @@ pub struct JoinSessionParams {
     /// is generated per call to [`JoinSessionParams::membership_id`].
     pub membership_id: Option<String>,
 
-    /// The slot ID for the session (e.g., "m.call#ROOM").
+    /// The slot ID for the session (e.g., "m.call#room").
     pub slot_id: String,
 
     /// `content.application` to publish. A `String` or `&str` converts into a
@@ -176,13 +177,13 @@ pub struct JoinSessionParams {
 }
 
 impl JoinSessionParams {
-    /// Joins `application`'s room-wide slot, `{application}#ROOM`, as the
+    /// Joins `application`'s room-wide slot, `{application}#room`, as the
     /// backend's account with a fresh `member.id` and default timings. A join
     /// also needs a [`transport`](Self::transport()); each other setter
     /// overrides one default.
     pub fn application(application: impl Into<ApplicationInfo>) -> Self {
         let application = application.into();
-        let slot_id = slot_id_of(&application, ROOM_SLOT_NAME);
+        let slot_id = slot_id_of(&application, ROOM_APPLICATION_SLOT_ID);
         Self {
             membership_id: None,
             slot_id,
@@ -196,9 +197,9 @@ impl JoinSessionParams {
         }
     }
 
-    /// Joins the application's slot named `name`: `{application}#{name}`.
-    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
-        self.slot_id = slot_id_of(&self.application, name.as_ref());
+    /// Joins the application's slot `{application}#{application_slot_id}`.
+    pub fn slot(mut self, application_slot_id: impl AsRef<str>) -> Self {
+        self.slot_id = slot_id_of(&self.application, application_slot_id.as_ref());
         self
     }
 
@@ -448,7 +449,7 @@ mod tests {
     fn the_slot_id_is_composed_from_the_application() {
         assert_eq!(
             JoinSessionParams::application("m.call").slot_id,
-            "m.call#ROOM"
+            "m.call#room"
         );
         assert_eq!(
             JoinSessionParams::application("org.example.board")

@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn normalises_a_pre_2026_membership() {
         let event = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "msc4354_sticky_key": "MEMBER",
             "application": { "type": "m.call" },
             "member": { "id": "MEMBER", "user_id": "@alice:example.org", "device_id": "ALICEDEVICE" },
@@ -468,7 +468,7 @@ mod tests {
     #[test]
     fn prefers_the_decrypted_device_over_the_claimed_one() {
         let event = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "msc4354_sticky_key": "MEMBER",
             "application": { "type": "m.call" },
             "member": { "id": "MEMBER", "device_id": "CLAIMED" },
@@ -482,7 +482,7 @@ mod tests {
     #[test]
     fn falls_back_to_the_claimed_device_when_nothing_decrypted() {
         let mut event = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "msc4354_sticky_key": "MEMBER",
             "application": { "type": "m.call" },
             "member": { "id": "MEMBER", "device_id": "CLAIMED" },
@@ -522,7 +522,7 @@ mod tests {
 
         let converted = to_core_state_memberships("!room:example.org", events);
         assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].content.slot_id, "m.call#ROOM");
+        assert_eq!(converted[0].content.slot_id, "m.call#room");
         assert_eq!(
             converted[0].content.member.id.as_deref(),
             Some("@alice:example.org:ALICEDEVICE"),
@@ -558,7 +558,7 @@ mod tests {
     fn a_sticky_membership_wins_over_the_state_one_with_the_same_key() {
         let now = room_state::now_ms();
         let sticky = raw(serde_json::json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "msc4354_sticky_key": "@alice:example.org:ALICEDEVICE",
             "application": { "type": "m.call" },
             "member": { "id": "@alice:example.org:ALICEDEVICE" },

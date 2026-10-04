@@ -20,7 +20,7 @@ use crate::notification::{DEFAULT_RING_LIFETIME_MS, NOTIFICATION_EVENT_TYPE};
 use crate::reactions::ReactionSound;
 
 const ROOM: &str = "!room:example.org";
-const SLOT: &str = "m.call#ROOM";
+const SLOT: &str = "m.call#room";
 const ALICE: &str = "@alice:example.org";
 const BOB: &str = "@bob:example.org";
 const BOB_MEMBER: &str = "bob-member-1";

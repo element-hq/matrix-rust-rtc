@@ -70,7 +70,7 @@ mod tests {
     use crate::session::{ApplicationInfo, MemberInfo, Membership};
 
     const ROOM_ID: &str = "!room:example.org";
-    const SLOT_ID: &str = "m.call#ROOM";
+    const SLOT_ID: &str = "m.call#room";
 
     fn joined(sender: &str, member_id: &str, event_id: &str) -> RawStickyEvent {
         RawStickyEvent {

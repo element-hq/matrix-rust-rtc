@@ -306,7 +306,7 @@ mod tests {
             "@us:example.io",
             "DEVICE",
             "!room:example.io",
-            "m.call#ROOM",
+            "m.call#room",
         ))
     }
 
@@ -331,7 +331,7 @@ mod tests {
             OutboundDialect::Sticky(Sticky2025Dialect::new(
                 "@us:example.io",
                 "DEVICE",
-                "m.call#ROOM",
+                "m.call#room",
             )),
         ] {
             let route =

@@ -728,7 +728,7 @@ mod tests {
     use matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE;
 
     const ROOM: &str = "!room:example.org";
-    const SLOT: &str = "m.call#ROOM";
+    const SLOT: &str = "m.call#room";
     const SFU: &str = "https://sfu.example.org";
 
     fn cleartext() -> FfiEventEncryption {
@@ -841,8 +841,7 @@ mod tests {
 
     fn join_params() -> FfiJoinSessionParams {
         FfiJoinSessionParams {
-            slot_id: SLOT.to_owned(),
-            application: "m.call".to_owned(),
+            application_slot_id: None,
             transport: FfiJoinTransport::Publish {
                 livekit_service_url: SFU.to_owned(),
             },
@@ -1161,6 +1160,27 @@ mod tests {
             membership.content.pointer("/transports").unwrap(),
             &serde_json::json!({ "can_subscribe": ["livekit"] }),
         );
+    }
+
+    #[tokio::test]
+    async fn an_application_slot_id_joins_that_call_slot() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let slot = FfiEventIn {
+            state_key: Some("m.call#TEST".to_owned()),
+            ..open_slot(None)
+        };
+        let room = open(&client, &mock, None, false, vec![slot], Vec::new()).await;
+
+        let call = room
+            .clone()
+            .join_call(FfiJoinSessionParams {
+                application_slot_id: Some("TEST".to_owned()),
+                ..join_params()
+            })
+            .await
+            .expect("join");
+        assert_eq!(call.slot_id(), "m.call#TEST");
     }
 
     #[tokio::test]

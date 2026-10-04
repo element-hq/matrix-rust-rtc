@@ -28,9 +28,7 @@
 
 use std::sync::Arc;
 
-use matrix_rtc_call::{
-    CallJoinOptions, JoinOptions, JoinTransport, Mentions, NotificationType, NotifyConfig,
-};
+use matrix_rtc_call::{CallJoinOptions, JoinTransport, Mentions, NotificationType, NotifyConfig};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::{EncryptionConfig, LeaveSessionParams, MatrixBackend, SlotEncryption};
@@ -149,7 +147,8 @@ impl WasmRtcRoom {
     /// Joins a call slot, returning our participation in it.
     ///
     /// `params`:
-    ///   - `slot_id` (e.g. "m.call#ROOM"), `application` (e.g. "m.call")
+    ///   - `application_slot_id`: the call slot to join, `m.call#{application_slot_id}`;
+    ///     omitted is the room-wide call, `room`
     ///   - `transport`: `{ kind: "advertised" }` (the default when omitted)
     ///     publishes on the first LiveKit transport the homeserver advertises
     ///     (the host's `rtcTransports`); `{ kind: "publish",
@@ -175,10 +174,12 @@ impl WasmRtcRoom {
                 JsError::new(&format!("invalid join params: {err}"))
             })?;
         log::info!(
-            "room: [{}/{}] join requested application={}",
+            "room: [{}] join requested slot={}",
             self.room_id,
-            params.slot_id,
-            params.application,
+            params
+                .application_slot_id
+                .as_deref()
+                .unwrap_or(matrix_rtc_core::ROOM_APPLICATION_SLOT_ID),
         );
         let options = params.into_call()?;
         let room = self.open().await?;
@@ -444,8 +445,10 @@ pub fn reaction_sound_for(name: String) -> Option<String> {
 /// WASM-friendly join session parameters.
 #[derive(Debug, Deserialize)]
 pub struct WasmJoinSessionParams {
-    pub slot_id: String,
-    pub application: String,
+    /// The call slot to join, `m.call#{application_slot_id}`. Omitted is the
+    /// room-wide call, `room`.
+    #[serde(default)]
+    pub application_slot_id: Option<String>,
     /// What the join publishes on, if anything. Omitted is advertised.
     #[serde(default)]
     pub transport: WasmJoinTransport,
@@ -577,22 +580,19 @@ impl WasmJoinSessionParams {
     /// The SDK generates the `member.id`: MSC4143 requires a fresh one per
     /// join.
     fn into_call(self) -> Result<CallJoinOptions, JsError> {
-        // The binding names the whole slot id; the room checks it belongs to
-        // the application.
-        let mut join = JoinOptions {
-            slot_id: self.slot_id,
-            ..JoinOptions::application(self.application)
-        };
+        let mut options = CallJoinOptions::new();
+        if let Some(name) = self.application_slot_id {
+            options = options.slot(name);
+        }
+        let join = &mut options.join;
         join.transport = self.transport.into();
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        Ok(CallJoinOptions {
-            join,
-            notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
-            reactions: self.reactions.map(Into::into),
-        })
+        options.notify = self.notify.map(WasmNotifyConfig::into_core).transpose()?;
+        options.reactions = self.reactions.map(Into::into);
+        Ok(options)
     }
 }
 
@@ -664,7 +664,6 @@ mod tests {
     use wasm_bindgen_test::*;
 
     const ROOM: &str = "!room:example.org";
-    const SLOT: &str = "m.call#ROOM";
 
     /// A JS stand-in for the page's backend: every send resolves, the room
     /// subscription delivers one open slot, an unencrypted room, ourselves as
@@ -724,7 +723,7 @@ mod tests {
              for (const type of subjects.state_event_types) { \
                  if (type === 'm.rtc.slot') sink.onStateEvents(type, [{ \
                      event_id: '$slot', sender: '@admin:example.org', event_type: type, \
-                     state_key: 'm.call#ROOM', origin_server_ts: 1, \
+                     state_key: 'm.call#room', origin_server_ts: 1, \
                      content: { status: 'open', application: { type: 'm.call' } }, \
                      encryption: { kind: 'cleartext' } }]); \
                  if (type === 'org.matrix.msc3401.call.member') sink.onStateEvents(type, []); \
@@ -771,14 +770,12 @@ mod tests {
 
     #[derive(Serialize)]
     struct TestJoinParams {
-        slot_id: &'static str,
-        application: &'static str,
+        application_slot_id: &'static str,
     }
 
     fn join_params() -> JsValue {
         serde_wasm_bindgen::to_value(&TestJoinParams {
-            slot_id: SLOT,
-            application: "m.call",
+            application_slot_id: "room",
         })
         .unwrap()
     }
@@ -812,15 +809,13 @@ mod tests {
     async fn a_joined_call_keeps_itself_alive() {
         #[derive(Serialize)]
         struct TestJoinParams {
-            slot_id: &'static str,
-            application: &'static str,
+            application_slot_id: &'static str,
             keep_alive_timeout_ms: u64,
         }
         let client = WasmRtcClient::new(mock_host(""));
         let room = open(&client, None).await;
         let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            slot_id: SLOT,
-            application: "m.call",
+            application_slot_id: "room",
             keep_alive_timeout_ms: 400,
         })
         .unwrap();
@@ -856,8 +851,7 @@ mod tests {
         }
         #[derive(Serialize)]
         struct TestJoinParams {
-            slot_id: &'static str,
-            application: &'static str,
+            application_slot_id: &'static str,
             transport: TestTransport,
         }
 
@@ -870,8 +864,7 @@ mod tests {
         ));
         let room = open(&client, Some("sticky_2025")).await;
         let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            slot_id: SLOT,
-            application: "m.call",
+            application_slot_id: "room",
             transport: TestTransport {
                 kind: "publish",
                 livekit_service_url: "https://sfu.example.org/livekit/jwt",

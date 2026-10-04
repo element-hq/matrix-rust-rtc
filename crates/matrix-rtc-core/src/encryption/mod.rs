@@ -173,7 +173,7 @@
 //!     "device123".to_string(),
 //!     "xyzABCDEF0123".to_string(),  // member_id
 //!     "!room:example.org".to_string(),
-//!     "m.call#ROOM".to_string(),
+//!     "m.call#room".to_string(),
 //!     get_memberships,
 //! );
 //!
@@ -2006,7 +2006,7 @@ mod tests {
     use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
-    const SLOT_ID: &str = "m.call#ROOM";
+    const SLOT_ID: &str = "m.call#room";
     const USER_ID: &str = "@alice:example.org";
     const DEVICE_ID: &str = "device123";
     const MEMBER_ID: &str = "alice-device123-uuid";

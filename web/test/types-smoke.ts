@@ -53,7 +53,7 @@ export function host(client: {
         event_id: '$slot',
         sender: '@admin:hs',
         event_type: 'm.rtc.slot',
-        state_key: 'm.call#ROOM',
+        state_key: 'm.call#room',
         content: { status: 'open' },
         encryption: { kind: 'cleartext' },
       };
@@ -87,8 +87,7 @@ export async function smoke(
   const room: WasmRtcRoom = await client.room('!r:hs', options);
 
   const params: JoinParamsIn = {
-    slot_id: 'm.call#ROOM',
-    application: 'm.call',
+    application_slot_id: 'room',
   };
   const call: WasmRtcCall = await room.joinCall(params);
   const memberId: string = call.memberId;

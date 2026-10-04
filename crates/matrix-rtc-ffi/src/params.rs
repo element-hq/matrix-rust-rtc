@@ -90,10 +90,10 @@ impl From<FfiNotifyConfig> for matrix_rtc_call::NotifyConfig {
 /// FFI-friendly join session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiJoinSessionParams {
-    /// Slot ID (e.g., "m.call#ROOM")
-    pub slot_id: String,
-    /// Application type (e.g., "m.call")
-    pub application: String,
+    /// The call slot to join, `m.call#{application_slot_id}`. `None` is the
+    /// room-wide call, `room`.
+    #[uniffi(default = None)]
+    pub application_slot_id: Option<String>,
     /// What the join publishes on, if anything. Usually
     /// [`FfiJoinTransport::Advertised`].
     pub transport: FfiJoinTransport,
@@ -214,9 +214,10 @@ impl FfiJoinSessionParams {
         };
 
         format!(
-            "[{}] application={} transport={} keep_alive={:?}ms encryption={} notify={:?}",
-            self.slot_id,
-            self.application,
+            "[slot {}] transport={} keep_alive={:?}ms encryption={} notify={:?}",
+            self.application_slot_id
+                .as_deref()
+                .unwrap_or(matrix_rtc_core::ROOM_APPLICATION_SLOT_ID),
             transport,
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
@@ -230,22 +231,19 @@ impl FfiJoinSessionParams {
     /// participant identity stable while the key index restarts at 0, so peers
     /// decrypt new media with a stale key and never recover.
     pub(crate) fn into_call(self) -> matrix_rtc_call::CallJoinOptions {
-        // The binding names the whole slot id; the room checks it belongs to
-        // the application.
-        let mut join = matrix_rtc_call::JoinOptions {
-            slot_id: self.slot_id,
-            ..matrix_rtc_call::JoinOptions::application(self.application)
-        };
+        let mut options = matrix_rtc_call::CallJoinOptions::new();
+        if let Some(name) = self.application_slot_id {
+            options = options.slot(name);
+        }
+        let join = &mut options.join;
         join.transport = self.transport.into();
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        matrix_rtc_call::CallJoinOptions {
-            join,
-            notify: self.notify.map(Into::into),
-            reactions: self.reactions.map(Into::into),
-        }
+        options.notify = self.notify.map(Into::into);
+        options.reactions = self.reactions.map(Into::into);
+        options
     }
 }
 

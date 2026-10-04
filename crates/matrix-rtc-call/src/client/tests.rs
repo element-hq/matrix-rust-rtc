@@ -18,7 +18,7 @@ use super::*;
 
 const ROOM: &str = "!room:example.org";
 const OTHER_ROOM: &str = "!other:example.org";
-const SLOT: &str = "m.call#ROOM";
+const SLOT: &str = "m.call#room";
 const BOB: &str = "@bob:example.org";
 
 fn mock() -> Arc<MockBackend> {
@@ -542,7 +542,7 @@ async fn a_raised_hand_follows_our_membership_across_a_refresh_by_itself() {
 
 #[test]
 fn a_call_join_names_only_its_slot() {
-    assert_eq!(CallJoinOptions::new().join.slot_id, "m.call#ROOM");
+    assert_eq!(CallJoinOptions::new().join.slot_id, "m.call#room");
     assert_eq!(
         CallJoinOptions::new().slot("standup").join.slot_id,
         "m.call#standup"

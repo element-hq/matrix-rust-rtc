@@ -10,6 +10,8 @@ log only.
 
 ### Breaking
 
+- FFI and web `joinCall` take an optional `application_slot_id` (`m.call#{application_slot_id}`, `room` when omitted) instead of `slot_id` and `application`.
+- The room-wide slot is `{application}#room`, as MSC4143 spells it, instead of `{application}#ROOM`, so it no longer meets clients still on `m.call#ROOM`; `ROOM_SLOT_NAME` becomes `ROOM_APPLICATION_SLOT_ID`.
 - A join refused because its slot is not open fails with `MatrixRtcFfiError::SlotClosed` instead of `InvalidInput`.
 - A join's transport is one choice, `Advertised`, `Publish` on a LiveKit focus, or `ReceiveOnly`, replacing `transport`, `receive_only` and `can_subscribe` in the FFI and web join params.
 - The library keeps a joined session alive and performs its key rotations at their deadline itself; `heartbeat()`, `flushDueKeyRotation()`/`flush_due_key_rotation`, `keyRotationDueAtMs()`/`key_rotation_due_at_ms` and `HEARTBEAT_INTERVAL_MS` are gone, and `LiveKitCallOptions::heartbeat_interval` becomes `keep_alive_interval_ms` (default 10 s).
@@ -28,7 +30,7 @@ log only.
 - `BaseRtcRoom::join` returns the event id of the membership it sent, and `RtcSession::membership_event_id` reads the current one.
 - The feeder feeds any `ApplicationIntake`, subscribing to the event types it names.
 - The feeder moves from `matrix_rtc_call::feeder` to `matrix_rtc_core::feeder`, reading a room through an `IngestDialect`.
-- `JoinSessionParams` no longer takes the user and device, which are the backend's: `JoinSessionParams::application("org.example.board").slot("planning")` composes the slot id (`{application}#ROOM` without `.slot`), and every other field is a named setter (`.transport(..)`, required, `.member_id(..)`, `.keep_alive_interval_ms(..)`, …); `JoinSessionParams::new` and `with_transport_intent` are gone. The call layer's options read the same way: `CallJoinOptions::new()` joins `m.call#ROOM` and `.slot("standup")` names another, `JoinOptions::application(..).slot(..)` for any application; `JoinOptions::new` and `CallJoinOptions::new(slot_id)` are gone.
+- `JoinSessionParams` no longer takes the user and device, which are the backend's: `JoinSessionParams::application("org.example.board").slot("planning")` composes the slot id (`{application}#room` without `.slot`), and every other field is a named setter (`.transport(..)`, required, `.member_id(..)`, `.keep_alive_interval_ms(..)`, …); `JoinSessionParams::new` and `with_transport_intent` are gone. The call layer's options read the same way: `CallJoinOptions::new()` joins `m.call#room` and `.slot("standup")` names another, `JoinOptions::application(..).slot(..)` for any application; `JoinOptions::new` and `CallJoinOptions::new(slot_id)` are gone.
 - The pre-2026 membership formats move from `matrix_rtc_call::compat` to `matrix_rtc_core::compat`, and `ElementCallCompat { Off, StickyEvents, StateEvents }` becomes `MembershipFormat { Current, Sticky2025, RoomState }` on every host (`FfiMembershipFormat`, the wasm `format: "current" | "sticky_2025" | "room_state"` room option, `LiveKitCallOptions::format`, `RoomOptions::format`, the load test's `--format`).
 - `WasmRtcSession`, the bare single-session wasm API, is removed; `WasmRtcClient` over a `MatrixBackendHost` is the one entry point, and `joinCall` rings like every other host.
 

@@ -30,7 +30,7 @@ plus reactions, the raised hand and the ring. Room-scoped reads (`slot_state`,
 `member_count`, `observe`) and `open_slot`/`close_slot` need no join.
 
 Both name the slot, not its id: `CallJoinOptions::new()` joins the room-wide
-call `m.call#ROOM`, `.slot("standup")` joins `m.call#standup`, and
+call `m.call#room`, `.slot("standup")` joins `m.call#standup`, and
 `JoinOptions::application("org.example.board").slot("planning")` composes
 `org.example.board#planning`. The transport is the homeserver's first LiveKit
 one unless `.transport(..)` names one.

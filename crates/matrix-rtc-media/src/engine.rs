@@ -2435,7 +2435,7 @@ mod tests {
     fn member_on(member_id: &str, user_id: &str, focus: &str) -> JoinedMembership {
         JoinedMembership {
             room_id: "!room:example.org".to_owned(),
-            slot_id: "m.call#ROOM".to_owned(),
+            slot_id: "m.call#room".to_owned(),
             sender: user_id.to_owned(),
             origin: EventOrigin::encrypted(Some("DEVICE".to_owned())),
             sticky_key: member_id.to_owned(),
@@ -2480,7 +2480,7 @@ mod tests {
                 own_member_id: "own".to_owned(),
                 ctx: ConnectionContext {
                     room_id: "!room:example.org".to_owned(),
-                    slot_id: "m.call#ROOM".to_owned(),
+                    slot_id: "m.call#room".to_owned(),
                     member: OwnMemberClaims {
                         member_id: "own".to_owned(),
                         user_id: "@alice:example.org".to_owned(),

@@ -66,7 +66,7 @@ const rtcRoom = await rtc.room(roomId, { format: 'current' });
 
 // 1. Publish our membership (starts the keep-alive machinery). The transport
 //    comes from the homeserver's /rtc/transports unless you pin one here.
-const rtcCall = await rtcRoom.joinCall({ slot_id: 'm.call#ROOM', application: 'm.call' });
+const rtcCall = await rtcRoom.joinCall({ slot_id: 'm.call#room', application: 'm.call' });
 
 // 2. Attach media: roster + LiveKit connection lifecycle.
 const call = new MatrixRtcCall({

@@ -50,7 +50,7 @@
 //! | `INVITE_USER` | *required* — the Matrix ID Element Call will log in as |
 //! | `DISPLAY_NAME` | `Rust Peer` — what the browser asserts it can see |
 //! | `ROOM_NAME` | `Interop LiveKitCall` |
-//! | `SLOT_ID` | `m.call#ROOM` |
+//! | `SLOT_ID` | `m.call#room` |
 //! | `LIVEKIT_SERVICE_URL` | unset — only a fallback when the homeserver advertises no focus |
 //! | `RECORD_SECS` | `3` |
 //! | `OUT_WAV` | unset — when set, the recorded peer audio is written there |
@@ -197,7 +197,7 @@ impl Config {
         Ok(Config {
             homeserver: env::var("HOMESERVER_URL")
                 .unwrap_or_else(|_| "https://synapse.m.localhost".to_owned()),
-            slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned()),
+            slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#room".to_owned()),
             // Deliberately no default. The interop stack advertises its focus
             // over MSC4143 `/rtc_transports` (`matrix_rtc.transports` in
             // homeserver.interop.yaml), which is what we want the test to

@@ -16,7 +16,7 @@ use crate::testing::MockBackend;
 use crate::{BaseRtcRoom, RawStickyEvent};
 
 const ROOM: &str = "!room:example.org";
-const SLOT: &str = "m.call#ROOM";
+const SLOT: &str = "m.call#room";
 const ME: &str = "@mock:example.org";
 const BOB: &str = "@bob:example.org";
 

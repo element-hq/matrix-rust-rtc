@@ -84,7 +84,7 @@ SUBSCRIBE=0
 # transport of its own.
 LIVEKIT_URL="http://localhost:6080"
 
-SLOT_ID="m.call#ROOM"
+SLOT_ID="m.call#room"
 
 # Publish the m.rtc.slot state event first. Needs the power level for it, and
 # is unnecessary when a real client already opened the call.

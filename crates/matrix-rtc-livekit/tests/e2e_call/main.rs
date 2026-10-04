@@ -108,7 +108,7 @@ impl Config {
         Config {
             homeserver: env::var("HOMESERVER_URL")
                 .unwrap_or_else(|_| "http://localhost:8008".to_owned()),
-            slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned()),
+            slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#room".to_owned()),
             livekit_service_url: env::var("LIVEKIT_SERVICE_URL")
                 .unwrap_or_else(|_| "http://localhost:6080".to_owned()),
             livekit_service_url_2: env::var("LIVEKIT_SERVICE_URL_2")

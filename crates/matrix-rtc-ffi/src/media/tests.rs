@@ -57,7 +57,7 @@ fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
                     event_id: "$slot".to_owned(),
                     sender: "@admin:example.org".to_owned(),
                     event_type: matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
-                    state_key: Some("m.call#ROOM".to_owned()),
+                    state_key: Some("m.call#room".to_owned()),
                     origin_server_ts: 1,
                     content_json: r#"{"status":"open","application":{"type":"m.call"}}"#.to_owned(),
                     encryption: FfiEventEncryption {
@@ -75,7 +75,7 @@ fn joined_call(mock: &Arc<MockHost>) -> (Arc<RtcRoom>, Arc<RtcCall>) {
         let call = room
             .clone()
             .join_call(FfiJoinSessionParams {
-                slot_id: "m.call#ROOM".to_owned(),
+                slot_id: "m.call#room".to_owned(),
                 application: "m.call".to_owned(),
                 transport: FfiJoinTransport::Publish {
                     livekit_service_url: DEAD_SFU_URL.to_owned(),

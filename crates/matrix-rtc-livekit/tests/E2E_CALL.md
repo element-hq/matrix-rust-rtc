@@ -100,7 +100,7 @@ collisions. Overrides for pointing at another deployment:
 | --- | --- | --- |
 | `HOMESERVER_URL` | `http://localhost:8008` | Synapse CS-API base URL |
 | `LIVEKIT_SERVICE_URL` | `http://localhost:6080` | `lk-jwt` `/get_token` base URL, pinned via `LiveKitCallOptions::livekit_transport` (overrides the homeserver's MSC4143 transports endpoint) |
-| `SLOT_ID` | `m.call#ROOM` | MatrixRTC slot |
+| `SLOT_ID` | `m.call#room` | MatrixRTC slot |
 | `ALICE` / `ALICE_PW`, `BOB` / `BOB_PW` | *(auto-provisioned)* | Use pre-existing users instead of registering throwaways (for stacks with closed registration) |
 | `INSECURE_TLS` | *(unset)* | set (any value) to accept self-signed certs on a remote TLS stack |
 | `RUST_LOG` | `info` | tracing filter |
@@ -116,7 +116,7 @@ collisions. Overrides for pointing at another deployment:
 [bob]   joined room !…
 [alice] room has 2 joined members
 [bob]   room has 2 joined members
-[alice] opened slot m.call#ROOM
+[alice] opened slot m.call#room
 [alice-…] joined RTC session (membership …)
 [bob-…]   joined RTC session (membership …)
 [alice-…] connected to the SFU (per-participant frame E2EE enabled)

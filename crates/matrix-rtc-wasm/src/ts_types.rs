@@ -196,8 +196,8 @@ export type JoinTransportIn =
 
 /** `joinCall`'s parameters. */
 export interface JoinParamsIn {
-    slot_id: string;
-    application: string;
+    /** The call slot to join, `m.call#{application_slot_id}`; omitted is the room-wide call, `room`. */
+    application_slot_id?: string;
     /** What the join publishes on; omitted is `advertised`, the first LiveKit transport the homeserver advertises (`rtcTransports`). */
     transport?: JoinTransportIn;
     keep_alive_timeout_ms?: number;

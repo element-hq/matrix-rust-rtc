@@ -105,7 +105,7 @@ impl From<RtcError> for LiveKitCallError {
 }
 
 /// Options for [`LiveKitCall::join`]. `LiveKitCallOptions::default()` matches the common
-/// case: the `m.call#ROOM` slot of the `m.call` application, transport
+/// case: the `m.call#room` slot of the `m.call` application, transport
 /// discovery via the homeserver, and the core's default encryption policy.
 #[derive(Clone, Debug)]
 pub struct LiveKitCallOptions {
@@ -206,7 +206,7 @@ pub struct LiveKitCallOptions {
 impl Default for LiveKitCallOptions {
     fn default() -> Self {
         Self {
-            slot_id: "m.call#ROOM".to_owned(),
+            slot_id: "m.call#room".to_owned(),
             application: "m.call".to_owned(),
             livekit_transport: None,
             encryption_config: None,

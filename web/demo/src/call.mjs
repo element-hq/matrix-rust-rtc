@@ -27,7 +27,7 @@ import {
   toneAudioTrack,
 } from './tracks.mjs';
 
-const DEFAULT_SLOT_ID = 'm.call#ROOM';
+const DEFAULT_SLOT_ID = 'm.call#room';
 
 export class WebPeerApp {
   /**
@@ -130,12 +130,12 @@ export class WebPeerApp {
    * Join the RTC slot and attach media: feed the room, publish the
    * membership, connect the SFU through the engine, publish tracks.
    */
-  async join({ roomId, slotId = DEFAULT_SLOT_ID, compat, publish = {} }) {
+  async join({ roomId, compat, publish = {} }) {
     const focusUrl = await this.host.discoverFocus();
     this.roomId = roomId;
-    this.slotId = slotId;
+    this.slotId = DEFAULT_SLOT_ID;
     this.compat = compat;
-    this.log(`joining ${roomId} / ${slotId} on focus ${focusUrl}`);
+    this.log(`joining ${roomId} / ${this.slotId} on focus ${focusUrl}`);
 
     // Open before joining: the room subscribes through the host and applies
     // its current state (encryption, slots, members, membership) before
@@ -145,8 +145,6 @@ export class WebPeerApp {
     });
 
     this.rtcCall = await this.rtcRoom.joinCall({
-      slot_id: slotId,
-      application: 'm.call',
       // The demo pins the focus it discovered; omit to take the homeserver's.
       transport: { kind: 'publish', livekit_service_url: focusUrl },
     });

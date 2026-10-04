@@ -313,7 +313,7 @@ mod tests {
             "@alice:example.org",
             "DEVICE",
             room_id,
-            "m.call#ROOM",
+            "m.call#room",
         )
     }
 
@@ -324,7 +324,7 @@ mod tests {
             .send_sticky_event(
                 "!room:example.org".to_owned(),
                 "m.rtc.member".to_owned(),
-                json!({ "slot_id": "m.call#ROOM" }),
+                json!({ "slot_id": "m.call#room" }),
                 90_000,
             )
             .await
@@ -333,7 +333,7 @@ mod tests {
             .send_state_event(
                 "!room:example.org".to_owned(),
                 crate::SLOT_EVENT_TYPE.to_owned(),
-                "m.call#ROOM".to_owned(),
+                "m.call#room".to_owned(),
                 json!({ "status": "open" }),
             )
             .await
@@ -458,7 +458,7 @@ mod tests {
                 "!legacy:example.org".to_owned(),
                 "m.rtc.member".to_owned(),
                 None,
-                json!({ "slot_id": "m.call#ROOM", "msc4354_sticky_key": "k", "member": { "membership": "leave" } }),
+                json!({ "slot_id": "m.call#room", "msc4354_sticky_key": "k", "member": { "membership": "leave" } }),
                 30_000,
             )
             .await

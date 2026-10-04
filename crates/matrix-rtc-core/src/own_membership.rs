@@ -961,7 +961,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -975,7 +975,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -988,12 +988,12 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
-        assert_eq!(machine.slot_id(), "m.call#ROOM");
+        assert_eq!(machine.slot_id(), "m.call#room");
     }
 
     #[test]
@@ -1001,7 +1001,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1015,7 +1015,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1057,7 +1057,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(event_type, "m.rtc.member");
         assert_eq!(
             content.get("slot_id").and_then(|v| v.as_str()),
-            Some("m.call#ROOM")
+            Some("m.call#room")
         );
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1131,7 +1131,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1172,7 +1172,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1218,7 +1218,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1246,7 +1246,7 @@ mod tests {
         let machine = OwnMembershipMachine::new(
             sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
             MembershipTimings {
@@ -1276,7 +1276,7 @@ mod tests {
         OwnMembershipMachine::with_default_timeout(
             mock_sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         )
@@ -1291,7 +1291,7 @@ mod tests {
         OwnMembershipMachine::new(
             mock_sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
             MembershipTimings {
@@ -1552,7 +1552,7 @@ mod tests {
         OwnMembershipMachine::new(
             sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
             MembershipTimings {
@@ -1757,7 +1757,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1851,7 +1851,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1888,7 +1888,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );

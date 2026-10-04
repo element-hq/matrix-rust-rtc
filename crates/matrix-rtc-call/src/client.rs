@@ -26,8 +26,8 @@ use std::time::Duration;
 use matrix_rtc_core::{
     ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveError, LeaveSessionParams, MatrixBackend, OpenError, ROOM_SLOT_NAME, RtcIdentityMapper,
-    SlotEncryption, SlotState, TransportIntent,
+    LeaveError, LeaveSessionParams, MatrixBackend, OpenError, ROOM_APPLICATION_SLOT_ID,
+    RtcIdentityMapper, SlotEncryption, SlotState, TransportIntent,
     executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -95,12 +95,12 @@ pub struct JoinOptions {
 }
 
 impl JoinOptions {
-    /// Joins `application`'s room-wide slot, `{application}#ROOM`, with
+    /// Joins `application`'s room-wide slot, `{application}#room`, with
     /// everything else defaulted; each setter overrides one default.
     pub fn application(application: impl Into<ApplicationInfo>) -> Self {
         let application = application.into();
         Self {
-            slot_id: slot_id_of(&application, ROOM_SLOT_NAME),
+            slot_id: slot_id_of(&application, ROOM_APPLICATION_SLOT_ID),
             application,
             transport: JoinTransport::Advertised,
             encryption_config: None,
@@ -111,9 +111,9 @@ impl JoinOptions {
         }
     }
 
-    /// Joins the application's slot named `name`: `{application}#{name}`.
-    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
-        self.slot_id = slot_id_of(&self.application, name.as_ref());
+    /// Joins the application's slot `{application}#{application_slot_id}`.
+    pub fn slot(mut self, application_slot_id: impl AsRef<str>) -> Self {
+        self.slot_id = slot_id_of(&self.application, application_slot_id.as_ref());
         self
     }
 
@@ -148,10 +148,10 @@ impl JoinOptions {
     }
 }
 
-/// `{application}#{name}`, MSC4143's slot id.
-fn slot_id_of(application: &ApplicationInfo, name: &str) -> String {
+/// `{application_type}#{application_slot_id}`, MSC4143's slot id.
+fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
     format!(
-        "{}#{name}",
+        "{}#{application_slot_id}",
         application.application_type().unwrap_or_default()
     )
 }
@@ -168,7 +168,7 @@ pub struct CallJoinOptions {
 }
 
 impl CallJoinOptions {
-    /// A quiet join of the room-wide call, `m.call#ROOM`, with default
+    /// A quiet join of the room-wide call, `m.call#room`, with default
     /// reactions.
     pub fn new() -> Self {
         Self {
@@ -178,9 +178,9 @@ impl CallJoinOptions {
         }
     }
 
-    /// Joins the call slot named `name`: `m.call#{name}`.
-    pub fn slot(mut self, name: impl AsRef<str>) -> Self {
-        self.join = self.join.slot(name);
+    /// Joins the call slot `m.call#{application_slot_id}`.
+    pub fn slot(mut self, application_slot_id: impl AsRef<str>) -> Self {
+        self.join = self.join.slot(application_slot_id);
         self
     }
 

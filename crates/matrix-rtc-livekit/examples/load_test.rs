@@ -145,7 +145,7 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 1)]
     devices: usize,
 
-    #[arg(long, default_value = "m.call#ROOM")]
+    #[arg(long, default_value = "m.call#room")]
     slot_id: String,
 
     #[arg(long, default_value = "m.call")]

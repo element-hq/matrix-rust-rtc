@@ -46,7 +46,7 @@
 //! | | Element Call, pre-sticky | MSC4143 today |
 //! |---|---|---|
 //! | carrier | `org.matrix.msc3401.call.member` state event | `m.rtc.member` sticky event |
-//! | session | `application: "m.call"` (a string) + `call_id` + `scope` | `slot_id: "m.call#ROOM"` |
+//! | session | `application: "m.call"` (a string) + `call_id` + `scope` | `slot_id: "m.call#room"` |
 //! | member id | `membershipID` | `member.id` (== the sticky key) |
 //! | device | `device_id` in the content, self-asserted | the device that encrypted the event |
 //! | join | any non-empty content | `member.membership: "join"` |
@@ -110,7 +110,7 @@ pub const STATE_MEMBER_EVENT_TYPE: &str = "org.matrix.msc3401.call.member";
 /// The `call_id` sentinel an MSC4143 slot id uses for the room-wide session,
 /// where this dialect uses an empty string. The same convention
 /// [`legacy_session`] reverses.
-const ROOM_CALL_ID: &str = "ROOM";
+const ROOM_CALL_ID: &str = crate::ROOM_APPLICATION_SLOT_ID;
 
 /// The lifetime to assume when a content states no `expires`: four hours, the JS
 /// SDK's own default. Ruma makes the field required; old builds omitted it.
@@ -734,7 +734,7 @@ mod tests {
         assert_eq!(
             membership.content,
             json!({
-                "slot_id": "m.call#ROOM",
+                "slot_id": "m.call#room",
                 "msc4354_sticky_key": "@alice:example.io:V5cP8FErcB",
                 "member": { "id": "@alice:example.io:V5cP8FErcB", "membership": "join" },
                 "application": { "type": "m.call", "m.call.intent": "video" },
@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn the_empty_call_id_becomes_the_room_sentinel() {
         let room_wide = one(EC_JOIN).unwrap();
-        assert_eq!(room_wide.content["slot_id"], "m.call#ROOM");
+        assert_eq!(room_wide.content["slot_id"], "m.call#room");
 
         let named = translate_values(
             &[("a", CREATED, join_with(&[("call_id", json!("standup"))]))],
@@ -781,7 +781,7 @@ mod tests {
 
         // And the sentinel round-trips through the convention the outbound half
         // uses, so a peer lands in the session we are actually in.
-        assert_eq!(legacy_session("m.call#ROOM"), ("m.call", ""));
+        assert_eq!(legacy_session("m.call#room"), ("m.call", ""));
         assert_eq!(legacy_session("m.call#standup"), ("m.call", "standup"));
     }
 
@@ -1058,7 +1058,7 @@ mod tests {
     /// The content the core hands us for a join, as `RawStickyEventContent`
     /// serializes it.
     const SPEC_JOIN: &str = r#"{
-        "slot_id": "m.call#ROOM",
+        "slot_id": "m.call#room",
         "msc4354_sticky_key": "xyzABCDEF0123",
         "member": { "id": "xyzABCDEF0123", "membership": "join" },
         "application": { "type": "m.call", "m.call.intent": "video" },
@@ -1070,7 +1070,7 @@ mod tests {
 
     /// The core's leave, and the delayed leave it arms at join time.
     const SPEC_LEAVE: &str = r#"{
-        "slot_id": "m.call#ROOM",
+        "slot_id": "m.call#room",
         "msc4354_sticky_key": "xyzABCDEF0123",
         "member": { "id": "xyzABCDEF0123", "membership": "leave" },
         "leave_reason": { "code": "m.delayed_leave", "reason": "Dead man's switch" }
@@ -1081,7 +1081,7 @@ mod tests {
             "@alice:example.io",
             "V5cP8FErcB",
             "!room:example.io",
-            "m.call#ROOM",
+            "m.call#room",
         )
     }
 
@@ -1287,7 +1287,7 @@ mod tests {
             RtcMembershipEvent::Left(_) => panic!("a join must not project as a leave"),
         };
 
-        assert_eq!(joined.slot_id, "m.call#ROOM");
+        assert_eq!(joined.slot_id, "m.call#room");
         assert_eq!(joined.sender, "@alice:example.io");
         assert_eq!(joined.member_id, "@alice:example.io:V5cP8FErcB");
         assert_eq!(joined.sticky_key, joined.member_id);

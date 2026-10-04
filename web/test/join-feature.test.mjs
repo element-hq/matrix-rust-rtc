@@ -12,7 +12,8 @@ import { mockBackendHost, openSlotEvent } from './mock-backend-host.mjs';
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
 const ROOM_ID = '!test:example.org';
-const SLOT_ID = 'm.call#TEST';
+const APPLICATION_SLOT_ID = 'TEST';
+const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@alice:example.org';
 const DEVICE_ID = 'device123';
 const SFU = 'https://example.com/livekit/jwt';
@@ -30,8 +31,7 @@ function getContentValue(content, key) {
 }
 
 const joinParams = {
-  slot_id: SLOT_ID,
-  application: 'm.call',
+  application_slot_id: APPLICATION_SLOT_ID,
   transport: { kind: 'publish', livekit_service_url: SFU },
 };
 
@@ -179,11 +179,10 @@ describe('WASM bindings with a mock backend host', () => {
   });
 
   describe('Error handling', () => {
-    it('join with missing required params throws', async () => {
+    it('join with malformed params throws', async () => {
       const client = new bindings.WasmRtcClient(host);
       const room = await client.room(ROOM_ID, undefined);
-      const { slot_id, ...invalidParams } = joinParams;
-      void slot_id;
+      const invalidParams = { ...joinParams, transport: { kind: 'publish' } };
       await expect(room.joinCall(invalidParams)).rejects.toThrow(/invalid join params/);
     });
   });

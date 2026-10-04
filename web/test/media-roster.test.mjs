@@ -18,7 +18,8 @@ import { mockBackendHost, openSlotEvent, memberEventIn } from './mock-backend-ho
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
 const ROOM_ID = '!call:example.org';
-const SLOT_ID = 'm.call#CALL';
+const APPLICATION_SLOT_ID = 'CALL';
+const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@me:example.org';
 const DEVICE_ID = 'MYDEVICE';
 const OWN_FOCUS = 'https://rtc.example.org/livekit/jwt';
@@ -102,8 +103,7 @@ describe('web media roster over a fake transport delegate', () => {
     // Join, then deliver the sticky state as a server would echo it:
     // ourselves, plus one peer on our focus and one on a second focus.
     const call = await room.joinCall({
-      slot_id: SLOT_ID,
-      application: 'm.call',
+      application_slot_id: APPLICATION_SLOT_ID,
       transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
     });
     const memberId = call.memberId;

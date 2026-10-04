@@ -22,7 +22,7 @@
 //! ```
 //!
 //! Env vars: `HOMESERVER_URL` (default `http://localhost:8008`), `MX_USER`,
-//! `MX_PASSWORD`, `ROOM_ID` (required), `SLOT_ID` (default `m.call#ROOM`),
+//! `MX_PASSWORD`, `ROOM_ID` (required), `SLOT_ID` (default `m.call#room`),
 //! `LIVEKIT_SERVICE_URL` (default `http://localhost:6080`, used when the
 //! homeserver doesn't advertise a transport), `RECOVERY_KEY` (see below),
 //! `OPEN_SLOT`, `PUBLISH_TONE`, `RECORD_SECS` (default 5), `OUT_WAV`
@@ -77,7 +77,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let user = required("MX_USER")?;
     let password = required("MX_PASSWORD")?;
     let room_id = RoomId::parse(required("ROOM_ID")?)?;
-    let slot_id = env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned());
+    let slot_id = env::var("SLOT_ID").unwrap_or_else(|_| "m.call#room".to_owned());
     let livekit_service_url =
         env::var("LIVEKIT_SERVICE_URL").unwrap_or_else(|_| "http://localhost:6080".to_owned());
     let insecure_tls = env::var("INSECURE_TLS").is_ok();

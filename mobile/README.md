@@ -61,8 +61,8 @@ logging up as your first SDK call covers it too.
 ```kotlin
 val client = RtcClient(backend)                    // one per Matrix session; does no I/O
 val room = client.room(roomId, FfiRoomOptions()) // subscribes, resolves once the room's state is in
-room.memberCount("m.call#ROOM")                    // observe a slot without joining it
-val call = room.joinCall(FfiJoinSessionParams(slotId = "m.call#ROOM", application = "m.call"))
+room.memberCount("m.call#room")                    // observe a slot without joining it
+val call = room.joinCall(FfiJoinSessionParams(slotId = "m.call#room", application = "m.call"))
 val media = connectMediaSession(call, MediaSessionConfig(/* … */))
 // …
 call.leave(FfiLeaveSessionParams(leaveReason = null))  // the call object is over afterwards
@@ -280,7 +280,7 @@ level for `m.rtc.slot` state; the room creator by default, or set it in the
 room's initial state):
 
 ```kotlin
-room.openSlot("m.call#ROOM", "m.call", FfiSlotEncryption.PerMember)
+room.openSlot("m.call#room", "m.call", FfiSlotEncryption.PerMember)
 ```
 
 `encryption` must be `PerMember` in an encrypted room and `null` elsewhere — the

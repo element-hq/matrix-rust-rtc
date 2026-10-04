@@ -43,7 +43,7 @@ function fakeClient() {
   const client = new EventEmitter();
   const room = new EventEmitter();
   room.roomId = ROOM;
-  room.state = { [SLOT]: [fakeEvent({ id: '$slot', type: SLOT, stateKey: 'm.call#ROOM' })] };
+  room.state = { [SLOT]: [fakeEvent({ id: '$slot', type: SLOT, stateKey: 'm.call#room' })] };
   room.members = ['@me:example.org'];
   room.sticky = [];
   room.currentState = {
@@ -119,7 +119,7 @@ describe('MatrixHost room subscription', () => {
     sink.calls.length = 0;
 
     client.room.state[SLOT] = [];
-    const change = fakeEvent({ id: '$closed', type: SLOT, stateKey: 'm.call#ROOM' });
+    const change = fakeEvent({ id: '$closed', type: SLOT, stateKey: 'm.call#room' });
     client.emit(sdk.RoomStateEvent.Events, change);
     client.emit(sdk.RoomStateEvent.Events, change);
     await flush();

@@ -542,8 +542,9 @@ pub fn flatten_notification_content(event_type: &str, content: &Value) -> Option
 /// Reconstruct the legacy `{application, call_id}` pair from a slot id.
 ///
 /// MSC4143 folded the old `{application, call_id, scope}` triple into a single
-/// slot id of the form `<application>#<call_id>`, where the sentinel `ROOM` is
-/// the room-scoped session that used to be an empty `call_id`.
+/// slot id of the form `<application>#<call_id>`, where the room-wide
+/// `application_slot_id` ([`crate::ROOM_APPLICATION_SLOT_ID`]) is the
+/// room-scoped session that used to be an empty `call_id`.
 ///
 /// A free function, and shared with [`super::room_state`], because that
 /// generation needs the same split in three places — the member content, the
@@ -552,7 +553,7 @@ pub fn flatten_notification_content(event_type: &str, content: &Value) -> Option
 /// peer in a session we are not in, and the roster is silently empty.
 pub(crate) fn legacy_session(slot_id: &str) -> (&str, &str) {
     match slot_id.split_once('#') {
-        Some((application, "ROOM")) => (application, ""),
+        Some((application, crate::ROOM_APPLICATION_SLOT_ID)) => (application, ""),
         Some((application, call_id)) => (application, call_id),
         // No separator: treat the whole thing as the application, which is
         // the room-scoped case again.
@@ -567,7 +568,7 @@ mod tests {
     /// A join exactly as observed from Element Call on the JS SDK.
     const LEGACY_JOIN: &str = r#"{
         "application": { "type": "m.call", "m.call.intent": "video" },
-        "slot_id": "m.call#ROOM",
+        "slot_id": "m.call#room",
         "rtc_transports": [
             {
                 "type": "livekit",
@@ -589,7 +590,7 @@ mod tests {
 
     /// A current-spec join, which must survive normalisation untouched.
     const SPEC_JOIN: &str = r#"{
-        "slot_id": "m.call#ROOM",
+        "slot_id": "m.call#room",
         "member": { "id": "xyzABCDEF0123", "membership": "join" },
         "application": { "type": "m.call" },
         "transports": {
@@ -768,7 +769,7 @@ mod tests {
     }
 
     fn dialect() -> Sticky2025Dialect {
-        Sticky2025Dialect::new("@bob:example.io", "BOBDEVICE", "m.call#ROOM")
+        Sticky2025Dialect::new("@bob:example.io", "BOBDEVICE", "m.call#room")
     }
 
     /// Additive: every MSC4143 field survives, so one event serves both
@@ -808,7 +809,7 @@ mod tests {
     #[test]
     fn outbound_leave_becomes_a_bare_sticky_key() {
         let mut content = json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "member": { "id": "abc", "membership": "leave" },
             "leave_reason": { "code": "leave" },
             "msc4354_sticky_key": "abc"
@@ -824,7 +825,7 @@ mod tests {
     #[test]
     fn outbound_delayed_leave_becomes_a_bare_sticky_key_too() {
         let mut content = json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "member": { "id": "abc", "membership": "leave" },
             "leave_reason": {
                 "code": "delayed_leave",
@@ -842,7 +843,7 @@ mod tests {
     #[test]
     fn a_leave_without_a_sticky_key_is_not_replaced() {
         let mut content = json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "member": { "id": "abc", "membership": "leave" }
         });
         dialect().rewrite_member_content(&mut content);
@@ -866,7 +867,7 @@ mod tests {
     #[test]
     fn a_rewritten_leave_survives_a_second_pass() {
         let mut content = json!({
-            "slot_id": "m.call#ROOM",
+            "slot_id": "m.call#room",
             "member": { "id": "abc", "membership": "leave" },
             "msc4354_sticky_key": "abc"
         });
@@ -1034,7 +1035,7 @@ mod tests {
     #[test]
     fn a_named_call_id_survives_the_slot_id_split() {
         assert_eq!(legacy_session("m.call#standup"), ("m.call", "standup"));
-        assert_eq!(legacy_session("m.call#ROOM"), ("m.call", ""));
+        assert_eq!(legacy_session("m.call#room"), ("m.call", ""));
         // No separator at all is the room-scoped case again.
         assert_eq!(legacy_session("m.call"), ("m.call", ""));
     }
