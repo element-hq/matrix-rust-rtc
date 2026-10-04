@@ -22,7 +22,7 @@
 //! ```
 //!
 //! Env vars: `HOMESERVER_URL` (default `http://localhost:8008`), `MX_USER`,
-//! `MX_PASSWORD`, `ROOM_ID` (required), `SLOT_ID` (default `m.call#ROOM`),
+//! `MX_PASSWORD`, `ROOM_ID` (required), `SLOT_ID` (default `m.call#room`),
 //! `LIVEKIT_SERVICE_URL` (default `http://localhost:6080`, used when the
 //! homeserver doesn't advertise a transport), `RECOVERY_KEY` (see below),
 //! `OPEN_SLOT`, `PUBLISH_TONE`, `RECORD_SECS` (default 5), `OUT_WAV`
@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::ElementCallCompat;
+use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::RoomId;
@@ -63,12 +63,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    // `LiveKitCall::join` drives `!Send` futures internally, so it must run inside a
-    // `LocalSet` — this runtime skeleton is part of the quick start.
+    // `LiveKitCall::join` spawns onto the current tokio runtime — this runtime
+    // skeleton is part of the quick start.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(tokio::task::LocalSet::new().run_until(run()))
+    runtime.block_on(run())
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -77,7 +77,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let user = required("MX_USER")?;
     let password = required("MX_PASSWORD")?;
     let room_id = RoomId::parse(required("ROOM_ID")?)?;
-    let slot_id = env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned());
+    let slot_id = env::var("SLOT_ID").unwrap_or_else(|_| "m.call#room".to_owned());
     let livekit_service_url =
         env::var("LIVEKIT_SERVICE_URL").unwrap_or_else(|_| "http://localhost:6080".to_owned());
     let insecure_tls = env::var("INSECURE_TLS").is_ok();
@@ -89,10 +89,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     //
     // `state`: the generation before MSC4354, where membership is room state.
     // Nothing about such a call is visible to a spec-current peer.
-    let element_call_compat = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
-        None => ElementCallCompat::Off,
-        Some("state") => ElementCallCompat::StateEvents,
-        Some(_) => ElementCallCompat::StickyEvents,
+    let format = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
+        None => MembershipFormat::Current,
+        Some("state") => MembershipFormat::RoomState,
+        Some(_) => MembershipFormat::Sticky2025,
     };
     let record_secs: u64 = env::var("RECORD_SECS")
         .ok()
@@ -194,7 +194,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                 livekit_service_url,
             }),
             http: Some(http),
-            element_call_compat,
+            format,
             ..LiveKitCallOptions::default()
         },
     )

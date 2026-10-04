@@ -16,7 +16,8 @@ matrix-rtc-core = { path = "../matrix-rtc-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# `sync` only, like the core: the call layer arms no timers either.
+# Sync primitives only: tasks and timers go through `matrix_rtc_core::executor`,
+# never `tokio::time`, which panics on wasm32-unknown-unknown.
 tokio = { workspace = true }
 log.workspace = true
 # `DialectBackend` wraps the host's `MatrixBackend`, an async trait.

@@ -323,7 +323,7 @@ mod tests {
     fn slot_in(json: &str, room_encryption: RoomEncryption) -> SlotState {
         RawSlotEvent {
             room_id: "!room:example.org".to_owned(),
-            slot_id: "m.call#ROOM".to_owned(),
+            slot_id: "m.call#room".to_owned(),
             content: serde_json::from_str(json).expect("content must parse"),
         }
         .resolve(room_encryption)
@@ -408,7 +408,7 @@ mod tests {
     fn application_type_prefix_must_end_at_the_separator() {
         let state = RawSlotEvent {
             room_id: "!room:example.org".to_owned(),
-            slot_id: "m.callisto#ROOM".to_owned(),
+            slot_id: "m.callisto#room".to_owned(),
             content: serde_json::from_str(
                 r#"{ "status": "open", "application": { "type": "m.call" } }"#,
             )

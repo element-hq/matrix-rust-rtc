@@ -53,7 +53,7 @@ export function host(client: {
         event_id: '$slot',
         sender: '@admin:hs',
         event_type: 'm.rtc.slot',
-        state_key: 'm.call#ROOM',
+        state_key: 'm.call#room',
         content: { status: 'open' },
         encryption: { kind: 'cleartext' },
       };
@@ -83,24 +83,16 @@ export async function smoke(
   client: WasmRtcClient,
   delegate: MediaDelegate,
 ): Promise<void> {
-  const options: RoomOptionsIn = { element_call_compat: 'sticky_events' };
+  const options: RoomOptionsIn = { format: 'sticky_2025' };
   const room: WasmRtcRoom = await client.room('!r:hs', options);
 
   const params: JoinParamsIn = {
-    slot_id: 'm.call#ROOM',
-    application: 'm.call',
+    application_slot_id: 'room',
   };
   const call: WasmRtcCall = await room.joinCall(params);
   const memberId: string = call.memberId;
 
-  const session: WasmMediaSession = await call.connectMedia(
-    {
-      user_id: '@a:hs',
-      device_id: 'DEV',
-      livekit_service_url: 'https://sfu',
-    },
-    delegate,
-  );
+  const session: WasmMediaSession = await call.connectMedia({}, delegate);
 
   const roster: RtcParticipant[] = session.participants();
   for (const participant of roster) {

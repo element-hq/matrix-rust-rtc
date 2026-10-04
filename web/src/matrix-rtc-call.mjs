@@ -32,8 +32,6 @@ export class MatrixRtcCall {
    * @param {object} options
    * @param {object} options.call - the `WasmRtcCall` that `room.joinCall`
    *   returned.
-   * @param {object} options.bindings - the wasm module (for
-   *   `HEARTBEAT_INTERVAL_MS`).
    * @param {object} options.livekit - the `livekit-client` module (peer
    *   dependency): `Room`, `RoomEvent`, `ExternalE2EEKeyProvider` are used.
    * @param {(url: string, body: object) => Promise<{status: number, body: string}>}
@@ -42,9 +40,8 @@ export class MatrixRtcCall {
    *   merged under the E2EE ones (pass `e2ee.worker` here to enable frame
    *   encryption).
    */
-  constructor({ call, bindings, livekit, fetchJson, roomOptions }) {
+  constructor({ call, livekit, fetchJson, roomOptions }) {
     this.call = call;
-    this.bindings = bindings;
     this.livekit = livekit;
     this.fetchJson = fetchJson ?? defaultFetchJson;
     this.roomOptions = roomOptions ?? {};
@@ -52,7 +49,6 @@ export class MatrixRtcCall {
     this.rooms = new Map();
     this.keyProvider = null;
     this.session = null;
-    this.heartbeatTimer = null;
     /** @type {(participants: object[]) => void} */
     this.onParticipants = () => {};
     /** @type {(event: object) => void} */
@@ -71,32 +67,23 @@ export class MatrixRtcCall {
    * connected; roster changes then arrive via `onParticipants` and call
    * events via `onEvent`.
    *
-   * @param {object} config - `{ userId, deviceId, livekitServiceUrl,
-   *   keyRingSize?, elementCallCompat? }`
+   * The own focus is the one the join publishes on (none for a receive-only
+   * call) and the account is the backend's.
+   *
+   * @param {object} [config] - `{ keyRingSize?, format? }`
    */
-  async connect(config) {
+  async connect(config = {}) {
     if (this.session) throw new Error('already connected');
     this.config = config;
     this.keyProvider = makePerParticipantKeyProvider(this.livekit);
 
     this.session = await this.call.connectMedia(
       {
-        user_id: config.userId,
-        device_id: config.deviceId,
-        livekit_service_url: config.livekitServiceUrl,
         key_ring_size: config.keyRingSize,
-        element_call_compat: config.elementCallCompat,
+        format: config.format,
       },
       this.delegate(),
     );
-
-    // The page owns the keep-alive clock.
-    const interval = this.bindings.HEARTBEAT_INTERVAL_MS();
-    this.heartbeatTimer = setInterval(() => {
-      this.call
-        .heartbeat()
-        .catch((error) => console.warn('matrix-rtc: heartbeat failed:', error));
-    }, interval);
 
     return this.participants();
   }
@@ -131,14 +118,10 @@ export class MatrixRtcCall {
   }
 
   /**
-   * Close every room, stop the timers, and shut the media session down.
+   * Close every room and shut the media session down.
    * Leaving the slot is the call's (`call.leave`).
    */
   async disconnect() {
-    if (this.heartbeatTimer !== null) {
-      clearInterval(this.heartbeatTimer);
-      this.heartbeatTimer = null;
-    }
     if (this.session) {
       // Closes peer-focus rooms via the engine and the own focus through the
       // delegate's handle.
@@ -163,15 +146,10 @@ export class MatrixRtcCall {
       // participant; nothing further to do. Kept as a seam for versions (or
       // providers) where the sender index is a separate call.
       setLocalKeyIndex: () => {},
-      // The push half: roster changes, call events, and the moment a key's
-      // delayBeforeUse window closes (when a coalesced rotation falls due).
+      // The push half: roster changes and call events.
       onParticipants: (roster) =>
         wrapper.onParticipants(wrapper.withLivekitParticipants(roster)),
       onEvent: (event) => wrapper.onEvent(event),
-      onSwitchComplete: () =>
-        wrapper.call
-          .flushDueKeyRotation()
-          .catch((error) => console.warn('matrix-rtc: rotation flush failed:', error)),
     };
   }
 

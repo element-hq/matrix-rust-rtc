@@ -64,7 +64,7 @@ export interface BackendSubscription {
 
 /** `WasmRtcClient.room`'s options. */
 export interface RoomOptionsIn {
-    element_call_compat?: ElementCallCompatMode;
+    format?: MembershipFormatMode;
 }
 
 /**
@@ -78,7 +78,7 @@ export interface RoomOptionsIn {
 export interface MatrixBackendHost {
     ownUserId(): string;
     ownDeviceId(): string;
-    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room opened in `state_events` mode, so a host without sticky support may reject it there. */
+    /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room opened in `room_state` mode, so a host without sticky support may reject it there. */
     sendStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, durationMs: number): Promise<{ event_id: string } | { eventId: string } | string>;
     sendStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
     /** MSC4140 delayed send — a delayed STATE event when `stateKey` is set; resolves with the bare delay id. A rejection carrying `errcode` lets the library tell a homeserver without delayed events apart. */
@@ -103,7 +103,7 @@ export interface MatrixBackendHost {
 }
 
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
-export type ElementCallCompatMode = "off" | "sticky_events" | "state_events";
+export type MembershipFormatMode = "current" | "sticky_2025" | "room_state";
 
 /** One roster entry, as `participants()` returns it. */
 export interface RtcParticipant {
@@ -144,16 +144,12 @@ export type RtcCallEvent =
     | { type: "media_connection_state"; degraded: boolean }
     | { type: "ended"; reason: string };
 
-/** `connectMedia`'s configuration; the room and slot are the call's. */
+/** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
 export interface MediaSessionConfigIn {
-    user_id: string;
-    device_id: string;
-    /** The MSC4195 authorisation-service URL of the focus we publish on. */
-    livekit_service_url: string;
     /** livekit-js key-provider ring size when configured away from its default of 16. */
     key_ring_size?: number;
     /** Cross-check only: the mode comes from the room. */
-    element_call_compat?: ElementCallCompatMode;
+    format?: MembershipFormatMode;
     /** How much the tile order is damped; omitted fields take the defaults. */
     stability?: StabilityConfigIn;
 }
@@ -186,19 +182,20 @@ export interface MediaDelegate {
     onParticipants?(roster: RtcParticipant[]): void;
     /** The push half: the unified call event stream. */
     onEvent?(event: RtcCallEvent): void;
-    /** A key's delayBeforeUse window closed: call `flushDueKeyRotation`. */
-    onSwitchComplete?(): void;
 }
+
+/** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */
+export type JoinTransportIn =
+    | { kind: 'advertised' }
+    | { kind: 'publish'; livekit_service_url: string }
+    | { kind: 'receive_only' };
 
 /** `joinCall`'s parameters. */
 export interface JoinParamsIn {
-    slot_id: string;
-    application: string;
-    /** Omit to take the first LiveKit transport the homeserver advertises (`rtcTransports`). */
-    transport?: { type: string; livekit_service_url?: string; [key: string]: unknown };
-    /** Join without publishing; `can_subscribe` then lists what this member can receive on. */
-    receive_only?: boolean;
-    can_subscribe?: string[];
+    /** The call slot to join, `m.call#{application_slot_id}`; omitted is the room-wide call, `room`. */
+    application_slot_id?: string;
+    /** What the join publishes on; omitted is `advertised`, the first LiveKit transport the homeserver advertises (`rtcTransports`). */
+    transport?: JoinTransportIn;
     keep_alive_timeout_ms?: number;
     sticky_duration_ms?: number;
     degraded_lifetime_ms?: number;

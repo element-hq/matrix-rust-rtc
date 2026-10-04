@@ -52,7 +52,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::ElementCallCompat;
+use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, open_slot};
 use matrix_rtc_media::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
@@ -68,24 +68,24 @@ use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::signal::unix::{SignalKind, signal};
 
-/// Clap-facing mirror of [`ElementCallCompat`], which lives in a crate that
+/// Clap-facing mirror of [`MembershipFormat`], which lives in a crate that
 /// should not grow a `clap` dependency for a delete-by-date module.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
-enum ElementCallCompatArg {
+enum MembershipFormatArg {
     /// Current MSC4143 + MSC4354 only.
-    Off,
+    Current,
     /// Element Call as of 2025: sticky events with the pre-2026 field names.
     Sticky,
     /// Element Call before MSC4354: membership as room state.
     State,
 }
 
-impl From<ElementCallCompatArg> for ElementCallCompat {
-    fn from(arg: ElementCallCompatArg) -> Self {
+impl From<MembershipFormatArg> for MembershipFormat {
+    fn from(arg: MembershipFormatArg) -> Self {
         match arg {
-            ElementCallCompatArg::Off => Self::Off,
-            ElementCallCompatArg::Sticky => Self::StickyEvents,
-            ElementCallCompatArg::State => Self::StateEvents,
+            MembershipFormatArg::Current => Self::Current,
+            MembershipFormatArg::Sticky => Self::Sticky2025,
+            MembershipFormatArg::State => Self::RoomState,
         }
     }
 }
@@ -145,7 +145,7 @@ struct Args {
     #[arg(short = 'n', long, default_value_t = 1)]
     devices: usize,
 
-    #[arg(long, default_value = "m.call#ROOM")]
+    #[arg(long, default_value = "m.call#room")]
     slot_id: String,
 
     #[arg(long, default_value = "m.call")]
@@ -211,10 +211,10 @@ struct Args {
     /// event that never replaces the sticky entry. An hour of ghosts poisons
     /// the room for the next attempt; two minutes does not.
     ///
-    /// The cost is signalling: the heartbeat re-sends each membership once it
+    /// The cost is signalling: the keep-alive re-sends each membership once it
     /// is halfway to expiring, so this many milliseconds means one extra send
-    /// per device every half of it. Keep it well above twice the heartbeat
-    /// interval (15s), or memberships lapse between beats.
+    /// per device every half of it. Keep it well above twice the keep-alive
+    /// interval (10s), or memberships lapse between ticks.
     #[arg(long, default_value_t = 120_000)]
     sticky_duration_ms: u64,
 
@@ -232,8 +232,8 @@ struct Args {
     /// `org.matrix.msc3401.call.member` room state — nothing about such a run is
     /// visible to a spec-current peer. Note `--open-slot` is pointless with
     /// `state`: that generation has no slot concept.
-    #[arg(long, value_enum, default_value_t = ElementCallCompatArg::Off)]
-    element_call_compat: ElementCallCompatArg,
+    #[arg(long, value_enum, default_value_t = MembershipFormatArg::Current)]
+    format: MembershipFormatArg,
 
     #[arg(long)]
     insecure_tls: bool,
@@ -299,11 +299,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .init();
 
     let args = Args::parse();
-    // `LiveKitCall::join` drives `!Send` futures, so it must run inside a `LocalSet`.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(tokio::task::LocalSet::new().run_until(run(args)))
+    runtime.block_on(run(args))
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn Error>> {
@@ -428,9 +427,8 @@ async fn stop_on_input(rx: tokio::sync::oneshot::Receiver<()>) {
 /// homeserver this tool has just been hammering, "shutting down" can outlast
 /// anyone's patience with no way to abort but `kill -9` from another terminal.
 ///
-/// Spawned with `tokio::spawn`, so it lives on the multithreaded runtime rather
-/// than the `LocalSet` every device's signalling shares. A saturated local
-/// thread therefore cannot delay it.
+/// Spawned with `tokio::spawn`, a task of its own on the multithreaded
+/// runtime, so devices busy signalling cannot delay it.
 ///
 /// SIGTERM is handled alongside SIGINT so a plain `kill` behaves the same as
 /// Ctrl-C; nothing else in the process claims it.
@@ -604,7 +602,7 @@ impl Fleet {
                     }),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
-                    element_call_compat: args.element_call_compat.into(),
+                    format: args.format.into(),
                     sticky_duration_ms: Some(args.sticky_duration_ms),
                     ..LiveKitCallOptions::default()
                 },

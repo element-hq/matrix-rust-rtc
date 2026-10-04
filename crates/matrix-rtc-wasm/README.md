@@ -62,11 +62,11 @@ const { client, userId, deviceId } =
 const host = new MatrixHost({ sdk, client });  // the MatrixBackendHost
 const rtc = new bindings.WasmRtcClient(host);   // one per Matrix session; no I/O
 // Subscribes through the host and resolves once the room's current state is in.
-const rtcRoom = await rtc.room(roomId, { element_call_compat: 'off' });
+const rtcRoom = await rtc.room(roomId, { format: 'current' });
 
 // 1. Publish our membership (starts the keep-alive machinery). The transport
 //    comes from the homeserver's /rtc/transports unless you pin one here.
-const rtcCall = await rtcRoom.joinCall({ slot_id: 'm.call#ROOM', application: 'm.call' });
+const rtcCall = await rtcRoom.joinCall({ slot_id: 'm.call#room', application: 'm.call' });
 
 // 2. Attach media: roster + LiveKit connection lifecycle.
 const call = new MatrixRtcCall({
@@ -157,23 +157,22 @@ messages are `{ sender, event_type, content, encryption }` with the Olm sender
 metadata and cross-signing status — MSC4153 discards keys from devices that are
 not cross-signed, so bootstrap cross-signing before joining anything encrypted.
 
-The page owns every clock: call `rtcCall.heartbeat()` on an interval
-(`HEARTBEAT_INTERVAL_MS()`, 10 s) while joined — without it the dead man's
-switch fires and peers see you depart mid-call. `MatrixRtcCall.connect` starts
-that interval for you.
+The page ticks nothing: a joined call restarts its delayed leave every 10 s,
+refreshes its sticky membership and performs its key rotations on its own
+until it leaves or is freed.
 
-### Element Call compatibility
+### Older membership formats (Element Call compatibility)
 
-Pass `element_call_compat` when opening the room (`rtc.room`) — `"off"` (default, spec-current),
-`"sticky_events"` (Element Call "Matrix 2.0", 2025), or `"state_events"`
+Pass `format` when opening the room (`rtc.room`) — `"current"` (default, spec-current),
+`"sticky_2025"` (Element Call "Matrix 2.0", 2025), or `"room_state"`
 (what deployed Element Call speaks) — and the library handles the rest:
 which room state it subscribes to, the inbound translation, outbound
 membership/key rewrites, identities, the token endpoint. Your host delivers
-the same raw events in every mode; in `state_events` it also honours the
+the same raw events in every format; in `room_state` it also honours the
 `stateKey` of `sendDelayedEvent`, because the dead man's switch is a state
 event there.
 
-**Both sides of a call must use the same mode.** A mismatch is a silence, not
+**Both sides of a call must use the same format.** A mismatch is a silence, not
 an error: identities derive differently, so the peer sits in the roster with
 no streams and its keys bind to nothing.
 

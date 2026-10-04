@@ -18,13 +18,13 @@
 //! This ensures that if the client crashes or loses connection, the delayed leave will
 //! automatically clean up after the timeout period, preventing ghost memberships.
 //!
-//! # Two clocks, one heartbeat
+//! # Two clocks, one keep-alive
 //!
 //! Our membership expires in two independent ways, and
-//! [`OwnMembershipMachine::heartbeat`] has to tend both:
+//! [`OwnMembershipMachine::keep_alive`] has to tend both:
 //!
 //! - The **delayed leave** (`keep_alive_timeout_ms`, seconds) is the dead man's
-//!   switch above. Its timer is pushed back out on every heartbeat via MSC4140's
+//!   switch above. Its timer is pushed back out on every tick via MSC4140's
 //!   `restart` action — never cancel-and-recreate, which leaves a window with
 //!   nothing armed and can leak a delay that then marks us departed mid-call.
 //! - The **sticky-map entry** (`sticky_duration_ms`, an hour by default) is how
@@ -32,9 +32,9 @@
 //!   halfway to expiry.
 //!
 //! Tending only the first produces a membership that vanishes mid-call with a
-//! perfectly healthy heartbeat; tending only the second leaves a ghost
-//! membership behind when the client dies. A host that never calls `heartbeat`
-//! gets both failures.
+//! perfectly healthy keep-alive; tending only the second leaves a ghost
+//! membership behind when the client dies. The slot session's upkeep
+//! (`upkeep.rs`) ticks it on an interval while joined.
 //!
 //! # When the homeserver has no delayed events
 //!
@@ -55,6 +55,8 @@
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+use tokio::sync::{Mutex as AsyncMutex, watch};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -82,10 +84,9 @@ const DELAYED_LEAVE_PROBE_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 /// Wall-clock milliseconds since the Unix epoch.
 ///
-/// `SystemTime` rather than a tokio timer on purpose: the core arms no timers,
-/// so the sticky refresh is decided by comparing timestamps when the host
-/// happens to call [`OwnMembershipMachine::heartbeat`], not by a task waking
-/// itself up.
+/// The sticky refresh is decided by comparing timestamps on each
+/// [`OwnMembershipMachine::keep_alive`] tick, so it does not depend on how
+/// punctually the session's upkeep wakes.
 pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -259,8 +260,14 @@ pub struct OwnMembershipMachine<T: MatrixBackend> {
     last_sticky: Arc<Mutex<Option<SentSticky>>>,
     /// The event id of the member event currently representing us in the
     /// sticky map: the join's, then each refresh's. `None` until we join and
-    /// again once we leave.
-    latest_event_id: Arc<Mutex<Option<String>>>,
+    /// again once we leave. A watch, so an application can follow it
+    /// ([`Self::subscribe_membership_event_id`]).
+    latest_event_id: watch::Sender<Option<String>>,
+    /// Held by a keep-alive tick and by `leave` for their whole run. The
+    /// session's upkeep ticks from its own task, so without this a refresh in
+    /// flight could re-send the join content after the leave content and put
+    /// us back in the call.
+    sending: AsyncMutex<()>,
 }
 
 /// The membership event we last put in the sticky map, and when.
@@ -311,7 +318,8 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             delayed_support: Arc::new(Mutex::new(DelayedLeaveSupport::Unknown)),
             published_lifetime_ms: AtomicU64::new(sticky_duration_ms),
             last_sticky: Arc::new(Mutex::new(None)),
-            latest_event_id: Arc::new(Mutex::new(None)),
+            latest_event_id: watch::Sender::new(None),
+            sending: AsyncMutex::new(()),
         }
     }
 
@@ -383,7 +391,12 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// Moves on every sticky refresh; read it when needed rather than caching
     /// it.
     pub fn membership_event_id(&self) -> Option<String> {
-        self.latest_event_id.lock().unwrap().clone()
+        self.latest_event_id.borrow().clone()
+    }
+
+    /// Follows [`Self::membership_event_id`]; wakes on every move.
+    pub fn subscribe_membership_event_id(&self) -> watch::Receiver<Option<String>> {
+        self.latest_event_id.subscribe()
     }
 
     pub fn delayed_event_id(&self) -> Option<String> {
@@ -527,7 +540,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 sent_at_ms: now_ms(),
             });
         }
-        *self.latest_event_id.lock().unwrap() = Some(event_id.clone());
+        self.latest_event_id.send_replace(Some(event_id.clone()));
 
         // Both steps completed successfully, transition to Joined state
         {
@@ -599,6 +612,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     ///
     /// Both operations are awaited to ensure proper cleanup.
     pub async fn leave(&self, leave_reason: Option<LeaveReason>) -> Result<(), CommandError> {
+        let _sending = self.sending.lock().await;
         let room_id = self.room_id.clone();
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
@@ -635,7 +649,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             let mut guard = self.last_sticky.lock().unwrap();
             *guard = None;
         }
-        *self.latest_event_id.lock().unwrap() = None;
+        self.latest_event_id.send_replace(None);
 
         // Cancel the delayed leave event if one exists
         if let Some(event_id) = self.delayed_event_id() {
@@ -680,7 +694,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// Restarts the keep-alive: pushes the delayed leave's timer back out, and
     /// re-sends the membership if its sticky entry is nearing expiry.
     ///
-    /// This is called periodically (heartbeat) to keep our membership active.
+    /// Ticked on an interval by the session's upkeep while joined.
     ///
     /// Uses MSC4140's `restart` action rather than cancel-then-reschedule. That
     /// matters for three reasons: it is one request instead of two; there is
@@ -690,11 +704,15 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// its leave out-expires our live membership and marks us departed while we
     /// are still in the call.
     ///
-    /// This method is fire-and-forget (doesn't return Result) because heartbeat failures
-    /// should not break the application - we'll retry on the next heartbeat.
-    pub async fn heartbeat(&self) {
+    /// Fire-and-forget (no `Result`): a failure is retried on the next tick.
+    /// A no-op unless joined, so a tick that waited out a leave sends nothing.
+    pub async fn keep_alive(&self) {
+        let _sending = self.sending.lock().await;
+        if self.state() != OwnMembershipState::Joined {
+            return;
+        }
         let room_id = self.room_id.clone();
-        log::trace!("[{}] Heartbeat: restarting keep-alive", room_id);
+        log::trace!("[{}] restarting keep-alive", room_id);
 
         // Two independent clocks expire our membership, and the heartbeat tends
         // both: the sticky-map entry here, and the delayed leave below.
@@ -855,7 +873,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             // The refresh replaces our entry in the sticky map, so from here on
             // *this* is the event a peer's reaction must relate to.
             Ok(event_id) => {
-                *self.latest_event_id.lock().unwrap() = Some(event_id);
+                self.latest_event_id.send_replace(Some(event_id));
                 let mut guard = self.last_sticky.lock().unwrap();
                 // Only advance the clock if we are still tracking the same
                 // content: a concurrent join/leave may have replaced it while
@@ -878,7 +896,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 
     /// Schedules a delayed leave event to clean up our membership if we disconnect.
     ///
-    /// This is used internally by join() and heartbeat().
+    /// This is used internally by join() and keep_alive().
     ///
     /// # Returns
     ///
@@ -943,7 +961,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -957,7 +975,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -970,12 +988,12 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
 
-        assert_eq!(machine.slot_id(), "m.call#ROOM");
+        assert_eq!(machine.slot_id(), "m.call#room");
     }
 
     #[test]
@@ -983,7 +1001,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             Arc::new(NoopBackend),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -997,7 +1015,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1039,7 +1057,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1059,7 +1077,7 @@ mod tests {
         assert_eq!(event_type, "m.rtc.member");
         assert_eq!(
             content.get("slot_id").and_then(|v| v.as_str()),
-            Some("m.call#ROOM")
+            Some("m.call#room")
         );
     }
 
@@ -1069,7 +1087,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1113,7 +1131,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1154,7 +1172,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             mock_sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1169,7 +1187,7 @@ mod tests {
             .delayed_event_id()
             .expect("join arms a delayed leave");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         // The beat restarts the existing delay in place: one request, the same
         // delay id, and no second delay scheduled. Scheduling a replacement
@@ -1200,7 +1218,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1212,7 +1230,7 @@ mod tests {
 
         // The mock fails every restart. The delay was armed moments ago, so it
         // cannot have fired yet: keep it and retry next beat.
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(*sender.scheduled.lock().unwrap(), 1, "no replacement armed");
         assert_eq!(machine.delayed_event_id(), Some(delay_id));
@@ -1228,7 +1246,7 @@ mod tests {
         let machine = OwnMembershipMachine::new(
             sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
             MembershipTimings {
@@ -1244,7 +1262,7 @@ mod tests {
         // Let real time pass the (zero) delay, so the check has unambiguously
         // elapsed rather than sitting exactly on the boundary.
         tokio::time::sleep(Duration::from_millis(5)).await;
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             *sender.scheduled.lock().unwrap(),
@@ -1258,7 +1276,7 @@ mod tests {
         OwnMembershipMachine::with_default_timeout(
             mock_sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         )
@@ -1273,7 +1291,7 @@ mod tests {
         OwnMembershipMachine::new(
             mock_sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
             MembershipTimings {
@@ -1534,7 +1552,7 @@ mod tests {
         OwnMembershipMachine::new(
             sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
             MembershipTimings {
@@ -1578,7 +1596,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             sender.sticky_events.lock().unwrap().len(),
@@ -1622,8 +1640,8 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
-        machine.heartbeat().await;
+        machine.keep_alive().await;
+        machine.keep_alive().await;
         machine.leave(None).await.expect("leave should succeed");
 
         let durations: Vec<u64> = sender
@@ -1651,7 +1669,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(*sender.restarts.lock().unwrap(), 0);
     }
@@ -1667,8 +1685,8 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
-        machine.heartbeat().await;
+        machine.keep_alive().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             *sender.refused.lock().unwrap(),
@@ -1699,7 +1717,7 @@ mod tests {
         };
         sender.accepts_now.store(true, Ordering::Relaxed);
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert!(machine.delayed_leave_supported());
         assert!(machine.delayed_event_id().is_some(), "armed on the retry");
@@ -1739,7 +1757,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1764,7 +1782,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         let sticky = mock_sender.sticky_events.lock().unwrap();
         assert_eq!(sticky.len(), 2, "the heartbeat should re-send the join");
@@ -1783,7 +1801,7 @@ mod tests {
             .await
             .expect("join should succeed");
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             mock_sender.sticky_events.lock().unwrap().len(),
@@ -1797,7 +1815,7 @@ mod tests {
         let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
 
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert!(
             mock_sender.sticky_events.lock().unwrap().is_empty(),
@@ -1816,7 +1834,7 @@ mod tests {
         machine.leave(None).await.expect("leave should succeed");
 
         let after_leave = mock_sender.sticky_events.lock().unwrap().len();
-        machine.heartbeat().await;
+        machine.keep_alive().await;
 
         assert_eq!(
             mock_sender.sticky_events.lock().unwrap().len(),
@@ -1833,7 +1851,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender.clone(),
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );
@@ -1870,7 +1888,7 @@ mod tests {
         let machine = OwnMembershipMachine::with_default_timeout(
             sender,
             "!room:example.org".to_string(),
-            "m.call#ROOM".to_string(),
+            "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
         );

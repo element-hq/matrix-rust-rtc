@@ -32,7 +32,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use matrix_rtc_core::{DiscardedKey, EncryptionKeySignalHandler, KeyMaterialSignal, MaybeSend};
 
-use crate::rt;
+use matrix_rtc_core::executor as rt;
 
 /// A transport's frame-encryption key ring: where imported media keys land.
 ///

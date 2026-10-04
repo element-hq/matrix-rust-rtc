@@ -16,7 +16,7 @@
 //! HOMESERVER_URL=https://synapse.m.localhost \
 //! MX_USER=alice MX_PASSWORD=secret \
 //! ROOM_ID='!yourroom:synapse.m.localhost' \
-//! SLOT_ID='m.call#ROOM' \
+//! SLOT_ID='m.call#room' \
 //! LIVEKIT_SERVICE_URL=https://matrix-rtc.m.localhost/livekit/jwt \
 //! INSECURE_TLS=1 \
 //! cargo run -p matrix-rtc-livekit --example connect --features matrix-sdk
@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let user = required("MX_USER")?;
     let password = required("MX_PASSWORD")?;
     let room_id = required("ROOM_ID")?;
-    let slot_id = env::var("SLOT_ID").unwrap_or_else(|_| "m.call#ROOM".to_owned());
+    let slot_id = env::var("SLOT_ID").unwrap_or_else(|_| "m.call#room".to_owned());
     let livekit_service_url = required("LIVEKIT_SERVICE_URL")?;
     let insecure_tls = env::var("INSECURE_TLS").is_ok();
 

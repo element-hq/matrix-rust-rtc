@@ -12,11 +12,9 @@ publish = false
 description = "The pure MSC4195 LiveKit control plane: identity derivations, token exchange shapes, and dialect selection. No IO, no libwebrtc — compiles for wasm32."
 
 [dependencies]
-# `RtcIdentityMapper`, the identity seam `identity_mapper` produces.
+# `RtcIdentityMapper`, the identity seam `identity_mapper` produces, and the
+# pre-2026 membership formats (`compat`) the identity/endpoint choices key on.
 matrix-rtc-core = { path = "../matrix-rtc-core" }
-# The pre-2026 `compat` dialects the identity/endpoint choices key on. No
-# Matrix SDK, so this stays wasm-clean.
-matrix-rtc-call = { path = "../matrix-rtc-call" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true

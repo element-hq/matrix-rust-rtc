@@ -438,7 +438,7 @@ mod tests {
 
     /// A spec-shaped join event as another client would send it on the wire.
     const JOIN_JSON: &str = r#"{
-        "slot_id": "m.call#ROOM",
+        "slot_id": "m.call#room",
         "member": { "id": "xyzABCDEF0123", "membership": "join" },
         "application": { "type": "m.call", "m.call.voice_only": true },
         "transports": {
@@ -568,17 +568,17 @@ mod tests {
     /// Events on the wire have been seen with both spellings of the sticky key.
     #[test]
     fn sticky_key_accepted_under_either_or_both_spellings() {
-        let both = r#"{ "slot_id": "m.call#ROOM",
+        let both = r#"{ "slot_id": "m.call#room",
                         "member": { "id": "abc", "membership": "join" },
                         "msc4354_sticky_key": "abc", "sticky_key": "abc" }"#;
         let content: RawStickyEventContent = serde_json::from_str(both).unwrap();
         assert_eq!(content.sticky_key, "abc");
 
-        let stable = r#"{ "slot_id": "m.call#ROOM", "sticky_key": "abc" }"#;
+        let stable = r#"{ "slot_id": "m.call#room", "sticky_key": "abc" }"#;
         let content: RawStickyEventContent = serde_json::from_str(stable).unwrap();
         assert_eq!(content.sticky_key, "abc");
 
-        let disagree = r#"{ "slot_id": "m.call#ROOM",
+        let disagree = r#"{ "slot_id": "m.call#room",
                             "msc4354_sticky_key": "abc", "sticky_key": "xyz" }"#;
         assert!(serde_json::from_str::<RawStickyEventContent>(disagree).is_err());
 
@@ -592,7 +592,7 @@ mod tests {
     fn leave_reason_parses_generic_and_custom_codes() {
         let leave = |code: &str| {
             let json = format!(
-                r#"{{ "slot_id": "m.call#ROOM",
+                r#"{{ "slot_id": "m.call#room",
                       "member": {{ "id": "abc", "membership": "leave" }},
                       "leave_reason": {{ "code": "{code}", "reason": "bye" }},
                       "msc4354_sticky_key": "abc" }}"#
@@ -628,7 +628,7 @@ mod tests {
     #[test]
     fn built_join_content_round_trips() {
         let built = RawStickyEventContent::for_join(
-            "m.call#ROOM".to_owned(),
+            "m.call#room".to_owned(),
             "xyzABCDEF0123".to_owned(),
             "m.call".into(),
             MemberTransports::publishing(RawRtcTransport {
@@ -655,7 +655,7 @@ mod tests {
     #[test]
     fn built_join_content_carries_application_properties() {
         let built = RawStickyEventContent::for_join(
-            "org.example.board#ROOM".to_owned(),
+            "org.example.board#room".to_owned(),
             "xyzABCDEF0123".to_owned(),
             ApplicationInfo::new("org.example.board")
                 .with_extra("board_id", serde_json::json!("b1")),

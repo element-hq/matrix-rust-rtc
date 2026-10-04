@@ -28,12 +28,11 @@ import * as livekit from 'livekit-client';
 
 const call = new MatrixRtcCall({
   call: rtcCall,           // what `rtcRoom.joinCall(...)` returned
-  bindings,                // the wasm module
   livekit,
   roomOptions: { e2ee: { worker: e2eeWorker } }, // omit to run without frame E2EE
 });
 call.onParticipants = (roster) => render(roster);
-await call.connect({ userId, deviceId, livekitServiceUrl });
+await call.connect(); // the focus is the join's, the account the backend's
 ```
 
 Every roster entry is the Rust participant (`member_id`, `user_id`,
@@ -41,7 +40,8 @@ Every roster entry is the Rust participant (`member_id`, `user_id`,
 `livekitParticipant` — the live livekit-js participant, joined by
 `rtc_identity`. Rust owns the roster/pool/identity/key logic (the same
 engine the mobile bindings run); this wrapper owns `fetch`, the livekit-js
-rooms, the RoomEvent translation, and the heartbeat interval.
+rooms and the RoomEvent translation. The call keeps its own membership
+alive; the page ticks nothing.
 
 Media stays entirely in livekit-js: publish, subscribe, and render through
 `livekitParticipant` / the `Room` as usual.

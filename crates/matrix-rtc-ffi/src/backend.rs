@@ -815,6 +815,13 @@ pub(crate) mod test_support {
                 .expect("the room should be attached")
         }
 
+        /// Forgets the room's last subscription, so a seeder waiting on
+        /// [`Self::subjects`] waits for the next one rather than seeding a
+        /// stale sink.
+        pub fn forget_room_sink(&self, room_id: &str) {
+            self.room_sinks.lock().unwrap().remove(room_id);
+        }
+
         pub fn subjects(&self, room_id: &str) -> Option<FfiRoomSubjects> {
             self.room_sinks
                 .lock()

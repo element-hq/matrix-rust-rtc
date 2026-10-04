@@ -12,7 +12,7 @@ import { mockBackendHost, openSlotEvent } from './mock-backend-host.mjs';
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
 const ROOM_ID = '!RhkzuEOlOxpckXJkhY:synapse.m.localhost';
-const SLOT_ID = 'm.call#ROOM';
+const SLOT_ID = 'm.call#room';
 const ME = '@me:synapse.m.localhost';
 const BOB = '@bob:synapse.othersite.m.localhost';
 const ALICE = '@alice:synapse.m.localhost';

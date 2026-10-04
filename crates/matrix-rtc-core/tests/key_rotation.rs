@@ -56,7 +56,7 @@ use matrix_rtc_core::{
 use serde_json::Value;
 
 const ROOM_ID: &str = "!room:example.org";
-const SLOT_ID: &str = "m.call#ROOM";
+const SLOT_ID: &str = "m.call#room";
 
 /// Where the scenarios start, so ages and deadlines read as offsets from zero.
 const EPOCH: u64 = 1_700_000_000_000;

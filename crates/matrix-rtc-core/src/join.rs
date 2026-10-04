@@ -6,17 +6,28 @@
 //! Join functionality for RTC sessions.
 //!
 //! This module provides the data structures and parameters needed for joining
-//! an RTC session, including user information, the application and transport
-//! configuration.
+//! an RTC session: the slot, the application, the transport, and overrides of
+//! the timings. Who joins is the backend's account; it is never a parameter.
 
 use crate::encryption::types::EncryptionConfig;
 use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::RtcTransport;
 
+impl From<RtcTransport> for TransportIntent {
+    fn from(transport: RtcTransport) -> Self {
+        Self::Publish(transport)
+    }
+}
+
 /// Default keep-alive timeout in milliseconds (30 seconds).
 ///
 /// This is the delay before the cleanup event would fire if not restarted.
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
+
+/// Default interval between keep-alive ticks, in milliseconds (10 seconds):
+/// three inside the default timeout, so one slow round trip cannot let the
+/// delayed leave fire.
+pub const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
 
 /// Default sticky-map lifetime for our membership event, in milliseconds
 /// (1 hour).
@@ -24,10 +35,10 @@ pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 /// Distinct from [`DEFAULT_KEEP_ALIVE_TIMEOUT_MS`]: that one arms the delayed
 /// leave (the dead man's switch for a client that dies), while this one is how
 /// long the homeserver keeps our membership in the sticky map at all. Both are
-/// refreshed by [`heartbeat`], the sticky one only once it is halfway to
+/// refreshed by [`keep_alive`], the sticky one only once it is halfway to
 /// expiry.
 ///
-/// [`heartbeat`]: crate::OwnMembershipMachine::heartbeat
+/// [`keep_alive`]: crate::OwnMembershipMachine::keep_alive
 pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 
 /// The longest sticky lifetime that is actually honoured (1 hour).
@@ -55,6 +66,18 @@ pub const MAX_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 /// in the sticky dialect however often we refresh.
 pub const DEFAULT_DEGRADED_LIFETIME_MS: u64 = 5 * 60 * 1000;
 
+/// The MSC4143 `application_slot_id` of an application's room-wide slot
+/// (`m.call#room`).
+pub const ROOM_APPLICATION_SLOT_ID: &str = "room";
+
+/// `{application_type}#{application_slot_id}`, MSC4143's slot id.
+fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
+    format!(
+        "{}#{application_slot_id}",
+        application.application_type().unwrap_or_default()
+    )
+}
+
 /// Generates a fresh `member.id` for a join.
 ///
 /// MSC4143 requires the id to be unique per join and suggests it be
@@ -73,8 +96,8 @@ pub fn generate_member_id() -> String {
 ///
 /// Which transport to publish on is the application's decision — discovering
 /// what the homeserver offers (`GET /_matrix/client/v1/rtc/transports`) and
-/// choosing among them happens above this crate, and the result is passed in
-/// here.
+/// choosing among them happens above this crate (`matrix-rtc-call` takes the
+/// first LiveKit one), and the result is passed in here.
 ///
 /// MSC4143 does not require a member to publish anything — `transports` carries
 /// no REQUIRED marker — so a member that only receives, such as a recorder, is
@@ -97,19 +120,10 @@ pub enum TransportIntent {
 
 /// Parameters for joining an RTC session.
 ///
-/// Contains all the information needed to construct and send a membership event
-/// to join a session, including user identification, the application and
-/// transport details.
+/// The slot, application and transport to join with, and overrides of the
+/// timings. The user and device are the backend's.
 #[derive(Clone, Debug)]
 pub struct JoinSessionParams {
-    /// The Matrix user ID of the user joining the session (e.g., "@alice:example.org").
-    pub user_id: String,
-
-    /// The device ID of the user's device joining the session.
-    ///
-    /// This is used to create a unique sticky key for this membership.
-    pub device_id: String,
-
     /// The `member.id` (and sticky key) for this join.
     ///
     /// MSC4143 requires this to be unique for *each* join, so that leaving and
@@ -117,26 +131,33 @@ pub struct JoinSessionParams {
     /// is generated per call to [`JoinSessionParams::membership_id`].
     pub membership_id: Option<String>,
 
-    /// The slot ID for the session (e.g., "m.call#ROOM").
+    /// The slot ID for the session (e.g., "m.call#room").
     pub slot_id: String,
 
     /// `content.application` to publish. A `String` or `&str` converts into a
     /// type-only one.
     pub application: ApplicationInfo,
 
-    /// What this member does with transports.
-    pub transport: TransportIntent,
+    /// What this member does with transports. Required: a join without one is
+    /// refused ([`Self::transport`](Self::transport()) sets it).
+    pub transport: Option<TransportIntent>,
 
     /// Keep-alive timeout in milliseconds.
     ///
     /// Defaults to `DEFAULT_KEEP_ALIVE_TIMEOUT_MS` if not specified.
     pub keep_alive_timeout_ms: Option<u64>,
 
+    /// How often the session's upkeep ticks the keep-alive, in milliseconds.
+    ///
+    /// Defaults to `DEFAULT_KEEP_ALIVE_INTERVAL_MS`; clamped to half the
+    /// keep-alive timeout, so one late tick does not end the membership.
+    pub keep_alive_interval_ms: Option<u64>,
+
     /// How long the homeserver should keep our membership in the sticky map,
     /// in milliseconds.
     ///
     /// Defaults to `DEFAULT_STICKY_DURATION_MS` if not specified. The
-    /// heartbeat re-sends the membership before this elapses, so a host that
+    /// keep-alive re-sends the membership before this elapses, so a host that
     /// shortens it is choosing a higher signalling rate, not a shorter
     /// presence.
     pub sticky_duration_ms: Option<u64>,
@@ -156,50 +177,73 @@ pub struct JoinSessionParams {
 }
 
 impl JoinSessionParams {
-    /// Creates new join parameters with defaults.
-    ///
-    /// The membership_id will be generated from user_id and device_id if not provided.
-    pub fn new(
-        user_id: String,
-        device_id: String,
-        slot_id: String,
-        application: impl Into<ApplicationInfo>,
-        transport: RtcTransport,
-    ) -> Self {
+    /// Joins `application`'s room-wide slot, `{application}#room`, as the
+    /// backend's account with a fresh `member.id` and default timings. A join
+    /// also needs a [`transport`](Self::transport()); each other setter
+    /// overrides one default.
+    pub fn application(application: impl Into<ApplicationInfo>) -> Self {
+        let application = application.into();
+        let slot_id = slot_id_of(&application, ROOM_APPLICATION_SLOT_ID);
         Self {
-            user_id,
-            device_id,
             membership_id: None,
             slot_id,
-            application: application.into(),
-            transport: TransportIntent::Publish(transport),
+            application,
+            transport: None,
             keep_alive_timeout_ms: None,
+            keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
         }
     }
 
-    /// Creates join parameters with the given transport intent.
-    pub fn with_transport_intent(
-        user_id: String,
-        device_id: String,
-        slot_id: String,
-        application: impl Into<ApplicationInfo>,
-        transport: TransportIntent,
-    ) -> Self {
-        Self {
-            user_id,
-            device_id,
-            membership_id: None,
-            slot_id,
-            application: application.into(),
-            transport,
-            keep_alive_timeout_ms: None,
-            sticky_duration_ms: None,
-            degraded_lifetime_ms: None,
-            encryption_config: None,
-        }
+    /// Joins the application's slot `{application}#{application_slot_id}`.
+    pub fn slot(mut self, application_slot_id: impl AsRef<str>) -> Self {
+        self.slot_id = slot_id_of(&self.application, application_slot_id.as_ref());
+        self
+    }
+
+    /// Publishes on (or only receives from) `transport`.
+    pub fn transport(mut self, transport: impl Into<TransportIntent>) -> Self {
+        self.transport = Some(transport.into());
+        self
+    }
+
+    /// Joins as `member_id` instead of a fresh one. MSC4143 wants a fresh id
+    /// per join; this is for a format that keys membership otherwise.
+    pub fn member_id(mut self, member_id: impl Into<String>) -> Self {
+        self.membership_id = Some(member_id.into());
+        self
+    }
+
+    /// Sets the `keep_alive_timeout_ms` field.
+    pub fn keep_alive_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.keep_alive_timeout_ms = Some(timeout_ms);
+        self
+    }
+
+    /// Sets the `keep_alive_interval_ms` field.
+    pub fn keep_alive_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.keep_alive_interval_ms = Some(interval_ms);
+        self
+    }
+
+    /// Sets the `sticky_duration_ms` field.
+    pub fn sticky_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.sticky_duration_ms = Some(duration_ms);
+        self
+    }
+
+    /// Sets the `degraded_lifetime_ms` field.
+    pub fn degraded_lifetime_ms(mut self, lifetime_ms: u64) -> Self {
+        self.degraded_lifetime_ms = Some(lifetime_ms);
+        self
+    }
+
+    /// Sets the `encryption_config` field.
+    pub fn encryption_config(mut self, config: EncryptionConfig) -> Self {
+        self.encryption_config = Some(config);
+        self
     }
 
     /// Gets the `member.id` (sticky key) to use for this join.
@@ -216,15 +260,33 @@ impl JoinSessionParams {
     /// Gets the keep-alive timeout to use.
     ///
     /// Returns the configured timeout or the default.
-    pub fn keep_alive_timeout_ms(&self) -> u64 {
+    pub(crate) fn effective_keep_alive_timeout_ms(&self) -> u64 {
         self.keep_alive_timeout_ms
             .unwrap_or(DEFAULT_KEEP_ALIVE_TIMEOUT_MS)
+    }
+
+    /// Gets the keep-alive interval to use: the configured one or the
+    /// default, at most half the keep-alive timeout.
+    pub(crate) fn effective_keep_alive_interval_ms(&self) -> u64 {
+        let interval = self
+            .keep_alive_interval_ms
+            .unwrap_or(DEFAULT_KEEP_ALIVE_INTERVAL_MS);
+        let ceiling = self.effective_keep_alive_timeout_ms() / 2;
+        if interval > ceiling {
+            log::warn!(
+                "[{}] keep-alive interval {interval}ms clamped to {ceiling}ms, half the timeout",
+                self.slot_id,
+            );
+            ceiling
+        } else {
+            interval
+        }
     }
 
     /// Gets the sticky-map lifetime to use.
     ///
     /// Returns the configured duration or the default.
-    pub fn sticky_duration_ms(&self) -> u64 {
+    pub(crate) fn effective_sticky_duration_ms(&self) -> u64 {
         let requested = self
             .sticky_duration_ms
             .unwrap_or(DEFAULT_STICKY_DURATION_MS);
@@ -243,9 +305,9 @@ impl JoinSessionParams {
     ///
     /// Returns the configured duration or the default. Clamped to
     /// [`MAX_STICKY_DURATION_MS`] for the same reason
-    /// [`Self::sticky_duration_ms`] is, and it is only ever *shorter* than that
+    /// [`Self::effective_sticky_duration_ms`] is, and it is only ever *shorter* than that
     /// in practice.
-    pub fn degraded_lifetime_ms(&self) -> u64 {
+    pub(crate) fn effective_degraded_lifetime_ms(&self) -> u64 {
         self.degraded_lifetime_ms
             .unwrap_or(DEFAULT_DEGRADED_LIFETIME_MS)
             .min(MAX_STICKY_DURATION_MS)
@@ -254,7 +316,7 @@ impl JoinSessionParams {
     /// Gets the encryption configuration to use.
     ///
     /// Returns the configured config or the default.
-    pub fn encryption_config(&self) -> EncryptionConfig {
+    pub(crate) fn effective_encryption_config(&self) -> EncryptionConfig {
         self.encryption_config.clone().unwrap_or_default()
     }
 
@@ -263,14 +325,11 @@ impl JoinSessionParams {
     /// Returns `Ok(())` if all required fields are present and valid.
     /// Returns `Err` with a description of the validation error otherwise.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.user_id.is_empty() {
-            return Err("user_id is required");
-        }
-        if self.device_id.is_empty() {
-            return Err("device_id is required");
-        }
         if self.slot_id.is_empty() {
             return Err("slot_id is required");
+        }
+        if self.transport.is_none() {
+            return Err("transport is required");
         }
         if self.application.application_type().is_none() {
             return Err("application is required");
@@ -314,15 +373,11 @@ mod tests {
     /// must not be derived from the (stable) user and device IDs.
     #[test]
     fn test_membership_id_is_unique_per_call() {
-        let params = JoinSessionParams::new(
-            "@alice:example.org".to_string(),
-            "device123".to_string(),
-            "m.call#ROOM".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com".to_string(),
-            }),
-        );
+            },
+        ));
 
         let first = params.membership_id();
         let second = params.membership_id();
@@ -335,15 +390,11 @@ mod tests {
 
     #[test]
     fn test_explicit_membership_id() {
-        let mut params = JoinSessionParams::new(
-            "@alice:example.org".to_string(),
-            "device123".to_string(),
-            "m.call#ROOM".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com".to_string(),
-            }),
-        );
+            },
+        ));
         params.membership_id = Some("custom-id".to_string());
 
         assert_eq!(params.membership_id(), "custom-id");
@@ -351,80 +402,80 @@ mod tests {
 
     #[test]
     fn test_keep_alive_timeout_default() {
-        let params = JoinSessionParams::new(
-            "@alice:example.org".to_string(),
-            "device123".to_string(),
-            "m.call#ROOM".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com".to_string(),
-            }),
-        );
+            },
+        ));
 
         assert_eq!(
-            params.keep_alive_timeout_ms(),
+            params.effective_keep_alive_timeout_ms(),
             DEFAULT_KEEP_ALIVE_TIMEOUT_MS
         );
     }
 
     #[test]
     fn test_keep_alive_timeout_custom() {
-        let mut params = JoinSessionParams::new(
-            "@alice:example.org".to_string(),
-            "device123".to_string(),
-            "m.call#ROOM".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com".to_string(),
-            }),
-        );
+            },
+        ));
         params.keep_alive_timeout_ms = Some(60_000);
 
-        assert_eq!(params.keep_alive_timeout_ms(), 60_000);
+        assert_eq!(params.effective_keep_alive_timeout_ms(), 60_000);
     }
 
     #[test]
     fn test_validate_success() {
-        let params = JoinSessionParams::new(
-            "@alice:example.org".to_string(),
-            "device123".to_string(),
-            "m.call#ROOM".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
+        let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+            LiveKitTransport {
                 livekit_service_url: "https://example.com".to_string(),
-            }),
-        );
+            },
+        ));
 
         assert!(params.validate().is_ok());
     }
 
     #[test]
-    fn test_validate_empty_user_id() {
-        let params = JoinSessionParams::new(
-            "".to_string(),
-            "device123".to_string(),
-            "m.call#ROOM".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            }),
-        );
+    fn test_validate_empty_slot_id() {
+        let mut params = JoinSessionParams::application("m.call");
+        params.slot_id.clear();
 
-        assert_eq!(params.validate(), Err("user_id is required"));
+        assert_eq!(params.validate(), Err("slot_id is required"));
     }
 
     #[test]
-    fn test_validate_empty_slot_id() {
-        let params = JoinSessionParams::new(
-            "@alice:example.org".to_string(),
-            "device123".to_string(),
-            "".to_string(),
-            "m.call".to_string(),
-            RtcTransport::LiveKit(LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            }),
+    fn the_slot_id_is_composed_from_the_application() {
+        assert_eq!(
+            JoinSessionParams::application("m.call").slot_id,
+            "m.call#room"
         );
+        assert_eq!(
+            JoinSessionParams::application("org.example.board")
+                .slot("planning")
+                .slot_id,
+            "org.example.board#planning"
+        );
+    }
 
-        assert_eq!(params.validate(), Err("slot_id is required"));
+    #[test]
+    fn a_join_names_only_what_it_overrides() {
+        let params = JoinSessionParams::application("m.call");
+        assert!(params.transport.is_none());
+        assert!(params.membership_id.is_none());
+
+        let params = params
+            .member_id("mine")
+            .keep_alive_interval_ms(5_000)
+            .transport(RtcTransport::LiveKit(LiveKitTransport {
+                livekit_service_url: "https://example.com".to_string(),
+            }));
+        assert_eq!(params.membership_id(), "mine");
+        assert_eq!(params.effective_keep_alive_interval_ms(), 5_000);
+        assert!(matches!(
+            params.transport,
+            Some(TransportIntent::Publish(_))
+        ));
     }
 }

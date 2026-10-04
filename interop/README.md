@@ -33,15 +33,15 @@ top of that file.
 
 ## Scenarios
 
-| Test name             | Element Call ("Developer" tab) | Our `ElementCallCompat` | Generation |
+| Test name             | Element Call ("Developer" tab) | Our `MembershipFormat`  | Generation |
 | --------------------- | ------------------------------ | ----------------------- | ---------- |
-| `ec-2024 state events`| `Compatibility: state events`  | `StateEvents`           | pre-MSC4354: membership as `org.matrix.msc3401.call.member` room state, plain `{user}:{device}` identities, `/sfu/get` |
-| `ec-2025 sticky events`| `Matrix 2.0`                  | `StickyEvents`          | MSC4354 sticky membership carrying the pre-2026 field names, MSC4195 hashed identities, `/get_token` |
+| `ec-2024 state events`| `Compatibility: state events`  | `RoomState`             | pre-MSC4354: membership as `org.matrix.msc3401.call.member` room state, plain `{user}:{device}` identities, `/sfu/get` |
+| `ec-2025 sticky events`| `Matrix 2.0`                  | `Sticky2025`            | MSC4354 sticky membership carrying the pre-2026 field names, MSC4195 hashed identities, `/get_token` |
 
 The tests are **not** named after Element Call's UI labels, deliberately.
 `Matrix 2.0` is Element Call's name for its 2025 generation, not for the
 spec-current one: the actually-current 2026 format is
-`ElementCallCompat::Off`, which Element Call does not speak at all, so it has no
+`MembershipFormat::Current`, which Element Call does not speak at all, so it has no
 counterpart here and `e2e_call` remains its only test. The UI strings live in
 one place, `RTC_MODE_LABEL` in `helpers/element-web.ts`.
 
@@ -52,7 +52,7 @@ one place, `RTC_MODE_LABEL` in `helpers/element-web.ts`.
 browser page, served by the `webServer` in `playwright.config.ts` and driven
 through `helpers/web-peer.ts`, the page-shaped sibling of `rust-peer.ts`).
 It shares a call with the Rust peer in the spec-current dialect
-(`ElementCallCompat::Off`), asserting both directions: membership, key
+(`MembershipFormat::Current`), asserting both directions: membership, key
 import under the SFU identity, the video pattern read back from a `<video>`,
 and audio energy. This is the web stack's only test against a real
 homeserver, authorisation service, and SFU — everything else it has runs

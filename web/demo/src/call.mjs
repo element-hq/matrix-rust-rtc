@@ -27,7 +27,7 @@ import {
   toneAudioTrack,
 } from './tracks.mjs';
 
-const DEFAULT_SLOT_ID = 'm.call#ROOM';
+const DEFAULT_SLOT_ID = 'm.call#room';
 
 export class WebPeerApp {
   /**
@@ -105,7 +105,7 @@ export class WebPeerApp {
     // session closed. Encrypted room ⇒ MSC4143 requires `m.per_member`. Not in
     // the pre-sticky mode: that generation predates slots (a join in it leaves
     // the condition unenforced), and its Element Call ignores them anyway.
-    if (mode !== 'state_events') {
+    if (mode !== 'room_state') {
       // Opened only for the slot: `join` opens it again in its own mode.
       const rtcRoom = await this.rtc.room(response.room_id, undefined);
       try {
@@ -130,32 +130,29 @@ export class WebPeerApp {
    * Join the RTC slot and attach media: feed the room, publish the
    * membership, connect the SFU through the engine, publish tracks.
    */
-  async join({ roomId, slotId = DEFAULT_SLOT_ID, compat, publish = {} }) {
+  async join({ roomId, compat, publish = {} }) {
     const focusUrl = await this.host.discoverFocus();
     this.roomId = roomId;
-    this.slotId = slotId;
+    this.slotId = DEFAULT_SLOT_ID;
     this.compat = compat;
-    this.log(`joining ${roomId} / ${slotId} on focus ${focusUrl}`);
+    this.log(`joining ${roomId} / ${this.slotId} on focus ${focusUrl}`);
 
     // Open before joining: the room subscribes through the host and applies
     // its current state (encryption, slots, members, membership) before
     // publishing ours.
     this.rtcRoom = await this.rtc.room(roomId, {
-      element_call_compat: compat === 'off' ? undefined : compat,
+      format: compat === 'current' ? undefined : compat,
     });
 
     this.rtcCall = await this.rtcRoom.joinCall({
-      slot_id: slotId,
-      application: 'm.call',
       // The demo pins the focus it discovered; omit to take the homeserver's.
-      transport: { type: 'livekit', livekit_service_url: focusUrl },
+      transport: { kind: 'publish', livekit_service_url: focusUrl },
     });
     const memberId = this.rtcCall.memberId;
     this.memberId = memberId;
 
     this.call = new MatrixRtcCall({
       call: this.rtcCall,
-      bindings,
       livekit,
       roomOptions: { e2ee: { worker: new E2EEWorker() } },
     });
@@ -164,10 +161,7 @@ export class WebPeerApp {
     this.call.onRoomCreated = (room, key) => this.onRoomCreated(room, key);
 
     await this.call.connect({
-      userId: this.userId,
-      deviceId: this.deviceId,
-      livekitServiceUrl: focusUrl,
-      elementCallCompat: compat === 'off' ? undefined : compat,
+      format: compat === 'current' ? undefined : compat,
     });
 
     await this.publishMedia(focusUrl, publish);
@@ -241,7 +235,7 @@ export class WebPeerApp {
       // derive SFU identities differently, so the peer maps to no membership,
       // its key binds to nothing, and its tile stays black. Name it.
       const looksHashed = !event.identity.includes(':');
-      const stateMode = this.compat === 'state_events';
+      const stateMode = this.compat === 'room_state';
       if (stateMode && looksHashed) {
         this.log(
           `HINT: ${event.identity} is a hashed identity but this call speaks state events — ` +
