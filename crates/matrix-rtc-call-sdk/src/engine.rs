@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matrix_rtc_call::{RaisedHand, ReceivedReaction};
-use matrix_rtc_core::{DiscardedKey, JoinedMembership};
+use matrix_rtc_core::{DiscardedKey, JoinedMembership, LeaveCode, LeaveReason};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use matrix_rtc_core::executor as rt;
@@ -99,6 +99,9 @@ pub struct EngineConfig {
     /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
     /// reports no reactions.
     pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,
+    /// `RtcSession::subscribe_ended`: once `Some`, the engine ends the call
+    /// and closes every connection, the own-focus one included.
+    pub ended: Option<watch::Receiver<Option<LeaveReason>>>,
     /// Damping of the tile order; see [`StabilityConfig`].
     pub stability: StabilityConfig,
 }
@@ -269,6 +272,7 @@ impl CallEngine {
             pool_inbox,
             config.raised_hands,
             config.reactions,
+            config.ended,
         ));
 
         CallEngine {
@@ -612,6 +616,18 @@ async fn hands_changed(
     }
 }
 
+/// Resolves once the participation has ended; `None` once the channel closes.
+/// Never resolves when there is no channel.
+async fn participation_ended(
+    ended: &mut Option<watch::Receiver<Option<LeaveReason>>>,
+) -> Option<LeaveReason> {
+    let Some(ended) = ended else {
+        return std::future::pending().await;
+    };
+    let reason = ended.wait_for(Option::is_some).await.ok()?;
+    reason.clone()
+}
+
 /// The next reaction, skipping over any the receiver lagged past; `None`
 /// once the channel is closed. Never resolves when there is no channel.
 async fn next_reaction(
@@ -641,6 +657,7 @@ impl Actor {
         mut pool_inbox: mpsc::UnboundedReceiver<PoolMessage>,
         mut raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
         mut reactions: Option<broadcast::Receiver<ReceivedReaction>>,
+        mut ended: Option<watch::Receiver<Option<LeaveReason>>>,
     ) {
         // The watch channels always have a value; start from it.
         let initial = memberships.borrow_and_update().clone();
@@ -676,6 +693,12 @@ impl Actor {
                     Some(reaction) => self.apply_reaction(reaction),
                     None => reactions = None,
                 },
+                left = participation_ended(&mut ended) => {
+                    ended = None;
+                    if let Some(reason) = left {
+                        self.end_on_leave(reason).await;
+                    }
+                }
                 // Never closes: the pool holds a sender for its own timers.
                 Some(message) = pool_inbox.recv() => {
                     let events = self.pool.handle(message);
@@ -1266,6 +1289,25 @@ impl Actor {
         self.pool.close();
     }
 
+    /// Unlike a media-only shutdown, also closes the own-focus connection.
+    /// Awaited, so a shutdown queued behind it finds it closed.
+    async fn end_on_leave(&mut self, reason: LeaveReason) {
+        if self.ended {
+            return;
+        }
+        log::info!("call: the session ended ({:?}); ending media", reason.code);
+        let own = self.pool.own_connection();
+        self.end(match reason.code {
+            LeaveCode::SlotClosed => EndedReason::SlotClosed,
+            _ => EndedReason::Left,
+        });
+        if let Some(own) = own
+            && let Err(error) = own.close().await
+        {
+            log::warn!("call: own focus did not close cleanly after the leave: {error}");
+        }
+    }
+
     fn emit(&self, event: CallEvent) {
         // Err means no subscriber right now; the roster watch still updates.
         let _ = self.events_tx.send(event);
@@ -1709,6 +1751,7 @@ mod tests {
         memberships: watch::Sender<Vec<JoinedMembership>>,
         raised_hands: watch::Sender<Vec<RaisedHand>>,
         reactions: broadcast::Sender<ReceivedReaction>,
+        ended: watch::Sender<Option<LeaveReason>>,
         state: Arc<TransportState>,
     }
 
@@ -1729,6 +1772,7 @@ mod tests {
         let (memberships, memberships_rx) = watch::channel(Vec::new());
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
         let (reactions, reactions_rx) = broadcast::channel(8);
+        let (ended, ended_rx) = watch::channel(None);
         let engine = CallEngine::new(
             EngineConfig {
                 transports: vec![Arc::new(FakeTransport {
@@ -1747,6 +1791,7 @@ mod tests {
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
                 raised_hands: Some(raised_hands_rx),
                 reactions: Some(reactions_rx),
+                ended: Some(ended_rx),
                 stability,
             },
             memberships_rx,
@@ -1757,6 +1802,7 @@ mod tests {
             memberships,
             raised_hands,
             reactions,
+            ended,
             state,
         }
     }
@@ -3540,6 +3586,44 @@ mod tests {
         // The adopted own connection is left to its owner.
         assert!(!closed(&fx, OWN_FOCUS));
         drop(own);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_closed_slot_ends_the_call_and_closes_the_own_connection() {
+        let mut fx = fixture();
+        let _own = adopt(&fx);
+        settle(&fx.engine).await;
+
+        fx.ended
+            .send_replace(Some(LeaveReason::new(LeaveCode::SlotClosed)));
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::Ended {
+                reason: EndedReason::SlotClosed,
+            }
+        );
+        wait_until(|| closed(&fx, OWN_FOCUS)).await;
+        // The host's own teardown afterwards is harmless.
+        fx.engine.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_host_leave_ends_the_call_and_closes_the_own_connection() {
+        let mut fx = fixture();
+        let _own = adopt(&fx);
+        settle(&fx.engine).await;
+
+        fx.ended
+            .send_replace(Some(LeaveReason::new(LeaveCode::Leave)));
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::Ended {
+                reason: EndedReason::Left,
+            }
+        );
+        wait_until(|| closed(&fx, OWN_FOCUS)).await;
     }
 
     // ---- tiles (spec 002) ---------------------------------------------------

@@ -64,8 +64,8 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
-use matrix_rtc_call_sdk::{CallEvent, Participant as MediaParticipant};
-use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, open_slot};
+use matrix_rtc_call_sdk::{CallEvent, EndedReason, Participant as MediaParticipant};
+use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, close_slot, open_slot};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::media;
@@ -152,6 +152,12 @@ enum Scenario {
     /// (matrix-rtc-core) and `a_rejoin_distributes_keys_without_new_sticky_events`
     /// (matrix-rtc-ffi).
     RejoinSameProcess,
+    /// Single focus, then alice closes the slot mid-call. MSC4143 counts nobody
+    /// as joined to a closed slot, so both rosters must empty out — each peer's
+    /// own entry included — and both calls end themselves
+    /// (`EndedReason::SlotClosed`), after which `LiveKitCall::leave` still
+    /// succeeds. Not run in `RoomState`, which has no slots.
+    SlotClosed,
 }
 
 /// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
@@ -366,6 +372,43 @@ async fn wait_for_members(call: &LiveKitCall, target: usize, label: &str) -> boo
     false
 }
 
+/// Poll a call's member count until it drops to `target`, or time out.
+async fn wait_for_member_count(call: &LiveKitCall, target: usize, label: &str) -> bool {
+    let mut last_count = usize::MAX;
+    for _ in 0..60 {
+        last_count = call.member_count().await;
+        if last_count == target {
+            println!("[{label}] sees {last_count} members");
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    println!("[{label}] WARNING: still {last_count} members (wanted {target}) after 30s");
+    false
+}
+
+/// Wait for the call to end itself with `EndedReason::SlotClosed`.
+async fn wait_for_slot_closed_end(
+    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    label: &str,
+) -> bool {
+    use tokio::sync::broadcast::error::RecvError;
+    let ended = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            match events.recv().await {
+                Ok(CallEvent::Ended { reason }) => return Some(reason),
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    println!("[{label}] call ended: {ended:?}");
+    ended == Some(EndedReason::SlotClosed)
+}
+
 /// Poll until a peer's media key has been imported, or time out.
 ///
 /// Distinct from [`wait_for_members`]: that one proves the *signalling* round
@@ -405,6 +448,8 @@ e2e_tests! {
     e2e_call_rejoin_current => (RejoinSameProcess, Current),
     e2e_call_rejoin_sticky_2025 => (RejoinSameProcess, Sticky2025),
     e2e_call_rejoin_room_state => (RejoinSameProcess, RoomState),
+    e2e_call_slot_closed_current => (SlotClosed, Current),
+    e2e_call_slot_closed_sticky_2025 => (SlotClosed, Sticky2025),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -452,6 +497,7 @@ async fn run(
     let alice = login_and_sync(&cfg, &alice_creds).await?;
     let bob = login_and_sync(&cfg, &bob_creds).await?;
     let bob_id = bob.client.user_id().ok_or("bob has no user id")?.to_owned();
+    let alice_client = alice.client.clone();
 
     // 2. Alice creates the encrypted room and invites bob.
     let room_id = create_encrypted_room(&alice.client, &bob_id).await?;
@@ -494,7 +540,9 @@ async fn run(
     //    publishes on their own SFU; the engines then cross-connect to the
     //    peer's focus for subscribing (MSC4195 multi-SFU).
     let bob_url = match scenario {
-        Scenario::SingleFocus | Scenario::RejoinSameProcess => cfg.livekit_service_url.clone(),
+        Scenario::SingleFocus | Scenario::RejoinSameProcess | Scenario::SlotClosed => {
+            cfg.livekit_service_url.clone()
+        }
         Scenario::TwoFoci => cfg.livekit_service_url_2.clone(),
     };
     let alice_url = cfg.livekit_service_url.clone();
@@ -530,7 +578,7 @@ async fn run(
     let mut _bob_tone = None;
     let mut _alice_video = None;
     let (tone_ok, reverse_tone_ok, video_ok, constraints_ok) = match scenario {
-        Scenario::SingleFocus | Scenario::RejoinSameProcess => (
+        Scenario::SingleFocus | Scenario::RejoinSameProcess | Scenario::SlotClosed => (
             record_and_verify_tone(&mut bob.call, "first-call").await?,
             true,
             true,
@@ -609,6 +657,24 @@ async fn run(
         (true, true)
     };
 
+    // Alice closes the slot while both are still in the call. Nothing else
+    // happens in the room afterwards, so this also shows the close is noticed
+    // without other membership traffic to prompt a re-read.
+    let slot_closed_ok = if scenario == Scenario::SlotClosed {
+        let mut alice_events = alice.call.subscribe_call_events();
+        let mut bob_events = bob.call.subscribe_call_events();
+        println!("[alice] closing slot {}", cfg.slot_id);
+        close_slot(&alice_client, room_id.as_str(), &cfg.slot_id).await?;
+        let alice_empty = wait_for_member_count(&alice.call, 0, "alice").await;
+        let bob_empty = wait_for_member_count(&bob.call, 0, "bob").await;
+        // Both calls end themselves; the closer is not exempt.
+        let alice_ended = wait_for_slot_closed_end(&mut alice_events, "alice").await;
+        let bob_ended = wait_for_slot_closed_end(&mut bob_events, "bob").await;
+        alice_empty && bob_empty && alice_ended && bob_ended
+    } else {
+        true
+    };
+
     // Tear down both peers cleanly and symmetrically: `LiveKitCall::leave` ends the
     // keep-alive, sends the leave event (cancelling the delayed leave), shuts
     // the media engine down (closing peer-focus connections), and closes the
@@ -648,6 +714,9 @@ async fn run(
         println!("alice's key received on bob's redial:   {rejoin_key_ok}");
         println!("tone alice->bob on bob's redial:        {rejoin_tone_ok}");
     }
+    if scenario == Scenario::SlotClosed {
+        println!("slot close emptied + ended both calls:  {slot_closed_ok}");
+    }
     println!("clean teardown (leave both sides):      {teardown_ok}");
 
     if alice_sees
@@ -660,6 +729,7 @@ async fn run(
         && constraints_ok
         && rejoin_tone_ok
         && rejoin_key_ok
+        && slot_closed_ok
         && teardown_ok
     {
         println!("END-TO-END TEST PASSED (with per-participant frame E2EE)");

@@ -42,7 +42,7 @@ pub use event::{CallEvent, EndedReason, FrameEncryptionDiagnostic};
 #[cfg(feature = "livekit")]
 pub use livekit::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 #[cfg(feature = "matrix-sdk")]
-pub use livekit::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, open_slot};
+pub use livekit::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, close_slot, open_slot};
 pub use participant::{Participant, StreamState};
 pub use tile::{
     CallTile, DetailWindow, LocalState, TileId, TileKind, TileRef, TileRoster, Tiles, derive_tiles,

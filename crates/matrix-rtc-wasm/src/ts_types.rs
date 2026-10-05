@@ -142,6 +142,7 @@ export type RtcCallEvent =
     | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string | null }
     | { type: "unknown_participant"; identity: string }
     | { type: "media_connection_state"; degraded: boolean }
+    /** `reason` is `"left"`, `"slot_closed"`, or the transport's message when the own focus closed. */
     | { type: "ended"; reason: string };
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */

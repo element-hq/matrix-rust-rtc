@@ -49,7 +49,9 @@ use matrix_rtc_call::{
 };
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
-use matrix_rtc_core::{BaseRtcRoom, EncryptionConfig, LiveKitTransport, SlotEncryption};
+use matrix_rtc_core::{
+    BaseRtcRoom, EncryptionConfig, LeaveError, LiveKitTransport, SlotEncryption,
+};
 use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 use matrix_rtc_transport::{
     LocalTrackHandle, MediaConstraints, MediaStreamKind, PublishOptions, ReceiveStats,
@@ -558,6 +560,10 @@ impl LiveKitCall {
     ///
     /// The SFU connection is closed even if the Matrix-side leave fails; the
     /// first error wins.
+    ///
+    /// A call whose slot closed has already left and ended itself
+    /// ([`CallEvent::Ended`] with `EndedReason::SlotClosed`); leaving it then
+    /// only releases what is left, and succeeds.
     pub async fn leave(self) -> Result<(), LiveKitCallError> {
         let LiveKitCall {
             call,
@@ -570,10 +576,20 @@ impl LiveKitCall {
 
         // Step logs bracket every await so a wedged teardown pinpoints itself.
         log::debug!("[{room_id}] leave: sending matrix leave (membership + delayed-event cancel)");
-        let leave_result = call
-            .leave(Default::default())
-            .await
-            .map_err(LiveKitCallError::from);
+        let leave_result = call.leave(Default::default()).await;
+        // The only way a `LiveKitCall` is over before its leave: the slot
+        // closed, the core left, and the engine closed the SFU connection.
+        // `NotJoined` is the same, caught before the session heard of it.
+        let auto_left = matches!(
+            leave_result,
+            Err(RtcError::SessionOver | RtcError::Leave(LeaveError::NotJoined))
+        );
+        let leave_result = if auto_left {
+            log::debug!("[{room_id}] leave: the call already left on its own");
+            Ok(())
+        } else {
+            leave_result.map_err(LiveKitCallError::from)
+        };
         // After the leave, whose cancel of the delayed event still goes through
         // the backend; the subscriptions are not needed for that.
         drop(room);
@@ -585,15 +601,37 @@ impl LiveKitCall {
                 "FAILED"
             },
         );
-        // Emits `CallEvent::Ended { reason: Left }` and closes every
-        // peer-focus connection; the own-focus close below reports its result.
+        // The leave ended the engine; this waits for it to finish closing.
         engine.shutdown().await;
         log::debug!("[{room_id}] leave: media engine down; closing own SFU connection");
         use matrix_rtc_transport::TransportConnection as _;
-        let close_result = connection.close().await.map_err(LiveKitCallError::from);
+        let close_result = match connection.close().await {
+            // Already closed by the engine; nothing for the caller to act on.
+            Err(error) if auto_left => {
+                log::debug!("[{room_id}] leave: own SFU connection already gone: {error}");
+                Ok(())
+            }
+            result => result.map_err(LiveKitCallError::from),
+        };
         log::debug!("[{room_id}] leave: complete");
         leave_result.and(close_result)
     }
+}
+
+/// Close a MatrixRTC slot in a room by publishing an empty `m.rtc.slot` state
+/// event. Everyone in it — this client's own calls included — leaves, and
+/// their calls end with `EndedReason::SlotClosed`.
+///
+/// Requires the power level for `m.rtc.slot` state, as [`open_slot`] does.
+pub async fn close_slot(
+    client: &Client,
+    room_id: &str,
+    slot_id: &str,
+) -> Result<(), LiveKitCallError> {
+    BaseRtcRoom::with_backend(room_id, Arc::new(SdkMatrixBackend::new(client.clone())))
+        .close_slot(slot_id.to_owned())
+        .await
+        .map_err(signalling_error)
 }
 
 /// Open a MatrixRTC slot in a room by publishing its `m.rtc.slot` state event.

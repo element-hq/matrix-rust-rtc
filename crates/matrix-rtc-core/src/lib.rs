@@ -1144,6 +1144,100 @@ mod tests {
         assert!(room.own_member_id("m.call#room").is_some(), "still joined");
     }
 
+    /// A slot closing under our own join ends it: we leave with `slot_closed`,
+    /// cancel the delayed leave, stop keeping alive, and announce the leave so
+    /// the host can tear its media down.
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_slot_leaves_our_own_join() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+
+        room.on_slots_received(vec![slot_event("m.call#room", r#"{ "status": "closed" }"#)])
+            .await;
+
+        assert_eq!(
+            auto_leaves.try_recv().expect("an auto-leave").code,
+            LeaveCode::SlotClosed
+        );
+        assert_eq!(room.own_member_id("m.call#room"), None);
+        let (_, _, leave, _) = sender.last_sticky_event().expect("a leave was sent");
+        assert_eq!(leave["leave_reason"]["code"], "slot_closed", "{leave}");
+        assert_eq!(sender.cancelled_events.lock().unwrap().len(), 1);
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+    }
+
+    /// A leave that fails to send still ends our join and is announced, so the
+    /// host stops publishing; the delayed leave stays armed to remove us.
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_slot_ends_our_join_even_when_the_leave_fails() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+        let sent_before = sender.sticky_events.lock().unwrap().len();
+        *sender.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
+
+        room.on_slots_received(vec![slot_event("m.call#room", r#"{ "status": "closed" }"#)])
+            .await;
+
+        assert_eq!(
+            auto_leaves.try_recv().expect("an auto-leave").code,
+            LeaveCode::SlotClosed
+        );
+        assert_eq!(room.own_member_id("m.call#room"), None);
+        assert_eq!(sender.sticky_events.lock().unwrap().len(), sent_before);
+        assert!(
+            sender.cancelled_events.lock().unwrap().is_empty(),
+            "the delayed leave is left to fire"
+        );
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+    }
+
+    /// A host leave that fails to send is reported, but still ends our join:
+    /// the machine is gone, so the delayed leave removes the membership.
+    #[tokio::test(start_paused = true)]
+    async fn a_leave_that_fails_to_send_still_ends_our_join() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        *sender.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
+
+        let result = room.leave("m.call#room", LeaveSessionParams::new()).await;
+
+        assert!(result.is_err(), "the failed send is reported");
+        assert_eq!(room.own_member_id("m.call#room"), None);
+        assert!(sender.cancelled_events.lock().unwrap().is_empty());
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+    }
+
+    /// Only the leaves the session makes on its own are announced; a host that
+    /// hung up knows it did.
+    #[tokio::test(start_paused = true)]
+    async fn a_host_leave_is_not_announced_as_an_auto_leave() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+
+        leave_call(&mut room).await;
+        // Closing the slot now finds nobody of ours to leave.
+        room.on_slots_received(vec![slot_event("m.call#room", r#"{ "status": "closed" }"#)])
+            .await;
+
+        assert!(auto_leaves.try_recv().is_err());
+    }
+
     /// Without a runtime the join still succeeds; the host ticks it instead.
     #[test]
     fn a_join_off_a_runtime_has_no_upkeep() {

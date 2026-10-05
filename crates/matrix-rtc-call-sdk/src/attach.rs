@@ -120,6 +120,7 @@ where
     let memberships = call.subscribe_memberships().await;
     let raised_hands = call.subscribe_raised_hands().await;
     let reactions = call.subscribe_reactions().await;
+    let ended = call.subscribe_ended();
 
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
@@ -155,6 +156,7 @@ where
             own_connection_key: own_key.clone(),
             raised_hands,
             reactions,
+            ended: Some(ended),
             stability: options.stability,
         },
         memberships,

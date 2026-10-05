@@ -632,6 +632,8 @@ pub struct MockBackend {
     pub transports_requests: std::sync::atomic::AtomicUsize,
     /// When set, `subscribe_room` fails with it.
     pub room_subscription_error: std::sync::Mutex<Option<BackendError>>,
+    /// When set, sticky sends fail with this message and are not recorded.
+    pub sticky_event_error: std::sync::Mutex<Option<String>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -655,6 +657,7 @@ impl Default for MockBackend {
             transports: std::sync::Mutex::new(Ok(Value::Array(Vec::new()))),
             transports_requests: Default::default(),
             room_subscription_error: Default::default(),
+            sticky_event_error: Default::default(),
         }
     }
 }
@@ -743,6 +746,9 @@ impl MatrixBackend for MockBackend {
         content: Value,
         duration_ms: u64,
     ) -> Result<String, CommandError> {
+        if let Some(message) = self.sticky_event_error.lock().unwrap().clone() {
+            return Err(CommandError::from_message(message));
+        }
         let mut guard = self.sticky_events.lock().unwrap();
         guard.push((room_id, event_type, content, duration_ms));
         // Numbered by send order, so a test can name the event a relation is

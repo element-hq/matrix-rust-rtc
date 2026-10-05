@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
@@ -113,6 +113,10 @@ struct OwnParticipation {
     member_id: String,
 }
 
+/// Buffer of [`SlotSession::subscribe_auto_leaves`]. One auto-leave ends a
+/// join, so a subscriber only falls behind across several rejoins.
+const AUTO_LEAVES_CAPACITY: usize = 4;
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct SlotSession<T: MatrixBackend> {
     /// Member events that are join-shaped and still sticky. These are
@@ -131,6 +135,9 @@ pub struct SlotSession<T: MatrixBackend> {
     /// required to be encrypted.
     room_encryption: RoomEncryption,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
+    /// Announces every leave this session makes without the host asking. See
+    /// [`SlotSession::subscribe_auto_leaves`].
+    auto_leaves_tx: broadcast::Sender<LeaveReason>,
     /// Command sender for sending events to the Matrix room.
     backend: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
@@ -161,6 +168,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             room_members: self.room_members.clone(),
             room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
+            auto_leaves_tx: self.auto_leaves_tx.clone(),
             backend: self.backend.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             upkeep: None,
@@ -193,6 +201,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             room_members: None,
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
+            auto_leaves_tx: broadcast::channel(AUTO_LEAVES_CAPACITY).0,
             backend,
             own_membership_machine: None,
             upkeep: None,
@@ -547,6 +556,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     ///
     /// Returns `Ok(())` if the leave completed successfully.
     /// Returns `Err(LeaveError)` if not joined, backend is not configured, or commands fail.
+    /// A failed send still ends the join here, since the machine is gone and
+    /// cannot retry; the delayed leave removes the membership.
     pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
         // Check if we have a membership machine (i.e., we've joined)
         let machine = self.own_membership_machine.take().ok_or_else(|| {
@@ -565,10 +576,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         );
 
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        machine
+        let sent = machine
             .leave(params.leave_reason.clone())
             .await
-            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag))?;
+            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
@@ -584,8 +595,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // want to see who is left in the call.
         self.refresh().await;
 
+        sent?;
         log::info!("[{}] left", self.log_tag);
-
         Ok(())
     }
 
@@ -665,6 +676,13 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// This is used by bindings that implement their own polling/callback model.
     pub fn subscribe_membership_snapshots(&self) -> watch::Receiver<Vec<JoinedMembership>> {
         self.membership_snapshots_tx.subscribe()
+    }
+
+    /// Subscribes to the leaves this session makes on its own, without the
+    /// host asking — today only [`LeaveCode::SlotClosed`]. A host that runs
+    /// media ends it here; a leave the host asked for is not announced.
+    pub fn subscribe_auto_leaves(&self) -> broadcast::Receiver<LeaveReason> {
+        self.auto_leaves_tx.subscribe()
     }
 
     /// Applies the initial membership events for this single session.
@@ -937,7 +955,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     ///
     /// Closing a slot leaves every member of it, and reopening it restores the
     /// ones whose member events are still sticky — MSC4143 requires clients to
-    /// track the latest room state at all times, not just at join.
+    /// track the latest room state at all times, not just at join. Our own join
+    /// is no exception: closing the slot under it sends our leave with
+    /// [`LeaveCode::SlotClosed`] (see [`SlotSession::subscribe_auto_leaves`]).
     pub async fn set_slot_state(&mut self, state: SlotState) {
         if self.slot == SlotKnowledge::Known(state.clone()) {
             return;
@@ -948,8 +968,30 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             self.slot,
             if state.is_open() { "Open" } else { "Closed" },
         );
+        let closed = !state.is_open();
         self.slot = SlotKnowledge::Known(state);
-        self.refresh().await;
+        if closed && self.own_membership_machine.is_some() {
+            self.auto_leave(LeaveReason::new(LeaveCode::SlotClosed))
+                .await;
+        } else {
+            self.refresh().await;
+        }
+    }
+
+    /// Leaves without the host asking, and tells it so — even when the send
+    /// fails, since `leave` ends the join regardless.
+    async fn auto_leave(&mut self, reason: LeaveReason) {
+        log::info!("[{}] leaving on our own ({:?})", self.log_tag, reason.code);
+        let params = LeaveSessionParams {
+            leave_reason: Some(reason.clone()),
+        };
+        if let Err(error) = self.leave(params).await {
+            log::warn!(
+                "[{}] could not send our leave; the delayed leave will: {error}",
+                self.log_tag
+            );
+        }
+        let _ = self.auto_leaves_tx.send(reason);
     }
 
     /// Returns this session's slot to [`SlotKnowledge::Unsupplied`], so the
@@ -1233,6 +1275,16 @@ impl LeaveCode {
             "delayed_leave" => Self::DelayedLeave,
             "slot_closed" => Self::SlotClosed,
             other => Self::Other(other.to_owned()),
+        }
+    }
+
+    /// The wire `leave_reason.code`; the inverse of [`LeaveCode::from_code`].
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Leave => "leave",
+            Self::DelayedLeave => "delayed_leave",
+            Self::SlotClosed => "slot_closed",
+            Self::Other(code) => code,
         }
     }
 }
