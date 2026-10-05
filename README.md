@@ -189,7 +189,7 @@ Breaking section before bumping the SDK.
 ```bash
 cd web
 npm run build
-npm test
+npm run test:vitest
 ```
 
 The `web/` package uses `wasm-pack` to generate browser-first bindings under `web/pkg/`.
@@ -257,7 +257,7 @@ Then run binding tasks when relevant:
 
 ```bash
 cd web && npm run build
-cd web && npm test
+cd web && npm run test:vitest
 ```
 
 - If changes touch `crates/matrix-rtc-ffi/**`, `mobile/**`, or `scripts/build-*.sh`:
