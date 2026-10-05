@@ -13,20 +13,20 @@ MSC4143 call-membership signalling, per-participant media-key exchange, and a
 **transport-agnostic media layer** — one Rust codebase behind Kotlin/Swift
 bindings (UniFFI) and a signalling-only WebAssembly build for the web.
 
-## The media layer
+## The call SDK layer
 
-The centrepiece of the project. To the application, a call is a set of
+The centrepiece of the project. To the host, a call is a set of
 **participants with observable frame streams** (microphone, camera,
 screenshare) plus per-stream **constraints** (visibility, rendered size,
 low-bandwidth mode). Everything underneath is hidden in Rust:
 
 - **No LiveKit types on the API surface.** LiveKit is one implementation of
-  the `MediaTransport` trait (`crates/matrix-rtc-media`); future transports
+  the `MediaTransport` trait (`crates/matrix-rtc-transport`); future transports
   (P2P, WebTransport) slot into the same model.
 - **MSC4195 multi-SFU built in**: each member publishes to their own focus
-  and the engine maintains one connection per distinct focus in the call,
-  with backoff, roster union, and identity mapping — so Kotlin/Swift never
-  reimplement it.
+  and the connection pool (`matrix-rtc-transport`) maintains one connection
+  per distinct focus in the call, with backoff, roster union, and identity
+  mapping — so Kotlin/Swift never reimplement it.
 - **Constraints drive simulcast subscribe-side**: tell the engine how a tile
   is rendered and it picks the right layer, pauses off-screen streams, and
   re-applies settings across reconnects.
@@ -35,10 +35,9 @@ low-bandwidth mode). Everything underneath is hidden in Rust:
 
 ```rust,no_run
 use futures_util::StreamExt;
-use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions};
-use matrix_rtc_media::{
-    CallEvent, Dimensions, MediaConstraints, MediaStreamKind, PublishOptions, VideoDetail,
-    VideoSourceConfig,
+use matrix_rtc_call_sdk::{CallEvent, LiveKitCall, LiveKitCallOptions};
+use matrix_rtc_transport::{
+    Dimensions, MediaConstraints, MediaStreamKind, PublishOptions, VideoDetail, VideoSourceConfig,
 };
 
 async fn video_call(room: &matrix_sdk::Room) -> Result<(), Box<dyn std::error::Error>> {
@@ -102,18 +101,25 @@ zero-copy plane access, latest-frame-wins so slow consumers drop frames
 instead of lagging. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full
 design, the module docs in `crates/matrix-rtc-ffi/src/media/mod.rs` for the
 host-app integration flow, and
-[crates/matrix-rtc-livekit/README.md](crates/matrix-rtc-livekit/README.md)
+[crates/matrix-rtc-call-sdk/README.md](crates/matrix-rtc-call-sdk/README.md)
 for a runnable two-client example against the local backend.
 
 ## Workspace crates
 
-- `crates/matrix-rtc-media`: the transport-agnostic media model — participants,
-  frame streams, constraints resolver, and the `CallEngine` connection pool
-  (MSC4195 multi-SFU). Depends on core + tokio only; **no LiveKit**, fully
-  unit-tested against a fake transport.
+- `crates/matrix-rtc-transport`: how media flows, for any MatrixRTC
+  application on the core — the `MediaTransport` contract, frames,
+  constraints, the media key handler, the MSC4195 multi-SFU connection pool
+  (`pool`), and the pure MSC4195 control plane (`livekit`). No transport IO,
+  **no LiveKit client**; compiles for wasm32.
+- `crates/matrix-rtc-call-sdk`: the call SDK hosts use — the call's media
+  model over that contract (participants, tiles, the unified event stream,
+  the `CallEngine`), `attach_media`, and
+  behind features `attach_livekit` and the high-level `LiveKitCall::join`
+  facade with the examples and e2e test. Fully unit-tested against a fake
+  transport.
 - `crates/matrix-rtc-livekit`: MSC4195 LiveKit transport — SFU token exchange,
-  per-participant frame E2EE, the `MediaTransport` implementation, and the
-  high-level `LiveKitCall::join` facade. Native-only (pulls in `libwebrtc`).
+  per-participant frame E2EE, and the `MediaTransport` implementation. Knows no
+  call. Native-only (pulls in `libwebrtc`).
 - `crates/matrix-rtc-core`: the per-room MSC4143 core (`BaseRtcRoom`, a
   `SlotSession` per slot), the MSC4143/MSC4354 event conversion boundary, and
   the feeder that subscribes through a host's `MatrixBackend` and feeds it
@@ -126,8 +132,9 @@ for a runnable two-client example against the local backend.
 - `crates/matrix-rtc-matrix-sdk`: `SdkMatrixBackend`, the `MatrixBackend` over
   matrix-rust-sdk. **No LiveKit**.
 - `crates/matrix-rtc-ffi`: UniFFI-based Kotlin/Swift bindings — the
-  client → room → call objects always, plus the media layer behind the `media`
-  cargo feature (default off, keeps the slim artifact libwebrtc-free).
+  client → room → call objects always, plus the call SDK's media
+  (`matrix-rtc-call-sdk` with LiveKit) behind the `media` cargo feature
+  (default off, keeps the slim artifact libwebrtc-free).
 - `crates/matrix-rtc-wasm`: wasm bindings for the web (signalling only —
   browsers keep using livekit-js for media).
 - `web`: browser-first JavaScript package and wasm-pack build/test scaffold.
@@ -189,7 +196,7 @@ Breaking section before bumping the SDK.
 ```bash
 cd web
 npm run build
-npm test
+npm run test:vitest
 ```
 
 The `web/` package uses `wasm-pack` to generate browser-first bindings under `web/pkg/`.
@@ -257,7 +264,7 @@ Then run binding tasks when relevant:
 
 ```bash
 cd web && npm run build
-cd web && npm test
+cd web && npm run test:vitest
 ```
 
 - If changes touch `crates/matrix-rtc-ffi/**`, `mobile/**`, or `scripts/build-*.sh`:

@@ -81,7 +81,7 @@ jobs:
           shared-key: e2e-call
 
       - name: Build the interop peer
-        run: cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
+        run: cargo build -p matrix-rtc-call-sdk --features matrix-sdk,testing --example interop_peer
 
       # The web peer's wasm bindings. The rust-cache step above covers the
       # cargo half of this build too.

@@ -13,16 +13,11 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
+use matrix_rtc_call_sdk::{AttachError, CallEngine, CallEvent, MediaAttachment};
+use matrix_rtc_call_sdk::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{RtcTransport, TransportIntent};
-use matrix_rtc_livekit::{
-    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
-    identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
-};
-use matrix_rtc_media::{
-    CallEngine, CallEvent, ConnectionContext, EngineConfig, MediaStreamKind, OwnMemberClaims,
-    TransportConnection as _,
-};
+use matrix_rtc_livekit::{LiveKitTransportConnection, MediaKeyBridge};
+use matrix_rtc_transport::{MediaStreamKind, TransportConnection as _};
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
@@ -67,192 +62,49 @@ async fn build_media_session(
     call: Arc<RtcCall>,
     config: MediaSessionConfig,
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
-    let (room_id, slot_id) = (call.room_id(), call.slot_id());
-    let backend = call.backend();
-    let (user_id, device_id) = (backend.own_user_id(), backend.own_device_id());
-    // The focus our membership announces; a receive-only call has none and
-    // only connects to its peers' foci.
-    let own_focus = match call.inner().transport() {
-        TransportIntent::Publish(RtcTransport::LiveKit(livekit)) => {
-            Some(livekit.livekit_service_url.clone())
-        }
-        TransportIntent::Publish(other) => {
-            return Err(MediaFfiError::Transport(format!(
-                "the call publishes on {other:?}, which is not a LiveKit transport"
-            )));
-        }
-        TransportIntent::ReceiveOnly { .. } => None,
-    };
-    log::info!(
-        "media: connecting [{room_id}/{slot_id}] user={user_id} device={device_id} focus={}",
-        own_focus.as_deref().unwrap_or("none (receive only)"),
-    );
-
     // Which MatrixRTC generation this room was joined for, read back from the
     // join rather than taken as a parameter: it decides the participant identity
     // and the token endpoint, and those disagreeing with the membership we
-    // already published is not an error but a silence — peers sit in the roster
-    // with no media, keys install under an identity the SFU never assigned, and
-    // nothing logs a problem. See `crate::compat`.
+    // already published is not an error but a silence. See `crate::compat`.
     let compat = call.format();
     if compat != MembershipFormat::Current {
         log::info!(
-            "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode {compat:?}",
+            "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
+            call.room_id(),
+            call.slot_id(),
         );
     }
-    // Call it once and share the `Arc`: it has four uses here — the core's
-    // encryption manager, the media transport, our own identity, and the key
-    // ring — and they must not skew.
-    let identity_mapper = identity_mapper(compat);
-
-    // Frame encryption: one shared KeyProvider feeds every SFU connection
-    // (keys are indexed by the participant identity, globally unique per
-    // membership) and the bridge that imports keys the core signals.
-    let provider = msc4195_key_provider();
-    let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
-
-    // Wire the core's encryption manager to the bridge and to the MSC4195
-    // identity derivation, and take the membership snapshot channel the engine
-    // consumes. The `member.id` is the join's rather than the host's: it is
-    // what our MSC4195 participant identity is derived from, so a value that
-    // disagrees with the published membership would put our media on an
-    // identity no peer holds a key for.
-    let joined = call.inner();
-    if !joined.is_live() {
-        log::warn!("media: [{room_id}/{slot_id}] the call is over — join again first");
-        return Err(MediaFfiError::NotJoined(format!(
-            "{room_id}/{slot_id} is over — join the slot first"
-        )));
-    }
-    let member_id = joined.member_id().to_owned();
-    let raised_hands = joined.subscribe_raised_hands().await;
-    let reactions = joined.subscribe_reactions().await;
-    let memberships = joined.subscribe_memberships().await;
-    // Mapper before handler: the replay below derives identities through it,
-    // and installing it second would replay peer keys under the raw
-    // `member_id` fallback — an identity the SFU never uses, which is
-    // indistinguishable from importing nothing.
-    joined
-        .set_encryption_identity_mapper(identity_mapper.clone())
-        .await;
-    if !joined.set_encryption_signal_handler(bridge.clone()).await {
-        log::warn!(
-            "media: call [{room_id}/{slot_id}] has no encryption manager — join the slot first",
-        );
-        return Err(MediaFfiError::NotJoined(
-            "the call has no encryption manager — join the slot first".into(),
-        ));
-    }
-
-    let transport = Arc::new(
-        LiveKitMediaTransport::new(reqwest::Client::new(), call.backend(), provider)
-            // The same mapper the core got, so our own identity, the peers' and the
-            // key ring's all agree.
-            .with_identity_mapper(identity_mapper.clone())
-            .with_token_endpoint(match compat {
-                // Pre-MSC4195 `/sfu/get`, which is also where that generation's
-                // unhashed `{user}:{device}` identity comes from — the endpoint mints
-                // the identity, so the two are one decision, not two.
-                MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
-                _ => TokenEndpoint::Msc4195,
-            }),
-    );
-    let ctx = ConnectionContext {
-        room_id: room_id.clone(),
-        // The token request names the slot as this generation spells it.
-        slot_id: compat.token_slot_id(&slot_id).into_owned(),
-        member: OwnMemberClaims {
-            member_id: member_id.clone(),
-            user_id: user_id.clone(),
-            device_id: device_id.clone(),
+    let LiveKitAttachment {
+        media:
+            MediaAttachment {
+                engine,
+                own_connection,
+                own_identity,
+                events,
+            },
+        key_bridge,
+    } = attach_livekit(
+        call.inner(),
+        call.backend(),
+        LiveKitAttachOptions {
+            format: compat,
+            http: None,
+            auto_subscribe: true,
+            stability: config.stability.map(Into::into).unwrap_or_default(),
         },
-    };
-    let engine = CallEngine::new(
-        EngineConfig {
-            transports: vec![transport.clone()],
-            own_member_id: member_id.clone(),
-            ctx: ctx.clone(),
-            own_connection_key: own_focus.clone(),
-            raised_hands,
-            reactions,
-            stability: config.stability.clone().map(Into::into).unwrap_or_default(),
-        },
-        memberships,
-    );
-
-    // Imported media keys surface as `CallEvent::KeyImported`.
-    let engine_handle = engine.handle();
-    bridge.set_key_import_listener(Box::new(move |key| {
-        engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
-    }));
-
-    // Refused keys surface as `FfiCallEvent::KeyDiscarded`. Without this the
-    // reason a key was rejected never leaves the core, and the host sees only a
-    // `MissingKey` it cannot distinguish from a key that never arrived.
-    let engine_handle = engine.handle();
-    bridge.set_key_discard_listener(Box::new(move |discarded| {
-        engine_handle.notify_key_discarded(discarded);
-    }));
-
-    // Keys signalled between `join` and now were stored but dropped — nothing
-    // was listening. Without this, every participant whose key arrived before
-    // media attached stays undecryptable until a rotation, which only a
-    // membership change triggers.
-    //
-    // Deliberately *after* the import listener, even though the handler has been
-    // installed since the block above: replaying earlier still fixes decryption,
-    // but silently — no `KeyImported` reaches the host for the very keys the host
-    // is most likely to be missing, so a working call is indistinguishable from
-    // the bug this replay exists to fix. Still before `connect_livekit`, so the
-    // key ring is populated before the first frame can arrive.
-    //
-    joined.replay_encryption_keys().await;
-
-    let events = engine.subscribe_events();
-    let own_identity = identity_mapper(&user_id, &device_id, &member_id);
-
-    // Own focus connects synchronously so a broken SFU fails this call
-    // instead of surfacing later as a dead session.
-    let connection = match &own_focus {
-        Some(own_focus) => {
-            let (connection, connection_events) = transport
-                .connect_livekit(own_focus, &ctx)
-                .await
-                .map_err(|error| {
-                    log::warn!("media: own focus {own_focus} refused the connection: {error}");
-                    MediaFfiError::Transport(error.to_string())
-                })?;
-            engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
-
-            // Move our sender onto each key we rotate to. Importing a key only
-            // fills the provider's ring; the index our frames actually carry
-            // lives on the frame cryptor. Without this we advertise a rotation
-            // to peers and carry on encrypting with the previous key, so anyone
-            // joining after it decrypts nothing — and the forward secrecy the
-            // rotation exists for is not delivered.
-            let connection_for_keys = connection.clone();
-            bridge.set_local_sender(
-                own_identity.clone(),
-                Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
-            );
-            // Adopt the index we are already on rather than assuming 0, and
-            // record it for tracks published later.
-            if let Some(own_key) = bridge.key_for(&own_identity) {
-                connection.set_local_key_index(own_key.key_index);
-            }
-            Some(connection)
-        }
-        None => None,
-    };
-
-    log::info!("media: connected as member {member_id}, local identity {own_identity}");
+    )
+    .await
+    .map_err(|error| match error {
+        AttachError::NotJoined(message) => MediaFfiError::NotJoined(message),
+        error => MediaFfiError::Transport(error.to_string()),
+    })?;
 
     let tiles = engine.subscribe_tiles();
     let local = engine.subscribe_local_state();
     Ok(Arc::new(MediaSession {
         engine,
-        connection,
-        _bridge: bridge,
+        connection: own_connection,
+        _bridge: key_bridge,
         events: TokioMutex::new(events),
         tiles: TokioMutex::new(tiles),
         local: TokioMutex::new(local),
@@ -275,8 +127,8 @@ pub struct MediaSession {
     /// core's encryption manager also holds it.
     _bridge: Arc<MediaKeyBridge>,
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
-    tiles: TokioMutex<watch::Receiver<matrix_rtc_media::TileRoster>>,
-    local: TokioMutex<watch::Receiver<Option<matrix_rtc_media::LocalState>>>,
+    tiles: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::TileRoster>>,
+    local: TokioMutex<watch::Receiver<Option<matrix_rtc_call_sdk::LocalState>>>,
     own_identity: String,
 }
 

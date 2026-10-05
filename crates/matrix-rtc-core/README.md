@@ -100,7 +100,7 @@ An application opens its own room state with `BaseRtcClient::open_with(room_id, 
 options)`: the state is any `ApplicationIntake`, which also receives the timeline events,
 redactions and `/relations` it asks for. It renders a join in the room's format with
 `BaseRtcRoomHandle::prepare_join` before joining. `matrix-rtc-call`'s `RtcClient` is this, with
-the call's room state; `matrix_rtc_livekit::LiveKitCall::join` and the FFI and wasm `RtcClient`
+the call's room state; `matrix_rtc_call_sdk::LiveKitCall::join` and the FFI and wasm `RtcClient`
 objects are built on it.
 
 The per-room core type is `BaseRtcRoom`. What the feeder calls on it —

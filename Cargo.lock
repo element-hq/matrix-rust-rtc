@@ -2697,6 +2697,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-rtc-call-sdk"
+version = "0.4.0-rc.1"
+dependencies = [
+ "async-trait",
+ "clap",
+ "futures-core",
+ "futures-util",
+ "livekit",
+ "log",
+ "matrix-rtc-call",
+ "matrix-rtc-core",
+ "matrix-rtc-livekit",
+ "matrix-rtc-matrix-sdk",
+ "matrix-rtc-transport",
+ "matrix-sdk",
+ "matrix-sdk-ui",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matrix-rtc-core"
 version = "0.4.0-rc.1"
 dependencies = [
@@ -2728,10 +2754,10 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "matrix-rtc-call",
+ "matrix-rtc-call-sdk",
  "matrix-rtc-core",
  "matrix-rtc-livekit",
- "matrix-rtc-media",
- "reqwest 0.12.28",
+ "matrix-rtc-transport",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2745,37 +2771,17 @@ name = "matrix-rtc-livekit"
 version = "0.4.0-rc.1"
 dependencies = [
  "async-trait",
- "clap",
  "futures-util",
  "jni 0.21.1",
  "livekit",
  "log",
- "matrix-rtc-call",
  "matrix-rtc-core",
- "matrix-rtc-livekit-proto",
- "matrix-rtc-matrix-sdk",
- "matrix-rtc-media",
- "matrix-sdk",
- "matrix-sdk-ui",
+ "matrix-rtc-transport",
  "reqwest 0.12.28",
- "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "matrix-rtc-livekit-proto"
-version = "0.4.0-rc.1"
-dependencies = [
- "base64 0.22.1",
- "matrix-rtc-core",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2793,15 +2799,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrix-rtc-media"
+name = "matrix-rtc-transport"
 version = "0.4.0-rc.1"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "futures-core",
- "futures-util",
  "log",
- "matrix-rtc-call",
  "matrix-rtc-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -2818,9 +2826,9 @@ dependencies = [
  "js-sys",
  "log",
  "matrix-rtc-call",
+ "matrix-rtc-call-sdk",
  "matrix-rtc-core",
- "matrix-rtc-livekit-proto",
- "matrix-rtc-media",
+ "matrix-rtc-transport",
  "serde",
  "serde-wasm-bindgen",
  "serde_json",

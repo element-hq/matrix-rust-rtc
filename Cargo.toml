@@ -8,11 +8,11 @@ members = [
     "crates/matrix-rtc-core",
     "crates/matrix-rtc-call",
     "crates/matrix-rtc-matrix-sdk",
-    "crates/matrix-rtc-media",
+    "crates/matrix-rtc-call-sdk",
     "crates/matrix-rtc-wasm",
     "crates/matrix-rtc-ffi",
     "crates/matrix-rtc-livekit",
-    "crates/matrix-rtc-livekit-proto",
+    "crates/matrix-rtc-transport",
     "uniffi-bindgen",
 ]
 resolver = "2"
@@ -53,7 +53,45 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 log = "0.4"
 async-trait = "0.1"
 
-# The Matrix SDK, used by matrix-rtc-matrix-sdk, and by matrix-rtc-livekit behind
+# The LiveKit client and the HTTP client of the token exchange, declared once:
+# `matrix-rtc-livekit` names their types in its API (a session's `RoomEvent`s,
+# the token exchange's `reqwest::Client`) and `matrix-rtc-call-sdk` uses the
+# same ones, so two version specs would build two copies whose types do not
+# match.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# `livekit`: keep default features (notably `tokio`, which enables the signal client) and
+# select the rustls TLS backend for the SFU WebSocket/HTTP connections.
+#
+# BOTH root stores, deliberately. `rustls-tls-native-roots` alone breaks the
+# signal WebSocket on every Android device: `rustls-native-certs` probes the
+# filesystem (/etc/ssl/certs, SSL_CERT_FILE, ...) and Android keeps its trust
+# store in the Java KeyStore instead, so it returns zero certificates and
+# tokio-tungstenite fails the connection with "no native root CA certificates
+# found (errors: [])". Nothing failed to parse — there was nothing to read.
+#
+# tokio-tungstenite is written for the two to coexist (src/tls.rs): an empty
+# native store is fatal *only* when `rustls-tls-webpki-roots` is off, and the
+# webpki roots are then unioned into the same store. So Android falls back to
+# the bundled roots while desktop keeps the system store, including any
+# enterprise CA an admin added there.
+#
+# Not a swap, for two reasons. Desktop would lose user/enterprise-added CAs.
+# And livekit-api gates its WSS-over-HTTP-proxy path on
+# `rustls-tls-native-roots` (signal_client/signal_stream.rs) — without it, any
+# wss:// through a proxy becomes a hard "requires rustls-tls-native-roots".
+#
+# This does NOT give Android enterprise/internal CAs: nothing here can read the
+# Java KeyStore. That needs a platform verifier
+# (`rustls-platform-verifier`) plumbed through livekit-api, which calls
+# `connect_async` without a connector and so cannot accept one today — an
+# upstream change, not a local knob.
+livekit = { version = "0.7", features = [
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+] }
+
+# The Matrix SDK, used by matrix-rtc-matrix-sdk, and by matrix-rtc-call-sdk behind
 # its `matrix-sdk` feature. Upstream `main`, pinned to a rev so builds are
 # reproducible; the three crates MUST share one rev or cargo resolves two copies
 # of matrix-sdk and the `Client` one crate takes is not the one the other accepts.
@@ -66,7 +104,7 @@ matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "
 # matrix-rust-sdk carries these git pins in its own `[patch]` tables. Cargo does
 # NOT propagate a dependency's `[patch]` to the consuming workspace, so they are
 # replicated here verbatim, or the SDK fails to build; a downstream workspace
-# that depends on matrix-rtc-matrix-sdk, or -livekit with `matrix-sdk` on, must do the
+# that depends on matrix-rtc-matrix-sdk, or -call-sdk with `matrix-sdk` on, must do the
 # same. Source: matrix-org/matrix-rust-sdk@c6ad52e Cargo.toml — keep in step when
 # bumping the rev above.
 [patch.crates-io]

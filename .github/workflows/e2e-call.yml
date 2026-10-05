@@ -49,7 +49,7 @@ jobs:
       # Build without running so a compile failure is distinguishable from a
       # call failure, and the stack gets extra minutes to settle.
       - name: Build e2e test
-        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call --no-run
+        run: cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing --test e2e_call --no-run
 
       - name: Wait for backend readiness
         run: ./demo/backend/wait-ready.sh
@@ -57,13 +57,13 @@ jobs:
       - name: Run e2e call test
         # --test-threads=1: the scenarios share the compose stack; run them
         # sequentially.
-        run: cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
+        run: cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
         env:
           # `debug` on our own crates: this is the only CI job that exercises a
           # real join end to end, so its log is the reference for what a healthy
           # sequence looks like. `livekit`/`webrtc_sys` stay at `warn` — at
           # `debug` they are most of the output.
-          RUST_LOG: info,matrix_rtc_core=debug,matrix_rtc_media=debug,matrix_rtc_livekit=debug,livekit=warn,webrtc_sys=warn
+          RUST_LOG: info,matrix_rtc_core=debug,matrix_rtc_call_sdk=debug,matrix_rtc_livekit=debug,livekit=warn,webrtc_sys=warn
 
       # Always, not just on failure: the auth-service (lk-jwt) logs are the
       # only visibility into the OpenID/token hop, and green runs that log

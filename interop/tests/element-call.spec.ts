@@ -15,7 +15,7 @@ Please see LICENSE in the repository root for full details.
  * - **Element Call sees Rust**: our membership renders as a tile with our
  *   display name, and Element Call is not stuck on "Waiting for media...",
  *   which is what it shows when nothing decodes.
- * `crates/matrix-rtc-livekit/tests/e2e_call` already proves our stack talks to
+ * `crates/matrix-rtc-call-sdk/tests/e2e_call` already proves our stack talks to
  * itself in every mode. What it cannot prove is that Element Call agrees with
  * our reading of the wire format — that needs a browser, and this is it.
  */

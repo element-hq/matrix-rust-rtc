@@ -99,9 +99,9 @@ pub struct RtcLogConfig {
     /// `"matrix_rtc_core::session=trace,livekit=info,webrtc_sys=warn"`.
     ///
     /// Targets are module paths, so a directive matches by prefix: the
-    /// filterable roots are `matrix_rtc_core`, `matrix_rtc_media`,
-    /// `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus third-party `livekit` and
-    /// `webrtc_sys`. Empty means "no overrides".
+    /// filterable roots are `matrix_rtc_core`, `matrix_rtc_call_sdk`,
+    /// `matrix_rtc_transport`, `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus
+    /// third-party `livekit` and `webrtc_sys`. Empty means "no overrides".
     #[uniffi(default = "")]
     pub filter: String,
 
@@ -538,8 +538,8 @@ mod tests {
         assert!(enabled("matrix_rtc_core::session", Level::Trace));
         assert!(!enabled("livekit::room", Level::Warn));
         // Unmatched targets fall back to the baseline.
-        assert!(enabled("matrix_rtc_media::engine", Level::Warn));
-        assert!(!enabled("matrix_rtc_media::engine", Level::Info));
+        assert!(enabled("matrix_rtc_call_sdk::engine", Level::Warn));
+        assert!(!enabled("matrix_rtc_call_sdk::engine", Level::Info));
         // `set_max_level` must not clip the most permissive directive.
         assert_eq!(filter.filter(), LevelFilter::Trace);
     }

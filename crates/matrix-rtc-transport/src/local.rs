@@ -1,0 +1,159 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+//! Publishing local media.
+//!
+//! Capture stays platform-side (camera, microphone, screen grabber): the
+//! application pushes raw frames *into* the transport through a
+//! [`LocalTrackHandle`], and the transport owns encoding, simulcast layering,
+//! and pacing. Publications always go to the *own* focus — the one announced
+//! in our membership's `transports`, where peers subscribe to us.
+
+use async_trait::async_trait;
+use matrix_rtc_core::MaybeSend;
+
+use crate::connection::TransportError;
+use crate::frame::{AudioFrame, VideoFrame};
+use crate::stream::MediaStreamKind;
+
+/// PCM format the application will push into an audio publication.
+#[derive(Clone, Copy, Debug)]
+pub struct AudioSourceConfig {
+    pub sample_rate: u32,
+    pub num_channels: u32,
+}
+
+impl Default for AudioSourceConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48_000,
+            num_channels: 1,
+        }
+    }
+}
+
+/// Capture resolution of a video publication. Transports derive encoder and
+/// simulcast layer settings from it.
+#[derive(Clone, Copy, Debug)]
+pub struct VideoSourceConfig {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// What to publish.
+#[derive(Clone, Debug)]
+pub struct PublishOptions {
+    /// Which stream this is (microphone, camera, screenshare, ...); peers see
+    /// it under the same [`MediaStreamKind`].
+    pub kind: MediaStreamKind,
+    /// PCM format, for audio kinds.
+    pub audio: Option<AudioSourceConfig>,
+    /// Capture resolution, for video kinds.
+    pub video: Option<VideoSourceConfig>,
+    /// Publish multiple quality layers so receivers can pick per their
+    /// [`MediaConstraints`](crate::constraints::MediaConstraints). Video only;
+    /// transports without layered publishing ignore it.
+    pub simulcast: bool,
+    /// Publish already muted, so peers see a deliberate off from the first
+    /// frame on.
+    ///
+    /// For a lobby that joins muted. Muting after the publish resolves cannot
+    /// express that: it leaves a window in which the track is live and unmuted
+    /// at the SFU, which for a microphone is a hot mic. The mute travels in the
+    /// same request that announces the track, so there is no such window.
+    pub muted: bool,
+}
+
+impl PublishOptions {
+    /// A microphone publication with the default PCM format.
+    pub fn microphone() -> Self {
+        Self {
+            kind: MediaStreamKind::Microphone,
+            audio: Some(AudioSourceConfig::default()),
+            video: None,
+            simulcast: false,
+            muted: false,
+        }
+    }
+
+    /// A camera publication with simulcast enabled.
+    pub fn camera(video: VideoSourceConfig) -> Self {
+        Self {
+            kind: MediaStreamKind::Camera,
+            audio: None,
+            video: Some(video),
+            simulcast: true,
+            muted: false,
+        }
+    }
+
+    /// A screenshare publication with simulcast enabled.
+    pub fn screen_share(video: VideoSourceConfig) -> Self {
+        Self {
+            kind: MediaStreamKind::ScreenShare,
+            audio: None,
+            video: Some(video),
+            simulcast: true,
+            muted: false,
+        }
+    }
+
+    /// Publish already muted; see [`PublishOptions::muted`].
+    pub fn muted(mut self) -> Self {
+        self.muted = true;
+        self
+    }
+}
+
+/// A live local publication: push captured frames into it.
+///
+/// Handles are cheap `Arc`s. A publication ends with its connection
+/// (leave/close) or when retracted through
+/// `CallEngine::unpublish`; after
+/// that, `capture_*` calls on the handle error rather than silently
+/// succeeding, so a capture loop learns to stop.
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait LocalTrackHandle: MaybeSend {
+    fn kind(&self) -> MediaStreamKind;
+
+    /// Mute or unmute this publication at the transport.
+    ///
+    /// Muting stops media reaching peers and tells them why, so their UI can
+    /// show it. Distinct from simply not calling `capture_*`: that looks like a
+    /// stalled sender to a peer, which is what they see for a wedged client.
+    fn set_muted(&self, _muted: bool) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this publication cannot be muted".into(),
+        ))
+    }
+
+    /// Retract this publication at the transport, so peers drop the stream
+    /// entirely — unlike a mute, which keeps the publication up and tells
+    /// them why it is silent. Already-retracted is success (the room may
+    /// have closed and taken every publication with it).
+    async fn unpublish(&self) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this publication cannot be unpublished".into(),
+        ))
+    }
+
+    /// Push a chunk of captured PCM. Paced by the transport: resolves when
+    /// the frame has been accepted, applying backpressure to the capture
+    /// loop. Errors once the publication is gone.
+    async fn capture_audio(&self, _frame: AudioFrame) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this publication does not accept audio frames".into(),
+        ))
+    }
+
+    /// Push a captured video frame. Delivery to the encoder is
+    /// latest-frame-wins; there is no backpressure.
+    fn capture_video(&self, _frame: VideoFrame) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this publication does not accept video frames".into(),
+        ))
+    }
+}

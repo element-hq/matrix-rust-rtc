@@ -10,6 +10,9 @@ log only.
 
 ### Breaking
 
+- `matrix-rtc-media` is renamed `matrix-rtc-call-sdk`, and `LiveKitCall`, `open_slot`, `attach_livekit` and the examples and e2e test move there from `matrix-rtc-livekit` (features `livekit` and `matrix-sdk`), leaving `matrix-rtc-livekit` the transport alone, without a `matrix-sdk` feature.
+- The transport contract, frames, constraints and media key handler move from `matrix-rtc-media` to the new `matrix-rtc-transport`, and `matrix-rtc-livekit-proto` becomes its `livekit` module; `matrix-rtc-media` keeps the call's roster, tiles, events and `attach_media`.
+- `LiveKitMediaTransport::connect_livekit` becomes `OwnFocusTransport::connect_own`, and `LiveKitTransportConnection::set_local_key_index` moves onto `TransportConnection`.
 - `connect_media_session`/`connectMedia` take the own focus from the call and the account from the backend: `MediaSessionConfig` loses `livekit_service_url`, `user_id` and `device_id`, and a receive-only call connects only to its peers' foci.
 - `MembershipSnapshotSubscription::next_snapshot()`, which polled, becomes an async `next()` that waits for the next roster and returns `None` once the room is gone.
 - FFI and web `joinCall` take an optional `application_slot_id` (`m.call#{application_slot_id}`, `room` when omitted) instead of `slot_id` and `application`.
@@ -39,6 +42,8 @@ log only.
 
 ### Added
 
+- `matrix_rtc_transport::pool::MediaPool`, the MSC4195 multi-SFU connection pool extracted from the call engine, reports a session's media per `member_id` for any application on the core.
+- `matrix_rtc_call_sdk::attach_media` and `attach_livekit` attach media to a joined call, now the one wiring behind the FFI and web media sessions and `LiveKitCall`.
 - A room still waiting on its first deliveries logs which `RoomSink` calls are missing every 5 s, so a host that never delivers one sees why `room()` has not returned.
 - `BaseRtcClient` opens a core room that subscribes through the backend and feeds itself, so a host of the core alone feeds and ticks nothing.
 - A core room opens in a `MembershipFormat` (`BaseRtcClient::room(room_id, RoomOptions)`) and renders its joins in it, so a host of the core alone can join in the 2025 sticky or the pre-sticky room-state format.
@@ -51,9 +56,9 @@ log only.
 - `SdkMatrixBackend` discovers transports through matrix-sdk's cached `discover_rtc_transports`, falling back to the well-known `rtc_foci`; a failed request is an error rather than "none advertised".
 - A member event carrying both `msc4354_sticky_key` and `sticky_key` (as seen on the wire) now parses; it was dropped as a duplicate field.
 
-
 ### Fixed
 
+- The web `onEvent` callback now receives `key_imported` for keys that arrived before `connectMedia`, and `LiveKitCall::join` leaves the slot on any media attach failure, not only a refused SFU.
 - In the 2025 Element Call format the room-wide slot is sent and read as `m.call#ROOM`, including in the token request, so we share a session and an SFU room with Element Call again.
 - The media engine's first event subscriber now receives events emitted before it subscribed, so `KeyImported` for keys replayed during connect is no longer lost.
 

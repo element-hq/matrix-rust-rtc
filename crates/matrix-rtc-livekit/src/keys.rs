@@ -7,7 +7,7 @@
 //!
 //! The bookkeeping — recording, the ring-size guard, the rejected-key rule,
 //! the local sender's index switch, the MSC4143 `delayBeforeUse` wait — lives
-//! in [`matrix_rtc_media::keys`], shared with the web binding. This module
+//! in [`matrix_rtc_transport::keys`], shared with the web binding. This module
 //! contributes only what is LiveKit-native: a [`KeyProvider`] configured for
 //! MSC4195 per-participant mode, and its [`FrameKeyRing`] adapter.
 //!
@@ -18,9 +18,9 @@
 use async_trait::async_trait;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
 use livekit::id::ParticipantIdentity;
-use matrix_rtc_media::keys::{FrameKeyRing, MediaKeyHandler};
+use matrix_rtc_transport::keys::{FrameKeyRing, MediaKeyHandler};
 
-pub use matrix_rtc_media::keys::{
+pub use matrix_rtc_transport::keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, ParticipantKey,
     SwitchCompleteListener,
 };

@@ -58,10 +58,10 @@ The integration test provisions its own throwaway users and defaults to the
 endpoints above, so this is all it takes:
 
 ```sh
-cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
+cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture
 ```
 
-See [`crates/matrix-rtc-livekit/tests/E2E_CALL.md`](../../crates/matrix-rtc-livekit/tests/E2E_CALL.md).
+See [`crates/matrix-rtc-call-sdk/tests/E2E_CALL.md`](../../crates/matrix-rtc-call-sdk/tests/E2E_CALL.md).
 
 ## Why auth-service shares the LiveKit container's network namespace
 

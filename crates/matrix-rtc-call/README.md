@@ -4,7 +4,7 @@ The call application over `matrix-rtc-core`: Element Call's reactions and raised
 hand, MSC4075 ringing, and the host-facing objects (client → room → session) —
 plus how a host's `MatrixBackend` reaches them, and how it interoperates with clients that speak an
 older wire format. None of it needs a Matrix SDK or a transport: the SDK
-backend is `matrix-rtc-matrix-sdk`, LiveKit is `matrix-rtc-livekit`.
+backend is `matrix-rtc-matrix-sdk`, the call's media is `matrix-rtc-call-sdk`.
 
 ```
 matrix-rtc-core        what the protocol says
@@ -12,7 +12,7 @@ matrix-rtc-core        what the protocol says
 matrix-rtc-call        the call                            ← this crate
       ▲
 matrix-rtc-matrix-sdk  the matrix-rust-sdk backend
-matrix-rtc-livekit     how bytes flow (MSC4195 SFU)
+matrix-rtc-call-sdk    the call's media, over matrix-rtc-transport / -livekit
 ```
 
 ## The objects: client → room → session
@@ -79,8 +79,9 @@ The boundary is load-bearing, so the exclusions are explicit:
   generation*; what that means for an identity or an endpoint is MSC4195 — a
   LiveKit document — so it lives with the transport. Each is one `match` on
   `MembershipFormat`.
-- **Media, frame encryption, and SFU connections.** `matrix-rtc-media` defines
-  the transport-agnostic media model; a transport crate implements it.
+- **Media, frame encryption, and SFU connections.** `matrix-rtc-transport`
+  defines the contract a transport implements (`matrix-rtc-livekit` natively),
+  and `matrix-rtc-call-sdk` the call's media model over it.
 
 The core's `compat` keeps its own notes on why compatibility is confined to JSON
 funnels at the edge — read the module docs before touching it.
@@ -89,7 +90,7 @@ funnels at the edge — read the module docs before touching it.
 
 Every entry point opens rooms through `RtcClient` and differs only in where the
 backend comes from and which runtime is current when it does:
-`matrix_rtc_livekit::LiveKitCall::join` (`SdkMatrixBackend`, the caller's tokio runtime),
+`matrix_rtc_call_sdk::LiveKitCall::join` (`SdkMatrixBackend`, the caller's tokio runtime),
 `matrix_rtc_ffi::RtcClient` (the host's foreign trait, the FFI runtime) and
 `matrix_rtc_wasm::WasmRtcClient` (the page's `MatrixBackendHost`, the JS event loop).
 The library spawns the feeds itself; the core runs each joined slot's upkeep.

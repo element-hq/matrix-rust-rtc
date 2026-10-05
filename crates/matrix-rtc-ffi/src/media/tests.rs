@@ -153,7 +153,7 @@ fn a_receive_only_call_connects_without_a_focus_of_its_own() {
 
 #[test]
 fn constraint_dtos_fold_like_the_core_model() {
-    let constraints: matrix_rtc_media::MediaConstraints = FfiMediaConstraints {
+    let constraints: matrix_rtc_transport::MediaConstraints = FfiMediaConstraints {
         enabled: true,
         visible: false,
         detail: FfiVideoDetail::Dimensions {
@@ -166,16 +166,16 @@ fn constraint_dtos_fold_like_the_core_model() {
 
     assert!(matches!(
         constraints.detail,
-        matrix_rtc_media::VideoDetail::Dimensions(d) if d.width == 320 && d.height == 180
+        matrix_rtc_transport::VideoDetail::Dimensions(d) if d.width == 320 && d.height == 180
     ));
-    let resolved = constraints.resolve(matrix_rtc_media::MediaStreamKind::Camera);
-    assert_eq!(resolved.demand, matrix_rtc_media::StreamDemand::Paused);
+    let resolved = constraints.resolve(matrix_rtc_transport::MediaStreamKind::Camera);
+    assert_eq!(resolved.demand, matrix_rtc_transport::StreamDemand::Paused);
 }
 
 // ---- tile DTOs (spec 002) ------------------------------------------------------
 
-fn participant(id: &str) -> matrix_rtc_media::Participant {
-    matrix_rtc_media::Participant {
+fn participant(id: &str) -> matrix_rtc_call_sdk::Participant {
+    matrix_rtc_call_sdk::Participant {
         member_id: id.to_owned(),
         user_id: format!("@{id}:example.org"),
         device_id: None,
@@ -189,13 +189,13 @@ fn participant(id: &str) -> matrix_rtc_media::Participant {
 
 #[test]
 fn tile_id_round_trips_through_the_ffi() {
-    use matrix_rtc_media::TileKind::{Person, ScreenShare};
+    use matrix_rtc_call_sdk::TileKind::{Person, ScreenShare};
     for kind in [Person, ScreenShare] {
-        let id = matrix_rtc_media::TileId {
+        let id = matrix_rtc_call_sdk::TileId {
             member_id: "m".to_owned(),
             kind,
         };
-        let back: matrix_rtc_media::TileId = FfiTileId::from(id.clone()).into();
+        let back: matrix_rtc_call_sdk::TileId = FfiTileId::from(id.clone()).into();
         assert_eq!(back, id);
     }
 }
@@ -204,7 +204,7 @@ fn tile_id_round_trips_through_the_ffi() {
 fn stream_ref_converts_every_kind() {
     use FfiStreamKind::{Camera, Data, Microphone, ScreenShare, ScreenShareAudio};
     for kind in [Microphone, Camera, ScreenShare, ScreenShareAudio, Data] {
-        let (member_id, back): (String, matrix_rtc_media::MediaStreamKind) = FfiStreamRef {
+        let (member_id, back): (String, matrix_rtc_transport::MediaStreamKind) = FfiStreamRef {
             member_id: "m".to_owned(),
             kind,
         }
@@ -226,7 +226,7 @@ fn stream_stats_dto_zips_request_with_results() {
             kind: FfiStreamKind::Camera,
         },
     ];
-    let answered = matrix_rtc_media::ReceiveStats {
+    let answered = matrix_rtc_transport::ReceiveStats {
         packets_received: 7,
         ..Default::default()
     };
@@ -245,14 +245,14 @@ fn stream_stats_dto_zips_request_with_results() {
 fn tile_roster_dto_preserves_order_and_detail() {
     let roster: Vec<_> = (0..5).map(|i| participant(&format!("m{i}"))).collect();
     let ranked =
-        matrix_rtc_media::derive_tiles(&roster, &Default::default(), &Default::default()).remote;
+        matrix_rtc_call_sdk::derive_tiles(&roster, &Default::default(), &Default::default()).remote;
     let last = ranked[4].id();
-    let w = matrix_rtc_media::DetailWindow {
+    let w = matrix_rtc_call_sdk::DetailWindow {
         offset: 1,
         len: 2,
         also: [last].into(),
     };
-    let dto: FfiTileRoster = matrix_rtc_media::window(&ranked, &w).into();
+    let dto: FfiTileRoster = matrix_rtc_call_sdk::window(&ranked, &w).into();
 
     assert_eq!(dto.order.len(), 5, "order is never truncated");
     assert_eq!(dto.detail.len(), 3);
@@ -269,10 +269,10 @@ fn tile_roster_dto_preserves_order_and_detail() {
 fn local_state_dto_carries_the_share_flag() {
     let mut me = participant("me");
     me.is_local = true;
-    let own = matrix_rtc_media::derive_tiles(&[me], &Default::default(), &Default::default())
+    let own = matrix_rtc_call_sdk::derive_tiles(&[me], &Default::default(), &Default::default())
         .own
         .expect("own tile");
-    let dto: FfiLocalState = matrix_rtc_media::LocalState {
+    let dto: FfiLocalState = matrix_rtc_call_sdk::LocalState {
         tile: own,
         is_screen_sharing: true,
     }

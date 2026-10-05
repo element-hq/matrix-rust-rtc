@@ -32,7 +32,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use tokio::sync::Mutex as TokioMutex;
 
-use matrix_rtc_media::{AudioFrame, LocalTrackHandle, VideoFrame};
+use matrix_rtc_transport::{AudioFrame, LocalTrackHandle, VideoFrame};
 
 use super::MediaFfiError;
 use super::types::FfiStreamKind;
@@ -80,9 +80,9 @@ pub enum FfiVideoRotation {
     Deg270,
 }
 
-impl From<matrix_rtc_media::VideoRotation> for FfiVideoRotation {
-    fn from(rotation: matrix_rtc_media::VideoRotation) -> Self {
-        use matrix_rtc_media::VideoRotation as Rotation;
+impl From<matrix_rtc_transport::VideoRotation> for FfiVideoRotation {
+    fn from(rotation: matrix_rtc_transport::VideoRotation) -> Self {
+        use matrix_rtc_transport::VideoRotation as Rotation;
         match rotation {
             Rotation::Deg0 => Self::Deg0,
             Rotation::Deg90 => Self::Deg90,
@@ -92,7 +92,7 @@ impl From<matrix_rtc_media::VideoRotation> for FfiVideoRotation {
     }
 }
 
-impl From<FfiVideoRotation> for matrix_rtc_media::VideoRotation {
+impl From<FfiVideoRotation> for matrix_rtc_transport::VideoRotation {
     fn from(rotation: FfiVideoRotation) -> Self {
         match rotation {
             FfiVideoRotation::Deg0 => Self::Deg0,
@@ -347,7 +347,7 @@ impl FfiLocalTrack {
     pub fn capture_video(&self, frame: FfiVideoFrameData) -> Result<(), MediaFfiError> {
         self.inner
             .capture_video(VideoFrame {
-                buffer: matrix_rtc_media::I420Buffer {
+                buffer: matrix_rtc_transport::I420Buffer {
                     width: frame.width,
                     height: frame.height,
                     data_y: frame.data_y,

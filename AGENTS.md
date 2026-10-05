@@ -64,7 +64,7 @@ This project is in active development.
 - `cargo fmt`
 - `make clippy`
 - `cargo test`
-- Web bindings: `cd web && npm run build && npm test`
+- Web bindings: `cd web && npm run build && npm run test:vitest`
 - Android bindings: `./scripts/build-android-aar.sh`
 - iOS bindings (macOS): `./scripts/build-ios-xcframework.sh`
 
@@ -83,7 +83,7 @@ Then run binding tasks for any touched binding surface:
 
 - If changes touch `crates/matrix-rtc-wasm/**` or `web/**`:
   - `cd web && npm run build`
-  - `cd web && npm test`
+  - `cd web && npm run test:vitest`
 - If changes touch `crates/matrix-rtc-ffi/**`, `mobile/**`, or `scripts/build-*.sh`:
   - `./scripts/build-android-aar.sh`
   - `./scripts/build-ios-xcframework.sh` (on macOS)

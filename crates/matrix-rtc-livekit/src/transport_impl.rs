@@ -6,7 +6,7 @@
 //! [`MediaTransport`] implementation for the MSC4195 LiveKit transport.
 //!
 //! This is where LiveKit stops being visible: everything above this module
-//! (the [`matrix_rtc_media::CallEngine`], the `LiveKitCall` facade's unified event
+//! (the `matrix_rtc_call_sdk::CallEngine`, the `LiveKitCall` facade's unified event
 //! stream, and eventually the FFI) speaks the transport-neutral vocabulary of
 //! `matrix-rtc-media`, and this module translates it to SFU reality —
 //! the token exchange, the E2EE room connection, `RoomEvent`s, and
@@ -47,11 +47,11 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
-use matrix_rtc_media::{
+use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
-    LocalTrackHandle, MediaStreamKind, MediaTransport, PublishOptions, QualityLimit, ReceiveStats,
-    RemoteTrackHandle, ResolvedConstraints, SpeakingParticipant, StreamDemand, TransportConnection,
-    TransportError, VideoDetail, VideoFrame, VideoRotation,
+    LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
+    QualityLimit, ReceiveStats, RemoteTrackHandle, ResolvedConstraints, SpeakingParticipant,
+    StreamDemand, TransportConnection, TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
 use crate::identity::pseudonymous_identity;
@@ -81,7 +81,7 @@ pub struct LiveKitMediaTransport {
     /// MUST be the same value installed on the core's encryption manager. A
     /// divergence does not error — it silences: every `identity_map` lookup
     /// misses, so peers sit in the roster with no media and their keys are
-    /// installed under an identity the SFU never assigned. See [`crate::compat`].
+    /// installed under an identity the SFU never assigned. See [`matrix_rtc_core::compat`].
     identity_mapper: RtcIdentityMapper,
     /// Which authorisation-service dialect to speak. MSC4195 `/get_token` by
     /// default.
@@ -117,26 +117,30 @@ impl LiveKitMediaTransport {
     /// Substitute the participant-identity derivation.
     ///
     /// A builder rather than a `new` parameter: the MSC4195 derivation is the
-    /// default and every spec-current caller leaves it alone. Both callers that
-    /// do substitute it — `LiveKitCall::join` and the FFI media session — pass the same
-    /// `Arc` they gave the core's encryption manager, which is the point: the
-    /// derivation sites must not skew. Temporary; see [`crate::compat`].
+    /// default and every spec-current caller leaves it alone. The caller that
+    /// does substitute it, `matrix_rtc_call_sdk::attach_livekit`, passes the same `Arc` it
+    /// gives the core's encryption manager, which is the point: the derivation
+    /// sites must not skew. Temporary; see [`matrix_rtc_core::compat`].
     pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
         self.identity_mapper = identity_mapper;
         self
     }
 
     /// Substitute the authorisation-service dialect. Temporary; see
-    /// [`crate::compat`].
+    /// [`matrix_rtc_core::compat`].
     pub fn with_token_endpoint(mut self, token_endpoint: TokenEndpoint) -> Self {
         self.token_endpoint = token_endpoint;
         self
     }
+}
 
-    /// Typed variant of [`MediaTransport::connect`], for callers that need
-    /// access to the underlying [`LiveKitSession`] (the `LiveKitCall` facade's
-    /// deprecated raw accessors).
-    pub async fn connect_livekit(
+/// The typed connect, for callers that need the underlying [`LiveKitSession`]
+/// (the `LiveKitCall` facade's deprecated raw accessors).
+#[async_trait]
+impl OwnFocusTransport for LiveKitMediaTransport {
+    type Connection = LiveKitTransportConnection;
+
+    async fn connect_own(
         &self,
         livekit_service_url: &str,
         ctx: &ConnectionContext,
@@ -231,7 +235,7 @@ impl MediaTransport for LiveKitMediaTransport {
         ),
         TransportError,
     > {
-        let (connection, events) = self.connect_livekit(connection_key, ctx).await?;
+        let (connection, events) = self.connect_own(connection_key, ctx).await?;
         Ok((Box::new(connection), events))
     }
 }
@@ -259,21 +263,6 @@ impl LiveKitTransportConnection {
     /// accessors.
     pub fn session(&self) -> &LiveKitSession {
         &self.session
-    }
-
-    /// Switch our own outgoing frames to `key_index`, and remember it for tracks
-    /// published later.
-    ///
-    /// The key provider's `set_key` only fills the key *ring*; the index a
-    /// sender stamps lives on its frame cryptor and changes only here. Called
-    /// when one of our own rotated keys activates — see
-    /// [`crate::LocalKeyIndexHook`].
-    pub fn set_local_key_index(&self, key_index: u8) {
-        *self
-            .local_key_index
-            .lock()
-            .expect("local key index mutex poisoned") = Some(key_index);
-        self.apply_local_key_index(key_index);
     }
 
     /// Re-assert the current index on our senders, for a track published after a
@@ -313,6 +302,17 @@ impl LiveKitTransportConnection {
 impl TransportConnection for LiveKitTransportConnection {
     fn connection_key(&self) -> &str {
         &self.connection_key
+    }
+
+    /// Also remembered for tracks published later. The key provider's
+    /// `set_key` only fills the key *ring*; the index a sender stamps lives on
+    /// its frame cryptor and changes only here.
+    fn set_local_key_index(&self, key_index: u8) {
+        *self
+            .local_key_index
+            .lock()
+            .expect("local key index mutex poisoned") = Some(key_index);
+        self.apply_local_key_index(key_index);
     }
 
     async fn publish(

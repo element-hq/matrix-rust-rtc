@@ -37,12 +37,13 @@ log.workspace = true
 env_filter = { version = "0.1", default-features = false }
 
 # --- `media` feature only (pulls libwebrtc; see the feature's comment) ------
-matrix-rtc-media = { path = "../matrix-rtc-media", optional = true }
-# Deliberately WITHOUT the `matrix-sdk` feature: the FFI host brings its own
-# Matrix stack; only the transport layer (token exchange, SFU, E2EE bridge)
-# is used.
+# `livekit` for `attach_livekit`, and deliberately WITHOUT `matrix-sdk`: the FFI
+# host brings its own Matrix stack.
+matrix-rtc-call-sdk = { path = "../matrix-rtc-call-sdk", optional = true, features = ["livekit"] }
+matrix-rtc-transport = { path = "../matrix-rtc-transport", optional = true }
+# The native transport's types the media session names (its connection, key
+# bridge, Android init).
 matrix-rtc-livekit = { path = "../matrix-rtc-livekit", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # For the JNI_OnLoad libwebrtc initialisation (media feature). Android-only,
@@ -60,9 +61,9 @@ android_logger = { version = "0.15", default-features = false }
 # libwebrtc (native C++, needs a C++ toolchain, adds ~8-15 MB per ABI). The
 # slim signalling-only artifact is the default build.
 media = [
-    "dep:matrix-rtc-media",
+    "dep:matrix-rtc-call-sdk",
+    "dep:matrix-rtc-transport",
     "dep:matrix-rtc-livekit",
-    "dep:reqwest",
     "dep:jni",
     "dep:webrtc-sys-build",
     "tokio/rt-multi-thread",

@@ -84,7 +84,7 @@
 //!
 //! In `matrix-rtc-livekit`:
 //!
-//! 3. `call::LiveKitCall::join` — mode selection and the member id.
+//! 3. `matrix_rtc_call_sdk::LiveKitCall::join` — mode selection and the member id.
 //! 4. `identity_mapper` — the participant-identity derivation (see above).
 //! 5. `transport_impl` + `token` — `/sfu/get`.
 //!

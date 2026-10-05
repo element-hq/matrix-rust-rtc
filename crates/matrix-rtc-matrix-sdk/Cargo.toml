@@ -34,7 +34,7 @@ tokio = { workspace = true }
 # and simply does not see those peers — the exact failure that makes an
 # in-progress Element Call invisible to a new device. Tools that want the
 # request/forward chatter out of their measurements switch it off per client at
-# runtime instead; see `matrix-rtc-livekit/examples/load_test.rs`.
+# runtime instead; see `matrix-rtc-call-sdk/examples/load_test.rs`.
 #
 # `experimental-send-custom-to-device` exposes
 # `Encryption::encrypt_and_send_raw_to_device`, used to distribute MSC4143 media
