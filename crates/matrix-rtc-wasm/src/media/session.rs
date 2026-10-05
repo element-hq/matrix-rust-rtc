@@ -185,6 +185,7 @@ impl WasmRtcCall {
                 own_user_id: backend.own_user_id(),
                 own_device_id: backend.own_device_id(),
                 identity_mapper: mapper.clone(),
+                format: compat,
                 stability: config
                     .stability
                     .as_ref()
@@ -421,8 +422,12 @@ enum WasmCallEvent {
         name: String,
         sound: Option<String>,
     },
+    /// `identity` is the transport identity the key installed under: keys
+    /// held before media connects surface while `connectMedia` is still
+    /// pending, before the page has a session to look a roster up on.
     KeyImported {
         member_id: String,
+        identity: String,
         key_index: u8,
     },
     FrameEncryptionState {
@@ -518,9 +523,11 @@ impl From<CallEvent> for WasmCallEvent {
             },
             CallEvent::KeyImported {
                 member_id,
+                identity,
                 key_index,
             } => Self::KeyImported {
                 member_id,
+                identity,
                 key_index,
             },
             CallEvent::FrameEncryptionState {

@@ -70,6 +70,7 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
             own_user_id,
             own_device_id,
             identity_mapper: mapper,
+            format: options.format,
             stability: options.stability,
         },
     )

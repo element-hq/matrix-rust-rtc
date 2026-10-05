@@ -18,6 +18,7 @@
 //! | member | `{user_id, device_id, id}` | `{id, membership}` |
 //! | leave | content is `{msc4354_sticky_key}` alone | full content, `membership: "leave"` + `leave_reason` |
 //! | transports | flat `rtc_transports` array | `transports.{published,can_subscribe}` |
+//! | room-wide slot | `m.call#ROOM` | `m.call#room` |
 //! | extras | `versions`, `m.relation` | gone from the spec |
 //! | key type | `io.element.call.encryption_keys` | `m.rtc.encryption_key` |
 //! | key content | `{keys, member, room_id, session, sent_ts}` | `{room_id, member_id, media_key, format}` |
@@ -47,6 +48,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value, json};
 
 /// The pre-2026 to-device message type carrying media keys.
@@ -61,6 +64,11 @@ const KEY_EVENT_TYPES: [&str; 2] = [
     "m.rtc.encryption_key",
     "org.matrix.msc4143.rtc.encryption_key",
 ];
+
+/// The room-wide `application_slot_id` as the JS SDK spells it. MSC4143 spells
+/// it [`crate::ROOM_APPLICATION_SLOT_ID`], and slot ids compare exactly, so the
+/// two would otherwise be two sessions.
+const LEGACY_ROOM_APPLICATION_SLOT_ID: &str = "ROOM";
 
 /// The core's event type for an MSC4075 notification, before the bridge maps it
 /// to the unstable id that goes on the wire.
@@ -127,10 +135,40 @@ pub fn normalize_member_content(content: &mut Value) -> MemberContent {
         return MemberContent::Usable;
     }
 
+    lift_room_slot_id(object);
     lift_rtc_transports(object);
     infer_membership(object);
 
     MemberContent::Usable
+}
+
+/// `{application}#ROOM` → `{application}#room`.
+fn lift_room_slot_id(object: &mut Map<String, Value>) {
+    let current = object
+        .get("slot_id")
+        .and_then(Value::as_str)
+        .and_then(|slot_id| slot_id.strip_suffix(LEGACY_ROOM_APPLICATION_SLOT_ID))
+        .and_then(|application| application.strip_suffix('#'))
+        .map(|application| format!("{application}#{}", crate::ROOM_APPLICATION_SLOT_ID));
+    if let Some(current) = current {
+        object.insert("slot_id".to_owned(), Value::String(current));
+    }
+}
+
+/// The slot id this generation puts on the wire for `slot_id`: the room-wide
+/// slot as `{application}#ROOM`, any other slot unchanged.
+///
+/// Needed wherever the slot id leaves us, not only in member content: the
+/// MSC4195 `/get_token` body names it too, and the authorisation service
+/// derives the SFU room from it, so a mismatch there puts us in a different
+/// SFU room from Element Call.
+pub fn legacy_slot_id(slot_id: &str) -> Cow<'_, str> {
+    match slot_id.split_once('#') {
+        Some((application, crate::ROOM_APPLICATION_SLOT_ID)) => {
+            Cow::Owned(format!("{application}#{LEGACY_ROOM_APPLICATION_SLOT_ID}"))
+        }
+        _ => Cow::Borrowed(slot_id),
+    }
 }
 
 /// `rtc_transports: [...]` → `transports: {published: [...], can_subscribe: [...]}`.
@@ -390,9 +428,15 @@ impl Sticky2025Dialect {
         // Already the legacy leave (or otherwise not a membership we can dress
         // up). Adding a `member` object here would turn a departure back into
         // something that looks like a membership.
-        if !object.contains_key("slot_id") {
+        let Some(slot_id) = object.get("slot_id").and_then(Value::as_str) else {
             return;
-        }
+        };
+
+        // Not additive: a slot id has one value, and Element Call matches it
+        // exactly. A spec-current peer loses nothing it had — in this mode our
+        // keys only go out in the legacy type anyway.
+        let legacy = legacy_slot_id(slot_id).into_owned();
+        object.insert("slot_id".to_owned(), Value::String(legacy));
 
         // Mirror `transports.published` back into the flat array. A leave
         // carries no transports, and then neither does the alias.
@@ -568,7 +612,7 @@ mod tests {
     /// A join exactly as observed from Element Call on the JS SDK.
     const LEGACY_JOIN: &str = r#"{
         "application": { "type": "m.call", "m.call.intent": "video" },
-        "slot_id": "m.call#room",
+        "slot_id": "m.call#ROOM",
         "rtc_transports": [
             {
                 "type": "livekit",
@@ -798,6 +842,57 @@ mod tests {
             "https://sfu.example.com"
         );
         assert_eq!(content.get("versions").unwrap(), &json!([]));
+    }
+
+    /// The JS SDK spells the room-wide slot `ROOM`, and slot ids compare
+    /// exactly: unmapped, Element Call and we sit in two sessions, each with
+    /// the other excluded. Ours goes out its way, its comes in ours.
+    #[test]
+    fn the_room_wide_slot_crosses_in_each_generations_spelling() {
+        let mut ours: Value = serde_json::from_str(SPEC_JOIN).unwrap();
+        dialect().rewrite_member_content(&mut ours);
+        assert_eq!(ours["slot_id"], "m.call#ROOM");
+
+        let (_, theirs) = normalized(LEGACY_JOIN);
+        assert_eq!(theirs["slot_id"], "m.call#room");
+    }
+
+    /// Only the room-wide slot has two spellings; a named slot is the same in
+    /// both generations and must not be touched either way.
+    #[test]
+    fn a_named_slot_keeps_its_spelling_both_ways() {
+        assert_eq!(legacy_slot_id("m.call#standup"), "m.call#standup");
+        assert_eq!(legacy_slot_id("m.call#ROOM"), "m.call#ROOM");
+
+        let mut ours: Value = serde_json::from_str(SPEC_JOIN).unwrap();
+        ours["slot_id"] = json!("m.call#standup");
+        dialect().rewrite_member_content(&mut ours);
+        assert_eq!(ours["slot_id"], "m.call#standup");
+
+        let mut theirs: Value = serde_json::from_str(LEGACY_JOIN).unwrap();
+        theirs["slot_id"] = json!("m.call#standup");
+        normalize_member_content(&mut theirs);
+        assert_eq!(theirs["slot_id"], "m.call#standup");
+    }
+
+    /// The token request names the slot too, and the authorisation service
+    /// derives the SFU room from it: only the 2025 format respells it.
+    #[test]
+    fn the_token_slot_id_follows_the_format() {
+        use super::super::MembershipFormat;
+
+        assert_eq!(
+            MembershipFormat::Sticky2025.token_slot_id("m.call#room"),
+            "m.call#ROOM"
+        );
+        assert_eq!(
+            MembershipFormat::Current.token_slot_id("m.call#room"),
+            "m.call#room"
+        );
+        assert_eq!(
+            MembershipFormat::RoomState.token_slot_id("m.call#room"),
+            "m.call#room"
+        );
     }
 
     /// A leave becomes the legacy shape outright: content holding nothing but

@@ -134,8 +134,13 @@ pub enum PoolEvent {
         state: FrameEncryptionState,
     },
     /// A media key for a member was imported (reported through
-    /// [`MediaPool::key_imported`], released once the membership is known).
-    KeyImported { member_id: String, key_index: u8 },
+    /// [`MediaPool::key_imported`], released once the membership is known),
+    /// with the transport identity it was installed under.
+    KeyImported {
+        member_id: String,
+        identity: String,
+        key_index: u8,
+    },
     /// A transport participant joined that maps to no membership.
     UnknownParticipant { identity: String },
     /// Whether any connection is impaired (reconnecting or failing to
@@ -407,6 +412,7 @@ impl MediaPool {
         match self.identity_map.get(&identity) {
             Some(member_id) => vec![PoolEvent::KeyImported {
                 member_id: member_id.clone(),
+                identity,
                 key_index,
             }],
             None => {
@@ -558,6 +564,7 @@ impl MediaPool {
         for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
             self.out.push(PoolEvent::KeyImported {
                 member_id: member.member_id.clone(),
+                identity: identity.clone(),
                 key_index,
             });
         }

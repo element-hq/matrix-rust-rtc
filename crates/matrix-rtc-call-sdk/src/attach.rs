@@ -16,6 +16,7 @@
 use std::sync::Arc;
 
 use matrix_rtc_call::RtcCall;
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{MatrixBackend, RtcIdentityMapper, TransportIntent};
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
@@ -37,6 +38,9 @@ pub struct AttachOptions {
     /// the transport, our own identity and the key ring all derive through
     /// it, and a skew between them is silent.
     pub identity_mapper: RtcIdentityMapper,
+    /// The membership format the call's room was opened in: the token request
+    /// names the slot as that generation spells it.
+    pub format: MembershipFormat,
     /// Damping of the tile order.
     pub stability: StabilityConfig,
 }
@@ -134,7 +138,8 @@ where
 
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
-        slot_id: slot_id.clone(),
+        // The token request names the slot as this generation spells it.
+        slot_id: options.format.token_slot_id(&slot_id).into_owned(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: options.own_user_id.clone(),

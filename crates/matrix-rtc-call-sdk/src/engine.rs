@@ -19,7 +19,7 @@
 //! call; a peer focus is the pool's to reconnect.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matrix_rtc_call::{RaisedHand, ReceivedReaction};
@@ -201,6 +201,9 @@ impl EngineHandle {
 pub struct CallEngine {
     messages: mpsc::UnboundedSender<ActorMessage>,
     events_tx: broadcast::Sender<CallEvent>,
+    /// The receiver created with the channel, handed to the first
+    /// [`Self::subscribe_events`]; see there.
+    first_events_rx: Mutex<Option<broadcast::Receiver<CallEvent>>>,
     participants_rx: watch::Receiver<Vec<Participant>>,
     tiles_rx: watch::Receiver<TileRoster>,
     local_rx: watch::Receiver<Option<LocalState>>,
@@ -227,7 +230,7 @@ impl CallEngine {
         memberships: watch::Receiver<Vec<JoinedMembership>>,
     ) -> CallEngine {
         let (messages_tx, messages_rx) = mpsc::unbounded_channel();
-        let (events_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (events_tx, first_events_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
         let (tiles_tx, tiles_rx) = watch::channel(TileRoster::default());
         let (local_tx, local_rx) = watch::channel(None);
@@ -271,6 +274,7 @@ impl CallEngine {
         CallEngine {
             messages: messages_tx,
             events_tx,
+            first_events_rx: Mutex::new(Some(first_events_rx)),
             participants_rx,
             tiles_rx,
             local_rx,
@@ -287,8 +291,19 @@ impl CallEngine {
     }
 
     /// Subscribe to the unified call event stream.
+    ///
+    /// The first subscriber sees every event since the engine was created
+    /// (up to the channel capacity, past which it reads `Lagged`); later ones
+    /// see events from their subscription on. Hosts emit events before they
+    /// get to subscribe — the held-key replay surfaces `KeyImported`s while
+    /// media is still connecting — so a plain broadcast subscription would
+    /// make each host's correctness depend on its call order.
     pub fn subscribe_events(&self) -> broadcast::Receiver<CallEvent> {
-        self.events_tx.subscribe()
+        self.first_events_rx
+            .lock()
+            .expect("engine first-receiver mutex poisoned")
+            .take()
+            .unwrap_or_else(|| self.events_tx.subscribe())
     }
 
     /// The current participant roster.
@@ -921,11 +936,13 @@ impl Actor {
                 }
                 PoolEvent::KeyImported {
                     member_id,
+                    identity,
                     key_index,
                 } => {
                     self.record_installed_key(&member_id, key_index);
                     self.emit(CallEvent::KeyImported {
                         member_id,
+                        identity,
                         key_index,
                     });
                 }
@@ -1419,7 +1436,6 @@ impl Actor {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
@@ -1701,6 +1717,14 @@ mod tests {
     }
 
     fn fixture_with(stability: StabilityConfig) -> Fixture {
+        let mut fx = unsubscribed_fixture(stability);
+        fx.events = fx.engine.subscribe_events();
+        fx
+    }
+
+    /// A fixture whose `events` is a placeholder: nothing has subscribed to
+    /// the engine yet, so the first `subscribe_events` is still to come.
+    fn unsubscribed_fixture(stability: StabilityConfig) -> Fixture {
         let state = Arc::new(TransportState::default());
         let (memberships, memberships_rx) = watch::channel(Vec::new());
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
@@ -1727,15 +1751,47 @@ mod tests {
             },
             memberships_rx,
         );
-        let events = engine.subscribe_events();
         Fixture {
             engine,
-            events,
+            events: broadcast::channel(1).1,
             memberships,
             raised_hands,
             reactions,
             state,
         }
+    }
+
+    /// Events emitted before anyone subscribes reach the first subscriber.
+    /// Hosts replay held keys while media is still connecting, before they
+    /// subscribe; with a plain broadcast those `KeyImported`s were dropped, and
+    /// each host had to get its call order right to see them.
+    #[tokio::test]
+    async fn the_first_subscriber_sees_events_from_before_it_subscribed() {
+        let fx = unsubscribed_fixture(StabilityConfig::default());
+
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        fx.engine.notify_key_imported("id-bob", 0);
+        wait_until(|| fx.engine.participants().len() == 1).await;
+        tokio::task::yield_now().await;
+
+        let mut events = fx.engine.subscribe_events();
+        assert_eq!(
+            next_event(&mut events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "bob".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+            }
+        );
+        assert_eq!(
+            next_event(&mut events).await,
+            CallEvent::KeyImported {
+                member_id: "bob".to_owned(),
+                identity: "id-bob".to_owned(),
+                key_index: 0,
+            }
+        );
     }
 
     /// A hand and a reaction are keyed by `member_id` like everything else;
@@ -2041,6 +2097,7 @@ mod tests {
         }));
         assert!(flushed.contains(&CallEvent::KeyImported {
             member_id: "bob".to_owned(),
+            identity: "id-bob".to_owned(),
             key_index: 3,
         }));
     }
@@ -2073,6 +2130,7 @@ mod tests {
             next_event(&mut fx.events).await,
             CallEvent::KeyImported {
                 member_id: "bob".to_owned(),
+                identity: "id-bob".to_owned(),
                 key_index: 0,
             }
         );
@@ -2080,6 +2138,7 @@ mod tests {
             next_event(&mut fx.events).await,
             CallEvent::KeyImported {
                 member_id: "bob".to_owned(),
+                identity: "id-bob".to_owned(),
                 key_index: 1,
             }
         );
@@ -2172,6 +2231,7 @@ mod tests {
             next_event(&mut fx.events).await,
             CallEvent::KeyImported {
                 member_id: "bob".to_owned(),
+                identity: "id-bob".to_owned(),
                 key_index: 4,
             }
         );

@@ -235,10 +235,12 @@ async fn media_and_keys_that_beat_the_membership_are_released_when_it_lands() {
             },
             PoolEvent::KeyImported {
                 member_id: "bob".into(),
+                identity: "id-bob".into(),
                 key_index: 0,
             },
             PoolEvent::KeyImported {
                 member_id: "bob".into(),
+                identity: "id-bob".into(),
                 key_index: 1,
             },
         ]

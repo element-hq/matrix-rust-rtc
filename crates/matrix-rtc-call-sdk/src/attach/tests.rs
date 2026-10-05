@@ -212,6 +212,7 @@ fn options(mock: &MockBackend) -> AttachOptions {
         own_user_id: mock.user_id.clone(),
         own_device_id: mock.device_id.clone(),
         identity_mapper: mapper(),
+        format: matrix_rtc_core::compat::MembershipFormat::Current,
         stability: StabilityConfig::default(),
     }
 }
