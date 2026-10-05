@@ -284,6 +284,29 @@ pub trait TransportConnection: MaybeSend {
         Ok(())
     }
 
+    /// Switch our own outgoing frames to `key_index` (only ever called on the
+    /// own focus). Importing a key only fills the transport's ring; the index
+    /// our frames carry changes here. The default ignores it, for transports
+    /// without frame encryption.
+    fn set_local_key_index(&self, _key_index: u8) {}
+
     /// Close the connection. Idempotent.
     async fn close(&self) -> Result<(), TransportError>;
+}
+
+/// A transport whose own-focus connection the caller keeps a typed handle to,
+/// next to the engine's: to close it on leave, and for whatever the concrete
+/// connection offers beyond [`TransportConnection`].
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+pub trait OwnFocusTransport: MediaTransport {
+    /// A cheap clonable handle; one clone is handed to the engine.
+    type Connection: TransportConnection + Clone + 'static;
+
+    /// [`MediaTransport::connect`], returning the concrete connection.
+    async fn connect_own(
+        &self,
+        connection_key: &str,
+        ctx: &ConnectionContext,
+    ) -> Result<(Self::Connection, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError>;
 }

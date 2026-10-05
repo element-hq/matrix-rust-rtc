@@ -42,29 +42,22 @@ use matrix_sdk::{Client, Room};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{broadcast, watch};
 
-use matrix_rtc_call::transports;
 use matrix_rtc_call::{
     CallJoinOptions, JoinOptions, JoinTransport, NotifyConfig, RaisedHand, ReactionError,
     ReactionsConfig, RtcCall, RtcClient, RtcError, RtcRoom,
 };
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
-use matrix_rtc_core::{
-    BaseRtcRoom, EncryptionConfig, LiveKitTransport, MatrixBackend, RtcTransport, SlotEncryption,
-    TransportIntent,
-};
+use matrix_rtc_core::{BaseRtcRoom, EncryptionConfig, LiveKitTransport, SlotEncryption};
 use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 use matrix_rtc_media::{
-    CallEngine, CallEvent, ConnectionContext, EngineConfig, LocalTrackHandle, MediaConstraints,
-    MediaStreamKind, OwnMemberClaims, Participant, PublishOptions, ReceiveStats, RemoteTrackHandle,
-    StabilityConfig,
+    CallEngine, CallEvent, LocalTrackHandle, MediaAttachment, MediaConstraints, MediaStreamKind,
+    Participant, PublishOptions, ReceiveStats, RemoteTrackHandle, StabilityConfig,
 };
 
 use crate::session::LiveKitSession;
-use crate::transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
-use crate::{
-    MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
-};
+use crate::transport_impl::LiveKitTransportConnection;
+use crate::{LiveKitAttachOptions, LiveKitAttachment, MediaKeyBridge, attach_livekit};
 
 /// Errors produced when joining, operating, or leaving a [`LiveKitCall`].
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +73,10 @@ pub enum LiveKitCallError {
     /// A media transport error surfaced through the media layer.
     #[error(transparent)]
     Media(#[from] matrix_rtc_media::TransportError),
+
+    /// Attaching media to the joined call failed.
+    #[error(transparent)]
+    Attach(#[from] matrix_rtc_media::AttachError),
 
     /// MatrixRTC signalling through the core failed (membership, slot, keys).
     #[error("MatrixRTC signalling failed: {0}")]
@@ -304,36 +301,6 @@ impl LiveKitCall {
             .await?;
         room.seeded().await;
 
-        // Frame encryption: a single shared KeyProvider handle feeds both the
-        // LiveKit room (which encrypts our frames and decrypts peers') and the
-        // MediaKeyBridge (which imports every key the core signals). MSC4195
-        // per-participant HKDF mode.
-        let provider = msc4195_key_provider();
-        let bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
-        let identity_mapper = identity_mapper(options.format);
-
-        // The transport is resolved here rather than by the join, because the
-        // SFU connection below needs the LiveKit focus it names: the join's own
-        // choice, else the first LiveKit one the homeserver advertises.
-        let chosen = options
-            .livekit_transport
-            .clone()
-            .map_or(JoinTransport::Advertised, JoinTransport::Publish);
-        let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
-            transports::resolve(room.backend().as_ref(), chosen)
-                .await
-                .map_err(signalling_error)?
-        else {
-            return Err(LiveKitCallError::Signalling(
-                "the chosen transport is not a LiveKit one".into(),
-            ));
-        };
-        log::info!(
-            "[{room_id}/{}] join: focus is {}",
-            options.slot_id,
-            livekit.livekit_service_url,
-        );
-
         // The join picks the `member.id` this mode joins with (a fresh one per
         // join, except in the pre-sticky generation; see
         // `compat::ingest::member_id`) and renders our sends in the room's
@@ -342,7 +309,12 @@ impl LiveKitCall {
             slot_id: options.slot_id.clone(),
             ..JoinOptions::application(options.application.clone())
         };
-        join.transport = JoinTransport::Publish(livekit.clone());
+        // The join's own choice, else the first LiveKit focus the homeserver
+        // advertises; media reads it back from the call.
+        join.transport = options
+            .livekit_transport
+            .clone()
+            .map_or(JoinTransport::Advertised, JoinTransport::Publish);
         join.encryption_config = options.encryption_config.clone();
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
@@ -356,170 +328,62 @@ impl LiveKitCall {
             .await?,
         );
         let membership_id = call.member_id().to_owned();
-        let own_identity = identity_mapper(&user_id, &device_id, &membership_id);
         log::info!(
-            "[{room_id}/{}] join: user={user_id} device={device_id} member={membership_id} \
-             identity={own_identity}",
+            "[{room_id}/{}] join: user={user_id} device={device_id} member={membership_id}",
             options.slot_id,
         );
 
-        // Wire the encryption manager to the MSC4195 pseudonymous-identity
-        // derivation and to our bridge. The same `Arc` that produced
-        // `own_identity` above and that the media transport is given below: one
-        // value for all of them, so the derivation sites cannot skew — a
-        // divergence there is not an error but a silence: peers sit in the
-        // roster with no media, their keys land under an identity the SFU never
-        // assigned, and nothing logs a problem.
-        //
-        // The mapper goes in *before* the signal handler. Identities are derived
-        // at signal time, so a key signalled in between would be imported under
-        // the fallback `user:device` identity. Keys that arrive before the
-        // handler are held and replayed below.
-        call.set_encryption_identity_mapper(identity_mapper.clone())
-            .await;
-        if !call.set_encryption_signal_handler(bridge.clone()).await {
-            log::warn!(
-                "[{room_id}/{}] join: the joined session has no encryption manager",
-                options.slot_id,
-            );
-            return Err(LiveKitCallError::Signalling(
-                "failed to register encryption signal handler".into(),
-            ));
-        }
-        let raised_hands = call.subscribe_raised_hands().await;
-        let reactions = call.subscribe_reactions().await;
-        let memberships = call.subscribe_memberships().await;
-
-        // The media layer: a LiveKit transport sharing the E2EE key provider,
-        // and the engine reconciling memberships with connection events. The
-        // client is the OpenID token source for the MSC4195 token exchange.
-        let http = match options.http {
-            Some(http) => http,
-            None => reqwest::Client::new(),
-        };
-        let token_backend: Arc<dyn MatrixBackend> = room.backend().clone();
-        let transport = Arc::new(
-            LiveKitMediaTransport::new(http, token_backend, provider)
-                .with_auto_subscribe(options.auto_subscribe)
-                // The same mapper the core got, so our own identity, the peers'
-                // and the key ring's all agree.
-                .with_identity_mapper(identity_mapper.clone())
-                .with_token_endpoint(match options.format {
-                    // Pre-MSC4195 `/sfu/get`, which is also where the unhashed
-                    // `{user}:{device}` identity above comes from — the two are
-                    // one decision, not two.
-                    MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
-                    _ => TokenEndpoint::Msc4195,
-                }),
-        );
-        let ctx = ConnectionContext {
-            room_id: room_id.clone(),
-            slot_id: options.slot_id.clone(),
-            member: OwnMemberClaims {
-                member_id: membership_id.clone(),
-                user_id,
-                device_id,
-            },
-        };
-        // The engine owns connections to every peer focus (MSC4195 multi-SFU);
-        // only the own focus is connected here, synchronously, so a failed
-        // join can be reported (and signalled away) immediately.
-        let engine = CallEngine::new(
-            EngineConfig {
-                transports: vec![transport.clone()],
-                own_member_id: membership_id.clone(),
-                ctx: ctx.clone(),
-                own_connection_key: Some(livekit.livekit_service_url.clone()),
-                raised_hands,
-                reactions,
+        // The media layer: the engine reconciling memberships with connection
+        // events, and the own focus connected synchronously so a failed join
+        // can be reported (and signalled away) immediately.
+        let attached = attach_livekit(
+            &call,
+            room.backend().clone(),
+            LiveKitAttachOptions {
+                format: options.format,
+                http: options.http.clone(),
+                auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),
             },
-            memberships,
-        );
-
-        // Imported media keys surface as `CallEvent::KeyImported`, and refused
-        // ones as `CallEvent::KeyDiscarded` — the only way the reason a key was
-        // rejected leaves the core.
-        let engine_handle = engine.handle();
-        bridge.set_key_import_listener(Box::new(move |key| {
-            engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
-        }));
-        let engine_handle = engine.handle();
-        bridge.set_key_discard_listener(Box::new(move |discarded| {
-            engine_handle.notify_key_discarded(discarded);
-        }));
-
-        // Re-signal every key held so far, now that the listener above exists.
-        //
-        // Two things arrive before this point: our own first key, which `join`
-        // distributes and signals, and any peer key the sticky bridge has already
-        // pumped in. Both were applied to the key provider, but with no listener
-        // installed neither produced a `KeyImported` — so the one path a host
-        // cannot otherwise observe was also the one it most needed to see. The
-        // replay is idempotent at the provider and honours whatever remains of a
-        // rotation's `delayBeforeUse`.
-        //
-        // It runs before `connect_livekit` so the key ring is populated before the
-        // first frame can arrive.
-        if !call.replay_encryption_keys().await {
-            log::warn!(
-                "[{room_id}/{}] join: could not replay held keys; peers may stay undecryptable \
-                 until the next rotation",
-                options.slot_id,
-            );
-        }
-
-        log::info!(
-            "[{room_id}/{}] join: connecting own focus {}",
-            options.slot_id,
-            livekit.livekit_service_url,
-        );
-        let (connection, connection_events) = match transport
-            .connect_livekit(&livekit.livekit_service_url, &ctx)
-            .await
-        {
-            Ok(connected) => connected,
+        )
+        .await;
+        let attached = match attached {
+            Ok(LiveKitAttachment {
+                media:
+                    MediaAttachment {
+                        engine,
+                        own_connection: Some(connection),
+                        own_identity,
+                        ..
+                    },
+                key_bridge,
+            }) => Ok((engine, connection, own_identity, key_bridge)),
+            // The join publishes on a LiveKit focus, so attaching connects it.
+            Ok(_) => Err(LiveKitCallError::Signalling(
+                "the joined call publishes on no LiveKit focus".into(),
+            )),
+            Err(error) => Err(error.into()),
+        };
+        let (engine, connection, own_identity, bridge) = match attached {
+            Ok(attached) => attached,
             Err(error) => {
                 log::warn!(
-                    "[{room_id}/{}] join: own focus {} refused the connection ({error}); \
-                     leaving the slot again",
+                    "[{room_id}/{}] join: attaching media failed ({error}); leaving the slot again",
                     options.slot_id,
-                    livekit.livekit_service_url,
                 );
                 // We are signalled as joined but have no media path; leave so
                 // peers don't wait on the dead man's switch to notice.
                 if let Err(leave_error) = call.leave(Default::default()).await {
-                    log::warn!("leave after failed SFU connect also failed: {leave_error}");
+                    log::warn!("leave after failed media attach also failed: {leave_error}");
                 }
-                return Err(error.into());
+                return Err(error);
             }
         };
-        engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
 
-        // Now that a room exists, let the bridge move our sender onto each key we
-        // rotate to. Importing a key only fills the provider's ring — the index
-        // our frames actually carry lives on the frame cryptor, and without this
-        // we advertise a rotation to peers and keep encrypting with the previous
-        // key. A peer joining after a rotation then holds only the new index and
-        // decrypts nothing, and the forward secrecy the rotation exists for is
-        // not delivered.
-        //
-        // Installed after `connect_livekit`, and after the replay above, so the
-        // first key is already in the ring; the hook only ever *moves* the index.
-        let connection_for_keys = connection.clone();
-        bridge.set_local_sender(
-            own_identity.clone(),
-            Box::new(move |key_index| connection_for_keys.set_local_key_index(key_index)),
+        log::info!(
+            "[{room_id}/{}] join: complete, identity {own_identity}",
+            options.slot_id
         );
-        // Adopt whatever index we are already on, rather than assuming 0: a
-        // rotation between `join` and here would otherwise be missed, and the
-        // connection remembers the value for tracks published later (nothing is
-        // published yet, so this only records it).
-        if let Some(own_key) = bridge.key_for(&own_identity) {
-            connection.set_local_key_index(own_key.key_index);
-        }
-
-        log::info!("[{room_id}/{}] join: complete", options.slot_id);
 
         // Transition-period raw stream; subscribed immediately after connect,
         // so only events racing the connect itself can be missed here.

@@ -33,6 +33,7 @@
 pub use matrix_rtc_livekit_proto::identity;
 pub use matrix_rtc_livekit_proto::{LiveKitTransportConfig, TokenEndpoint, identity_mapper};
 
+pub mod attach;
 pub mod keys;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API
 // (the recording-bot use case); the synthetic-tone generator and frequency
@@ -52,6 +53,7 @@ pub mod call;
 // `MembershipFormat` in this crate's own public API.
 pub use matrix_rtc_core::compat;
 
+pub use attach::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
     ParticipantKey, SwitchCompleteListener, msc4195_key_provider, msc4195_key_provider_options,

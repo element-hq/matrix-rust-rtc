@@ -321,6 +321,12 @@ Membership is always applied as a complete set: a member whose event is absent f
   Only the *own* focus — established synchronously by the caller so join can
   fail fast, then handed over via `adopt_own_connection` — ends the call
   when it dies.
+- `attach_media` attaches media to a joined `RtcCall`: the one copy of the
+  order-sensitive wiring (identity mapper before key handler, key listeners
+  before the replay of held keys, replay before the own-focus connect, our
+  sender's key index after it) shared by the FFI and wasm media sessions and
+  `LiveKitCall`. Transports opt in with `OwnFocusTransport`, which hands the
+  caller a typed own-focus connection.
 - Depends only on `matrix-rtc-core`, `matrix-rtc-call` (temporarily, for hand and
   reaction types) + tokio/futures — no LiveKit, no
   libwebrtc, fully unit-testable (`FakeTransport`). Compiles for wasm32:
@@ -356,8 +362,9 @@ Membership is always applied as a complete set: a member whose event is absent f
   `client.room` runs the room's feed on `spawn_local`; `room.close` leaves and
   unsubscribes. The room has `openSlot`/`closeSlot` and `joinCall`. A joined
   call keeps itself alive and rotates its keys; the page ticks nothing.
-- `media/`: `call.connectMedia` attaches media to the joined call — the shared
-  `CallEngine` (roster + multi-focus pool) over `JsMediaTransport`, a JS
+- `media/`: `call.connectMedia` attaches media to the joined call through
+  `matrix_rtc_media::attach_media` — the shared `CallEngine` (roster +
+  multi-focus pool) over `JsMediaTransport`, a JS
   delegate driving livekit-js. Rust owns the protocol (token requests via
   `-proto`, identities, pool policy, key bookkeeping via the shared
   `MediaKeyHandler` backed by the delegate's `setKey`); JS owns the IO
@@ -399,9 +406,9 @@ Membership is always applied as a complete set: a member whose event is absent f
 - Behind the **`media` cargo feature** (default off — pulls the LiveKit
   client and libwebrtc, ~8–15 MB per ABI): `src/media/` exposes the
   transport-agnostic media model to mobile. The host joins the slot through
-  the room as usual, then `connect_media_session(call, config)` attaches media (E2EE
-  key bridge into the core, the `CallEngine` with its multi-focus pool, the
-  own-focus SFU connection). `MediaSession` surfaces `next_event()` (async
+  the room as usual, then `connect_media_session(call, config)` attaches media
+  through `matrix_rtc_livekit::attach_livekit` (E2EE key bridge into the core,
+  the `CallEngine` with its multi-focus pool, the own-focus SFU connection). `MediaSession` surfaces `next_event()` (async
   pull → Kotlin `Flow` / Swift `AsyncStream`), the participant roster,
   `set_constraints`, frame streams (audio frames by value; video frames as
   objects with safe copies *and* zero-copy plane pointers), and local
@@ -428,7 +435,8 @@ Membership is always applied as a complete set: a member whose event is absent f
   (`LiveKitMediaTransport`): connection key = `livekit_service_url`, remote
   identity = MSC4195 pseudonymous identity, `RoomEvent` → `ConnectionEvent`
   translation, and `NativeAudioStream` → owned PCM frame streams behind
-  `RemoteTrackHandle`.
+  `RemoteTrackHandle`. `attach_livekit` builds the key provider, bridge and
+  transport for a joined call and runs `attach_media` over them.
 - Behind `matrix-sdk` it ships `call` — a `LiveKitCall::join`/`LiveKitCall::leave` facade that
   composes `matrix-rtc-matrix-sdk`'s `SdkMatrixBackend` and `matrix-rtc-call`'s feeder with
   this transport: membership, key exchange, the library's transport choice, the

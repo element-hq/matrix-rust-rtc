@@ -2802,6 +2802,7 @@ dependencies = [
  "log",
  "matrix-rtc-call",
  "matrix-rtc-core",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
 ]

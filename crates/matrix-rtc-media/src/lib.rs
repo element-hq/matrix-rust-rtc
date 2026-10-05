@@ -30,6 +30,7 @@
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
+pub mod attach;
 pub mod constraints;
 pub mod engine;
 pub mod event;
@@ -41,6 +42,7 @@ pub mod stats;
 pub mod tile;
 pub mod transport;
 
+pub use attach::{AttachError, AttachOptions, MediaAttachment, attach_media};
 pub use constraints::{
     Dimensions, MediaConstraints, QualityLimit, ResolvedConstraints, StreamDemand, VideoDetail,
 };
@@ -59,6 +61,6 @@ pub use tile::{
     window,
 };
 pub use transport::{
-    ConnectionContext, ConnectionEvent, MediaTransport, OwnMemberClaims, RemoteTrackHandle,
-    SpeakingParticipant, TransportConnection, TransportError,
+    ConnectionContext, ConnectionEvent, MediaTransport, OwnFocusTransport, OwnMemberClaims,
+    RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
 };

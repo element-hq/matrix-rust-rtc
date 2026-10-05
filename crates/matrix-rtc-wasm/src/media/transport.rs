@@ -41,7 +41,7 @@ use matrix_rtc_livekit_proto::{SfuToken, TokenEndpoint};
 use matrix_rtc_media::keys::FrameKeyRing;
 use matrix_rtc_media::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaStreamKind, MediaTransport,
-    RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
+    OwnFocusTransport, RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -371,11 +371,15 @@ impl JsMediaTransport {
         parse_sfu_token(response.status, &response.body)
             .map_err(|error| TransportError::Connect(error.to_string()))
     }
+}
 
-    /// The concrete half of [`MediaTransport::connect`], returning the
-    /// clonable connection so the caller can keep a handle to the own-focus
-    /// one (mirrors the native `connect_livekit`).
-    pub(crate) async fn connect_js(
+/// The concrete half of [`MediaTransport::connect`], returning the clonable
+/// connection so the caller can keep a handle to the own-focus one.
+#[async_trait(?Send)]
+impl OwnFocusTransport for JsMediaTransport {
+    type Connection = JsTransportConnection;
+
+    async fn connect_own(
         &self,
         connection_key: &str,
         ctx: &ConnectionContext,
@@ -410,6 +414,7 @@ impl JsMediaTransport {
             JsTransportConnection {
                 connection_key: connection_key.to_owned(),
                 handle,
+                delegate: self.delegate.clone(),
             },
             rx,
         ))
@@ -453,7 +458,7 @@ impl MediaTransport for JsMediaTransport {
         ),
         TransportError,
     > {
-        let (connection, events) = self.connect_js(connection_key, ctx).await?;
+        let (connection, events) = self.connect_own(connection_key, ctx).await?;
         Ok((Box::new(connection), events))
     }
 }
@@ -464,6 +469,9 @@ impl MediaTransport for JsMediaTransport {
 pub(crate) struct JsTransportConnection {
     connection_key: String,
     handle: JsValue,
+    /// Owns the frame cryptor our own frames go through, so the key index
+    /// switch goes through it.
+    delegate: JsValue,
 }
 
 #[async_trait(?Send)]
@@ -474,6 +482,23 @@ impl TransportConnection for JsTransportConnection {
 
     // `publish` and `apply_constraints` keep their defaults: on the web the
     // app publishes and constrains through livekit-js directly.
+
+    /// Through the delegate's `setLocalKeyIndex(index)`.
+    fn set_local_key_index(&self, index: u8) {
+        let method = Reflect::get(&self.delegate, &JsValue::from_str("setLocalKeyIndex"))
+            .ok()
+            .filter(|method| !method.is_undefined());
+        let Some(method) = method.and_then(|method| method.dyn_into::<Function>().ok()) else {
+            log::warn!(
+                "media: delegate has no setLocalKeyIndex — our key rotations will not change \
+                 what we encrypt with"
+            );
+            return;
+        };
+        if let Err(error) = method.call1(&self.delegate, &JsValue::from(index)) {
+            log::warn!("media: setLocalKeyIndex({index}) threw: {error:?}");
+        }
+    }
 
     async fn close(&self) -> Result<(), TransportError> {
         call_delegate(&self.handle, "close", &[]).await.map(|_| ())

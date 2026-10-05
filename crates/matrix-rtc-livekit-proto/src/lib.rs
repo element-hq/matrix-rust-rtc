@@ -33,7 +33,7 @@ use matrix_rtc_core::compat::{MembershipFormat, room_state};
 ///
 /// Call it once per call and share the returned `Arc`: it has four uses (the
 /// core's encryption manager, the media transport, our own identity, and the
-/// key ring — see `matrix-rtc-livekit`'s `call::LiveKitCall::join`), and they must not
+/// key ring — see `matrix_rtc_media::attach_media`), and they must not
 /// skew. That matters more than it looks, because a divergence is not an error
 /// but a silence: peers appear in the roster with no media, their keys land
 /// under an identity the SFU never assigned, and nothing anywhere logs a
@@ -68,6 +68,19 @@ pub enum TokenEndpoint {
     /// Pre-MSC4195 `POST /sfu/get`, for Element Call builds older than MSC4354.
     /// Temporary; see `matrix_rtc_core::compat`.
     LegacyElementCall,
+}
+
+impl TokenEndpoint {
+    /// The endpoint a MatrixRTC generation's authorisation service speaks.
+    /// `/sfu/get` is also where the pre-sticky generation's unhashed identity
+    /// comes from — the endpoint mints the identity — so this and
+    /// [`identity_mapper`] are one decision, taken from the same format.
+    pub fn for_format(compat: MembershipFormat) -> Self {
+        match compat {
+            MembershipFormat::RoomState => Self::LegacyElementCall,
+            MembershipFormat::Current | MembershipFormat::Sticky2025 => Self::Msc4195,
+        }
+    }
 }
 
 /// Configuration identifying the MatrixRTC slot to connect to.

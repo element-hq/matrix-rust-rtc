@@ -7,9 +7,8 @@
 //! livekit-js, layered on a call the page has already joined
 //! ([`WasmRtcCall`]).
 //!
-//! A port of the FFI's `connect_media_session` seam
-//! (`matrix-rtc-ffi/src/media/session.rs`) — same wiring, same order — minus
-//! everything media: frames, publishing, and constraints stay in livekit-js.
+//! The wiring is `matrix_rtc_media::attach_media`'s, shared with the FFI;
+//! frames, publishing, and constraints stay in livekit-js.
 //! The shared `CallEngine` still owns roster reconciliation and the
 //! multi-focus connection pool; its actor runs on the JS microtask queue.
 
@@ -18,12 +17,12 @@ use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{RtcTransport, TransportIntent};
 use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
 use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
-    CallEngine, CallEvent, ConnectionContext, EndedReason, EngineConfig, FrameEncryptionDiagnostic,
-    FrameEncryptionState, OwnMemberClaims, Participant, StabilityConfig, TransportConnection as _,
+    AttachOptions, CallEngine, CallEvent, EndedReason, FrameEncryptionDiagnostic,
+    FrameEncryptionState, MediaAttachment, Participant, StabilityConfig, TransportConnection as _,
+    attach_media,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -96,23 +95,6 @@ impl From<&WasmStabilityConfig> for StabilityConfig {
     }
 }
 
-/// Calls the delegate's `setLocalKeyIndex(index)`; the local-sender hook.
-fn set_local_key_index(delegate: &JsValue, index: u8) {
-    let method = Reflect::get(delegate, &JsValue::from_str("setLocalKeyIndex"))
-        .ok()
-        .filter(|method| !method.is_undefined());
-    let Some(method) = method.and_then(|method| method.dyn_into::<Function>().ok()) else {
-        log::warn!(
-            "media: delegate has no setLocalKeyIndex — our key rotations will not change \
-             what we encrypt with"
-        );
-        return;
-    };
-    if let Err(error) = method.call1(delegate, &JsValue::from(index)) {
-        log::warn!("media: setLocalKeyIndex({index}) threw: {error:?}");
-    }
-}
-
 #[wasm_bindgen]
 impl WasmRtcCall {
     /// Attach media to this call: wire frame-key signalling into the core,
@@ -141,35 +123,11 @@ impl WasmRtcCall {
                 .map_err(|err| JsError::new(&format!("invalid media session config: {err}")))?
         };
 
-        let room_id = self.inner().room_id().to_owned();
-        let slot_id = self.inner().slot_id().to_owned();
-        let backend = self.backend();
-        let (user_id, device_id) = (backend.own_user_id(), backend.own_device_id());
-        // The focus our membership announces; a receive-only call has none and
-        // only connects to its peers' foci.
-        let own_focus = match self.inner().transport() {
-            TransportIntent::Publish(RtcTransport::LiveKit(livekit)) => {
-                Some(livekit.livekit_service_url.clone())
-            }
-            TransportIntent::Publish(other) => {
-                return Err(JsError::new(&format!(
-                    "the call publishes on {other:?}, which is not a LiveKit transport"
-                )));
-            }
-            TransportIntent::ReceiveOnly { .. } => None,
-        };
-        log::info!(
-            "media: connecting [{room_id}/{slot_id}] user={user_id} device={device_id} focus={}",
-            own_focus.as_deref().unwrap_or("none (receive only)"),
-        );
-
         // Which MatrixRTC generation this room was joined for, read back from
         // the join rather than trusted from this config: it decides the
         // participant identity and the token endpoint, and those disagreeing
         // with the membership we already published is not an error but a
-        // silence — peers sit in the roster with no media, keys install under
-        // an identity the SFU never assigned, and nothing logs a problem. The
-        // config field is accepted only as a cross-check.
+        // silence. The config field is accepted only as a cross-check.
         let compat = self.format();
         if let Some(requested) = config.format.as_deref() {
             let requested = crate::compat::parse_compat(Some(requested))?;
@@ -182,15 +140,14 @@ impl WasmRtcCall {
         }
         if compat != MembershipFormat::Current {
             log::info!(
-                "media: [{room_id}/{slot_id}] connecting in Element Call compatibility mode \
-                 {compat:?}",
+                "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
+                self.inner().room_id(),
+                self.inner().slot_id(),
             );
         }
-        // Call it once and share the `Arc`: it has four uses here — the core's
-        // encryption manager, the media transport, our own identity, and the
-        // key ring — and they must not skew.
+        // One mapper for the core, the transport, our own identity and the
+        // ring: they must not skew.
         let mapper = identity_mapper(compat);
-
         // Frame encryption: livekit-js owns the key provider; the shared
         // handler forwards every signalled key into it through the delegate.
         let ring = JsFrameKeyRing::new(
@@ -204,116 +161,39 @@ impl WasmRtcCall {
         // engine's APIs take.
         #[expect(clippy::arc_with_non_send_sync)]
         let handler = Arc::new(MediaKeyHandler::with_ring(Arc::new(ring)));
-
-        // Read the `member.id` from the join rather than taking one from the
-        // page: it is what our MSC4195 participant identity is derived from,
-        // so a value that disagrees with the published membership would put
-        // our media on an identity no peer holds a key for.
-        let call = self.inner();
-        if !call.is_live() {
-            return Err(JsError::new(
-                "the call is over — join the slot again before connecting media",
-            ));
-        }
-        let member_id = call.member_id().to_owned();
-        let memberships = call.subscribe_memberships().await;
-        let raised_hands = call.subscribe_raised_hands().await;
-        let reactions = call.subscribe_reactions().await;
-
-        // Mapper before handler: the replay below derives identities through
-        // it, and installing it second would replay peer keys under the raw
-        // `member_id` fallback — an identity the SFU never uses, which is
-        // indistinguishable from importing nothing.
-        call.set_encryption_identity_mapper(mapper.clone()).await;
-        if !call.set_encryption_signal_handler(handler.clone()).await {
-            return Err(JsError::new(
-                "the call has no encryption manager — join the slot first",
-            ));
-        }
-
         // `allow`, not `expect`: whether clippy fires this depends on the
         // toolchain (1.98 no longer does), and an unfulfilled expectation is
         // itself an error under `-D warnings`.
+        let backend = self.backend();
         #[allow(clippy::arc_with_non_send_sync)]
         let transport = Arc::new(JsMediaTransport::new(
             delegate.clone(),
-            self.backend(),
+            backend.clone(),
             mapper.clone(),
-            match compat {
-                // Pre-MSC4195 `/sfu/get`, which is also where that
-                // generation's unhashed `{user}:{device}` identity comes from
-                // — the endpoint mints the identity, so the two are one
-                // decision, not two.
-                MembershipFormat::RoomState => TokenEndpoint::LegacyElementCall,
-                _ => TokenEndpoint::Msc4195,
-            },
+            TokenEndpoint::for_format(compat),
         ));
-        let ctx = ConnectionContext {
-            room_id,
-            slot_id,
-            member: OwnMemberClaims {
-                member_id: member_id.clone(),
-                user_id: user_id.clone(),
-                device_id: device_id.clone(),
-            },
-        };
-        let engine = CallEngine::new(
-            EngineConfig {
-                transports: vec![transport.clone()],
-                own_member_id: member_id.clone(),
-                ctx: ctx.clone(),
-                own_connection_key: own_focus.clone(),
-                raised_hands,
-                reactions,
+        let MediaAttachment {
+            engine,
+            own_connection,
+            own_identity,
+            events,
+        } = attach_media(
+            self.inner(),
+            transport,
+            handler.clone(),
+            AttachOptions {
+                own_user_id: backend.own_user_id(),
+                own_device_id: backend.own_device_id(),
+                identity_mapper: mapper.clone(),
                 stability: config
                     .stability
                     .as_ref()
                     .map(Into::into)
                     .unwrap_or_default(),
             },
-            memberships,
-        );
-
-        // Imported media keys surface as `key_imported` events.
-        let engine_handle = engine.handle();
-        handler.set_key_import_listener(Box::new(move |key| {
-            engine_handle.notify_key_imported(key.rtc_backend_identity.clone(), key.key_index);
-        }));
-
-        // Refused keys surface as `key_discarded`. Without this the reason a
-        // key was rejected never leaves the core, and the page sees only a
-        // `missing_key` it cannot distinguish from a key that never arrived.
-        let engine_handle = engine.handle();
-        handler.set_key_discard_listener(Box::new(move |discarded| {
-            engine_handle.notify_key_discarded(discarded);
-        }));
-
-        // Keys signalled between `join` and now were stored but dropped —
-        // nothing was listening. Without this, every participant whose key
-        // arrived before media attached stays undecryptable until a rotation.
-        // After the listeners (so `key_imported` reaches the page for exactly
-        // the keys it is most likely to be missing), before the connect (so
-        // the ring is populated before the first frame can arrive).
-        call.replay_encryption_keys().await;
-
-        // Own focus connects synchronously so a broken SFU fails this call
-        // instead of surfacing later as a dead session.
-        let connection = match &own_focus {
-            Some(own_focus) => {
-                let (connection, connection_events) = transport
-                    .connect_js(own_focus, &ctx)
-                    .await
-                    .map_err(|error| {
-                    log::warn!("media: own focus {own_focus} refused the connection: {error}");
-                    JsError::new(&error.to_string())
-                })?;
-                engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
-                Some(connection)
-            }
-            None => None,
-        };
-
-        let own_identity = mapper(&user_id, &device_id, &member_id);
+        )
+        .await
+        .map_err(|error| JsError::new(&error.to_string()))?;
 
         // Roster, event, and switch-complete delivery run as spawned pumps
         // owning their receivers, invoking the delegate's optional callbacks.
@@ -341,7 +221,7 @@ impl WasmRtcCall {
             });
         }
         if let Some(on_event) = delegate_callback(&delegate, "onEvent") {
-            let mut events = engine.subscribe_events();
+            let mut events = events;
             wasm_bindgen_futures::spawn_local(async move {
                 loop {
                     match events.recv().await {
@@ -364,24 +244,10 @@ impl WasmRtcCall {
                 }
             });
         }
-        // Move our sender onto each key we rotate to. Importing a key only
-        // fills the ring; the index our frames actually carry lives on the
-        // frame cryptor, which livekit-js owns — hence through the delegate.
-        let delegate_for_keys = delegate.clone();
-        handler.set_local_sender(
-            own_identity.clone(),
-            Box::new(move |key_index| set_local_key_index(&delegate_for_keys, key_index)),
-        );
-        // Adopt the index we are already on rather than assuming 0.
-        if let Some(own_key) = handler.key_for(&own_identity) {
-            set_local_key_index(&delegate, own_key.key_index);
-        }
-
-        log::info!("media: connected as member {member_id}, local identity {own_identity}");
 
         Ok(WasmMediaSession {
             engine,
-            own_connection: connection,
+            own_connection,
             _handler: handler,
             identity_mapper: mapper,
             own_identity,
