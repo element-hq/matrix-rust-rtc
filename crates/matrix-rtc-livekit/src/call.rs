@@ -414,7 +414,8 @@ impl LiveKitCall {
         );
         let ctx = ConnectionContext {
             room_id: room_id.clone(),
-            slot_id: options.slot_id.clone(),
+            // The token request names the slot as this generation spells it.
+            slot_id: options.format.token_slot_id(&options.slot_id).into_owned(),
             member: OwnMemberClaims {
                 member_id: membership_id.clone(),
                 user_id,

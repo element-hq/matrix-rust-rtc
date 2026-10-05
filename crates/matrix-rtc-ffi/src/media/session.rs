@@ -159,7 +159,8 @@ async fn build_media_session(
     );
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
-        slot_id: slot_id.clone(),
+        // The token request names the slot as this generation spells it.
+        slot_id: compat.token_slot_id(&slot_id).into_owned(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: user_id.clone(),

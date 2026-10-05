@@ -250,7 +250,8 @@ impl WasmRtcCall {
         ));
         let ctx = ConnectionContext {
             room_id,
-            slot_id,
+            // The token request names the slot as this generation spells it.
+            slot_id: compat.token_slot_id(&slot_id).into_owned(),
             member: OwnMemberClaims {
                 member_id: member_id.clone(),
                 user_id: user_id.clone(),
@@ -555,8 +556,12 @@ enum WasmCallEvent {
         name: String,
         sound: Option<String>,
     },
+    /// `identity` is the transport identity the key installed under: keys
+    /// held before media connects surface while `connectMedia` is still
+    /// pending, before the page has a session to look a roster up on.
     KeyImported {
         member_id: String,
+        identity: String,
         key_index: u8,
     },
     FrameEncryptionState {
@@ -652,9 +657,11 @@ impl From<CallEvent> for WasmCallEvent {
             },
             CallEvent::KeyImported {
                 member_id,
+                identity,
                 key_index,
             } => Self::KeyImported {
                 member_id,
+                identity,
                 key_index,
             },
             CallEvent::FrameEncryptionState {
