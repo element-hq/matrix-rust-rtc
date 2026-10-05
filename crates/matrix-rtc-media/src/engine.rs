@@ -44,21 +44,18 @@ use matrix_rtc_call::{RaisedHand, ReceivedReaction};
 use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::constraints::MediaConstraints;
-use crate::event::{
-    CallEvent, EndedReason, FrameEncryptionDiagnostic, FrameEncryptionState, SpeakingMember,
+use matrix_rtc_core::executor as rt;
+use matrix_rtc_transport::{
+    ConnectionContext, ConnectionEvent, FrameEncryptionState, LocalTrackHandle, MediaConstraints,
+    MediaStreamKind, MediaTransport, PublishOptions, ReceiveStats, RemoteTrackHandle,
+    TransportConnection, TransportError,
 };
-use crate::local::{LocalTrackHandle, PublishOptions};
-use crate::participant::{MediaStreamKind, Participant, StreamState};
-use crate::stats::ReceiveStats;
+
+use crate::event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, SpeakingMember};
+use crate::participant::{Participant, StreamState};
 use crate::tile::{
     CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
 };
-use crate::transport::{
-    ConnectionContext, ConnectionEvent, MediaTransport, RemoteTrackHandle, TransportConnection,
-    TransportError,
-};
-use matrix_rtc_core::executor as rt;
 
 /// Capacity of the broadcast [`CallEvent`] channel. Subscribers that fall
 /// further behind than this observe a `Lagged` error and miss events; they
@@ -2212,14 +2209,14 @@ mod tests {
     use futures_util::StreamExt;
     use matrix_rtc_core::{EventOrigin, LiveKitTransport, RtcTransport};
 
-    use crate::event::{FrameEncryptionDiagnostic, FrameEncryptionState};
+    use crate::event::FrameEncryptionDiagnostic;
     use matrix_rtc_core::KeyRejection;
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
-    use crate::frame::AudioFrame;
-    use crate::local::VideoSourceConfig;
-    use crate::transport::{OwnMemberClaims, SpeakingParticipant};
+    use matrix_rtc_transport::{
+        AudioFrame, LocalTrackHandle, OwnMemberClaims, SpeakingParticipant, VideoSourceConfig,
+    };
 
     const OWN_FOCUS: &str = "https://sfu.example.org";
     const PEER_FOCUS: &str = "https://sfu-b.example.org";
@@ -2236,7 +2233,13 @@ mod tests {
         /// `(connection_key, kind, muted)` of every publish call.
         published: StdMutex<Vec<(String, MediaStreamKind, bool)>>,
         /// `(identity, kind, resolved)` of every apply_constraints call.
-        applied: StdMutex<Vec<(String, MediaStreamKind, crate::ResolvedConstraints)>>,
+        applied: StdMutex<
+            Vec<(
+                String,
+                MediaStreamKind,
+                matrix_rtc_transport::ResolvedConstraints,
+            )>,
+        >,
         /// `(kind, muted)` of every local mute call that reached the transport.
         local_mutes: StdMutex<Vec<(MediaStreamKind, bool)>>,
         /// Kind of every unpublish call that reached the transport.
@@ -2311,7 +2314,7 @@ mod tests {
             &self,
             identity: &str,
             kind: MediaStreamKind,
-            resolved: crate::ResolvedConstraints,
+            resolved: matrix_rtc_transport::ResolvedConstraints,
         ) -> Result<(), TransportError> {
             self.state
                 .applied
@@ -4159,7 +4162,9 @@ mod tests {
             MediaStreamKind::Camera,
             MediaConstraints {
                 visible: true,
-                detail: crate::VideoDetail::Quality(crate::QualityLimit::Low),
+                detail: matrix_rtc_transport::VideoDetail::Quality(
+                    matrix_rtc_transport::QualityLimit::Low,
+                ),
                 ..Default::default()
             },
         );
@@ -4173,10 +4178,10 @@ mod tests {
         let (identity, kind, resolved) = &applied[0];
         assert_eq!(identity, "id-bob");
         assert_eq!(*kind, MediaStreamKind::Camera);
-        assert_eq!(resolved.demand, crate::StreamDemand::Active);
+        assert_eq!(resolved.demand, matrix_rtc_transport::StreamDemand::Active);
         assert_eq!(
             resolved.detail,
-            crate::VideoDetail::Quality(crate::QualityLimit::Low)
+            matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low)
         );
     }
 
@@ -4213,7 +4218,7 @@ mod tests {
         // low_bandwidth folds video to a pause (subscription kept).
         assert_eq!(
             fx.state.applied.lock().unwrap()[1].2.demand,
-            crate::StreamDemand::Paused
+            matrix_rtc_transport::StreamDemand::Paused
         );
 
         // ...and so does a transport-level reconnect.

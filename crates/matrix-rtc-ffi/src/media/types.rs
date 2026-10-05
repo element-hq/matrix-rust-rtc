@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-/// The kind of media stream (mirrors `matrix_rtc_media::MediaStreamKind`).
+/// The kind of media stream (mirrors `matrix_rtc_transport::MediaStreamKind`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiStreamKind {
     Microphone,
@@ -18,7 +18,7 @@ pub enum FfiStreamKind {
     Data,
 }
 
-impl From<FfiStreamKind> for matrix_rtc_media::MediaStreamKind {
+impl From<FfiStreamKind> for matrix_rtc_transport::MediaStreamKind {
     fn from(kind: FfiStreamKind) -> Self {
         match kind {
             FfiStreamKind::Microphone => Self::Microphone,
@@ -30,9 +30,9 @@ impl From<FfiStreamKind> for matrix_rtc_media::MediaStreamKind {
     }
 }
 
-impl From<matrix_rtc_media::MediaStreamKind> for FfiStreamKind {
-    fn from(kind: matrix_rtc_media::MediaStreamKind) -> Self {
-        use matrix_rtc_media::MediaStreamKind as Kind;
+impl From<matrix_rtc_transport::MediaStreamKind> for FfiStreamKind {
+    fn from(kind: matrix_rtc_transport::MediaStreamKind) -> Self {
+        use matrix_rtc_transport::MediaStreamKind as Kind;
         match kind {
             Kind::Microphone => Self::Microphone,
             Kind::Camera => Self::Camera,
@@ -277,7 +277,7 @@ pub enum FfiEndedReason {
 }
 
 /// Whether a participant's frames are encrypting and decrypting cleanly
-/// (mirrors `matrix_rtc_media::FrameEncryptionState`).
+/// (mirrors `matrix_rtc_transport::FrameEncryptionState`).
 ///
 /// Reported per participant, not per stream: the frame cryptor is keyed by
 /// participant identity, so a failure does not say which of their tracks it
@@ -377,9 +377,9 @@ impl From<matrix_rtc_core::KeyRejection> for FfiKeyRejection {
     }
 }
 
-impl From<matrix_rtc_media::FrameEncryptionState> for FfiFrameEncryptionState {
-    fn from(state: matrix_rtc_media::FrameEncryptionState) -> Self {
-        use matrix_rtc_media::FrameEncryptionState as State;
+impl From<matrix_rtc_transport::FrameEncryptionState> for FfiFrameEncryptionState {
+    fn from(state: matrix_rtc_transport::FrameEncryptionState) -> Self {
+        use matrix_rtc_transport::FrameEncryptionState as State;
         match state {
             State::Ok => Self::Ok,
             State::MissingKey => Self::MissingKey,
@@ -391,7 +391,7 @@ impl From<matrix_rtc_media::FrameEncryptionState> for FfiFrameEncryptionState {
 }
 
 /// Cumulative receive-side RTP counters for one subscribed stream (mirrors
-/// `matrix_rtc_media::ReceiveStats`). Obtain via
+/// `matrix_rtc_transport::ReceiveStats`). Obtain via
 /// [`MediaSession::receive_stats`](super::MediaSession::receive_stats).
 ///
 /// These exist because the receive path emits frames at a fixed cadence
@@ -442,8 +442,8 @@ pub struct FfiReceiveStats {
     pub concealment_events: u64,
 }
 
-impl From<matrix_rtc_media::ReceiveStats> for FfiReceiveStats {
-    fn from(stats: matrix_rtc_media::ReceiveStats) -> Self {
+impl From<matrix_rtc_transport::ReceiveStats> for FfiReceiveStats {
+    fn from(stats: matrix_rtc_transport::ReceiveStats) -> Self {
         Self {
             packets_received: stats.packets_received,
             packets_lost: stats.packets_lost,
@@ -471,7 +471,7 @@ pub struct FfiStreamRef {
     pub kind: FfiStreamKind,
 }
 
-impl From<FfiStreamRef> for (String, matrix_rtc_media::MediaStreamKind) {
+impl From<FfiStreamRef> for (String, matrix_rtc_transport::MediaStreamKind) {
     fn from(r: FfiStreamRef) -> Self {
         (r.member_id, r.kind.into())
     }
@@ -493,7 +493,7 @@ pub struct FfiStreamStats {
 /// records. Same length is the engine's guarantee.
 pub(super) fn zip_stream_stats(
     streams: Vec<FfiStreamRef>,
-    results: Vec<Option<matrix_rtc_media::ReceiveStats>>,
+    results: Vec<Option<matrix_rtc_transport::ReceiveStats>>,
 ) -> Vec<FfiStreamStats> {
     debug_assert_eq!(streams.len(), results.len());
     streams
@@ -717,7 +717,7 @@ pub enum FfiVideoDetail {
 }
 
 /// Subscription constraints for one stream of one participant (mirrors
-/// `matrix_rtc_media::MediaConstraints` — see its docs for the semantics).
+/// `matrix_rtc_transport::MediaConstraints` — see its docs for the semantics).
 #[derive(Clone, Copy, Debug, uniffi::Record)]
 pub struct FfiMediaConstraints {
     /// `false` releases the stream as fully as the transport supports; use
@@ -730,24 +730,23 @@ pub struct FfiMediaConstraints {
     pub low_bandwidth: bool,
 }
 
-impl From<FfiMediaConstraints> for matrix_rtc_media::MediaConstraints {
+impl From<FfiMediaConstraints> for matrix_rtc_transport::MediaConstraints {
     fn from(constraints: FfiMediaConstraints) -> Self {
         Self {
             enabled: constraints.enabled,
             visible: constraints.visible,
             detail: match constraints.detail {
-                FfiVideoDetail::Auto => matrix_rtc_media::VideoDetail::Auto,
+                FfiVideoDetail::Auto => matrix_rtc_transport::VideoDetail::Auto,
                 FfiVideoDetail::Dimensions { width, height } => {
-                    matrix_rtc_media::VideoDetail::Dimensions(matrix_rtc_media::Dimensions {
-                        width,
-                        height,
-                    })
+                    matrix_rtc_transport::VideoDetail::Dimensions(
+                        matrix_rtc_transport::Dimensions { width, height },
+                    )
                 }
                 FfiVideoDetail::Quality { limit } => {
-                    matrix_rtc_media::VideoDetail::Quality(match limit {
-                        FfiQualityLimit::Low => matrix_rtc_media::QualityLimit::Low,
-                        FfiQualityLimit::Medium => matrix_rtc_media::QualityLimit::Medium,
-                        FfiQualityLimit::High => matrix_rtc_media::QualityLimit::High,
+                    matrix_rtc_transport::VideoDetail::Quality(match limit {
+                        FfiQualityLimit::Low => matrix_rtc_transport::QualityLimit::Low,
+                        FfiQualityLimit::Medium => matrix_rtc_transport::QualityLimit::Medium,
+                        FfiQualityLimit::High => matrix_rtc_transport::QualityLimit::High,
                     })
                 }
             },
@@ -770,7 +769,7 @@ pub struct FfiVideoSourceConfig {
     pub height: u32,
 }
 
-/// What to publish (mirrors `matrix_rtc_media::PublishOptions`).
+/// What to publish (mirrors `matrix_rtc_transport::PublishOptions`).
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiPublishOptions {
     pub kind: FfiStreamKind,
@@ -784,19 +783,19 @@ pub struct FfiPublishOptions {
     pub muted: bool,
 }
 
-impl From<FfiPublishOptions> for matrix_rtc_media::PublishOptions {
+impl From<FfiPublishOptions> for matrix_rtc_transport::PublishOptions {
     fn from(options: FfiPublishOptions) -> Self {
         Self {
             kind: options.kind.into(),
             audio: options
                 .audio
-                .map(|audio| matrix_rtc_media::AudioSourceConfig {
+                .map(|audio| matrix_rtc_transport::AudioSourceConfig {
                     sample_rate: audio.sample_rate,
                     num_channels: audio.num_channels,
                 }),
             video: options
                 .video
-                .map(|video| matrix_rtc_media::VideoSourceConfig {
+                .map(|video| matrix_rtc_transport::VideoSourceConfig {
                     width: video.width,
                     height: video.height,
                 }),

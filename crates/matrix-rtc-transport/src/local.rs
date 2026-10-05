@@ -14,9 +14,9 @@
 use async_trait::async_trait;
 use matrix_rtc_core::MaybeSend;
 
+use crate::connection::TransportError;
 use crate::frame::{AudioFrame, VideoFrame};
-use crate::participant::MediaStreamKind;
-use crate::transport::TransportError;
+use crate::stream::MediaStreamKind;
 
 /// PCM format the application will push into an audio publication.
 #[derive(Clone, Copy, Debug)]
@@ -111,7 +111,7 @@ impl PublishOptions {
 ///
 /// Handles are cheap `Arc`s. A publication ends with its connection
 /// (leave/close) or when retracted through
-/// [`CallEngine::unpublish`](crate::engine::CallEngine::unpublish); after
+/// `CallEngine::unpublish`; after
 /// that, `capture_*` calls on the handle error rather than silently
 /// succeeding, so a capture loop learns to stop.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]

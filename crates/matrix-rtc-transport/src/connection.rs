@@ -5,7 +5,8 @@
 
 //! The contract a media transport implements.
 //!
-//! A transport (LiveKit SFU today; P2P or WebTransport pub/sub later) knows
+//! The MSC4143 *transport* is the description a member advertises — the core's
+//! [`RtcTransport`]; this module is how media connects to one. A transport (LiveKit SFU today; P2P or WebTransport pub/sub later) knows
 //! how to reach the media a member advertises in the `transports.published`
 //! field of their `m.rtc.member` event, and how to map between MatrixRTC
 //! memberships and its own participant identities.
@@ -29,11 +30,39 @@ use matrix_rtc_core::{JoinedMembership, MaybeSend, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::constraints::ResolvedConstraints;
-use crate::event::FrameEncryptionState;
 use crate::frame::{AudioFrame, VideoFrame};
 use crate::local::{LocalTrackHandle, PublishOptions};
-use crate::participant::MediaStreamKind;
 use crate::stats::ReceiveStats;
+use crate::stream::MediaStreamKind;
+
+/// Whether a participant's frames are encrypting and decrypting cleanly.
+///
+/// Reported per participant rather than per stream: the transport's frame
+/// cryptor is keyed by participant identity, so a failure does not say which
+/// of their tracks it came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameEncryptionState {
+    /// Frames are being encrypted and decrypted normally.
+    Ok,
+    /// Frames are arriving with a key index we hold no key for — their media
+    /// key has not reached us (or reached us under the wrong identity).
+    MissingKey,
+    /// We hold a key for the index the frames carry, but it does not decrypt
+    /// them. The two sides disagree about the key material itself.
+    DecryptionFailed,
+    /// Our *outgoing* frames failed to encrypt, so peers receive nothing
+    /// usable from us.
+    EncryptionFailed,
+    /// The transport's cryptor failed internally.
+    InternalError,
+}
+
+impl FrameEncryptionState {
+    /// Whether this state means media is not flowing usably.
+    pub fn is_failure(&self) -> bool {
+        !matches!(self, Self::Ok)
+    }
+}
 
 /// A boxed frame stream: `Send` off `wasm32` (frames cross into the engine's
 /// tasks), locally boxed on it (one thread, and JS-backed streams are `!Send`).

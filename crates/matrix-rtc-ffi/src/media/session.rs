@@ -18,9 +18,8 @@ use matrix_rtc_livekit::{
     LiveKitAttachOptions, LiveKitAttachment, LiveKitTransportConnection, MediaKeyBridge,
     attach_livekit,
 };
-use matrix_rtc_media::{
-    AttachError, CallEngine, CallEvent, MediaAttachment, MediaStreamKind, TransportConnection as _,
-};
+use matrix_rtc_media::{AttachError, CallEngine, CallEvent, MediaAttachment};
+use matrix_rtc_transport::{MediaStreamKind, TransportConnection as _};
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{

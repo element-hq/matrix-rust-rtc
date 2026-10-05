@@ -17,15 +17,14 @@ use std::sync::Arc;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::{MatrixBackend, RtcIdentityMapper, TransportIntent};
+use matrix_rtc_transport::{
+    ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
+    TransportConnection, TransportError,
+};
 use tokio::sync::broadcast;
 
 use crate::engine::{CallEngine, EngineConfig, StabilityConfig};
 use crate::event::CallEvent;
-use crate::keys::MediaKeyHandler;
-use crate::transport::{
-    ConnectionContext, MediaTransport, OwnFocusTransport, OwnMemberClaims, TransportConnection,
-    TransportError,
-};
 
 /// What [`attach_media`] needs besides the call, the transport and the key
 /// handler.

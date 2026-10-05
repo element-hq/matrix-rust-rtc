@@ -22,13 +22,13 @@
 //!   [`ReceiveStats::frames_decoded`] (video) stays flat, or
 //!   [`ReceiveStats::concealed_samples`] climbs in step with
 //!   [`ReceiveStats::total_samples_received`] (audio). Usually a key problem,
-//!   corroborated by [`CallEvent::FrameEncryptionState`].
+//!   corroborated by [`ConnectionEvent::EncryptionStateChanged`].
 //! - **Arriving and decoding, but lossy** — packets and frames both climbing
 //!   with [`ReceiveStats::packets_lost`] or `jitter` rising.
 //!
 //! Sample twice and compare: every field is a monotonic total, not a rate.
 //!
-//! [`CallEvent::FrameEncryptionState`]: crate::event::CallEvent::FrameEncryptionState
+//! [`ConnectionEvent::EncryptionStateChanged`]: crate::ConnectionEvent::EncryptionStateChanged
 
 /// Cumulative receive-side counters for one subscribed track.
 ///

@@ -12,7 +12,7 @@ members = [
     "crates/matrix-rtc-wasm",
     "crates/matrix-rtc-ffi",
     "crates/matrix-rtc-livekit",
-    "crates/matrix-rtc-livekit-proto",
+    "crates/matrix-rtc-transport",
     "uniffi-bindgen",
 ]
 resolver = "2"

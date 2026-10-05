@@ -38,6 +38,7 @@ env_filter = { version = "0.1", default-features = false }
 
 # --- `media` feature only (pulls libwebrtc; see the feature's comment) ------
 matrix-rtc-media = { path = "../matrix-rtc-media", optional = true }
+matrix-rtc-transport = { path = "../matrix-rtc-transport", optional = true }
 # Deliberately WITHOUT the `matrix-sdk` feature: the FFI host brings its own
 # Matrix stack; only the transport layer (token exchange, SFU, E2EE bridge)
 # is used.
@@ -61,6 +62,7 @@ android_logger = { version = "0.15", default-features = false }
 # slim signalling-only artifact is the default build.
 media = [
     "dep:matrix-rtc-media",
+    "dep:matrix-rtc-transport",
     "dep:matrix-rtc-livekit",
     "dep:reqwest",
     "dep:jni",

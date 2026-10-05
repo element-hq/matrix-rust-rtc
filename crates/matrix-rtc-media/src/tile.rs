@@ -14,7 +14,9 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
-use crate::participant::{MediaStreamKind, Participant, StreamState};
+use matrix_rtc_transport::MediaStreamKind;
+
+use crate::participant::{Participant, StreamState};
 
 /// What a tile is: a person, or a screen they are sharing.
 ///

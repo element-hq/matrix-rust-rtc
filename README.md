@@ -21,7 +21,7 @@ screenshare) plus per-stream **constraints** (visibility, rendered size,
 low-bandwidth mode). Everything underneath is hidden in Rust:
 
 - **No LiveKit types on the API surface.** LiveKit is one implementation of
-  the `MediaTransport` trait (`crates/matrix-rtc-media`); future transports
+  the `MediaTransport` trait (`crates/matrix-rtc-transport`); future transports
   (P2P, WebTransport) slot into the same model.
 - **MSC4195 multi-SFU built in**: each member publishes to their own focus
   and the engine maintains one connection per distinct focus in the call,
@@ -107,10 +107,14 @@ for a runnable two-client example against the local backend.
 
 ## Workspace crates
 
-- `crates/matrix-rtc-media`: the transport-agnostic media model — participants,
-  frame streams, constraints resolver, and the `CallEngine` connection pool
-  (MSC4195 multi-SFU). Depends on core + tokio only; **no LiveKit**, fully
-  unit-tested against a fake transport.
+- `crates/matrix-rtc-transport`: how media flows, for any application on the
+  core — the `MediaTransport` contract, frames, constraints, the media key
+  handler, and the pure MSC4195 control plane (`livekit`). No IO, **no
+  LiveKit client**; compiles for wasm32.
+- `crates/matrix-rtc-media`: the call's media model over that contract —
+  participants, tiles, the unified event stream, `attach_media`, and the
+  `CallEngine` connection pool (MSC4195 multi-SFU). Fully unit-tested against
+  a fake transport.
 - `crates/matrix-rtc-livekit`: MSC4195 LiveKit transport — SFU token exchange,
   per-participant frame E2EE, the `MediaTransport` implementation, and the
   high-level `LiveKitCall::join` facade. Native-only (pulls in `libwebrtc`).

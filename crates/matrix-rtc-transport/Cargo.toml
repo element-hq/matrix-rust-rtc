@@ -1,0 +1,36 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "How MatrixRTC media flows: the transport contract, frames, constraints, the media key handler, and the pure MSC4195 LiveKit control plane. No IO, no libwebrtc — compiles for wasm32."
+
+[dependencies]
+# Memberships and transports the contract is phrased in, the key signals the
+# handler consumes, `MaybeSend`, the executor (the `delayBeforeUse` timer), and
+# the pre-2026 formats (`compat`) the LiveKit identity/endpoint choices key on.
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+# Sync primitives only (the connection event channel); timers go through
+# `matrix_rtc_core::executor`.
+tokio = { workspace = true }
+# `BoxStream`/`LocalBoxStream` for the frame streams handed out by
+# `RemoteTrackHandle`. Only the type is needed here; combinators stay in the
+# transport implementations.
+futures-core = "0.3"
+async-trait.workspace = true
+log.workspace = true
+thiserror.workspace = true
+# The `livekit` module: token exchange shapes and the MSC4195 hash derivations.
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time", "sync", "test-util"] }

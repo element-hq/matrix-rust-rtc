@@ -54,7 +54,7 @@ use clap::Parser;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, open_slot};
-use matrix_rtc_media::{
+use matrix_rtc_transport::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
     VideoRotation, VideoSourceConfig,
 };

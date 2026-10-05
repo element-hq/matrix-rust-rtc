@@ -47,7 +47,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
-use matrix_rtc_media::{
+use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
     QualityLimit, ReceiveStats, RemoteTrackHandle, ResolvedConstraints, SpeakingParticipant,

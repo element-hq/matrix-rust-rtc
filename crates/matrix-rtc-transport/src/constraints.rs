@@ -11,7 +11,7 @@
 //! deliberately transport-free so a P2P or WebTransport backend can interpret
 //! the same values with its own signalling.
 //!
-//! The [`CallEngine`](crate::engine::CallEngine) stores constraints and hands
+//! The call engine (`matrix-rtc-media`) stores constraints and hands
 //! transports only the folded [`ResolvedConstraints`]; transports interpret,
 //! they never police. Whatever is asked for is a *cap*: transports and
 //! servers still adapt downwards under congestion on their own.
@@ -35,7 +35,7 @@
 //!   its wire protocol in favour of dimensions). The two are mutually
 //!   exclusive by construction.
 
-use crate::participant::MediaStreamKind;
+use crate::stream::MediaStreamKind;
 
 /// A rendered size in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

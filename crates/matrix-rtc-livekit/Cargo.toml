@@ -20,11 +20,13 @@ matrix-rtc-call = { path = "../matrix-rtc-call" }
 # `SdkBackend`, the matrix-rust-sdk `MatrixBackend` that `call` drives. Behind
 # this crate's `matrix-sdk` feature. Nothing in it knows about LiveKit.
 matrix-rtc-matrix-sdk = { path = "../matrix-rtc-matrix-sdk", optional = true }
-# The pure MSC4195 control plane (identity derivations, token shapes, dialect
-# choices), shared with the web binding. This crate re-exports it and adds the
-# IO: reqwest for the token POST, livekit for the SFU itself.
-matrix-rtc-livekit-proto = { path = "../matrix-rtc-livekit-proto" }
-# Transport-agnostic media model this crate implements (`transport_impl`).
+# The transport contract this crate implements (`transport_impl`), and the pure
+# MSC4195 control plane (`livekit`: identity derivations, token shapes, dialect
+# choices) shared with the web binding. This crate re-exports the latter and
+# adds the IO: reqwest for the token POST, livekit for the SFU itself.
+matrix-rtc-transport = { path = "../matrix-rtc-transport" }
+# The call's media engine and `attach_media`, for `attach_livekit` and the
+# `LiveKitCall` facade.
 matrix-rtc-media = { path = "../matrix-rtc-media" }
 serde = { workspace = true }
 serde_json = { workspace = true }

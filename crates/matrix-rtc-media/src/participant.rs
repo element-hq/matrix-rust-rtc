@@ -11,18 +11,7 @@
 //! of truth for who is in the call; transports only attach media to entries
 //! that already exist.
 
-/// The kind of media stream a participant publishes.
-///
-/// Ordered so a set of streams can be reported in a stable order; the
-/// declaration order below is what that ordering is.
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum MediaStreamKind {
-    Microphone,
-    Camera,
-    ScreenShare,
-    ScreenShareAudio,
-    Data,
-}
+use matrix_rtc_transport::MediaStreamKind;
 
 /// Live state of one media stream of a participant.
 #[derive(Clone, Debug, PartialEq, Eq)]

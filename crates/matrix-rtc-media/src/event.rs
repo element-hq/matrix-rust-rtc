@@ -16,36 +16,7 @@
 
 use matrix_rtc_core::KeyRejection;
 
-use crate::participant::MediaStreamKind;
-
-/// Whether a participant's frames are encrypting and decrypting cleanly.
-///
-/// Reported per participant rather than per stream: the transport's frame
-/// cryptor is keyed by participant identity, so a failure does not say which
-/// of their tracks it came from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameEncryptionState {
-    /// Frames are being encrypted and decrypted normally.
-    Ok,
-    /// Frames are arriving with a key index we hold no key for — their media
-    /// key has not reached us (or reached us under the wrong identity).
-    MissingKey,
-    /// We hold a key for the index the frames carry, but it does not decrypt
-    /// them. The two sides disagree about the key material itself.
-    DecryptionFailed,
-    /// Our *outgoing* frames failed to encrypt, so peers receive nothing
-    /// usable from us.
-    EncryptionFailed,
-    /// The transport's cryptor failed internally.
-    InternalError,
-}
-
-impl FrameEncryptionState {
-    /// Whether this state means media is not flowing usably.
-    pub fn is_failure(&self) -> bool {
-        !matches!(self, Self::Ok)
-    }
-}
+use matrix_rtc_transport::{FrameEncryptionState, MediaStreamKind};
 
 /// What the media layer can say about a frame-encryption failure.
 ///

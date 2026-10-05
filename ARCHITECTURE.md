@@ -13,51 +13,57 @@ The goal is to keep protocol logic in one Rust core crate and make all platform 
 - `matrix-rtc-matrix-sdk` owns the matrix-rust-sdk implementation of that backend.
 - `matrix-rtc-wasm` owns JavaScript-facing conversion and wasm export details.
 - `matrix-rtc-ffi` owns native binding-facing conversion and UniFFI boundary types.
-- `matrix-rtc-livekit-proto` owns the pure MSC4195 control plane (identity
-  derivations, token shapes, dialect choices) shared by the native transport
-  and the web binding.
+- `matrix-rtc-transport` owns how media flows for any application on the
+  core: the transport contract, frames, constraints, the media key handler,
+  and the pure MSC4195 control plane (`livekit`: identity derivations, token
+  shapes, dialect choices) shared by the native transport and the web binding.
+- `matrix-rtc-media` owns the call's media model over that contract: the
+  roster, tiles, the unified event stream, and attaching media to a call.
 
 Three axes, kept separate on purpose: the core answers *what the protocol says*,
 `matrix-rtc-call` and a backend (`matrix-rtc-matrix-sdk`'s, or the host's) *how it
-reaches a homeserver*, and `matrix-rtc-media` + a transport crate *how bytes
-flow*. Only the top-level facade
+reaches a homeserver*, and `matrix-rtc-transport` + an implementation of it
+*how bytes flow*. Only the top-level facade
 (`matrix_rtc_livekit::call::LiveKitCall`) knows all three.
 
 Arrows point at what a crate depends on:
 
 ```
- matrix-rtc-wasm              matrix-rtc-ffi
-   │   │                        │      ╎ feature "media"
-   │   │                        │      ▼
-   │   │                        │   matrix-rtc-livekit ──▶ matrix-rtc-matrix-sdk
-   │   ▼                        │      │                      │
-   │ matrix-rtc-livekit-proto ◀─┼──────┤                      │
-   │   │                        │      │                      │
-   ▼   │                        │      ▼                      │
- matrix-rtc-media ─────────┐    │                             │
-                           ▼    ▼                             ▼
+ matrix-rtc-wasm            matrix-rtc-ffi
+      │                       │  ╎ feature "media"
+      │                       │  ▼
+      │                       │ matrix-rtc-livekit ──────▶ matrix-rtc-matrix-sdk
+      │                       │  │  native SFU, facade             │
+      ▼                       │  ▼                                 │
+ matrix-rtc-media ◀───────────┼──┘  roster, tiles, attach_media    │
+      │                       │                                    │
+      ▼                       │                                    │
+ matrix-rtc-transport         │     contract, keys, MSC4195 shapes │
+      ╎                       ▼                                    ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │     matrix-rtc-call   (the call, the dialects)                     │
 ├────────────────────────────────────────────────────────────────────┤
 │                          matrix-rtc-core                           │
 └────────────────────────────────────────────────────────────────────┘
-   (every crate above also depends on matrix-rtc-core directly; the
-    ffi takes matrix-rtc-media and matrix-rtc-livekit only under "media")
+   (every crate above also depends on matrix-rtc-core directly, and
+    matrix-rtc-transport on it alone; the ffi takes the media crates
+    only under "media")
 ```
 
-Two things that shape reveals. **`matrix-rtc-matrix-sdk` and `matrix-rtc-media` are
+Three things that shape reveals. **`matrix-rtc-matrix-sdk` and `matrix-rtc-media` are
 siblings, not layers** — the SDK backend and the media plane both sit on the
 call layer, neither knows the other exists, and `matrix-rtc-livekit` is the first crate
-that needs both. And **the media plane splits by what owns the bytes**:
-`matrix-rtc-media` (the roster/pool engine) and `matrix-rtc-livekit-proto` (the
-pure MSC4195 control plane) compile for wasm32 and are shared by both bindings,
+that needs both. **`matrix-rtc-transport` knows no call**: it sits on the core
+alone, so another application on MSC4143 can carry media with it. And **the
+media plane splits by what owns the bytes**: `matrix-rtc-media` and
+`matrix-rtc-transport` compile for wasm32 and are shared by both bindings,
 while `matrix-rtc-livekit` (libwebrtc, reqwest) stays native-only — browsers keep
 using livekit-js for the media itself, driven through a JS delegate.
 `matrix-rtc-ffi`'s default build stays slim: the transport and media crates enter
 only under its `media` feature, which is what keeps that mobile artifact free of
-`libwebrtc`. For legibility the diagram omits one edge: under `media`,
-`matrix-rtc-ffi` also depends on `matrix-rtc-media` directly, not just through
-the transport.
+`libwebrtc`. For legibility the diagram omits the direct edges from
+`matrix-rtc-wasm`, `matrix-rtc-ffi` and `matrix-rtc-livekit` to
+`matrix-rtc-transport`.
 
 This keeps the core reusable and testable while avoiding platform-specific dependencies in core.
 
@@ -71,7 +77,7 @@ shared board would be a sibling of `matrix-rtc-call` on the same core:
                  │
                  ▼
           matrix-rtc-media   engine, pool, tiles (still imports call types)
-                 │
+                 │                 └──▶ matrix-rtc-transport  contract, keys, MSC4195
                  ▼
           matrix-rtc-call    RtcClient → RtcRoom → RtcSession/RtcCall; reactions, MSC4075
                  │
@@ -253,7 +259,7 @@ Membership is always applied as a complete set: a member whose event is absent f
     and the slot condition is left unenforced because that generation has no
     slot concept.
   - Two things refuse to be JSON and so live outside `compat` as one `match`
-    each, in `matrix-rtc-livekit-proto` because both are MSC4195 rather than
+    each, in `matrix_rtc_transport::livekit` because both are MSC4195 rather than
     Matrix concerns: the token endpoint and the identity derivation. The backend
     knows no format: it delivers whatever state types the feeder asks for.
 
@@ -296,22 +302,16 @@ Membership is always applied as a complete set: a member whose event is absent f
 
 ## `crates/matrix-rtc-media`
 
-- The transport-agnostic media model: `Participant` roster keyed by
-  `member_id`, `CallEvent` (the unified membership + media event stream),
-  owned frame types (`AudioFrame` PCM, `VideoFrame` I420), per-stream
-  `MediaConstraints` (visibility, rendered size, quality cap → subscribe-side
-  simulcast control, debounced and re-applied by the engine whenever a
-  stream (re)appears), and the publish surface (`PublishOptions` →
-  `LocalTrackHandle`; the application pushes captured frames in, the
-  transport owns encoding/simulcast, publications go to the own focus, and
-  `CallEngine::unpublish` retracts one — a mute keeps the publication up,
-  which is right for a camera but not for a stopped screen share).
-- Defines the `MediaTransport`/`TransportConnection`/`RemoteTrackHandle`
-  traits a transport backend implements (LiveKit today; P2P/WebTransport
-  designed for) and the `CallEngine` that reconciles core membership
+- The call's media model over `matrix-rtc-transport`: `Participant` roster
+  keyed by `member_id`, `CallEvent` (the unified membership + media event
+  stream), tiles, and the `CallEngine` that reconciles core membership
   snapshots with transport `ConnectionEvent`s: reverse identity mapping
   (pseudonymous identity → membership), buffering of media that arrives
-  before its membership, roster/event emission.
+  before its membership, roster/event emission. It stores per-stream
+  `MediaConstraints` (debounced and re-applied whenever a stream (re)appears)
+  and routes publications to the own focus; `CallEngine::unpublish` retracts
+  one — a mute keeps the publication up, which is right for a camera but not
+  for a stopped screen share.
 - The engine owns the **multi-focus connection pool** (MSC4195 multi-SFU):
   members are grouped by their published transports' connection key
   (LiveKit: the `livekit_service_url`); the engine connects to every peer
@@ -327,31 +327,40 @@ Membership is always applied as a complete set: a member whose event is absent f
   sender's key index after it) shared by the FFI and wasm media sessions and
   `LiveKitCall`. Transports opt in with `OwnFocusTransport`, which hands the
   caller a typed own-focus connection.
-- Depends only on `matrix-rtc-core`, `matrix-rtc-call` (temporarily, for hand and
-  reaction types) + tokio/futures — no LiveKit, no
+- Depends only on `matrix-rtc-core`, `matrix-rtc-transport`, `matrix-rtc-call`
+  (temporarily, for hand and reaction types) + tokio/futures — no LiveKit, no
   libwebrtc, fully unit-testable (`FakeTransport`). Compiles for wasm32:
   the transport traits are `Send + Sync` off wasm (via `MaybeSend`) and
   unconstrained on it, and tasks/timers go through `matrix_rtc_core::executor`
   (tokio natively; `spawn_local` + setTimeout-backed sleeps in the browser,
   where the engine's actor runs on the JS microtask queue).
-- Also owns the transport-agnostic media-key handler (`keys`):
-  `FrameKeyRing` is the seam a transport's key ring implements (LiveKit
-  native's `KeyProvider`, livekit-js's `ExternalE2EEKeyProvider`), and
-  `MediaKeyHandler` owns the recording, ring-size guard, rejected-key rule,
-  local sender's index switch, and the MSC4143 `delayBeforeUse` wait.
 - Design/feasibility notes and the phased plan:
   `agent-workspace/media-abstraction/PLAN.md`.
 
-## `crates/matrix-rtc-livekit-proto`
+## `crates/matrix-rtc-transport`
 
-- The pure half of the MSC4195 LiveKit control plane, shared by the native
-  transport and the web binding: `identity` (the hash derivations),
-  `token` (`/get_token` and legacy `/sfu/get` request builders and the
-  response decoder — no IO), `TokenEndpoint`, and `identity_mapper` (the
-  per-generation identity derivation, deliberately a Rust closure because
-  `RtcIdentityMapper` is `Send + Sync`).
-- Compiles for wasm32; `matrix-rtc-livekit` re-exports it under its
-  original paths and adds the IO (reqwest, the LiveKit client).
+- How media flows, for any application on the core — no call vocabulary, no
+  IO, no libwebrtc; compiles for wasm32.
+- `connection`: the `MediaTransport`/`TransportConnection`/`RemoteTrackHandle`
+  traits a transport implements (LiveKit today; P2P/WebTransport designed
+  for), `OwnFocusTransport` for a typed own-focus connection, and the
+  `ConnectionEvent`s it reports.
+- Owned frames (`AudioFrame` PCM, `VideoFrame` I420), the publish surface
+  (`PublishOptions` → `LocalTrackHandle`; the application pushes captured
+  frames in, the transport owns encoding/simulcast), `ReceiveStats`, and
+  per-stream `MediaConstraints` (visibility, rendered size, quality cap →
+  subscribe-side simulcast control).
+- `keys`: `FrameKeyRing` is the seam a transport's key ring implements
+  (LiveKit native's `KeyProvider`, livekit-js's `ExternalE2EEKeyProvider`),
+  and `MediaKeyHandler` owns the recording, ring-size guard, rejected-key
+  rule, local sender's index switch, and the MSC4143 `delayBeforeUse` wait.
+- `livekit`: the pure half of the MSC4195 control plane, shared by the native
+  transport and the web binding — `identity` (the hash derivations), `token`
+  (`/get_token` and legacy `/sfu/get` request builders and the response
+  decoder), `TokenEndpoint`, and `identity_mapper` (the per-generation identity
+  derivation, deliberately a Rust closure because `RtcIdentityMapper` is
+  `Send + Sync`). `matrix-rtc-livekit` re-exports it under its original paths
+  and adds the IO (reqwest, the LiveKit client).
 
 ## `crates/matrix-rtc-wasm`
 
@@ -366,7 +375,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   `matrix_rtc_media::attach_media` — the shared `CallEngine` (roster +
   multi-focus pool) over `JsMediaTransport`, a JS
   delegate driving livekit-js. Rust owns the protocol (token requests via
-  `-proto`, identities, pool policy, key bookkeeping via the shared
+  `matrix_rtc_transport::livekit`, identities, pool policy, key bookkeeping via the shared
   `MediaKeyHandler` backed by the delegate's `setKey`); JS owns the IO
   (OpenID token, `fetch`, `Room.connect`) and all media. Room events come
   back through the typed `WasmConnectionEventSink`; roster entries carry

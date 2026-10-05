@@ -78,8 +78,9 @@ use tokio::sync::{broadcast, mpsc};
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
-use matrix_rtc_media::{
-    CallEvent, I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
+use matrix_rtc_media::CallEvent;
+use matrix_rtc_transport::{
+    I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
 };
 
 /// Hard cap on a whole run, so a wedged stack fails the Playwright test with

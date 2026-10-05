@@ -67,9 +67,10 @@ use matrix_sdk_ui::sync_service::SyncService;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::compat::MembershipFormat;
 use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
-use matrix_rtc_media::{
-    CallEvent, I420Buffer, MediaConstraints, MediaStreamKind, Participant as MediaParticipant,
-    PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
+use matrix_rtc_media::{CallEvent, Participant as MediaParticipant};
+use matrix_rtc_transport::{
+    I420Buffer, MediaConstraints, MediaStreamKind, PublishOptions, VideoFrame, VideoRotation,
+    VideoSourceConfig,
 };
 
 use provision::Credentials;
@@ -773,7 +774,7 @@ async fn wait_for_remote_track(
     member_id: &str,
     kind: MediaStreamKind,
     deadline: tokio::time::Instant,
-) -> Option<std::sync::Arc<dyn matrix_rtc_media::RemoteTrackHandle>> {
+) -> Option<std::sync::Arc<dyn matrix_rtc_transport::RemoteTrackHandle>> {
     loop {
         if let Some(track) = call.remote_track(member_id, kind) {
             return Some(track);
@@ -1051,7 +1052,7 @@ async fn record_peer_tone(
     freq: f64,
 ) -> Result<bool, Box<dyn Error>> {
     use futures_util::StreamExt;
-    use matrix_rtc_media::MediaStreamKind;
+    use matrix_rtc_transport::MediaStreamKind;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
 

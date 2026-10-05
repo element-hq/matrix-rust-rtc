@@ -100,8 +100,8 @@ pub struct RtcLogConfig {
     ///
     /// Targets are module paths, so a directive matches by prefix: the
     /// filterable roots are `matrix_rtc_core`, `matrix_rtc_media`,
-    /// `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus third-party `livekit` and
-    /// `webrtc_sys`. Empty means "no overrides".
+    /// `matrix_rtc_transport`, `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus
+    /// third-party `livekit` and `webrtc_sys`. Empty means "no overrides".
     #[uniffi(default = "")]
     pub filter: String,
 

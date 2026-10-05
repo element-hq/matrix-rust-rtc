@@ -17,8 +17,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 
 use super::*;
-use crate::keys::FrameKeyRing;
-use crate::transport::{ConnectionEvent, TransportConnection};
+use matrix_rtc_transport::{ConnectionEvent, FrameKeyRing, TransportConnection};
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "m.call#room";

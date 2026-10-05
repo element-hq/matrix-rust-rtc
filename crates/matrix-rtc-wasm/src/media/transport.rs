@@ -8,7 +8,7 @@
 //!
 //! The division of labour mirrors [`JsBackend`](crate::backend::JsBackend):
 //! Rust owns the protocol — token request building and response decoding
-//! (`matrix-rtc-livekit-proto`), identity derivation, connection keying, and
+//! (`matrix_rtc_transport::livekit`), identity derivation, connection keying, and
 //! the engine's pool/backoff policy — while JS owns the IO: the OpenID token
 //! (matrix-js-sdk has it natively), the token `fetch` (so app-level CORS,
 //! proxy, and abort policy stay where the app configures them), and
@@ -29,17 +29,19 @@
 //!   index (see `MediaKeyHandler::set_local_sender`)
 //! - `setKey(identity, index, key: Uint8Array) -> Promise<boolean|void>` —
 //!   install a media key in livekit-js's key provider (the
-//!   [`FrameKeyRing`](matrix_rtc_media::keys::FrameKeyRing) seam)
+//!   [`FrameKeyRing`](matrix_rtc_transport::keys::FrameKeyRing) seam)
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
 use matrix_rtc_core::{JoinedMembership, MatrixBackend, RtcIdentityMapper, RtcTransport};
-use matrix_rtc_livekit_proto::token::{get_token_request, legacy_token_request, parse_sfu_token};
-use matrix_rtc_livekit_proto::{SfuToken, TokenEndpoint};
-use matrix_rtc_media::keys::FrameKeyRing;
-use matrix_rtc_media::{
+use matrix_rtc_transport::keys::FrameKeyRing;
+use matrix_rtc_transport::livekit::token::{
+    get_token_request, legacy_token_request, parse_sfu_token,
+};
+use matrix_rtc_transport::livekit::{SfuToken, TokenEndpoint};
+use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaStreamKind, MediaTransport,
     OwnFocusTransport, RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
 };
@@ -308,7 +310,7 @@ impl JsMediaTransport {
 
     /// Obtain a fresh OpenID token from the backend and exchange it for an
     /// SFU JWT: Rust builds the request and decodes the response
-    /// (`matrix-rtc-livekit-proto`), the delegate performs the fetch.
+    /// (`matrix_rtc_transport::livekit`), the delegate performs the fetch.
     async fn acquire_token(
         &self,
         livekit_service_url: &str,
@@ -325,7 +327,7 @@ impl JsMediaTransport {
                 livekit_service_url,
                 &ctx.room_id,
                 &ctx.slot_id,
-                &matrix_rtc_livekit_proto::MemberClaims {
+                &matrix_rtc_transport::livekit::MemberClaims {
                     id: ctx.member.member_id.clone(),
                     claimed_user_id: ctx.member.user_id.clone(),
                     claimed_device_id: ctx.member.device_id.clone(),

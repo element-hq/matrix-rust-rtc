@@ -17,13 +17,13 @@ use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_livekit_proto::{TokenEndpoint, identity_mapper};
-use matrix_rtc_media::keys::MediaKeyHandler;
 use matrix_rtc_media::{
-    AttachOptions, CallEngine, CallEvent, EndedReason, FrameEncryptionDiagnostic,
-    FrameEncryptionState, MediaAttachment, Participant, StabilityConfig, TransportConnection as _,
-    attach_media,
+    AttachOptions, CallEngine, CallEvent, EndedReason, FrameEncryptionDiagnostic, MediaAttachment,
+    Participant, StabilityConfig, attach_media,
 };
+use matrix_rtc_transport::keys::MediaKeyHandler;
+use matrix_rtc_transport::livekit::{TokenEndpoint, identity_mapper};
+use matrix_rtc_transport::{FrameEncryptionState, TransportConnection as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use wasm_bindgen::prelude::*;

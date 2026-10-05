@@ -50,9 +50,10 @@ use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{BaseRtcRoom, EncryptionConfig, LiveKitTransport, SlotEncryption};
 use matrix_rtc_matrix_sdk::SdkMatrixBackend;
-use matrix_rtc_media::{
-    CallEngine, CallEvent, LocalTrackHandle, MediaAttachment, MediaConstraints, MediaStreamKind,
-    Participant, PublishOptions, ReceiveStats, RemoteTrackHandle, StabilityConfig,
+use matrix_rtc_media::{CallEngine, CallEvent, MediaAttachment, Participant, StabilityConfig};
+use matrix_rtc_transport::{
+    LocalTrackHandle, MediaConstraints, MediaStreamKind, PublishOptions, ReceiveStats,
+    RemoteTrackHandle,
 };
 
 use crate::session::LiveKitSession;
@@ -72,7 +73,7 @@ pub enum LiveKitCallError {
 
     /// A media transport error surfaced through the media layer.
     #[error(transparent)]
-    Media(#[from] matrix_rtc_media::TransportError),
+    Media(#[from] matrix_rtc_transport::TransportError),
 
     /// Attaching media to the joined call failed.
     #[error(transparent)]
@@ -588,7 +589,7 @@ impl LiveKitCall {
         // peer-focus connection; the own-focus close below reports its result.
         engine.shutdown().await;
         log::debug!("[{room_id}] leave: media engine down; closing own SFU connection");
-        use matrix_rtc_media::TransportConnection as _;
+        use matrix_rtc_transport::TransportConnection as _;
         let close_result = connection.close().await.map_err(LiveKitCallError::from);
         log::debug!("[{room_id}] leave: complete");
         leave_result.and(close_result)

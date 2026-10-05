@@ -28,10 +28,10 @@
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
 // The pure control plane — hash derivations, token shapes, dialect choices —
-// lives in `matrix-rtc-livekit-proto`, which the web binding shares; this crate
+// lives in `matrix_rtc_transport::livekit`, which the web binding shares; this crate
 // re-exports it under the paths it always had.
-pub use matrix_rtc_livekit_proto::identity;
-pub use matrix_rtc_livekit_proto::{LiveKitTransportConfig, TokenEndpoint, identity_mapper};
+pub use matrix_rtc_transport::livekit::identity;
+pub use matrix_rtc_transport::livekit::{LiveKitTransportConfig, TokenEndpoint, identity_mapper};
 
 pub mod attach;
 pub mod keys;
@@ -185,7 +185,7 @@ pub enum Error {
     /// The authorisation service rejected the request or answered with a body
     /// that does not decode.
     #[error(transparent)]
-    Service(#[from] matrix_rtc_livekit_proto::TokenServiceError),
+    Service(#[from] matrix_rtc_transport::livekit::TokenServiceError),
 
     /// Obtaining the Matrix OpenID token from the host failed.
     #[error(transparent)]

@@ -153,7 +153,7 @@ fn a_receive_only_call_connects_without_a_focus_of_its_own() {
 
 #[test]
 fn constraint_dtos_fold_like_the_core_model() {
-    let constraints: matrix_rtc_media::MediaConstraints = FfiMediaConstraints {
+    let constraints: matrix_rtc_transport::MediaConstraints = FfiMediaConstraints {
         enabled: true,
         visible: false,
         detail: FfiVideoDetail::Dimensions {
@@ -166,10 +166,10 @@ fn constraint_dtos_fold_like_the_core_model() {
 
     assert!(matches!(
         constraints.detail,
-        matrix_rtc_media::VideoDetail::Dimensions(d) if d.width == 320 && d.height == 180
+        matrix_rtc_transport::VideoDetail::Dimensions(d) if d.width == 320 && d.height == 180
     ));
-    let resolved = constraints.resolve(matrix_rtc_media::MediaStreamKind::Camera);
-    assert_eq!(resolved.demand, matrix_rtc_media::StreamDemand::Paused);
+    let resolved = constraints.resolve(matrix_rtc_transport::MediaStreamKind::Camera);
+    assert_eq!(resolved.demand, matrix_rtc_transport::StreamDemand::Paused);
 }
 
 // ---- tile DTOs (spec 002) ------------------------------------------------------
@@ -204,7 +204,7 @@ fn tile_id_round_trips_through_the_ffi() {
 fn stream_ref_converts_every_kind() {
     use FfiStreamKind::{Camera, Data, Microphone, ScreenShare, ScreenShareAudio};
     for kind in [Microphone, Camera, ScreenShare, ScreenShareAudio, Data] {
-        let (member_id, back): (String, matrix_rtc_media::MediaStreamKind) = FfiStreamRef {
+        let (member_id, back): (String, matrix_rtc_transport::MediaStreamKind) = FfiStreamRef {
             member_id: "m".to_owned(),
             kind,
         }
@@ -226,7 +226,7 @@ fn stream_stats_dto_zips_request_with_results() {
             kind: FfiStreamKind::Camera,
         },
     ];
-    let answered = matrix_rtc_media::ReceiveStats {
+    let answered = matrix_rtc_transport::ReceiveStats {
         packets_received: 7,
         ..Default::default()
     };

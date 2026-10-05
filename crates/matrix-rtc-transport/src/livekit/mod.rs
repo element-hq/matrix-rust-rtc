@@ -11,7 +11,7 @@
 //! dialect choices ([`TokenEndpoint`], [`identity_mapper`]). The native
 //! transport (`matrix-rtc-livekit`, which owns libwebrtc and reqwest) builds on
 //! this; so does the web binding, where the browser does the fetching and
-//! livekit-js does the media — which is why this crate must stay free of
+//! livekit-js does the media — which is why this module must stay free of
 //! `livekit`, HTTP clients, and async runtimes, and compile for
 //! `wasm32-unknown-unknown`.
 

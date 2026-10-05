@@ -6,7 +6,7 @@
 //! LiveKit SFU authorisation service token exchange ([MSC4195]) — the IO half.
 //!
 //! The endpoint URLs, request bodies, and response decoding live in
-//! [`matrix_rtc_livekit_proto::token`], where the web binding shares them; this
+//! [`matrix_rtc_transport::livekit::token`], where the web binding shares them; this
 //! module only POSTs what that one builds. Obtaining the OpenID token itself is
 //! a Client-Server API concern and belongs to the backend: the host
 //! supplies one through
@@ -16,8 +16,10 @@
 //! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
 use matrix_rtc_core::OpenIdToken;
-pub use matrix_rtc_livekit_proto::token::{MemberClaims, SfuToken};
-use matrix_rtc_livekit_proto::token::{get_token_request, legacy_token_request, parse_sfu_token};
+pub use matrix_rtc_transport::livekit::token::{MemberClaims, SfuToken};
+use matrix_rtc_transport::livekit::token::{
+    get_token_request, legacy_token_request, parse_sfu_token,
+};
 
 use crate::Error;
 
@@ -45,7 +47,7 @@ pub async fn get_token(
 ///
 /// For interoperating with Element Call builds older than MSC4354. There is
 /// deliberately no fallback from `/get_token` to this on a 404 — see
-/// [`matrix_rtc_livekit_proto::token::legacy_token_request`]. Temporary; see
+/// [`matrix_rtc_transport::livekit::token::legacy_token_request`]. Temporary; see
 /// [`crate::compat`].
 pub async fn get_legacy_token(
     http: &reqwest::Client,
