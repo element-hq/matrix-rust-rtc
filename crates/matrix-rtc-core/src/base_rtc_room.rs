@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
@@ -23,7 +23,7 @@ use crate::host::backend::MatrixBackend;
 use crate::host::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
-use crate::session::{JoinedMembership, RtcMembershipEvent, SlotSession};
+use crate::session::{JoinedMembership, LeaveReason, RtcMembershipEvent, SlotSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
@@ -288,6 +288,15 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         self.sessions
             .get(slot_id)
             .map(SlotSession::subscribe_membership_snapshots)
+    }
+
+    /// Subscribes to the leaves one slot's session makes on its own (see
+    /// [`SlotSession::subscribe_auto_leaves`]), or `None` if no session exists
+    /// for it yet.
+    pub fn subscribe_auto_leaves(&self, slot_id: &str) -> Option<broadcast::Receiver<LeaveReason>> {
+        self.sessions
+            .get(slot_id)
+            .map(SlotSession::subscribe_auto_leaves)
     }
 
     /// Subscribes to membership snapshots of one slot, creating its session if

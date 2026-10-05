@@ -120,6 +120,8 @@ where
     let memberships = call.subscribe_memberships().await;
     let raised_hands = call.subscribe_raised_hands().await;
     let reactions = call.subscribe_reactions().await;
+    // A slot closing ends the call on every host from inside the engine.
+    let auto_leave = call.subscribe_auto_leave();
 
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
@@ -155,6 +157,7 @@ where
             own_connection_key: own_key.clone(),
             raised_hands,
             reactions,
+            auto_leave: Some(auto_leave),
             stability: options.stability,
         },
         memberships,

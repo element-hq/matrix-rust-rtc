@@ -83,6 +83,14 @@ room.shutdown()                                    // leaves what is still joine
   through its own SDK or push path; open the room when the user answers or
   starts a call.
 
+## When the slot closes
+
+A slot closing mid-call ends the call for everyone in it. The library sends your
+leave (`leave_reason.code = "slot_closed"`) and stops the keep-alive on its own;
+the call is over (`isLive()` is false). A `MediaSession` then ends itself with
+`Ended(SlotClosed)`; a host running its own media waits on
+`call.waitForAutoLeave()` and tears it down there.
+
 ## Turn on logging first
 
 The SDK is silent until the host installs a logger. Do this before creating an

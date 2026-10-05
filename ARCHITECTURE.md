@@ -741,9 +741,9 @@ Still outstanding:
 3. **A unified `CallEvent` stream on the `LiveKitCall` facade** — landed as
    `matrix_rtc_call_sdk::CallEvent` via `LiveKitCall::subscribe_call_events` (peer
    joined/left, stream started/stopped, key imported, connection health,
-   ended-with-reason). Remaining: migrate the e2e test and examples off the
-   raw `LiveKitCall::events`/`LiveKitCall::session` accessors and delete them, and surface
-   slot-close as `CallEvent::Ended`.
+   ended-with-reason, including `EndedReason::SlotClosed`). Remaining: migrate
+   the e2e test and examples off the raw `LiveKitCall::events`/`LiveKitCall::session`
+   accessors and delete them.
 
 ## Logging
 

@@ -118,6 +118,15 @@ impl From<FfiLeaveReason> for matrix_rtc_core::LeaveReason {
     }
 }
 
+impl From<matrix_rtc_core::LeaveReason> for FfiLeaveReason {
+    fn from(value: matrix_rtc_core::LeaveReason) -> Self {
+        FfiLeaveReason {
+            code: value.code.as_str().to_owned(),
+            reason: value.reason,
+        }
+    }
+}
+
 /// The RTC encryption mechanism an `m.rtc.slot` prescribes for its members.
 ///
 /// Its presence is what turns RTC encryption on for the slot; its absence turns
@@ -564,6 +573,26 @@ impl RtcCall {
     /// [`RtcRoom::subscribe_membership_snapshots`].
     pub async fn subscribe_membership_snapshots(&self) -> Arc<MembershipSnapshotSubscription> {
         MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await)
+    }
+
+    /// Resolves once the call has left without the host asking — the slot
+    /// closed under it (`code` `slot_closed`) — with the reason it sent; at once
+    /// if it already has. The leave is sent and the call is over by then. A
+    /// [`MediaSession`](crate::media::MediaSession) ends itself on this (as
+    /// `Ended(SlotClosed)`); a host running its own media tears it down here.
+    /// Never resolves for a call the host leaves itself: cancel it then.
+    pub async fn wait_for_auto_leave(&self) -> FfiLeaveReason {
+        let mut auto_leave = self.call.subscribe_auto_leave();
+        let reason = auto_leave
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|reason| reason.clone());
+        match reason {
+            Some(reason) => reason.into(),
+            // The sender lives as long as the call we hold.
+            None => std::future::pending().await,
+        }
     }
 
     // ---- Reactions and raised hands ----
@@ -1151,6 +1180,42 @@ mod tests {
             room.clone().join_call(join_params()).await,
             Err(MatrixRtcFfiError::InvalidInput(_))
         ));
+    }
+
+    /// A slot closing under a call makes it leave on its own, with
+    /// `slot_closed`, and tells a host that runs its own media.
+    #[tokio::test]
+    async fn closing_the_slot_leaves_and_reports_an_auto_leave() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.clone().join_call(join_params()).await.expect("join");
+
+        mock.room_sink(ROOM).on_state_events(
+            matrix_rtc_core::SLOT_EVENT_TYPE.to_owned(),
+            vec![FfiEventIn {
+                event_id: "$closed".to_owned(),
+                content_json: r#"{ "status": "closed" }"#.to_owned(),
+                ..open_slot(None)
+            }],
+        );
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), call.wait_for_auto_leave())
+            .await
+            .expect("an auto-leave");
+        assert_eq!(reason.code, "slot_closed");
+        assert!(!call.is_live());
+        let leave = mock
+            .sends()
+            .into_iter()
+            .rev()
+            .find(|send| send.carrier == Carrier::Sticky)
+            .expect("a leave was sent");
+        assert_eq!(
+            leave.content["leave_reason"]["code"], "slot_closed",
+            "{:?}",
+            leave.content
+        );
     }
 
     #[tokio::test]

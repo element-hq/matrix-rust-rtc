@@ -10,7 +10,7 @@ use std::time::Duration;
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     DiscardedKey, EncryptionKeySignalHandler, EventEncryption, EventIn, KEY_MESSAGE_TYPE,
-    KeyMaterialSignal, LeaveSessionParams, SLOT_EVENT_TYPE, ToDeviceMessageIn,
+    KeyMaterialSignal, LeaveCode, LeaveSessionParams, SLOT_EVENT_TYPE, ToDeviceMessageIn,
 };
 use serde_json::json;
 
@@ -216,6 +216,47 @@ async fn a_left_session_is_over_and_a_rejoin_yields_a_new_one() {
         call.member_id(),
         "MSC4143: a new id per join"
     );
+}
+
+/// The slot closing under a call ends it without the host asking: the core
+/// leaves, the session is over, and why is still readable afterwards.
+#[tokio::test]
+async fn a_closed_slot_ends_the_session_and_says_why() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    assert_eq!(*call.subscribe_auto_leave().borrow(), None);
+
+    let sink = mock
+        .room_subscription(ROOM)
+        .expect("subscribed")
+        .sink
+        .clone();
+    sink.on_state_events(
+        SLOT_EVENT_TYPE.to_owned(),
+        vec![EventIn {
+            event_id: "$closed".to_owned(),
+            sender: BOB.to_owned(),
+            event_type: SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 3,
+            content: json!({ "status": "closed" }),
+            encryption: EventEncryption::Cleartext,
+        }],
+    );
+    settle().await;
+
+    assert!(!call.is_live());
+    let reason = call.subscribe_auto_leave().borrow().clone();
+    assert_eq!(
+        reason.map(|reason| reason.code),
+        Some(LeaveCode::SlotClosed)
+    );
+    assert!(matches!(
+        call.leave(LeaveSessionParams::new()).await,
+        Err(RtcError::SessionOver)
+    ));
 }
 
 #[tokio::test]

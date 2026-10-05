@@ -42,6 +42,7 @@ log only.
 
 ### Added
 
+- A call leaves on its own when its slot closes (`leave_reason` `slot_closed`) and its media ends with `EndedReason::SlotClosed` on every host; hosts running their own media wait on `RtcSession::subscribe_auto_leave` / FFI `RtcCall.waitForAutoLeave()`.
 - `matrix_rtc_transport::pool::MediaPool`, the MSC4195 multi-SFU connection pool extracted from the call engine, reports a session's media per `member_id` for any application on the core.
 - `matrix_rtc_call_sdk::attach_media` and `attach_livekit` attach media to a joined call, now the one wiring behind the FFI and web media sessions and `LiveKitCall`.
 - A room still waiting on its first deliveries logs which `RoomSink` calls are missing every 5 s, so a host that never delivers one sees why `room()` has not returned.

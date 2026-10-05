@@ -271,6 +271,8 @@ impl From<FfiStabilityConfig> for matrix_rtc_call_sdk::StabilityConfig {
 pub enum FfiEndedReason {
     /// We left deliberately.
     Left,
+    /// The slot was closed, which ended the call without us asking.
+    SlotClosed,
     /// The connection to our own focus closed and will not be
     /// re-established.
     ConnectionClosed { message: String },
@@ -690,6 +692,7 @@ impl FfiCallEvent {
             Event::Ended { reason } => Self::Ended {
                 reason: match reason {
                     matrix_rtc_call_sdk::EndedReason::Left => FfiEndedReason::Left,
+                    matrix_rtc_call_sdk::EndedReason::SlotClosed => FfiEndedReason::SlotClosed,
                     matrix_rtc_call_sdk::EndedReason::ConnectionClosed { message } => {
                         FfiEndedReason::ConnectionClosed { message }
                     }
