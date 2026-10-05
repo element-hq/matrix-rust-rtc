@@ -575,15 +575,12 @@ impl RtcCall {
         MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await)
     }
 
-    /// Resolves once the call has left without the host asking — the slot
-    /// closed under it (`code` `slot_closed`) — with the reason it sent; at once
-    /// if it already has. The leave is sent and the call is over by then. A
-    /// [`MediaSession`](crate::media::MediaSession) ends itself on this (as
-    /// `Ended(SlotClosed)`); a host running its own media tears it down here.
-    /// Never resolves for a call the host leaves itself: cancel it then.
-    pub async fn wait_for_auto_leave(&self) -> FfiLeaveReason {
-        let mut auto_leave = self.call.subscribe_auto_leave();
-        let reason = auto_leave
+    /// Resolves once the call is over (left, slot closed, room closed), with
+    /// why. A host running its own media tears it down here. Never resolves
+    /// for a call dropped without leaving.
+    pub async fn wait_for_end(&self) -> FfiLeaveReason {
+        let mut ended = self.call.subscribe_ended();
+        let reason = ended
             .wait_for(Option::is_some)
             .await
             .ok()
@@ -639,8 +636,8 @@ impl RtcCall {
             .collect()
     }
 
-    /// Leaves the slot; the call is over afterwards. A failed leave leaves it
-    /// live, so it can be retried.
+    /// Leaves the slot; the call is over and its media stopped at once, even
+    /// when the send fails — the delayed leave then removes the membership.
     pub async fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
         log::info!(
             "call: [{}/{}] leave requested reason={:?}",
@@ -1185,7 +1182,7 @@ mod tests {
     /// A slot closing under a call makes it leave on its own, with
     /// `slot_closed`, and tells a host that runs its own media.
     #[tokio::test]
-    async fn closing_the_slot_leaves_and_reports_an_auto_leave() {
+    async fn closing_the_slot_leaves_and_reports_the_end() {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
@@ -1200,9 +1197,9 @@ mod tests {
             }],
         );
 
-        let reason = tokio::time::timeout(Duration::from_secs(2), call.wait_for_auto_leave())
+        let reason = tokio::time::timeout(Duration::from_secs(2), call.wait_for_end())
             .await
-            .expect("an auto-leave");
+            .expect("the call ended");
         assert_eq!(reason.code, "slot_closed");
         assert!(!call.is_live());
         let leave = mock

@@ -83,13 +83,16 @@ room.shutdown()                                    // leaves what is still joine
   through its own SDK or push path; open the room when the user answers or
   starts a call.
 
-## When the slot closes
+## When the call ends
 
-A slot closing mid-call ends the call for everyone in it. The library sends your
-leave (`leave_reason.code = "slot_closed"`) and stops the keep-alive on its own;
-the call is over (`isLive()` is false). A `MediaSession` then ends itself with
-`Ended(SlotClosed)`; a host running its own media waits on
-`call.waitForAutoLeave()` and tears it down there.
+Every ending takes one path: `call.leave()`, the slot closing mid-call (the
+library sends your leave with `leave_reason.code = "slot_closed"` on its own) or
+`room.close()`. The call is over (`isLive()` is false) as soon as `leave()` is
+called, even if the leave then fails to send, and a `MediaSession`
+ends itself — `Ended(Left)` or `Ended(SlotClosed)`, every SFU connection closed —
+so there is no separate `disconnect()` to call. Stop camera and microphone
+capture on that `Ended`. A host running its own media waits on
+`call.waitForEnd()` and tears it down there.
 
 ## Turn on logging first
 

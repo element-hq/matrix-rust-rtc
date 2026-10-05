@@ -226,7 +226,7 @@ async fn a_closed_slot_ends_the_session_and_says_why() {
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
     let call = room.join_call(CallJoinOptions::new()).await.expect("join");
-    assert_eq!(*call.subscribe_auto_leave().borrow(), None);
+    assert_eq!(*call.subscribe_ended().borrow(), None);
 
     let sink = mock
         .room_subscription(ROOM)
@@ -248,10 +248,71 @@ async fn a_closed_slot_ends_the_session_and_says_why() {
     settle().await;
 
     assert!(!call.is_live());
-    let reason = call.subscribe_auto_leave().borrow().clone();
+    let reason = call.subscribe_ended().borrow().clone();
     assert_eq!(
         reason.map(|reason| reason.code),
         Some(LeaveCode::SlotClosed)
+    );
+    assert!(matches!(
+        call.leave(LeaveSessionParams::new()).await,
+        Err(RtcError::SessionOver)
+    ));
+}
+
+/// A leave that fails to send still ends the session, so media stops
+/// publishing; the delayed leave removes the membership.
+#[tokio::test]
+async fn a_closed_slot_ends_the_session_even_when_the_leave_fails() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let ended = call.subscribe_ended();
+    *mock.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
+
+    let sink = mock
+        .room_subscription(ROOM)
+        .expect("subscribed")
+        .sink
+        .clone();
+    sink.on_state_events(
+        SLOT_EVENT_TYPE.to_owned(),
+        vec![EventIn {
+            event_id: "$closed".to_owned(),
+            sender: BOB.to_owned(),
+            event_type: SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 3,
+            content: json!({ "status": "closed" }),
+            encryption: EventEncryption::Cleartext,
+        }],
+    );
+    settle().await;
+
+    assert!(!call.is_live());
+    assert_eq!(
+        ended.borrow().clone().map(|reason| reason.code),
+        Some(LeaveCode::SlotClosed)
+    );
+}
+
+/// A leave that fails to send is reported, but the session has ended before
+/// the send, so media stops publishing either way.
+#[tokio::test]
+async fn a_leave_that_fails_to_send_still_ends_the_session() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let ended = call.subscribe_ended();
+    *mock.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
+
+    assert!(call.leave(LeaveSessionParams::new()).await.is_err());
+
+    assert!(!call.is_live());
+    assert_eq!(
+        ended.borrow().clone().map(|reason| reason.code),
+        Some(LeaveCode::Leave)
     );
     assert!(matches!(
         call.leave(LeaveSessionParams::new()).await,
@@ -618,4 +679,37 @@ async fn a_call_knows_the_transport_its_join_resolved() {
         call.transport(),
         TransportIntent::ReceiveOnly { .. }
     ));
+}
+
+#[tokio::test]
+async fn a_host_leave_publishes_why_the_session_ended() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let ended = call.subscribe_ended();
+
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+
+    assert_eq!(
+        ended.borrow().clone().map(|reason| reason.code),
+        Some(LeaveCode::Leave)
+    );
+}
+
+#[tokio::test]
+async fn closing_the_room_publishes_why_its_sessions_ended() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let ended = call.subscribe_ended();
+
+    room.close().await;
+
+    assert!(!call.is_live());
+    assert_eq!(
+        ended.borrow().clone().map(|reason| reason.code),
+        Some(LeaveCode::Leave)
+    );
 }

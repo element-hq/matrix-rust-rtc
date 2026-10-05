@@ -26,7 +26,7 @@ use std::time::Duration;
 use matrix_rtc_core::{
     ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError,
+    LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError,
     ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SlotEncryption, SlotState, TransportIntent,
     executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
@@ -277,9 +277,8 @@ pub struct RtcRoom<B: MatrixBackend + 'static> {
     backend: Arc<Backend<B>>,
     /// The core's open room, which feeds `state`; `None` once detached.
     handle: Option<BaseRtcRoomHandle<B, State<B>>>,
-    /// Whether each slot's current session object is live, by slot. A flag a
-    /// session shares, so leaving, dropping it or closing the room ends it.
-    sessions: StdMutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Each slot's current session, shared with it so closing the room ends it.
+    sessions: StdMutex<HashMap<String, Arc<SessionEnd>>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcRoom<B> {
@@ -402,7 +401,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// Leaves every slot joined through this room, then ends its
     /// subscriptions (R4). Every session of the room is over afterwards.
     pub async fn close(mut self) {
-        self.end_sessions();
+        self.end_sessions(LeaveReason::new(LeaveCode::Leave));
         let joined = self.state.lock().await.rtc().joined_slots();
         for slot_id in joined {
             log::info!("[{}/{slot_id}] leaving before closing", self.room_id);
@@ -495,7 +494,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         Ok(params)
     }
 
-    fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
+    fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<SessionEnd>>> {
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -504,7 +503,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     fn live_session(&self, slot_id: &str) -> bool {
         self.sessions()
             .get(slot_id)
-            .is_some_and(|live| live.load(Ordering::SeqCst))
+            .is_some_and(|end| end.is_live())
     }
 
     /// The session object for a join that just succeeded. `upkeep` is the
@@ -519,21 +518,17 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         upkeep: Option<AbortHandle>,
         auto_leaves: Option<broadcast::Receiver<LeaveReason>>,
     ) -> RtcSession<B> {
-        let live = Arc::new(AtomicBool::new(true));
-        self.sessions().insert(slot_id.clone(), live.clone());
-        let (auto_leave, _) = watch::channel(None);
-        let auto_leave = Arc::new(auto_leave);
+        let end = Arc::new(SessionEnd::new());
+        self.sessions().insert(slot_id.clone(), end.clone());
         RtcSession {
-            _follow_auto_leave: auto_leaves
-                .map(|leaves| follow_auto_leave(leaves, live.clone(), auto_leave.clone())),
+            _follow_auto_leave: auto_leaves.map(|leaves| follow_auto_leave(leaves, end.clone())),
             room_id: self.room_id.clone(),
             slot_id,
             member_id,
             transport,
             state: self.state.clone(),
-            live,
+            end,
             upkeep,
-            auto_leave,
         }
     }
 
@@ -557,21 +552,52 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         .abort_on_drop()
     }
 
-    fn end_sessions(&self) {
-        for (_, live) in self.sessions().drain() {
-            live.store(false, Ordering::SeqCst);
+    fn end_sessions(&self, reason: LeaveReason) {
+        for (_, end) in self.sessions().drain() {
+            end.end(reason.clone());
         }
     }
 }
 
-/// Ends a session when the core leaves its slot on its own (the slot closed):
-/// marks it over and publishes the reason. The core's channel is the slot's,
-/// shared by every join of it, so a session already over stops listening at
-/// the next leave rather than adopting a later join's.
+/// The one place a participation becomes over and says why, whatever ended it.
+struct SessionEnd {
+    live: AtomicBool,
+    ended: watch::Sender<Option<LeaveReason>>,
+}
+
+impl SessionEnd {
+    fn new() -> Self {
+        Self {
+            live: AtomicBool::new(true),
+            ended: watch::channel(None).0,
+        }
+    }
+
+    fn is_live(&self) -> bool {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// `false` if it was already over.
+    fn end(&self, reason: LeaveReason) -> bool {
+        let live = self.live.swap(false, Ordering::SeqCst);
+        if live {
+            self.ended.send_replace(Some(reason));
+        }
+        live
+    }
+
+    /// A dropped session sends no leave, so there is no ending to report.
+    fn abandon(&self) {
+        self.live.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Ends a session when the core leaves its slot on its own. The core's channel
+/// is per slot, so this stops at the first leave rather than adopt a later
+/// join's.
 fn follow_auto_leave(
     mut leaves: broadcast::Receiver<LeaveReason>,
-    live: Arc<AtomicBool>,
-    auto_leave: Arc<watch::Sender<Option<LeaveReason>>>,
+    end: Arc<SessionEnd>,
 ) -> AbortOnDrop<()> {
     executor::spawn(async move {
         let reason = loop {
@@ -581,9 +607,7 @@ fn follow_auto_leave(
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         };
-        if live.swap(false, Ordering::SeqCst) {
-            auto_leave.send_replace(Some(reason));
-        }
+        end.end(reason);
     })
     .abort_on_drop()
 }
@@ -612,13 +636,10 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     member_id: String,
     transport: TransportIntent,
     state: SharedState<B>,
-    live: Arc<AtomicBool>,
+    end: Arc<SessionEnd>,
     /// The core's upkeep for this join, aborted when the session object
     /// drops: a dropped session sends no leave and stops keeping alive.
     upkeep: Option<AbortHandle>,
-    /// Why the core left on its own, once it has; see
-    /// [`subscribe_auto_leave`](Self::subscribe_auto_leave).
-    auto_leave: Arc<watch::Sender<Option<LeaveReason>>>,
     _follow_auto_leave: Option<AbortOnDrop<()>>,
 }
 
@@ -642,7 +663,7 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     }
 
     pub fn is_live(&self) -> bool {
-        self.live.load(Ordering::SeqCst)
+        self.end.is_live()
     }
 
     /// The event id of our current membership event. Moves on every sticky
@@ -670,13 +691,11 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .observe_slot(&self.slot_id)
     }
 
-    /// Why this participation ended without the host asking — the slot
-    /// closed under it ([`LeaveCode::SlotClosed`](matrix_rtc_core::LeaveCode)) —
-    /// or `None` while it has not. The leave is already sent and the session is
-    /// over when this turns `Some`; a host running media ends it here. A watch,
-    /// so a host subscribing after the fact still sees it.
-    pub fn subscribe_auto_leave(&self) -> watch::Receiver<Option<LeaveReason>> {
-        self.auto_leave.subscribe()
+    /// Why this participation ended — the host left, the slot closed
+    /// ([`LeaveCode::SlotClosed`]) or the room closed — or `None` while live.
+    /// Whatever runs media tears down here. Not set when the session is dropped.
+    pub fn subscribe_ended(&self) -> watch::Receiver<Option<LeaveReason>> {
+        self.end.ended.subscribe()
     }
 
     pub async fn set_encryption_signal_handler(
@@ -713,14 +732,19 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
                 .await
     }
 
-    /// Leaves the slot; the session is over afterwards (R9). A failed leave
-    /// leaves it live, so it can be retried.
+    /// Leaves the slot; the session is over afterwards (R9), even when the
+    /// send fails — the delayed leave then removes the membership.
     pub async fn leave(&self, params: LeaveSessionParams) -> Result<(), RtcError> {
-        if !self.is_live() {
+        let reason = params
+            .leave_reason
+            .clone()
+            .unwrap_or_else(|| LeaveReason::new(LeaveCode::Leave));
+        // Ended before the send, so media stops publishing at once rather than
+        // after a slow or failing one.
+        if !self.end.end(reason) {
             return Err(RtcError::SessionOver);
         }
         self.state.lock().await.leave(&self.slot_id, params).await?;
-        self.live.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -735,7 +759,7 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
 
 impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
     fn drop(&mut self) {
-        self.live.store(false, Ordering::SeqCst);
+        self.end.abandon();
         if let Some(upkeep) = &self.upkeep {
             upkeep.abort();
         }

@@ -556,6 +556,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     ///
     /// Returns `Ok(())` if the leave completed successfully.
     /// Returns `Err(LeaveError)` if not joined, backend is not configured, or commands fail.
+    /// A failed send still ends the join here, since the machine is gone and
+    /// cannot retry; the delayed leave removes the membership.
     pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
         // Check if we have a membership machine (i.e., we've joined)
         let machine = self.own_membership_machine.take().ok_or_else(|| {
@@ -574,10 +576,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         );
 
         // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        machine
+        let sent = machine
             .leave(params.leave_reason.clone())
             .await
-            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag))?;
+            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
@@ -593,8 +595,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // want to see who is left in the call.
         self.refresh().await;
 
+        sent?;
         log::info!("[{}] left", self.log_tag);
-
         Ok(())
     }
 
@@ -976,10 +978,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
     }
 
-    /// Leaves without the host asking, and tells it so. A failed send still
-    /// ends the join — `leave` has dropped the machine and the upkeep, and the
-    /// delayed leave cleans up — so it is announced all the same; `leave`
-    /// refreshes the members itself only on success.
+    /// Leaves without the host asking, and tells it so — even when the send
+    /// fails, since `leave` ends the join regardless.
     async fn auto_leave(&mut self, reason: LeaveReason) {
         log::info!("[{}] leaving on our own ({:?})", self.log_tag, reason.code);
         let params = LeaveSessionParams {
@@ -990,11 +990,6 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 "[{}] could not send our leave; the delayed leave will: {error}",
                 self.log_tag
             );
-            if let Some(encryption_manager) = self.encryption_manager.take() {
-                encryption_manager.leave();
-            }
-            self.own_participation = None;
-            self.refresh().await;
         }
         let _ = self.auto_leaves_tx.send(reason);
     }

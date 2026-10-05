@@ -273,8 +273,8 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 /// `onParticipants` / `onEvent` callbacks, registered at
 /// [`WasmRtcCall::connect_media`] time.
 ///
-/// End it with [`WasmMediaSession::disconnect`]; leaving the slot itself stays
-/// the call's ([`WasmRtcCall::leave`]).
+/// Ends with the call; [`WasmMediaSession::disconnect`] ends it while staying
+/// joined.
 #[wasm_bindgen]
 pub struct WasmMediaSession {
     engine: CallEngine,
@@ -309,9 +309,8 @@ impl WasmMediaSession {
         self.own_identity.clone()
     }
 
-    /// Shut the media session down: stop the engine (closing peer-focus
-    /// connections) and close the own-focus room, if any, through the
-    /// delegate. Leaving the slot is separate ([`WasmRtcCall::leave`]).
+    /// End the media session while staying joined. After leaving it is not
+    /// needed, and would call the delegate's `close` a second time.
     pub async fn disconnect(&mut self) -> Result<(), JsError> {
         self.engine.shutdown().await;
         let Some(connection) = &self.own_connection else {

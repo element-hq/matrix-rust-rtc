@@ -601,8 +601,7 @@ impl LiveKitCall {
                 "FAILED"
             },
         );
-        // Emits `CallEvent::Ended { reason: Left }` and closes every
-        // peer-focus connection; the own-focus close below reports its result.
+        // The leave ended the engine; this waits for it to finish closing.
         engine.shutdown().await;
         log::debug!("[{room_id}] leave: media engine down; closing own SFU connection");
         use matrix_rtc_transport::TransportConnection as _;
