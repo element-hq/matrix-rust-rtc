@@ -75,10 +75,11 @@ use matrix_sdk_ui::sync_service::SyncService;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
+use matrix_rtc_call_sdk::CallEvent;
+use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, open_slot};
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::MembershipFormat;
-use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
-use matrix_rtc_media::CallEvent;
+use matrix_rtc_livekit::media;
 use matrix_rtc_transport::{
     I420Buffer, PublishOptions, VideoFrame, VideoRotation, VideoSourceConfig,
 };
@@ -503,7 +504,7 @@ async fn create_encrypted_room(
     // dialects, which never send the type at all.
     request.power_level_content_override = Some(
         Raw::new(&serde_json::json!({
-            "events": { matrix_rtc_livekit::compat::STATE_MEMBER_EVENT_TYPE: 0 },
+            "events": { matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE: 0 },
         }))?
         .cast_unchecked(),
     );

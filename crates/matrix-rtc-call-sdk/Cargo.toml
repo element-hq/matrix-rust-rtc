@@ -1,0 +1,140 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-call-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The call SDK hosts use: the call's media over any transport (participants, tiles, the unified event stream, the call engine), attaching it to a joined call, and the native LiveKit facade."
+
+[dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core" }
+# The transport contract the engine drives, and the key handler `attach` installs.
+matrix-rtc-transport = { path = "../matrix-rtc-transport" }
+# The joined `RtcCall` media attaches to, and the call types the engine merges
+# onto its roster (raised hands, reactions).
+matrix-rtc-call = { path = "../matrix-rtc-call" }
+# The engine's actor loop multiplexes channels with `tokio::select!`
+# (`macros`). Tasks and timers go through `matrix_rtc_core::executor`.
+tokio = { workspace = true, features = ["macros"] }
+# `join_all`, so a batched stats read awaits every track at once (`alloc`).
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+async-trait.workspace = true
+log.workspace = true
+thiserror.workspace = true
+
+# --- `livekit` feature: native LiveKit media (pulls libwebrtc) ---------------
+matrix-rtc-livekit = { path = "../matrix-rtc-livekit", optional = true }
+# The types `matrix-rtc-livekit`'s API names that the facade and examples use
+# too (`RoomEvent`, the token exchange's `reqwest::Client`); the workspace's
+# specs, so they are the same crates.
+livekit = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+
+# --- `matrix-sdk` feature: the `LiveKitCall` facade over matrix-rust-sdk -----
+# `SdkMatrixBackend`, the matrix-rust-sdk `MatrixBackend` the facade drives.
+# Nothing in it knows about LiveKit.
+matrix-rtc-matrix-sdk = { path = "../matrix-rtc-matrix-sdk", optional = true }
+# The facade takes a `matrix_sdk::Room`. Everything else Matrix-side is
+# `matrix-rtc-matrix-sdk`'s, and the rationale for the feature set (why room-key
+# forwarding stays on, what `experimental-send-custom-to-device` is for) lives
+# there, next to the code that depends on it. The rev is the workspace's, so the
+# two crates cannot drift onto two copies of matrix-sdk.
+matrix-sdk = { workspace = true, optional = true, features = ["experimental-send-custom-to-device"] }
+# Drives sliding sync plus the encryption sync in the examples and the e2e test.
+# Its `unstable-msc4354` (enabled by our `matrix-sdk` feature) turns on the
+# sliding-sync sticky-events extension, so sticky events actually flow;
+# encryption support rides along via matrix-sdk's default features.
+matrix-sdk-ui = { workspace = true, optional = true }
+
+[features]
+# Native LiveKit media: `attach_livekit`. Off by default — it pulls the LiveKit
+# client and libwebrtc; the web binding brings its own transport and uses none.
+livekit = ["dep:matrix-rtc-livekit", "dep:livekit", "dep:reqwest"]
+# The `LiveKitCall` join/leave facade over a `matrix_sdk::Client`, its examples
+# and `e2e_call`. Off by default to keep the crate buildable without the git
+# SDK. `matrix-sdk-ui/unstable-msc4354` is what makes `SyncService` request
+# sticky events over sliding sync.
+matrix-sdk = [
+    "livekit",
+    "dep:matrix-rtc-matrix-sdk",
+    "dep:matrix-sdk",
+    "dep:matrix-sdk-ui",
+    "matrix-sdk-ui/unstable-msc4354",
+]
+# The LiveKit tone generator and frequency detector, for the examples and
+# integration tests. Also turns on matrix-sdk's `testing`, whose only use here
+# is `Client::olm_machine_for_testing` — the one public route to the
+# `OlmMachine`, and so the only way to reach `set_room_key_forwarding_enabled`.
+# It costs `wiremock` and friends in the graph, which is what a testing feature
+# is for.
+testing = ["matrix-rtc-livekit?/testing", "matrix-sdk?/testing"]
+
+# The end-to-end call test (see tests/E2E_CALL.md). `required-features` keeps
+# plain `cargo test --workspace` from compiling it (and the git SDK + libwebrtc
+# behind it); the `#[ignore]` inside keeps `--all-features` runs from executing
+# it without the demo/backend stack.
+[[test]]
+name = "e2e_call"
+path = "tests/e2e_call/main.rs"
+required-features = ["matrix-sdk", "testing"]
+
+[dev-dependencies]
+# `MockBackend`, to join a real call in the `attach` tests.
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+serde = { workspace = true }
+serde_json.workspace = true
+# `signal` for the join_and_record example's Ctrl-C hang-up; `io-std` for the
+# interop_peer example, which is driven over stdin by the Playwright suite.
+tokio = { version = "1", features = [
+  "rt",
+  "rt-multi-thread",
+  "macros",
+  "time",
+  "sync",
+  "test-util",
+  "signal",
+  "io-std",
+  "io-util",
+] }
+futures-util = "0.3"
+futures-core = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Argument parsing for the `load_test` example. A dev-dependency on purpose:
+# examples may use them, so clap never enters the library's dependency graph.
+clap = { version = "4", features = ["derive", "env"] }
+# The dependency tree pulls in rustls with BOTH the `ring` and `aws-lc-rs`
+# crypto backends (livekit/reqwest vs matrix-sdk), so rustls cannot pick a
+# process-level `CryptoProvider` automatically and panics on first TLS use. The
+# examples install `aws-lc-rs` explicitly (matches matrix-sdk's default); this
+# dev-dep gives us the provider module to call `install_default()`.
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+
+[[example]]
+name = "connect"
+required-features = ["matrix-sdk"]
+
+# The quick-start example (see README.md). `testing` only for the optional
+# PUBLISH_TONE test-tone publisher, so two instances can call each other.
+[[example]]
+name = "join_and_record"
+required-features = ["matrix-sdk", "testing"]
+
+# The Rust half of the Element Call interop test (see interop/README.md and
+# demo/backend/INTEROP.md). Driven over stdin by Playwright, which owns the
+# browser running Element Call. `testing` for the tone generator it publishes
+# so Element Call has media to render.
+[[example]]
+name = "interop_peer"
+required-features = ["matrix-sdk", "testing"]
+
+# The load generator (see README.md). Publishes a video file from N devices of
+# one account. `testing` is only for `Client::olm_machine_for_testing`, used to
+# keep room-key gossip out of the to-device traffic this tool measures.
+[[example]]
+name = "load_test"
+required-features = ["matrix-sdk", "testing"]

@@ -51,7 +51,7 @@ for you, in the right comment syntax for the file type.
 
 Wire-format and Element Call compatibility changes should come with coverage in
 the interop suite (`interop/`) or the e2e call harness
-(`crates/matrix-rtc-livekit/tests/`). See `ARCHITECTURE.md` for how the crates
+(`crates/matrix-rtc-call-sdk/tests/`). See `ARCHITECTURE.md` for how the crates
 fit together, and `AGENTS.md` for the repository conventions.
 
 ## Spec Changes

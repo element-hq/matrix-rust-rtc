@@ -6,7 +6,7 @@
 //! [`MediaTransport`] implementation for the MSC4195 LiveKit transport.
 //!
 //! This is where LiveKit stops being visible: everything above this module
-//! (the [`matrix_rtc_media::CallEngine`], the `LiveKitCall` facade's unified event
+//! (the `matrix_rtc_call_sdk::CallEngine`, the `LiveKitCall` facade's unified event
 //! stream, and eventually the FFI) speaks the transport-neutral vocabulary of
 //! `matrix-rtc-media`, and this module translates it to SFU reality —
 //! the token exchange, the E2EE room connection, `RoomEvent`s, and
@@ -81,7 +81,7 @@ pub struct LiveKitMediaTransport {
     /// MUST be the same value installed on the core's encryption manager. A
     /// divergence does not error — it silences: every `identity_map` lookup
     /// misses, so peers sit in the roster with no media and their keys are
-    /// installed under an identity the SFU never assigned. See [`crate::compat`].
+    /// installed under an identity the SFU never assigned. See [`matrix_rtc_core::compat`].
     identity_mapper: RtcIdentityMapper,
     /// Which authorisation-service dialect to speak. MSC4195 `/get_token` by
     /// default.
@@ -118,16 +118,16 @@ impl LiveKitMediaTransport {
     ///
     /// A builder rather than a `new` parameter: the MSC4195 derivation is the
     /// default and every spec-current caller leaves it alone. The caller that
-    /// does substitute it, [`crate::attach_livekit`], passes the same `Arc` it
+    /// does substitute it, `matrix_rtc_call_sdk::attach_livekit`, passes the same `Arc` it
     /// gives the core's encryption manager, which is the point: the derivation
-    /// sites must not skew. Temporary; see [`crate::compat`].
+    /// sites must not skew. Temporary; see [`matrix_rtc_core::compat`].
     pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
         self.identity_mapper = identity_mapper;
         self
     }
 
     /// Substitute the authorisation-service dialect. Temporary; see
-    /// [`crate::compat`].
+    /// [`matrix_rtc_core::compat`].
     pub fn with_token_endpoint(mut self, token_endpoint: TokenEndpoint) -> Self {
         self.token_endpoint = token_endpoint;
         self

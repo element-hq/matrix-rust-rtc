@@ -3,7 +3,7 @@
 A Rust MatrixRTC client and a **real Element Call**, in the same call, asserted
 from both sides.
 
-[`crates/matrix-rtc-livekit/tests/e2e_call`](../crates/matrix-rtc-livekit/tests/E2E_CALL.md)
+[`crates/matrix-rtc-call-sdk/tests/e2e_call`](../crates/matrix-rtc-call-sdk/tests/E2E_CALL.md)
 already proves our stack talks to itself in every dialect, including the
 pre-sticky one. What it cannot prove is that Element Call *agrees* with our
 reading of the wire format — for that you need Element Call, and Element Call
@@ -68,7 +68,7 @@ make test-interop        # builds the Rust peer, then runs this suite
 or, once the stack is up and the peer is built:
 
 ```sh
-cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
+cargo build -p matrix-rtc-call-sdk --features matrix-sdk,testing --example interop_peer
 cd interop && npm ci && npx playwright install --with-deps chromium
 npx playwright test                 # add --headed to watch it
 npx playwright show-report

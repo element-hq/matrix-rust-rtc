@@ -146,7 +146,7 @@ backend-logs:
 # --test-threads=1: the scenarios share the compose stack; running them in
 # parallel would double the load and interleave logs.
 test-e2e: backend-up
-	cargo test -p matrix-rtc-livekit --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
+	cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing --test e2e_call -- --ignored --nocapture --test-threads=1
 
 # ---- Element Call interop ------------------------------------------------
 # The same base stack plus TLS (nginx + a dev CA) and Element Web, which ships
@@ -187,7 +187,7 @@ interop-trust:
 	@echo ""
 
 test-interop: interop-up
-	cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer
+	cargo build -p matrix-rtc-call-sdk --features matrix-sdk,testing --example interop_peer
 	# The web peer: wasm bindings into web/pkg, then its page deps. Playwright's
 	# webServer builds and serves the page itself.
 	./web/scripts/build-bindings.sh

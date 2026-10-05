@@ -26,9 +26,8 @@ use std::env;
 use std::error::Error;
 
 use livekit::RoomEvent;
-use matrix_rtc_livekit::{
-    LiveKitTransportConfig, MemberClaims, SdkMatrixBackend, TokenEndpoint, connect,
-};
+use matrix_rtc_call_sdk::SdkMatrixBackend;
+use matrix_rtc_livekit::{LiveKitTransportConfig, MemberClaims, TokenEndpoint, connect};
 
 fn required(name: &str) -> Result<String, Box<dyn Error>> {
     env::var(name).map_err(|_| format!("missing required env var {name}").into())

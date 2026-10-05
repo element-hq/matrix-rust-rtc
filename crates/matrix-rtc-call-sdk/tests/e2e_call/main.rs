@@ -64,10 +64,11 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
+use matrix_rtc_call_sdk::{CallEvent, Participant as MediaParticipant};
+use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, open_slot};
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::MembershipFormat;
-use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
-use matrix_rtc_media::{CallEvent, Participant as MediaParticipant};
+use matrix_rtc_livekit::media;
 use matrix_rtc_transport::{
     I420Buffer, MediaConstraints, MediaStreamKind, PublishOptions, VideoFrame, VideoRotation,
     VideoSourceConfig,
@@ -246,7 +247,7 @@ async fn create_encrypted_room(
     // a ruma struct whose shape is not the point of this test.
     request.power_level_content_override = Some(
         Raw::new(&serde_json::json!({
-            "events": { matrix_rtc_livekit::compat::STATE_MEMBER_EVENT_TYPE: 0 },
+            "events": { matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE: 0 },
         }))?
         .cast_unchecked(),
     );
@@ -673,7 +674,7 @@ async fn run(
 /// must be refused locally.
 async fn verify_reactions(alice: &LiveKitCall, bob: &LiveKitCall) -> Result<bool, Box<dyn Error>> {
     use matrix_rtc_call::ReactionError;
-    use matrix_rtc_livekit::LiveKitCallError;
+    use matrix_rtc_call_sdk::LiveKitCallError;
 
     const DEADLINE: Duration = Duration::from_secs(60);
     let alice_member = alice.membership_id().to_owned();

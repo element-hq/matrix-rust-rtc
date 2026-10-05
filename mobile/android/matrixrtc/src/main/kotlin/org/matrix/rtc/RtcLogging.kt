@@ -35,7 +35,7 @@ object RtcLogging {
      * @param filter `RUST_LOG`-style per-target overrides, e.g.
      *   `"matrix_rtc_core=trace,livekit=info,webrtc_sys=warn"`. Targets are Rust
      *   module paths and match by prefix; the roots are `matrix_rtc_core`,
-     *   `matrix_rtc_media`, `matrix_rtc_transport`, `matrix_rtc_livekit`,
+     *   `matrix_rtc_call_sdk`, `matrix_rtc_transport`, `matrix_rtc_livekit`,
      *   `matrix_rtc_ffi`, plus third-party `livekit` and `webrtc_sys`.
      * @throws MatrixRtcFfiException if [filter] is not a valid `RUST_LOG` spec.
      */

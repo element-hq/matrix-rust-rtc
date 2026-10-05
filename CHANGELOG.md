@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- `matrix-rtc-media` is renamed `matrix-rtc-call-sdk`, and `LiveKitCall`, `open_slot`, `attach_livekit` and the examples and e2e test move there from `matrix-rtc-livekit` (features `livekit` and `matrix-sdk`), leaving `matrix-rtc-livekit` the transport alone, without a `matrix-sdk` feature.
 - The transport contract, frames, constraints and media key handler move from `matrix-rtc-media` to the new `matrix-rtc-transport`, and `matrix-rtc-livekit-proto` becomes its `livekit` module; `matrix-rtc-media` keeps the call's roster, tiles, events and `attach_media`.
 - `LiveKitMediaTransport::connect_livekit` becomes `OwnFocusTransport::connect_own`, and `LiveKitTransportConnection::set_local_key_index` moves onto `TransportConnection`.
 - `connect_media_session`/`connectMedia` take the own focus from the call and the account from the backend: `MediaSessionConfig` loses `livekit_service_url`, `user_id` and `device_id`, and a receive-only call connects only to its peers' foci.

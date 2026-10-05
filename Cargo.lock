@@ -2697,6 +2697,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-rtc-call-sdk"
+version = "0.4.0-rc.1"
+dependencies = [
+ "async-trait",
+ "clap",
+ "futures-core",
+ "futures-util",
+ "livekit",
+ "log",
+ "matrix-rtc-call",
+ "matrix-rtc-core",
+ "matrix-rtc-livekit",
+ "matrix-rtc-matrix-sdk",
+ "matrix-rtc-transport",
+ "matrix-sdk",
+ "matrix-sdk-ui",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "matrix-rtc-core"
 version = "0.4.0-rc.1"
 dependencies = [
@@ -2728,11 +2754,10 @@ dependencies = [
  "jni 0.21.1",
  "log",
  "matrix-rtc-call",
+ "matrix-rtc-call-sdk",
  "matrix-rtc-core",
  "matrix-rtc-livekit",
- "matrix-rtc-media",
  "matrix-rtc-transport",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -2746,25 +2771,17 @@ name = "matrix-rtc-livekit"
 version = "0.4.0-rc.1"
 dependencies = [
  "async-trait",
- "clap",
  "futures-util",
  "jni 0.21.1",
  "livekit",
  "log",
- "matrix-rtc-call",
  "matrix-rtc-core",
- "matrix-rtc-matrix-sdk",
- "matrix-rtc-media",
  "matrix-rtc-transport",
- "matrix-sdk",
- "matrix-sdk-ui",
  "reqwest 0.12.28",
- "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -2778,22 +2795,6 @@ dependencies = [
  "matrix-sdk-base",
  "serde",
  "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "matrix-rtc-media"
-version = "0.4.0-rc.1"
-dependencies = [
- "async-trait",
- "futures-core",
- "futures-util",
- "log",
- "matrix-rtc-call",
- "matrix-rtc-core",
- "matrix-rtc-transport",
- "serde_json",
- "thiserror 2.0.21",
  "tokio",
 ]
 
@@ -2825,8 +2826,8 @@ dependencies = [
  "js-sys",
  "log",
  "matrix-rtc-call",
+ "matrix-rtc-call-sdk",
  "matrix-rtc-core",
- "matrix-rtc-media",
  "matrix-rtc-transport",
  "serde",
  "serde-wasm-bindgen",

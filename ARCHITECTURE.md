@@ -17,53 +17,62 @@ The goal is to keep protocol logic in one Rust core crate and make all platform 
   core: the transport contract, frames, constraints, the media key handler,
   and the pure MSC4195 control plane (`livekit`: identity derivations, token
   shapes, dialect choices) shared by the native transport and the web binding.
-- `matrix-rtc-media` owns the call's media model over that contract: the
-  roster, tiles, the unified event stream, and attaching media to a call.
+- `matrix-rtc-call-sdk` owns what a host uses for a call's media: the media
+  model over that contract (the roster, tiles, the unified event stream),
+  attaching media to a call, and behind features the native LiveKit wiring and
+  the `LiveKitCall` facade.
 
 Three axes, kept separate on purpose: the core answers *what the protocol says*,
 `matrix-rtc-call` and a backend (`matrix-rtc-matrix-sdk`'s, or the host's) *how it
 reaches a homeserver*, and `matrix-rtc-transport` + an implementation of it
 *how bytes flow*. Only the top-level facade
-(`matrix_rtc_livekit::call::LiveKitCall`) knows all three.
+(`matrix_rtc_call_sdk::LiveKitCall`) knows all three.
 
 Arrows point at what a crate depends on:
 
 ```
- matrix-rtc-wasm            matrix-rtc-ffi
-      │                       │  ╎ feature "media"
-      │                       │  ▼
-      │                       │ matrix-rtc-livekit ──────▶ matrix-rtc-matrix-sdk
-      │                       │  │  native SFU, facade             │
-      ▼                       │  ▼                                 │
- matrix-rtc-media ◀───────────┼──┘  roster, tiles, attach_media    │
-      │                       │                                    │
-      ▼                       │                                    │
- matrix-rtc-transport         │     contract, keys, MSC4195 shapes │
-      ╎                       ▼                                    ▼
+ matrix-rtc-wasm                       matrix-rtc-ffi
+      │                                  │  ╎ feature "media"
+      ▼                                  │  ╎
+ matrix-rtc-call-sdk ◀╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│╌╌┘ (with "livekit")
+   │  roster, tiles, attach_media        │
+   │   ╎ "livekit"     ╎ "matrix-sdk"    │
+   │   ▼               ▼                 │
+   │  matrix-rtc-     matrix-rtc-        │
+   │  livekit         matrix-sdk         │
+   │   │ native SFU     │                │
+   ▼   ▼                │                │
+ matrix-rtc-transport   │                │
+   contract, keys,      │                │
+   MSC4195 shapes       │                │
+   ╎                    ▼                ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │     matrix-rtc-call   (the call, the dialects)                     │
 ├────────────────────────────────────────────────────────────────────┤
 │                          matrix-rtc-core                           │
 └────────────────────────────────────────────────────────────────────┘
    (every crate above also depends on matrix-rtc-core directly, and
-    matrix-rtc-transport on it alone; the ffi takes the media crates
-    only under "media")
+    matrix-rtc-transport on it alone — ╎ passes through to the core;
+    dashed edges are features: the ffi takes the media crates only
+    under "media", and the call SDK with "livekit", never "matrix-sdk")
 ```
 
-Three things that shape reveals. **`matrix-rtc-matrix-sdk` and `matrix-rtc-media` are
-siblings, not layers** — the SDK backend and the media plane both sit on the
-call layer, neither knows the other exists, and `matrix-rtc-livekit` is the first crate
-that needs both. **`matrix-rtc-transport` knows no call**: it sits on the core
+Three things that shape reveals. **`matrix-rtc-matrix-sdk` and the media plane
+are siblings, not layers** — the SDK backend and the media plane both sit on the
+call layer, neither knows the other exists, and only `matrix-rtc-call-sdk`'s
+`matrix-sdk` feature brings them together. **`matrix-rtc-transport` and
+`matrix-rtc-livekit` know no call**: it sits on the core
 alone, so another application on MSC4143 can carry media with it. And **the
-media plane splits by what owns the bytes**: `matrix-rtc-media` and
+media plane splits by what owns the bytes**: `matrix-rtc-call-sdk` (without
+features) and
 `matrix-rtc-transport` compile for wasm32 and are shared by both bindings,
 while `matrix-rtc-livekit` (libwebrtc, reqwest) stays native-only — browsers keep
 using livekit-js for the media itself, driven through a JS delegate.
 `matrix-rtc-ffi`'s default build stays slim: the transport and media crates enter
 only under its `media` feature, which is what keeps that mobile artifact free of
 `libwebrtc`. For legibility the diagram omits the direct edges from
-`matrix-rtc-wasm`, `matrix-rtc-ffi` and `matrix-rtc-livekit` to
-`matrix-rtc-transport`.
+`matrix-rtc-wasm` and `matrix-rtc-ffi` to `matrix-rtc-transport`, and from
+`matrix-rtc-ffi` to `matrix-rtc-livekit`.
 
 This keeps the core reusable and testable while avoiding platform-specific dependencies in core.
 
@@ -73,10 +82,10 @@ MSC4143 is application-agnostic; a call (`m.call`) is one application, and a
 shared board would be a sibling of `matrix-rtc-call` on the same core:
 
 ```
-   bindings (ffi, wasm) · matrix-rtc-livekit's LiveKitCall facade
+   bindings (ffi, wasm) · matrix-rtc-call-sdk's LiveKitCall facade
                  │
                  ▼
-          matrix-rtc-media   engine, pool, tiles (still imports call types)
+          matrix-rtc-call-sdk  engine, pool, tiles, attach_media
                  │                 └──▶ matrix-rtc-transport  contract, keys, MSC4195
                  ▼
           matrix-rtc-call    RtcClient → RtcRoom → RtcSession/RtcCall; reactions, MSC4075
@@ -105,7 +114,7 @@ What lets an application sit on the core without the core knowing it:
 The DAG above never mentions a Matrix SDK. That is not because there is only one
 place it could go — it is because there are **two**, and neither is on a default
 dependency path. `matrix-sdk` enters the workspace only through
-`matrix-rtc-matrix-sdk`, which nothing depends on but `matrix-rtc-livekit`'s
+`matrix-rtc-matrix-sdk`, which nothing depends on but `matrix-rtc-call-sdk`'s
 `matrix-sdk` feature, off by default.
 
 `MatrixBackend` (defined in `matrix-rtc-core`) is the seam that makes both
@@ -147,13 +156,14 @@ consumer, not a dependency:
 └────────────────────────────────────────────────────────┘
                               │
                               ▼
-   matrix-rtc-call ──▶ matrix-rtc-core feeder  (+ media / livekit under "media")
+   matrix-rtc-call ──▶ matrix-rtc-core feeder  (+ call-sdk / livekit under "media")
 ```
 
 The bindings carry no Matrix SDK at all — not even transitively, and not even
 with the FFI's `media` feature on. `cargo tree -p matrix-rtc-ffi --features media`
 contains zero `matrix-sdk` entries, because the FFI depends on
-`matrix-rtc-livekit` *without* its `matrix-sdk` feature, deliberately.
+`matrix-rtc-call-sdk` with `livekit` but *without* `matrix-sdk`, deliberately,
+and `matrix-rtc-livekit` has no Matrix SDK to offer.
 
 ### Rust-driven — tests, examples, recording bots
 
@@ -169,7 +179,7 @@ below**. This is the topology of the e2e call test, `join_and_record`,
                               │
                               ▼
 ┌────────────────────────────────────────────────────────┐
-│ matrix_rtc_livekit::call::LiveKitCall                  │
+│ matrix_rtc_call_sdk::LiveKitCall                       │
 │ matrix_rtc_matrix_sdk::SdkMatrixBackend ──▶ matrix_sdk │
 │ both behind feature "matrix-sdk", off by default       │
 └────────────────────────────────────────────────────────┘
@@ -180,7 +190,7 @@ below**. This is the topology of the e2e call test, `join_and_record`,
 
 ### What the two topologies share
 
-`call::LiveKitCall` still exists only in the Rust-driven topology — it owns a
+`LiveKitCall` still exists only in the Rust-driven topology — it owns a
 `matrix_sdk::Client`, so it is gated on `matrix-sdk`. But the wiring under it
 is no longer its own: `LiveKitCall::join`, the FFI's `RtcClient` and the wasm
 `WasmRtcClient` all open rooms through `matrix_rtc_call::RtcClient` — which
@@ -300,7 +310,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   `m.call.member`, which it recognises through ruma), and from one `/state`
   fetch for the rest. Depends on the core alone.
 
-## `crates/matrix-rtc-media`
+## `crates/matrix-rtc-call-sdk`
 
 - The call's media model over `matrix-rtc-transport`: `Participant` roster
   keyed by `member_id`, `CallEvent` (the unified membership + media event
@@ -327,8 +337,20 @@ Membership is always applied as a complete set: a member whose event is absent f
   sender's key index after it) shared by the FFI and wasm media sessions and
   `LiveKitCall`. Transports opt in with `OwnFocusTransport`, which hands the
   caller a typed own-focus connection.
-- Depends only on `matrix-rtc-core`, `matrix-rtc-transport`, `matrix-rtc-call`
-  (temporarily, for hand and reaction types) + tokio/futures — no LiveKit, no
+- Behind `livekit`: `attach_livekit` builds the MSC4195 key provider, bridge
+  and `matrix-rtc-livekit` transport for a joined call (token endpoint and
+  identity from the call's `MembershipFormat`) and runs `attach_media` over
+  them — what the FFI's media session is.
+- Behind `matrix-sdk`: `LiveKitCall::join`/`LiveKitCall::leave`, a facade that
+  composes `matrix-rtc-matrix-sdk`'s `SdkMatrixBackend` and `matrix-rtc-call`'s
+  client with `attach_livekit`: membership, key exchange, the library's
+  transport choice, the E2EE SFU connection, and a `CallEngine` in one handle
+  (the crate README's quick start; also what the examples and the e2e test
+  drive). `LiveKitCall::subscribe_call_events`/`LiveKitCall::participants` are
+  the transport-agnostic surface; the raw `LiveKitCall::events`/
+  `LiveKitCall::session` accessors remain during the transition.
+- Without features it depends only on `matrix-rtc-core`, `matrix-rtc-transport`,
+  `matrix-rtc-call` + tokio/futures — no LiveKit, no
   libwebrtc, fully unit-testable (`FakeTransport`). Compiles for wasm32:
   the transport traits are `Send + Sync` off wasm (via `MaybeSend`) and
   unconstrained on it, and tasks/timers go through `matrix_rtc_core::executor`
@@ -372,7 +394,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   unsubscribes. The room has `openSlot`/`closeSlot` and `joinCall`. A joined
   call keeps itself alive and rotates its keys; the page ticks nothing.
 - `media/`: `call.connectMedia` attaches media to the joined call through
-  `matrix_rtc_media::attach_media` — the shared `CallEngine` (roster +
+  `matrix_rtc_call_sdk::attach_media` — the shared `CallEngine` (roster +
   multi-focus pool) over `JsMediaTransport`, a JS
   delegate driving livekit-js. Rust owns the protocol (token requests via
   `matrix_rtc_transport::livekit`, identities, pool policy, key bookkeeping via the shared
@@ -416,7 +438,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   client and libwebrtc, ~8–15 MB per ABI): `src/media/` exposes the
   transport-agnostic media model to mobile. The host joins the slot through
   the room as usual, then `connect_media_session(call, config)` attaches media
-  through `matrix_rtc_livekit::attach_livekit` (E2EE key bridge into the core,
+  through `matrix_rtc_call_sdk::attach_livekit` (E2EE key bridge into the core,
   the `CallEngine` with its multi-focus pool, the own-focus SFU connection). `MediaSession` surfaces `next_event()` (async
   pull → Kotlin `Flow` / Swift `AsyncStream`), the participant roster,
   `set_constraints`, frame streams (audio frames by value; video frames as
@@ -440,25 +462,14 @@ Membership is always applied as a complete set: a member whose event is absent f
   so the crate is not hard-wired to a particular Matrix SDK. `MemberClaims`
   stays here: those are the `/get_token` request body's claims, which no
   homeserver ever sees.
-- Implements `matrix-rtc-media`'s transport traits in `transport_impl`
+- Implements `matrix-rtc-transport`'s traits in `transport_impl`
   (`LiveKitMediaTransport`): connection key = `livekit_service_url`, remote
   identity = MSC4195 pseudonymous identity, `RoomEvent` → `ConnectionEvent`
   translation, and `NativeAudioStream` → owned PCM frame streams behind
-  `RemoteTrackHandle`. `attach_livekit` builds the key provider, bridge and
-  transport for a joined call and runs `attach_media` over them.
-- Behind `matrix-sdk` it ships `call` — a `LiveKitCall::join`/`LiveKitCall::leave` facade that
-  composes `matrix-rtc-matrix-sdk`'s `SdkMatrixBackend` and `matrix-rtc-call`'s feeder with
-  this transport: membership, key exchange, the library's transport choice, the
-  E2EE SFU connection, and a `CallEngine` in one handle (the crate README's
-  quick start; also what the e2e test drives).
-  `LiveKitCall::subscribe_call_events`/`LiveKitCall::participants` are the transport-agnostic
-  surface; the raw `LiveKitCall::events`/`LiveKitCall::session` accessors remain during the
-  transition.
-- Selects the membership format per call via `LiveKitCallOptions::format`, and
-  owns the two parts of it that refuse to be JSON and so cannot live in the
-  core's `compat`: the token endpoint
-  (`TokenEndpoint`, `token`/`lib`) and the participant-identity derivation
-  (`identity_mapper`, which hashes per MSC4195 — a LiveKit document).
+  `RemoteTrackHandle`.
+- Knows no call: no `matrix-rtc-call`, no call SDK, no Matrix SDK. The token
+  endpoint and identity derivation a membership format implies are
+  `matrix_rtc_transport::livekit`'s; the caller picks them.
 - Native-only by nature (the LiveKit client pulls in `libwebrtc`); never targets wasm.
 
 ## Spec alignment
@@ -723,7 +734,7 @@ Still outstanding:
    slot type to the SDK's sliding sync `required_state`, then reading the state
    store.
 3. **A unified `CallEvent` stream on the `LiveKitCall` facade** — landed as
-   `matrix-rtc-media::CallEvent` via `LiveKitCall::subscribe_call_events` (peer
+   `matrix_rtc_call_sdk::CallEvent` via `LiveKitCall::subscribe_call_events` (peer
    joined/left, stream started/stopped, key imported, connection health,
    ended-with-reason). Remaining: migrate the e2e test and examples off the
    raw `LiveKitCall::events`/`LiveKitCall::session` accessors and delete them, and surface
@@ -749,7 +760,7 @@ timeline, and dump current state with `debug_snapshot()` / `debugSnapshot()`.
 **Conventions.**
 
 - **Targets are module paths** (the `log` default — no explicit `target:`). The filterable
-  roots are `matrix_rtc_core`, `matrix_rtc_media`, `matrix_rtc_livekit`, `matrix_rtc_ffi`,
+  roots are `matrix_rtc_core`, `matrix_rtc_call_sdk`, `matrix_rtc_transport`, `matrix_rtc_livekit`, `matrix_rtc_ffi`,
   plus third-party `livekit` and `webrtc_sys`.
 - **Session-scoped lines are prefixed `[{room_id}/{slot_id}]`.** `SlotSession` carries a
   pre-formatted `log_tag` for this, built from the room and slot it was created for.

@@ -31,14 +31,24 @@
 pub mod attach;
 pub mod engine;
 pub mod event;
+#[cfg(feature = "livekit")]
+pub mod livekit;
 pub mod participant;
 pub mod tile;
 
 pub use attach::{AttachError, AttachOptions, MediaAttachment, attach_media};
 pub use engine::{CallEngine, EngineConfig, EngineHandle, StabilityConfig};
 pub use event::{CallEvent, EndedReason, FrameEncryptionDiagnostic};
+#[cfg(feature = "livekit")]
+pub use livekit::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
+#[cfg(feature = "matrix-sdk")]
+pub use livekit::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, open_slot};
 pub use participant::{Participant, StreamState};
 pub use tile::{
     CallTile, DetailWindow, LocalState, TileId, TileKind, TileRef, TileRoster, Tiles, derive_tiles,
     window,
 };
+// The SDK backend lives in `matrix-rtc-matrix-sdk`; re-exported so a host
+// driving a call keeps one dependency.
+#[cfg(feature = "matrix-sdk")]
+pub use matrix_rtc_matrix_sdk::SdkMatrixBackend;

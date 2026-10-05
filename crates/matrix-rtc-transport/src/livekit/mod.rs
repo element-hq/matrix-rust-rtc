@@ -33,7 +33,7 @@ use matrix_rtc_core::compat::{MembershipFormat, room_state};
 ///
 /// Call it once per call and share the returned `Arc`: it has four uses (the
 /// core's encryption manager, the media transport, our own identity, and the
-/// key ring — see `matrix_rtc_media::attach_media`), and they must not
+/// key ring — see `matrix_rtc_call_sdk::attach_media`), and they must not
 /// skew. That matters more than it looks, because a divergence is not an error
 /// but a silence: peers appear in the roster with no media, their keys land
 /// under an identity the SFU never assigned, and nothing anywhere logs a

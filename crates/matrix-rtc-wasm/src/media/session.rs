@@ -7,7 +7,7 @@
 //! livekit-js, layered on a call the page has already joined
 //! ([`WasmRtcCall`]).
 //!
-//! The wiring is `matrix_rtc_media::attach_media`'s, shared with the FFI;
+//! The wiring is `matrix_rtc_call_sdk::attach_media`'s, shared with the FFI;
 //! frames, publishing, and constraints stay in livekit-js.
 //! The shared `CallEngine` still owns roster reconciliation and the
 //! multi-focus connection pool; its actor runs on the JS microtask queue.
@@ -16,11 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use js_sys::{Function, Reflect};
-use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_media::{
+use matrix_rtc_call_sdk::{
     AttachOptions, CallEngine, CallEvent, EndedReason, FrameEncryptionDiagnostic, MediaAttachment,
     Participant, StabilityConfig, attach_media,
 };
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_transport::keys::MediaKeyHandler;
 use matrix_rtc_transport::livekit::{TokenEndpoint, identity_mapper};
 use matrix_rtc_transport::{FrameEncryptionState, TransportConnection as _};
@@ -57,7 +57,7 @@ struct WasmMediaSessionConfig {
 
 /// The tile-order damping a page can set (R10, R11). A product decision
 /// rather than a protocol one; each field defaults to what
-/// `matrix_rtc_media::StabilityConfig` uses.
+/// `matrix_rtc_call_sdk::StabilityConfig` uses.
 #[derive(Debug, Deserialize)]
 struct WasmStabilityConfig {
     /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.

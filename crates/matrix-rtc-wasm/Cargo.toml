@@ -20,7 +20,8 @@ matrix-rtc-call = { path = "../matrix-rtc-call" }
 # transport contract, shared key handler and MSC4195 identity derivation and
 # token shapes. Neither pulls livekit/libwebrtc — the browser's media is
 # livekit-js.
-matrix-rtc-media = { path = "../matrix-rtc-media" }
+# Without features: no LiveKit client, no matrix-sdk.
+matrix-rtc-call-sdk = { path = "../matrix-rtc-call-sdk" }
 matrix-rtc-transport = { path = "../matrix-rtc-transport" }
 serde.workspace = true
 serde_json.workspace = true

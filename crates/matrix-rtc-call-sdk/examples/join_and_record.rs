@@ -39,9 +39,10 @@ use std::error::Error;
 use std::time::Duration;
 
 use livekit::{RoomEvent, track::RemoteTrack};
+use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, open_slot};
+use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
-use matrix_rtc_livekit::compat::MembershipFormat;
-use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions, media, open_slot};
+use matrix_rtc_livekit::media;
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::RoomId;
 use matrix_sdk_ui::sync_service::SyncService;

@@ -48,7 +48,7 @@ pub async fn get_token(
 /// For interoperating with Element Call builds older than MSC4354. There is
 /// deliberately no fallback from `/get_token` to this on a 404 — see
 /// [`matrix_rtc_transport::livekit::token::legacy_token_request`]. Temporary; see
-/// [`crate::compat`].
+/// [`matrix_rtc_core::compat`].
 pub async fn get_legacy_token(
     http: &reqwest::Client,
     livekit_service_url: &str,

@@ -22,7 +22,7 @@ on:
     branches: [main, develop]
     paths:
       - 'crates/matrix-rtc-ffi/**'
-      - 'crates/matrix-rtc-media/**'
+      - 'crates/matrix-rtc-call-sdk/**'
       - 'crates/matrix-rtc-transport/**'
       - 'crates/matrix-rtc-livekit/**'
       - 'scripts/build-*.sh'

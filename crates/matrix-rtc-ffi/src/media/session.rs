@@ -13,12 +13,10 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 
+use matrix_rtc_call_sdk::{AttachError, CallEngine, CallEvent, MediaAttachment};
+use matrix_rtc_call_sdk::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_livekit::{
-    LiveKitAttachOptions, LiveKitAttachment, LiveKitTransportConnection, MediaKeyBridge,
-    attach_livekit,
-};
-use matrix_rtc_media::{AttachError, CallEngine, CallEvent, MediaAttachment};
+use matrix_rtc_livekit::{LiveKitTransportConnection, MediaKeyBridge};
 use matrix_rtc_transport::{MediaStreamKind, TransportConnection as _};
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
@@ -129,8 +127,8 @@ pub struct MediaSession {
     /// core's encryption manager also holds it.
     _bridge: Arc<MediaKeyBridge>,
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
-    tiles: TokioMutex<watch::Receiver<matrix_rtc_media::TileRoster>>,
-    local: TokioMutex<watch::Receiver<Option<matrix_rtc_media::LocalState>>>,
+    tiles: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::TileRoster>>,
+    local: TokioMutex<watch::Receiver<Option<matrix_rtc_call_sdk::LocalState>>>,
     own_identity: String,
 }
 

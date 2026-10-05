@@ -66,8 +66,8 @@ pub struct FfiParticipant {
     pub hand_raised_at_ms: Option<u64>,
 }
 
-impl From<matrix_rtc_media::Participant> for FfiParticipant {
-    fn from(participant: matrix_rtc_media::Participant) -> Self {
+impl From<matrix_rtc_call_sdk::Participant> for FfiParticipant {
+    fn from(participant: matrix_rtc_call_sdk::Participant) -> Self {
         Self {
             member_id: participant.member_id,
             user_id: participant.user_id,
@@ -106,16 +106,16 @@ pub enum FfiTileKind {
     ScreenShare,
 }
 
-impl From<matrix_rtc_media::TileKind> for FfiTileKind {
-    fn from(kind: matrix_rtc_media::TileKind) -> Self {
+impl From<matrix_rtc_call_sdk::TileKind> for FfiTileKind {
+    fn from(kind: matrix_rtc_call_sdk::TileKind) -> Self {
         match kind {
-            matrix_rtc_media::TileKind::Person => Self::Person,
-            matrix_rtc_media::TileKind::ScreenShare => Self::ScreenShare,
+            matrix_rtc_call_sdk::TileKind::Person => Self::Person,
+            matrix_rtc_call_sdk::TileKind::ScreenShare => Self::ScreenShare,
         }
     }
 }
 
-impl From<FfiTileKind> for matrix_rtc_media::TileKind {
+impl From<FfiTileKind> for matrix_rtc_call_sdk::TileKind {
     fn from(kind: FfiTileKind) -> Self {
         match kind {
             FfiTileKind::Person => Self::Person,
@@ -124,8 +124,8 @@ impl From<FfiTileKind> for matrix_rtc_media::TileKind {
     }
 }
 
-impl From<matrix_rtc_media::TileId> for FfiTileId {
-    fn from(id: matrix_rtc_media::TileId) -> Self {
+impl From<matrix_rtc_call_sdk::TileId> for FfiTileId {
+    fn from(id: matrix_rtc_call_sdk::TileId) -> Self {
         Self {
             member_id: id.member_id,
             kind: id.kind.into(),
@@ -133,7 +133,7 @@ impl From<matrix_rtc_media::TileId> for FfiTileId {
     }
 }
 
-impl From<FfiTileId> for matrix_rtc_media::TileId {
+impl From<FfiTileId> for matrix_rtc_call_sdk::TileId {
     fn from(id: FfiTileId) -> Self {
         Self {
             member_id: id.member_id,
@@ -153,8 +153,8 @@ pub struct FfiTileRef {
     pub hero: bool,
 }
 
-impl From<matrix_rtc_media::TileRef> for FfiTileRef {
-    fn from(r: matrix_rtc_media::TileRef) -> Self {
+impl From<matrix_rtc_call_sdk::TileRef> for FfiTileRef {
+    fn from(r: matrix_rtc_call_sdk::TileRef) -> Self {
         Self {
             id: r.id.into(),
             user_id: r.user_id,
@@ -166,7 +166,7 @@ impl From<matrix_rtc_media::TileRef> for FfiTileRef {
 /// One renderable stream of one membership, with what a UI needs to place
 /// and decorate it. `microphone_muted` is the member's microphone; this
 /// tile's own stream state is `has_video`. Mirrors
-/// [`matrix_rtc_media::CallTile`], where every field is documented.
+/// [`matrix_rtc_call_sdk::CallTile`], where every field is documented.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiCallTile {
     pub member_id: String,
@@ -183,10 +183,10 @@ pub struct FfiCallTile {
     pub reachable: bool,
 }
 
-impl From<matrix_rtc_media::CallTile> for FfiCallTile {
+impl From<matrix_rtc_call_sdk::CallTile> for FfiCallTile {
     // `joined_at_ms` stays on the Rust side: it only ranks, nothing decorates
     // with it, and it is `None` for every native MSC4143 membership today.
-    fn from(t: matrix_rtc_media::CallTile) -> Self {
+    fn from(t: matrix_rtc_call_sdk::CallTile) -> Self {
         Self {
             member_id: t.member_id,
             kind: t.kind.into(),
@@ -211,8 +211,8 @@ pub struct FfiTileRoster {
     pub detail: Vec<FfiCallTile>,
 }
 
-impl From<matrix_rtc_media::TileRoster> for FfiTileRoster {
-    fn from(r: matrix_rtc_media::TileRoster) -> Self {
+impl From<matrix_rtc_call_sdk::TileRoster> for FfiTileRoster {
+    fn from(r: matrix_rtc_call_sdk::TileRoster) -> Self {
         Self {
             order: r.order.into_iter().map(Into::into).collect(),
             detail: r.detail.into_iter().map(Into::into).collect(),
@@ -229,8 +229,8 @@ pub struct FfiLocalState {
     pub is_screen_sharing: bool,
 }
 
-impl From<matrix_rtc_media::LocalState> for FfiLocalState {
-    fn from(s: matrix_rtc_media::LocalState) -> Self {
+impl From<matrix_rtc_call_sdk::LocalState> for FfiLocalState {
+    fn from(s: matrix_rtc_call_sdk::LocalState) -> Self {
         Self {
             tile: s.tile.into(),
             is_screen_sharing: s.is_screen_sharing,
@@ -240,7 +240,7 @@ impl From<matrix_rtc_media::LocalState> for FfiLocalState {
 
 /// How much the tile order is damped (R10, R11). A product decision rather
 /// than a protocol one, so a host can tune it; the defaults are what
-/// `matrix_rtc_media::StabilityConfig` uses.
+/// `matrix_rtc_call_sdk::StabilityConfig` uses.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiStabilityConfig {
     /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
@@ -256,7 +256,7 @@ pub struct FfiStabilityConfig {
     pub coalesce_ms: u64,
 }
 
-impl From<FfiStabilityConfig> for matrix_rtc_media::StabilityConfig {
+impl From<FfiStabilityConfig> for matrix_rtc_call_sdk::StabilityConfig {
     fn from(c: FfiStabilityConfig) -> Self {
         Self {
             promote: Duration::from_millis(c.promote_ms),
@@ -299,7 +299,7 @@ pub enum FfiFrameEncryptionState {
 }
 
 /// What the media layer knows about a frame-encryption failure (mirrors
-/// `matrix_rtc_media::FrameEncryptionDiagnostic`).
+/// `matrix_rtc_call_sdk::FrameEncryptionDiagnostic`).
 ///
 /// The transport's cryptor reports *that* it cannot decrypt, never why. This says
 /// whether any key was installed for that participant at all, which splits a
@@ -322,9 +322,9 @@ pub enum FfiFrameEncryptionDiagnostic {
     KeysInstalled { key_indices: Vec<u16> },
 }
 
-impl From<matrix_rtc_media::FrameEncryptionDiagnostic> for FfiFrameEncryptionDiagnostic {
-    fn from(diagnostic: matrix_rtc_media::FrameEncryptionDiagnostic) -> Self {
-        use matrix_rtc_media::FrameEncryptionDiagnostic as Diagnostic;
+impl From<matrix_rtc_call_sdk::FrameEncryptionDiagnostic> for FfiFrameEncryptionDiagnostic {
+    fn from(diagnostic: matrix_rtc_call_sdk::FrameEncryptionDiagnostic) -> Self {
+        use matrix_rtc_call_sdk::FrameEncryptionDiagnostic as Diagnostic;
         match diagnostic {
             Diagnostic::NotApplicable => Self::NotApplicable,
             Diagnostic::NoKeyInstalled => Self::NoKeyInstalled,
@@ -508,7 +508,7 @@ pub(super) fn zip_stream_stats(
 }
 
 /// An event on the unified call stream (mirrors
-/// `matrix_rtc_media::CallEvent`). Consume via
+/// `matrix_rtc_call_sdk::CallEvent`). Consume via
 /// [`MediaSession::next_event`](super::MediaSession::next_event).
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiCallEvent {
@@ -612,8 +612,8 @@ impl FfiCallEvent {
     /// nothing drew from it. `CallEvent::ActiveSpeakers` itself survives in the
     /// core only because the wasm binding still relays it to a web client that
     /// has no tile roster; once the roster is exposed to wasm, delete the event.
-    pub(super) fn relayed(event: matrix_rtc_media::CallEvent) -> Option<Self> {
-        use matrix_rtc_media::CallEvent as Event;
+    pub(super) fn relayed(event: matrix_rtc_call_sdk::CallEvent) -> Option<Self> {
+        use matrix_rtc_call_sdk::CallEvent as Event;
         Some(match event {
             Event::ParticipantJoined { member_id, user_id } => {
                 Self::ParticipantJoined { member_id, user_id }
@@ -688,8 +688,8 @@ impl FfiCallEvent {
             Event::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },
             Event::Ended { reason } => Self::Ended {
                 reason: match reason {
-                    matrix_rtc_media::EndedReason::Left => FfiEndedReason::Left,
-                    matrix_rtc_media::EndedReason::ConnectionClosed { message } => {
+                    matrix_rtc_call_sdk::EndedReason::Left => FfiEndedReason::Left,
+                    matrix_rtc_call_sdk::EndedReason::ConnectionClosed { message } => {
                         FfiEndedReason::ConnectionClosed { message }
                     }
                 },

@@ -16,18 +16,11 @@ crate-type = ["rlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
-matrix-rtc-call = { path = "../matrix-rtc-call" }
-# `SdkBackend`, the matrix-rust-sdk `MatrixBackend` that `call` drives. Behind
-# this crate's `matrix-sdk` feature. Nothing in it knows about LiveKit.
-matrix-rtc-matrix-sdk = { path = "../matrix-rtc-matrix-sdk", optional = true }
 # The transport contract this crate implements (`transport_impl`), and the pure
 # MSC4195 control plane (`livekit`: identity derivations, token shapes, dialect
 # choices) shared with the web binding. This crate re-exports the latter and
 # adds the IO: reqwest for the token POST, livekit for the SFU itself.
 matrix-rtc-transport = { path = "../matrix-rtc-transport" }
-# The call's media engine and `attach_media`, for `attach_livekit` and the
-# `LiveKitCall` facade.
-matrix-rtc-media = { path = "../matrix-rtc-media" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror.workspace = true
@@ -35,138 +28,26 @@ async-trait.workspace = true
 log.workspace = true
 # `media` uses tokio timers (interval / timeout_at) on top of the workspace rt+sync.
 tokio = { workspace = true, features = ["time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Keep default features (notably `tokio`, which enables the signal client) and
-# select the rustls TLS backend for the SFU WebSocket/HTTP connections. This
-# pulls in libwebrtc (native C++) via webrtc-sys, so building this crate needs a
-# C++ toolchain — CI jobs that lack one must not build this crate.
-#
-# BOTH root stores, deliberately. `rustls-tls-native-roots` alone breaks the
-# signal WebSocket on every Android device: `rustls-native-certs` probes the
-# filesystem (/etc/ssl/certs, SSL_CERT_FILE, ...) and Android keeps its trust
-# store in the Java KeyStore instead, so it returns zero certificates and
-# tokio-tungstenite fails the connection with "no native root CA certificates
-# found (errors: [])". Nothing failed to parse — there was nothing to read.
-#
-# tokio-tungstenite is written for the two to coexist (src/tls.rs): an empty
-# native store is fatal *only* when `rustls-tls-webpki-roots` is off, and the
-# webpki roots are then unioned into the same store. So Android falls back to
-# the bundled roots while desktop keeps the system store, including any
-# enterprise CA an admin added there.
-#
-# Not a swap, for two reasons. Desktop would lose user/enterprise-added CAs.
-# And livekit-api gates its WSS-over-HTTP-proxy path on
-# `rustls-tls-native-roots` (signal_client/signal_stream.rs) — without it, any
-# wss:// through a proxy becomes a hard "requires rustls-tls-native-roots".
-#
-# This does NOT give Android enterprise/internal CAs: nothing here can read the
-# Java KeyStore. That needs a platform verifier
-# (`rustls-platform-verifier`) plumbed through livekit-api, which calls
-# `connect_async` without a connector and so cannot accept one today — an
-# upstream change, not a local knob.
-livekit = { version = "0.7", features = [
-    "rustls-tls-native-roots",
-    "rustls-tls-webpki-roots",
-] }
+# The token POST. Version and TLS backend are the workspace's.
+reqwest.workspace = true
+# The LiveKit client; see the workspace manifest for its version and features
+# (both rustls root stores, and why). Pulls in libwebrtc (native C++) via
+# webrtc-sys, so building this crate needs a C++ toolchain — CI jobs that lack
+# one must not build this crate.
+livekit.workspace = true
 # Stream combinators for draining the LiveKit audio stream in the media helpers.
 futures-util = "0.3"
-# `call` needs the SDK directly — `Client`, `Room`, the to-device event handlers
-# and ruma's `GET /rtc/transports` request type. Everything else Matrix-side is
-# `matrix-rtc-matrix-sdk`'s, and the rationale for the feature set (why room-key
-# forwarding stays on, what `experimental-send-custom-to-device` is for) lives
-# there, next to the code that depends on it. The rev is the workspace's, so the
-# two crates cannot drift onto two copies of matrix-sdk.
-matrix-sdk = { workspace = true, optional = true, features = ["experimental-send-custom-to-device"] }
-# Drives sliding sync plus the encryption sync in the examples and the e2e test.
-# Its `unstable-msc4354` (enabled by our `matrix-sdk` feature) turns on the
-# sliding-sync sticky-events extension, so sticky events actually flow;
-# encryption support rides along via matrix-sdk's default features.
-matrix-sdk-ui = { workspace = true, optional = true }
-
 [target.'cfg(target_os = "android")'.dependencies]
 # For the `android::initialize_android` re-export's signature; unifies with
 # the jni version libwebrtc itself uses.
 jni = "0.21"
 
 [features]
-# Turns on the SDK-backed half: `matrix-rtc-matrix-sdk`'s `SdkBackend`, the
-# `call::Call` facade that composes it with this transport, and the examples / `e2e_call`.
-# Off by default to keep the base crate light and buildable without the git SDK.
-# `matrix-sdk-ui/unstable-msc4354` is what makes `SyncService` request sticky
-# events over sliding sync.
-matrix-sdk = [
-    "dep:matrix-rtc-matrix-sdk",
-    "dep:matrix-sdk",
-    "dep:matrix-sdk-ui",
-    "matrix-sdk-ui/unstable-msc4354",
-]
 # Exposes the test-only parts of the `media` module (tone generator, Goertzel
-# frequency detector) for examples and integration tests; recording/WAV
-# helpers in that module are shipped API and need no feature. Otherwise the
-# test-only parts compile only under `cfg(test)`.
-#
-# Also turns on matrix-sdk's `testing`, whose only use here is
-# `Client::olm_machine_for_testing` — the one public route to the `OlmMachine`,
-# and so the only way to reach `set_room_key_forwarding_enabled`. It costs
-# `wiremock` and friends in the graph, which is what a testing feature is for.
-testing = ["matrix-sdk?/testing"]
-
-# The end-to-end call test (see tests/E2E_CALL.md). `required-features` keeps
-# plain `cargo test --workspace` from compiling it (and the git SDK + libwebrtc
-# behind it); the `#[ignore]` inside keeps `--all-features` runs from executing
-# it without the demo/backend stack.
-[[test]]
-name = "e2e_call"
-path = "tests/e2e_call/main.rs"
-required-features = ["matrix-sdk", "testing"]
+# frequency detector) for `matrix-rtc-call-sdk`'s examples and integration
+# tests; recording/WAV helpers in that module are shipped API and need no
+# feature. Otherwise the test-only parts compile only under `cfg(test)`.
+testing = []
 
 [dev-dependencies]
-# `signal` for the join_and_record example's Ctrl-C hang-up; `io-std` for the
-# interop_peer example, which is driven over stdin by the Playwright suite.
-tokio = { version = "1", features = [
-  "rt",
-  "rt-multi-thread",
-  "macros",
-  "time",
-  "test-util",
-  "signal",
-  "io-std",
-  "io-util",
-] }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Argument parsing for the `load_test` example. A dev-dependency on purpose:
-# examples may use them, so clap never enters the library's dependency graph.
-clap = { version = "4", features = ["derive", "env"] }
-# The dependency tree pulls in rustls with BOTH the `ring` and `aws-lc-rs`
-# crypto backends (livekit/reqwest vs matrix-sdk), so rustls cannot pick a
-# process-level `CryptoProvider` automatically and panics on first TLS use. The
-# example installs `aws-lc-rs` explicitly (matches matrix-sdk's default); this
-# dev-dep gives us the provider module to call `install_default()`.
-rustls = { version = "0.23", features = ["aws_lc_rs"] }
-
-[[example]]
-name = "connect"
-required-features = ["matrix-sdk"]
-
-# The quick-start example (see README.md). `testing` only for the optional
-# PUBLISH_TONE test-tone publisher, so two instances can call each other.
-[[example]]
-name = "join_and_record"
-required-features = ["matrix-sdk", "testing"]
-
-# The load generator (see README.md). Publishes a video file from N devices of
-# one account. Its tone generator is local, so `testing` is here for one reason
-# only: reaching the `OlmMachine`.
-# The Rust half of the Element Call interop test (see interop/README.md and
-# demo/backend/INTEROP.md). Driven over stdin by Playwright, which owns the
-# browser running Element Call. `testing` for the tone generator it publishes
-# so Element Call has media to render.
-[[example]]
-name = "interop_peer"
-required-features = ["matrix-sdk", "testing"]
-
-[[example]]
-name = "load_test"
-# `testing` is only for `Client::olm_machine_for_testing`, used to keep room-key
-# gossip out of the to-device traffic this tool measures.
-required-features = ["matrix-sdk", "testing"]
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

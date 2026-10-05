@@ -8,7 +8,7 @@
 //! [`LiveKitCall::join`] wires together everything a MatrixRTC participant needs —
 //! an [`RtcClient`] over a [`SdkMatrixBackend`], the room it opens and the call
 //! joined in it, the MSC4195 token exchange, and an E2EE-enabled SFU
-//! connection driven through the transport-agnostic [`matrix_rtc_media`]
+//! connection driven through the transport-agnostic [`matrix_rtc_call_sdk`]
 //! layer. [`LiveKitCall::leave`] tears
 //! all of it down in the right order.
 //!
@@ -42,6 +42,7 @@ use matrix_sdk::{Client, Room};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{broadcast, watch};
 
+use crate::{CallEngine, CallEvent, MediaAttachment, Participant, StabilityConfig};
 use matrix_rtc_call::{
     CallJoinOptions, JoinOptions, JoinTransport, NotifyConfig, RaisedHand, ReactionError,
     ReactionsConfig, RtcCall, RtcClient, RtcError, RtcRoom,
@@ -50,15 +51,14 @@ use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{self, MembershipFormat};
 use matrix_rtc_core::{BaseRtcRoom, EncryptionConfig, LiveKitTransport, SlotEncryption};
 use matrix_rtc_matrix_sdk::SdkMatrixBackend;
-use matrix_rtc_media::{CallEngine, CallEvent, MediaAttachment, Participant, StabilityConfig};
 use matrix_rtc_transport::{
     LocalTrackHandle, MediaConstraints, MediaStreamKind, PublishOptions, ReceiveStats,
     RemoteTrackHandle,
 };
 
-use crate::session::LiveKitSession;
-use crate::transport_impl::LiveKitTransportConnection;
-use crate::{LiveKitAttachOptions, LiveKitAttachment, MediaKeyBridge, attach_livekit};
+use matrix_rtc_livekit::{LiveKitSession, LiveKitTransportConnection, MediaKeyBridge};
+
+use super::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 
 /// Errors produced when joining, operating, or leaving a [`LiveKitCall`].
 #[derive(Debug, thiserror::Error)]
@@ -69,7 +69,7 @@ pub enum LiveKitCallError {
 
     /// A LiveKit transport error (token exchange, SFU connection).
     #[error(transparent)]
-    Transport(#[from] crate::Error),
+    Transport(#[from] matrix_rtc_livekit::Error),
 
     /// A media transport error surfaced through the media layer.
     #[error(transparent)]
@@ -77,7 +77,7 @@ pub enum LiveKitCallError {
 
     /// Attaching media to the joined call failed.
     #[error(transparent)]
-    Attach(#[from] matrix_rtc_media::AttachError),
+    Attach(#[from] crate::AttachError),
 
     /// MatrixRTC signalling through the core failed (membership, slot, keys).
     #[error("MatrixRTC signalling failed: {0}")]
@@ -176,7 +176,7 @@ pub struct LiveKitCallOptions {
     /// about such a call is visible to a spec-current peer.
     ///
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
-    /// [`crate::compat`], and delete all of it once Element Call catches up.
+    /// [`matrix_rtc_core::compat`], and delete all of it once Element Call catches up.
     pub format: MembershipFormat,
     /// Ask for an MSC4075 notification to be sent with this join, so other
     /// devices in the room ring or show an incoming call.

@@ -118,7 +118,7 @@ try setupLogging(config: RtcLogConfig(level: .debug, filter: "", writeToSystem: 
 Output goes to stderr, which appears in the Xcode console.
 
 **Filter syntax** is `RUST_LOG`'s. Targets are Rust module paths matched by prefix; the
-roots are `matrix_rtc_core`, `matrix_rtc_media`, `matrix_rtc_transport`, `matrix_rtc_livekit`,
+roots are `matrix_rtc_core`, `matrix_rtc_call_sdk`, `matrix_rtc_transport`, `matrix_rtc_livekit`,
 `matrix_rtc_ffi`, plus third-party `livekit` and `webrtc_sys`.
 
 **Useful extras**

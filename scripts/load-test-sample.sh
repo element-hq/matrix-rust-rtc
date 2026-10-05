@@ -5,7 +5,7 @@
 # Please see LICENSE in the repository root for full details.
 
 # Template for running the MatrixRTC load generator
-# (crates/matrix-rtc-livekit/examples/load_test.rs).
+# (crates/matrix-rtc-call-sdk/examples/load_test.rs).
 # Copy it, fill in the block below, and run your copy:
 #     cp scripts/load-test-sample.sh scripts/load-test.sh
 #     $EDITOR scripts/load-test.sh
@@ -40,7 +40,7 @@ VIDEO="clip.mp4"
 # three at 720p. Start low, double, and watch the "frames/10s" health line the
 # tool prints every 10 seconds — once it falls below FPS x 10 the generator is
 # saturated and further devices add no real load. See "How many devices?" in
-# crates/matrix-rtc-livekit/README.md.
+# crates/matrix-rtc-call-sdk/README.md.
 DEVICES=3
 
 # Encode cost per device is driven by these three. At 640x360 livekit
@@ -191,7 +191,7 @@ cd "$(dirname "$0")/.."
 #                      our own devices sharing keys with each other
 #
 # Drop a line to see one of them again, or use RUST_LOG=debug for everything.
-: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_media=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off}"
+: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_call_sdk=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off}"
 export RUST_LOG
 
 if [[ -z "$RECOVERY_KEY" ]]; then
@@ -238,5 +238,5 @@ args+=(--format "$MEMBERSHIP_FORMAT")
 # orphaned out of that group, so every later Ctrl-C lands nowhere while it keeps
 # printing to the same terminal. `exec` also means no shell is left wrapping it,
 # so the PID you see is the one to signal.
-cargo build --release -p matrix-rtc-livekit --example load_test --features matrix-sdk,testing
+cargo build --release -p matrix-rtc-call-sdk --example load_test --features matrix-sdk,testing
 exec ./target/release/examples/load_test "${args[@]}" "$@"

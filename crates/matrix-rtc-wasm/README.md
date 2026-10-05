@@ -1,7 +1,7 @@
 # matrix-rtc-wasm
 
 The browser binding for MatrixRTC: `matrix-rtc-core`'s signalling state
-machine plus the shared media engine (`matrix-rtc-media`), compiled to
+machine plus the shared media engine (`matrix-rtc-call-sdk`), compiled to
 wasm32 and exposed to JavaScript with wasm-bindgen.
 
 The division of labour is deliberate and strict:

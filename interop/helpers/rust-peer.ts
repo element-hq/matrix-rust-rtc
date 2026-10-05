@@ -7,7 +7,7 @@ Please see LICENSE in the repository root for full details.
 
 /**
  * The Rust half of the interop test, as a child process.
- * Wraps `crates/matrix-rtc-livekit/examples/interop_peer.rs`: commands go in on
+ * Wraps `crates/matrix-rtc-call-sdk/examples/interop_peer.rs`: commands go in on
  * stdin, JSON-line events come back on stdout, human logs on stderr. See that
  * file for the protocol.
  */
@@ -76,7 +76,7 @@ export class RustPeer {
     if (!existsSync(bin)) {
       throw new Error(
         `interop peer binary not found at ${bin}. Build it with:\n` +
-          `  cargo build -p matrix-rtc-livekit --features matrix-sdk,testing --example interop_peer`,
+          `  cargo build -p matrix-rtc-call-sdk --features matrix-sdk,testing --example interop_peer`,
       );
     }
     // The peer validates the stack's dev CA on two legs: the homeserver

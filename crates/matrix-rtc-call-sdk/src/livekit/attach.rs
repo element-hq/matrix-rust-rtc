@@ -4,21 +4,19 @@
 // Please see LICENSE in the repository root for full details.
 
 //! Native LiveKit media on a joined call: the MSC4195 key provider, the
-//! [`LiveKitMediaTransport`] over it, and [`matrix_rtc_media::attach_media`]'s
+//! [`LiveKitMediaTransport`] over it, and [`attach_media`](crate::attach_media)'s
 //! ordered wiring. Shared by the `LiveKitCall` facade and the FFI media session.
 
 use std::sync::Arc;
 
+use crate::{AttachError, AttachOptions, MediaAttachment, StabilityConfig, attach_media};
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_media::{
-    AttachError, AttachOptions, MediaAttachment, StabilityConfig, attach_media,
-};
 
-use crate::transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
-use crate::{
-    MediaKeyBridge, TokenEndpoint, identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
+use matrix_rtc_livekit::{
+    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
+    identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
 };
 
 /// What [`attach_livekit`] needs besides the call.

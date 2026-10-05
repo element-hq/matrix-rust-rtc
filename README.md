@@ -35,10 +35,9 @@ low-bandwidth mode). Everything underneath is hidden in Rust:
 
 ```rust,no_run
 use futures_util::StreamExt;
-use matrix_rtc_livekit::{LiveKitCall, LiveKitCallOptions};
-use matrix_rtc_media::{
-    CallEvent, Dimensions, MediaConstraints, MediaStreamKind, PublishOptions, VideoDetail,
-    VideoSourceConfig,
+use matrix_rtc_call_sdk::{CallEvent, LiveKitCall, LiveKitCallOptions};
+use matrix_rtc_transport::{
+    Dimensions, MediaConstraints, MediaStreamKind, PublishOptions, VideoDetail, VideoSourceConfig,
 };
 
 async fn video_call(room: &matrix_sdk::Room) -> Result<(), Box<dyn std::error::Error>> {
@@ -102,7 +101,7 @@ zero-copy plane access, latest-frame-wins so slow consumers drop frames
 instead of lagging. See [ARCHITECTURE.md](ARCHITECTURE.md) for the full
 design, the module docs in `crates/matrix-rtc-ffi/src/media/mod.rs` for the
 host-app integration flow, and
-[crates/matrix-rtc-livekit/README.md](crates/matrix-rtc-livekit/README.md)
+[crates/matrix-rtc-call-sdk/README.md](crates/matrix-rtc-call-sdk/README.md)
 for a runnable two-client example against the local backend.
 
 ## Workspace crates
@@ -111,13 +110,15 @@ for a runnable two-client example against the local backend.
   core — the `MediaTransport` contract, frames, constraints, the media key
   handler, and the pure MSC4195 control plane (`livekit`). No IO, **no
   LiveKit client**; compiles for wasm32.
-- `crates/matrix-rtc-media`: the call's media model over that contract —
-  participants, tiles, the unified event stream, `attach_media`, and the
-  `CallEngine` connection pool (MSC4195 multi-SFU). Fully unit-tested against
-  a fake transport.
+- `crates/matrix-rtc-call-sdk`: the call SDK hosts use — the call's media
+  model over that contract (participants, tiles, the unified event stream,
+  the `CallEngine` connection pool for MSC4195 multi-SFU), `attach_media`, and
+  behind features `attach_livekit` and the high-level `LiveKitCall::join`
+  facade with the examples and e2e test. Fully unit-tested against a fake
+  transport.
 - `crates/matrix-rtc-livekit`: MSC4195 LiveKit transport — SFU token exchange,
-  per-participant frame E2EE, the `MediaTransport` implementation, and the
-  high-level `LiveKitCall::join` facade. Native-only (pulls in `libwebrtc`).
+  per-participant frame E2EE, and the `MediaTransport` implementation. Knows no
+  call. Native-only (pulls in `libwebrtc`).
 - `crates/matrix-rtc-core`: the per-room MSC4143 core (`BaseRtcRoom`, a
   `SlotSession` per slot), the MSC4143/MSC4354 event conversion boundary, and
   the feeder that subscribes through a host's `MatrixBackend` and feeds it

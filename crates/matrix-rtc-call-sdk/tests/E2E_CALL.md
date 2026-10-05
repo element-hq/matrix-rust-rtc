@@ -31,7 +31,7 @@ registration).
 
 ## How it's wired
 
-Each participant is a `matrix_rtc_livekit::LiveKitCall` (`src/call.rs`) — the crate's
+Each participant is a `matrix_rtc_call_sdk::LiveKitCall` (`src/livekit/call.rs`) — the crate's
 join/leave facade, so the test exercises exactly what a consumer would use.
 Inside `LiveKitCall::join`:
 
@@ -87,7 +87,7 @@ First build is long (it compiles `matrix-sdk` + native `libwebrtc`).
 
 ```sh
 # the whole suite (or `make test-e2e`)
-cargo test -p matrix-rtc-livekit --features matrix-sdk,testing \
+cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing \
   --test e2e_call -- --ignored --nocapture --test-threads=1
 ```
 

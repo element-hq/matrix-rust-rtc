@@ -19,11 +19,11 @@
 //! - bridging `matrix-rtc-core`'s media keys into LiveKit frame encryption
 //!   ([`keys`]).
 //!
-//! Everything Matrix-side belongs elsewhere and knows nothing about LiveKit:
-//! `matrix_rtc_matrix_sdk` is the `matrix_sdk::Client` backend, and
-//! [`matrix_rtc_call`] feeds the core from it and translates the pre-2026
-//! Element Call wire dialects. With the `matrix-sdk` feature, [`call::LiveKitCall`]
-//! composes them with this transport into a join/leave facade — start there.
+//! It implements `matrix-rtc-transport`'s contract
+//! ([`LiveKitMediaTransport`]) and knows no call: the call's roster, attaching
+//! this transport to a joined call, and the `LiveKitCall` join/leave facade
+//! are `matrix-rtc-call-sdk`'s, behind its `livekit` and `matrix-sdk`
+//! features — start there.
 //!
 //! [`matrix-rtc-core`]: matrix_rtc_core
 
@@ -33,7 +33,6 @@
 pub use matrix_rtc_transport::livekit::identity;
 pub use matrix_rtc_transport::livekit::{LiveKitTransportConfig, TokenEndpoint, identity_mapper};
 
-pub mod attach;
 pub mod keys;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API
 // (the recording-bot use case); the synthetic-tone generator and frequency
@@ -43,17 +42,6 @@ pub mod session;
 pub mod token;
 pub mod transport_impl;
 
-#[cfg(feature = "matrix-sdk")]
-pub mod call;
-
-// Interop with MatrixRTC implementations that predate the 2026 MSC4143 rewrite.
-// Scaffolding with a delete-by date; nothing else should depend on it. Lives in
-// `matrix-rtc-call` (it is pure Matrix wire translation, with no LiveKit in
-// it), and is re-exported because `LiveKitCallOptions::format` names
-// `MembershipFormat` in this crate's own public API.
-pub use matrix_rtc_core::compat;
-
-pub use attach::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 pub use keys::{
     KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
     ParticipantKey, SwitchCompleteListener, msc4195_key_provider, msc4195_key_provider_options,
@@ -78,13 +66,6 @@ pub mod android {
         livekit::webrtc::android::initialize_android(vm);
     }
 }
-
-#[cfg(feature = "matrix-sdk")]
-pub use call::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, open_slot};
-// The SDK backend lives in `matrix-rtc-matrix-sdk`; re-exported so a
-// host driving a call keeps one dependency.
-#[cfg(feature = "matrix-sdk")]
-pub use matrix_rtc_matrix_sdk::SdkMatrixBackend;
 
 /// Obtain a fresh OpenID token and exchange it for an SFU JWT.
 ///
