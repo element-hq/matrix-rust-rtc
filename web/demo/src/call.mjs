@@ -250,13 +250,12 @@ export class WebPeerApp {
       }
     }
     if (event.type === 'key_imported') {
-      const entry = this.call
-        .participants()
-        .find((participant) => participant.member_id === event.member_id);
+      // The identity comes with the event: keys held before media connects
+      // arrive while `connect()` is pending, before there is a roster to read.
       this.emit({
         event: 'key_imported',
         member_id: event.member_id,
-        identity: entry?.rtc_identity,
+        identity: event.identity,
         key_index: event.key_index,
       });
       return;

@@ -13,7 +13,8 @@ log only.
 - `connect_media_session`/`connectMedia` take the own focus from the call and the account from the backend: `MediaSessionConfig` loses `livekit_service_url`, `user_id` and `device_id`, and a receive-only call connects only to its peers' foci.
 - `MembershipSnapshotSubscription::next_snapshot()`, which polled, becomes an async `next()` that waits for the next roster and returns `None` once the room is gone.
 - FFI and web `joinCall` take an optional `application_slot_id` (`m.call#{application_slot_id}`, `room` when omitted) instead of `slot_id` and `application`.
-- The room-wide slot is `{application}#room`, as MSC4143 spells it, instead of `{application}#ROOM`, so it no longer meets clients still on `m.call#ROOM`; `ROOM_SLOT_NAME` becomes `ROOM_APPLICATION_SLOT_ID`.
+- The room-wide slot is `{application}#room`, as MSC4143 spells it, instead of `{application}#ROOM` (the 2025 Element Call format still respells it `#ROOM` on the wire); `ROOM_SLOT_NAME` becomes `ROOM_APPLICATION_SLOT_ID`.
+- `CallEvent::KeyImported` (web `key_imported`) carries the `identity` the key was installed under.
 - A join refused because its slot is not open fails with `MatrixRtcFfiError::SlotClosed` instead of `InvalidInput`.
 - A join's transport is one choice, `Advertised`, `Publish` on a LiveKit focus, or `ReceiveOnly`, replacing `transport`, `receive_only` and `can_subscribe` in the FFI and web join params.
 - The library keeps a joined session alive and performs its key rotations at their deadline itself; `heartbeat()`, `flushDueKeyRotation()`/`flush_due_key_rotation`, `keyRotationDueAtMs()`/`key_rotation_due_at_ms` and `HEARTBEAT_INTERVAL_MS` are gone, and `LiveKitCallOptions::heartbeat_interval` becomes `keep_alive_interval_ms` (default 10 s).
@@ -49,6 +50,12 @@ log only.
 - `matrix_rtc_call::transports::choose`: the library's transport choice from the homeserver's `GET /rtc/transports`.
 - `SdkMatrixBackend` discovers transports through matrix-sdk's cached `discover_rtc_transports`, falling back to the well-known `rtc_foci`; a failed request is an error rather than "none advertised".
 - A member event carrying both `msc4354_sticky_key` and `sticky_key` (as seen on the wire) now parses; it was dropped as a duplicate field.
+
+
+### Fixed
+
+- In the 2025 Element Call format the room-wide slot is sent and read as `m.call#ROOM`, including in the token request, so we share a session and an SFU room with Element Call again.
+- The media engine's first event subscriber now receives events emitted before it subscribed, so `KeyImported` for keys replayed during connect is no longer lost.
 
 ## v0.4.0-rc.1 - 2026-09-25
 

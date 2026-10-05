@@ -94,6 +94,8 @@
 //! 6. `compat` — the binding-shaped mode vocabulary, given at `RtcClient::room`.
 //! 7. `media::session` — the identity derivation and token endpoint again.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 pub mod dialect_backend;
@@ -145,6 +147,17 @@ impl MembershipFormat {
     /// Whether membership is carried as room state in this mode.
     pub fn reads_state_membership(self) -> bool {
         matches!(self, Self::RoomState)
+    }
+
+    /// The slot id to name in an MSC4195 token request in this mode, which
+    /// must be the one peers of this generation name there too: the
+    /// authorisation service derives the SFU room from it.
+    pub fn token_slot_id(self, slot_id: &str) -> Cow<'_, str> {
+        match self {
+            Self::Sticky2025 => sticky_2025::legacy_slot_id(slot_id),
+            // `RoomState` asks `/sfu/get`, which takes no slot id.
+            Self::Current | Self::RoomState => Cow::Borrowed(slot_id),
+        }
     }
 }
 

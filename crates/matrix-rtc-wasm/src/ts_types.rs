@@ -128,7 +128,7 @@ export type RtcCallEvent =
     | { type: "stream_muted"; member_id: string; kind: RtcStreamKind }
     | { type: "stream_unmuted"; member_id: string; kind: RtcStreamKind }
     | { type: "active_speakers"; speakers: { member_id: string; level: number }[] }
-    | { type: "key_imported"; member_id: string; key_index: number }
+    | { type: "key_imported"; member_id: string; identity: string; key_index: number }
     | { type: "frame_encryption_state"; member_id: string;
         state: "ok" | "missing_key" | "decryption_failed" | "encryption_failed" | "internal_error";
         installed_key_indices: number[] | null }

@@ -105,7 +105,7 @@ export async function smoke(
   const handle = (event: RtcCallEvent): string => {
     switch (event.type) {
       case 'key_imported':
-        return `${event.member_id}@${event.key_index}`;
+        return `${event.member_id}/${event.identity}@${event.key_index}`;
       case 'active_speakers':
         return event.speakers.map((speaker) => speaker.member_id).join(',');
       case 'ended':

@@ -639,6 +639,7 @@ impl FfiCallEvent {
             Event::KeyImported {
                 member_id,
                 key_index,
+                ..
             } => Self::KeyImported {
                 member_id,
                 key_index,

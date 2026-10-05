@@ -136,7 +136,16 @@ pub enum CallEvent {
     ActiveSpeakers { speakers: Vec<SpeakingMember> },
     /// A media decryption key for this participant was imported; their frames
     /// are decryptable from here on.
-    KeyImported { member_id: String, key_index: u8 },
+    ///
+    /// `identity` is the transport identity the key was installed under, so a
+    /// host can match it to transport participants without a roster lookup —
+    /// which it may not be able to make yet: keys held before media connects
+    /// surface while the connect is still in flight.
+    KeyImported {
+        member_id: String,
+        identity: String,
+        key_index: u8,
+    },
     /// Frame encryption state for a participant's media changed.
     ///
     /// Anything but [`FrameEncryptionState::Ok`] means their frames are not
