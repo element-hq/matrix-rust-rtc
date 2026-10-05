@@ -34,52 +34,111 @@ low-bandwidth mode). Everything underneath is hidden in Rust:
   to-device messages and applied per participant across all connections.
 
 ```rust,no_run
-use futures_util::StreamExt;
-use matrix_rtc_call_sdk::{CallEvent, LiveKitCall, LiveKitCallOptions};
-use matrix_rtc_transport::{
-    Dimensions, MediaConstraints, MediaStreamKind, PublishOptions, VideoDetail, VideoSourceConfig,
-};
+let client = RtcClient::new(Arc::new(SdkMatrixBackend::new(matrix_sdk_client)));
+let room = client.room(room_id, RoomOptions::default()).await?;
+room.seeded().await;
 
-async fn video_call(room: &matrix_sdk::Room) -> Result<(), Box<dyn std::error::Error>> {
-    // Membership signalling + key exchange + connections to every focus.
-    let call = LiveKitCall::join(room, LiveKitCallOptions::default()).await?;
+let call = room.join_call(CallJoinOptions::new().slot("standup")).await?; // m.call#standup
 
-    // Publish the camera: push platform-captured I420 frames into the handle.
-    let camera = call
-        .publish(PublishOptions::camera(VideoSourceConfig { width: 1280, height: 720 }))
-        .await?;
+// Key exchange, the engine, and the connection to our own focus.
+let media = attach_livekit(
+    &call,
+    room.backend().clone(),
+    LiveKitAttachOptions {
+        format: Default::default(), // must match RoomOptions::format
+        http: None,
+        auto_subscribe: true,
+        stability: Default::default(),
+    },
+)
+.await?
+.media;
 
-    let mut events = call.subscribe_call_events();
-    while let Ok(event) = events.recv().await {
-        match event {
-            CallEvent::StreamStarted { member_id, kind: MediaStreamKind::Camera } => {
-                // Transport-neutral frames: I420 video, PCM audio.
-                let track = call.remote_track(&member_id, MediaStreamKind::Camera).unwrap();
-                let mut frames = track.video_frames().unwrap();
-                tokio::spawn(async move {
-                    while let Some(frame) = frames.next().await {
-                        // render frame.width x frame.height I420 planes
-                    }
-                });
+let camera = media
+    .engine
+    .publish(PublishOptions::camera(VideoSourceConfig { width: 1280, height: 720 }))
+    .await?;
 
-                // Say how the tile is rendered; the engine selects the
-                // matching simulcast layer server-side (and pauses the
-                // stream entirely while `visible: false`).
-                call.set_constraints(&member_id, MediaStreamKind::Camera, MediaConstraints {
-                    detail: VideoDetail::Dimensions(Dimensions { width: 320, height: 180 }),
-                    ..Default::default()
-                });
-            }
-            CallEvent::Ended { .. } => break,
-            _ => {}
+// `capture_video` is synchronous and latest-frame-wins: a plain thread does.
+let (frames, mut ffmpeg) = ffmpeg_frames("clip.mp4")?; // examples/publish_video.rs
+std::thread::spawn(move || {
+    for frame in frames {
+        // Errors once the publication is gone (left, slot closed, ...).
+        if camera.capture_video(frame).is_err() {
+            break;
         }
     }
+});
 
-    drop(camera);
-    call.leave().await?;
-    Ok(())
+// Receive: one task per remote camera, logging what arrives. Ctrl-C
+// leaves; the loop ends on `Ended`, which a leave, the slot or the room
+// closing all produce.
+let engine = media.engine;
+let mut events = engine.subscribe_events();
+let hang_up = tokio::signal::ctrl_c();
+tokio::pin!(hang_up);
+let mut left = false;
+loop {
+    let event = tokio::select! {
+        _ = &mut hang_up, if !left => {
+            left = true;
+            call.leave(Default::default()).await?;
+            continue;
+        }
+        event = events.recv() => event,
+    };
+    match event {
+        Ok(CallEvent::StreamStarted {
+            member_id,
+            kind: MediaStreamKind::Camera,
+        }) => {
+            let Some(mut frames) = engine
+                .remote_track(&member_id, MediaStreamKind::Camera)
+                .and_then(|track| track.video_frames())
+            else {
+                continue;
+            };
+            // How the tile is rendered: the engine picks the simulcast
+            // layer that fits, and pauses the stream while not visible.
+            engine.set_constraints(
+                &member_id,
+                MediaStreamKind::Camera,
+                MediaConstraints {
+                    detail: VideoDetail::Dimensions(Dimensions {
+                        width: 320,
+                        height: 180,
+                    }),
+                    ..Default::default()
+                },
+            );
+
+            println!("{member_id}: camera started");
+            tokio::spawn(async move {
+                let mut received = 0u64;
+                while let Some(frame) = frames.next().await {
+                    // A real host renders `frame.buffer`'s I420 planes here.
+                    received += 1;
+                    if received.is_multiple_of(100) {
+                        let (w, h) = (frame.buffer.width, frame.buffer.height);
+                        println!("{member_id}: {received} frames, now {w}x{h}");
+                    }
+                }
+            });
+        }
+        Ok(CallEvent::Ended { reason }) => {
+            println!("call ended: {reason:?}");
+            break;
+        }
+        Ok(_) | Err(RecvError::Lagged(_)) => {}
+        Err(RecvError::Closed) => break,
+    }
 }
+ffmpeg.kill()?;
 ```
+
+[`examples/publish_video.rs`](crates/matrix-rtc-call-sdk/examples/publish_video.rs)
+is this sample as a runnable program, login and sync included. `LiveKitCall::join(&room, LiveKitCallOptions)`
+does the client → room → call → attach steps in one call over a `matrix_sdk::Room`.
 
 The same model crosses the FFI boundary — on Android/Kotlin (media-enabled
 build, see below):

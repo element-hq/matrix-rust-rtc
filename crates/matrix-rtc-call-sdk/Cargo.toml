@@ -132,6 +132,11 @@ required-features = ["matrix-sdk", "testing"]
 name = "interop_peer"
 required-features = ["matrix-sdk", "testing"]
 
+# The layered client → room → call flow publishing a video file (see README.md).
+[[example]]
+name = "publish_video"
+required-features = ["matrix-sdk"]
+
 # The load generator (see README.md). Publishes a video file from N devices of
 # one account. `testing` is only for `Client::olm_machine_for_testing`, used to
 # keep room-key gossip out of the to-device traffic this tool measures.
