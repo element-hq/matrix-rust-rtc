@@ -108,11 +108,12 @@ for a runnable two-client example against the local backend.
 
 - `crates/matrix-rtc-transport`: how media flows, for any application on the
   core — the `MediaTransport` contract, frames, constraints, the media key
-  handler, and the pure MSC4195 control plane (`livekit`). No IO, **no
+  handler, the MSC4195 multi-SFU connection pool (`pool`), and the pure
+  MSC4195 control plane (`livekit`). No transport IO, **no
   LiveKit client**; compiles for wasm32.
 - `crates/matrix-rtc-call-sdk`: the call SDK hosts use — the call's media
   model over that contract (participants, tiles, the unified event stream,
-  the `CallEngine` connection pool for MSC4195 multi-SFU), `attach_media`, and
+  the `CallEngine`), `attach_media`, and
   behind features `attach_livekit` and the high-level `LiveKitCall::join`
   facade with the examples and e2e test. Fully unit-tested against a fake
   transport.

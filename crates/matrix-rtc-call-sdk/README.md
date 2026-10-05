@@ -4,8 +4,9 @@ The call SDK hosts use: a call's media over any transport, attached to a call
 joined through `matrix-rtc-call`.
 
 - The roster (`Participant`s keyed by `member_id`), the tiles a UI draws, the
-  unified `CallEvent` stream, and the `CallEngine` with its MSC4195 multi-focus
-  connection pool — over `matrix-rtc-transport`'s contract, for any transport.
+  unified `CallEvent` stream, and the `CallEngine` that builds them over
+  `matrix-rtc-transport`'s MSC4195 multi-focus connection pool, for any
+  transport.
 - `attach_media`, the one wiring of media onto a joined `RtcCall`.
 - Behind `livekit`: `attach_livekit`, the native LiveKit transport
   (`matrix-rtc-livekit`) attached to a call.

@@ -41,7 +41,8 @@ log only.
 
 ### Added
 
-- `matrix_rtc_media::attach_media` and `matrix_rtc_livekit::attach_livekit` attach media to a joined call, now the one wiring behind the FFI and web media sessions and `LiveKitCall`.
+- `matrix_rtc_transport::pool::MediaPool`, the MSC4195 multi-SFU connection pool extracted from the call engine, reports a session's media per `member_id` for any application on the core.
+- `matrix_rtc_call_sdk::attach_media` and `attach_livekit` attach media to a joined call, now the one wiring behind the FFI and web media sessions and `LiveKitCall`.
 - A room still waiting on its first deliveries logs which `RoomSink` calls are missing every 5 s, so a host that never delivers one sees why `room()` has not returned.
 - `BaseRtcClient` opens a core room that subscribes through the backend and feeds itself, so a host of the core alone feeds and ticks nothing.
 - A core room opens in a `MembershipFormat` (`BaseRtcClient::room(room_id, RoomOptions)`) and renders its joins in it, so a host of the core alone can join in the 2025 sticky or the pre-sticky room-state format.

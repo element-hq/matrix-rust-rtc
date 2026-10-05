@@ -85,8 +85,8 @@ shared board would be a sibling of `matrix-rtc-call` on the same core:
    bindings (ffi, wasm) · matrix-rtc-call-sdk's LiveKitCall facade
                  │
                  ▼
-          matrix-rtc-call-sdk  engine, pool, tiles, attach_media
-                 │                 └──▶ matrix-rtc-transport  contract, keys, MSC4195
+          matrix-rtc-call-sdk  engine (roster), tiles, attach_media
+                 │                 └──▶ matrix-rtc-transport  contract, pool, keys, MSC4195
                  ▼
           matrix-rtc-call    RtcClient → RtcRoom → RtcSession/RtcCall; reactions, MSC4075
                  │
@@ -315,22 +315,16 @@ Membership is always applied as a complete set: a member whose event is absent f
 - The call's media model over `matrix-rtc-transport`: `Participant` roster
   keyed by `member_id`, `CallEvent` (the unified membership + media event
   stream), tiles, and the `CallEngine` that reconciles core membership
-  snapshots with transport `ConnectionEvent`s: reverse identity mapping
-  (pseudonymous identity → membership), buffering of media that arrives
-  before its membership, roster/event emission. It stores per-stream
-  `MediaConstraints` (debounced and re-applied whenever a stream (re)appears)
-  and routes publications to the own focus; `CallEngine::unpublish` retracts
-  one — a mute keeps the publication up, which is right for a camera but not
-  for a stopped screen share.
-- The engine owns the **multi-focus connection pool** (MSC4195 multi-SFU):
-  members are grouped by their published transports' connection key
-  (LiveKit: the `livekit_service_url`); the engine connects to every peer
-  focus via `MediaTransport::connect` (exponential backoff on failure),
-  closes connections whose last member left after an idle grace, and
-  reconnects a dead peer-focus connection after tearing down its streams.
-  Only the *own* focus — established synchronously by the caller so join can
-  fail fast, then handed over via `adopt_own_connection` — ends the call
-  when it dies.
+  snapshots, the call's raised hands and reactions, and the member-keyed
+  media of a `matrix_rtc_transport::pool::MediaPool` into the roster: speaking
+  hysteresis and tile order damping, our own publications (routed to the own
+  focus; `CallEngine::unpublish` retracts one — a mute keeps the publication
+  up, which is right for a camera but not for a stopped screen share), and
+  the frame-encryption diagnostic.
+- The engine's actor drives the pool rather than running beside it, so a
+  member's join reaches the roster before their media does. Only the *own*
+  focus — established synchronously by the caller so join can fail fast,
+  then handed over via `adopt_own_connection` — ends the call when it dies.
 - `attach_media` attaches media to a joined `RtcCall`: the one copy of the
   order-sensitive wiring (identity mapper before key handler, key listeners
   before the replay of held keys, replay before the own-focus connect, our
@@ -376,13 +370,24 @@ Membership is always applied as a complete set: a member whose event is absent f
   (LiveKit native's `KeyProvider`, livekit-js's `ExternalE2EEKeyProvider`),
   and `MediaKeyHandler` owns the recording, ring-size guard, rejected-key
   rule, local sender's index switch, and the MSC4143 `delayBeforeUse` wait.
+- `pool`: the **multi-focus connection pool** (MSC4195 multi-SFU), a state
+  machine its owner drives with membership snapshots and its inbox's
+  messages, answering with member-keyed `PoolEvent`s. Members are grouped by
+  their published transports' connection key (LiveKit: the
+  `livekit_service_url`); it connects to every peer focus via
+  `MediaTransport::connect` (exponential backoff on failure), closes
+  connections whose last member left after an idle grace, and reconnects a
+  dead peer-focus connection after tearing down its streams. It reverse-maps
+  transport identities to `member_id`s, buffers media and keys that arrive
+  before their membership, and debounces per-stream `MediaConstraints`
+  (re-applied whenever a stream (re)appears or its connection resumes).
 - `livekit`: the pure half of the MSC4195 control plane, shared by the native
   transport and the web binding — `identity` (the hash derivations), `token`
   (`/get_token` and legacy `/sfu/get` request builders and the response
   decoder), `TokenEndpoint`, and `identity_mapper` (the per-generation identity
   derivation, deliberately a Rust closure because `RtcIdentityMapper` is
-  `Send + Sync`). `matrix-rtc-livekit` re-exports it under its original paths
-  and adds the IO (reqwest, the LiveKit client).
+  `Send + Sync`). `matrix-rtc-livekit` re-exports its identity and token
+  endpoint pieces and adds the IO (reqwest, the LiveKit client).
 
 ## `crates/matrix-rtc-wasm`
 

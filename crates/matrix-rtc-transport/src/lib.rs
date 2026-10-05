@@ -17,11 +17,13 @@
 //!   per-stream [`MediaConstraints`];
 //! - [`MediaKeyHandler`], the bridge from the core's key signals to a
 //!   transport's frame-encryption [`FrameKeyRing`];
+//! - [`pool`], the MSC4195 multi-SFU connection pool: one connection per
+//!   advertised focus, and media and keys reported per `member_id`;
 //! - [`livekit`], the pure MSC4195 control plane (identities, token shapes).
 //!
-//! No IO, no libwebrtc and no call vocabulary: implementations live in
-//! `matrix-rtc-livekit` (native) and the wasm binding (livekit-js), the call
-//! roster that consumes them in `matrix-rtc-media`. Compiles for wasm32, where
+//! No transport IO, no libwebrtc and no call vocabulary: implementations live
+//! in `matrix-rtc-livekit` (native) and the wasm binding (livekit-js), the call
+//! roster that consumes them in `matrix-rtc-call-sdk`. Compiles for wasm32, where
 //! the `Send` bounds vanish ([`matrix_rtc_core::MaybeSend`]).
 
 pub mod connection;
@@ -30,6 +32,7 @@ pub mod frame;
 pub mod keys;
 pub mod livekit;
 pub mod local;
+pub mod pool;
 pub mod stats;
 pub mod stream;
 

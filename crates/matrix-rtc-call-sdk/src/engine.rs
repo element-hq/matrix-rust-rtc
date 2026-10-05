@@ -5,39 +5,21 @@
 
 //! The call engine: one flat participant roster over N transport connections.
 //!
-//! The engine consumes two inputs — the core's membership snapshots (the
-//! signalling truth about who is in the call) and [`ConnectionEvent`]s from
-//! transport connections — and reconciles them into the [`Participant`]
-//! roster and the unified [`CallEvent`] stream.
+//! The engine consumes the core's membership snapshots (the signalling truth
+//! about who is in the call) and the call layer's raised hands and reactions,
+//! and reconciles them with the media of a [`MediaPool`] — which owns the
+//! MSC4195 connections and maps transport identities back to `member_id`s —
+//! into the [`Participant`] roster, the tiles and the unified [`CallEvent`]
+//! stream.
 //!
-//! # Connection pool (MSC4195 multi-SFU)
-//!
-//! Every member publishes media on the focus they announced in their
-//! membership's `transports`; subscribing to them means connecting to *their*
-//! focus. The engine groups members by [`MediaTransport::connection_key`] and
-//! keeps exactly one connection per key:
-//!
-//! - a key appearing in the snapshot opens a connection via
-//!   [`MediaTransport::connect`], retried with exponential backoff while
-//!   members still need it;
-//! - a key whose last member left is closed after a short idle grace (so
-//!   membership flaps don't churn connections);
-//! - a peer-focus connection dying tears down its members' streams and
-//!   reconnects — only the *own* focus (the one we publish on, adopted via
-//!   [`CallEngine::adopt_own_connection`]) ending ends the call.
-//!
-//! # Identity mapping
-//!
-//! Transports know participants by their own identities (LiveKit: the MSC4195
-//! pseudonymous identity), and the engine reverse-maps those to `member_id`s
-//! using [`MediaTransport::remote_identity`]. Transport participants that map
-//! to no membership are never surfaced as participants (and their media could
-//! not be decrypted anyway — keys are distributed per membership). Media that
-//! arrives *before* its membership (SFU connects are often faster than sticky
-//! event propagation) is buffered and flushed when the membership lands.
+//! The pool is driven from the engine's actor rather than running beside it,
+//! so a member's join always lands on the roster before their media does, and
+//! the roster and the event stream never disagree about it. Only the *own*
+//! focus ending (adopted via [`CallEngine::adopt_own_connection`]) ends the
+//! call; a peer focus is the pool's to reconnect.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use matrix_rtc_call::{RaisedHand, ReceivedReaction};
@@ -45,6 +27,7 @@ use matrix_rtc_core::{DiscardedKey, JoinedMembership};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use matrix_rtc_core::executor as rt;
+use matrix_rtc_transport::pool::{MediaPool, PoolConfig, PoolEvent, PoolMessage, RemoteTracks};
 use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, LocalTrackHandle, MediaConstraints,
     MediaStreamKind, MediaTransport, PublishOptions, ReceiveStats, RemoteTrackHandle,
@@ -62,45 +45,6 @@ use crate::tile::{
 /// should resynchronise from [`CallEngine::participants`].
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// How long a connection with no remaining members is kept before closing,
-/// so a membership flap (sticky expiry glitch, quick rejoin) doesn't tear a
-/// connection down just to rebuild it.
-const IDLE_GRACE: Duration = Duration::from_secs(10);
-
-/// First-retry delay after a failed connect; doubles per attempt.
-const BACKOFF_BASE: Duration = Duration::from_secs(1);
-/// Retry delay ceiling.
-const BACKOFF_MAX: Duration = Duration::from_secs(30);
-
-/// Constraint changes are coalesced for this long before being applied —
-/// scroll-driven visibility churn is the hot path, and only the final state
-/// matters to the transport.
-const CONSTRAINTS_DEBOUNCE: Duration = Duration::from_millis(150);
-
-fn backoff_delay(attempt: u32) -> Duration {
-    BACKOFF_BASE
-        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
-        .min(BACKOFF_MAX)
-}
-
-/// Subscribed remote tracks, keyed by member and stream kind. Shared between
-/// the actor (writes) and [`CallEngine::remote_track`] (reads).
-type TrackMap = Arc<Mutex<HashMap<(String, MediaStreamKind), Arc<dyn RemoteTrackHandle>>>>;
-
-/// Tracks whose transport identity has no membership yet, buffered per
-/// identity until the membership lands.
-type PendingTracks = HashMap<String, Vec<(MediaStreamKind, Arc<dyn RemoteTrackHandle>)>>;
-
-/// What [`MediaTransport::connect`] resolves to, as carried in the mailbox.
-type ConnectOutcome = Result<
-    (
-        Box<dyn TransportConnection>,
-        mpsc::UnboundedReceiver<ConnectionEvent>,
-    ),
-    TransportError,
->;
-
-/// Static configuration of a [`CallEngine`].
 /// How much the tile order is damped (spec 002 R10, R11). Configurable
 /// because the values are a product decision, not a protocol one.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,34 +110,6 @@ enum ActorMessage {
         connection: Box<dyn TransportConnection>,
         events: mpsc::UnboundedReceiver<ConnectionEvent>,
     },
-    /// An event from a pooled connection. `generation` guards against events
-    /// of a replaced connection being applied to its successor.
-    Connection {
-        connection_key: String,
-        generation: u64,
-        event: ConnectionEvent,
-    },
-    /// A pooled connection's event stream ended.
-    ConnectionEnded {
-        connection_key: String,
-        generation: u64,
-    },
-    /// A [`MediaTransport::connect`] attempt resolved.
-    ConnectFinished {
-        connection_key: String,
-        attempt: u32,
-        result: ConnectOutcome,
-    },
-    /// A backoff timer elapsed; try connecting again.
-    RetryConnect {
-        connection_key: String,
-        attempt: u32,
-    },
-    /// An idle grace timer elapsed; close the connection if still unneeded.
-    CloseIfIdle {
-        connection_key: String,
-        idle_generation: u64,
-    },
     /// A media decryption key was imported for a transport identity.
     KeyImported {
         identity: String,
@@ -231,17 +147,11 @@ enum ActorMessage {
         options: PublishOptions,
         respond: oneshot::Sender<Result<Arc<dyn LocalTrackHandle>, TransportError>>,
     },
-    /// Store new constraints for one stream and arm the debounce timer.
+    /// Store new constraints for one stream; the pool debounces them.
     SetConstraints {
         member_id: String,
         kind: MediaStreamKind,
         constraints: MediaConstraints,
-    },
-    /// A constraints debounce timer elapsed; apply if still current.
-    ApplyConstraints {
-        member_id: String,
-        kind: MediaStreamKind,
-        generation: u64,
     },
     /// A hysteresis timer elapsed; apply if it is still the current one (R10).
     SpeakerTimer {
@@ -294,7 +204,7 @@ pub struct CallEngine {
     participants_rx: watch::Receiver<Vec<Participant>>,
     tiles_rx: watch::Receiver<TileRoster>,
     local_rx: watch::Receiver<Option<LocalState>>,
-    tracks: TrackMap,
+    tracks: RemoteTracks,
     task: rt::JoinHandle<()>,
 }
 
@@ -321,16 +231,16 @@ impl CallEngine {
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
         let (tiles_tx, tiles_rx) = watch::channel(TileRoster::default());
         let (local_tx, local_rx) = watch::channel(None);
-        // On wasm32 the map is `!Send` (track handles hold JS values), but it
-        // is still shared — engine and actor — so `Arc` stays, uncontended.
-        #[cfg_attr(target_arch = "wasm32", expect(clippy::arc_with_non_send_sync))]
-        let tracks: TrackMap = Arc::new(Mutex::new(HashMap::new()));
-
-        let actor = Actor {
+        let (pool, pool_inbox) = MediaPool::new(PoolConfig {
             transports: config.transports,
-            own_member_id: config.own_member_id,
             ctx: config.ctx,
             own_connection_key: config.own_connection_key,
+        });
+        let tracks = pool.remote_tracks();
+
+        let actor = Actor {
+            pool,
+            own_member_id: config.own_member_id,
             events_tx: events_tx.clone(),
             participants_tx,
             tiles_tx,
@@ -342,27 +252,18 @@ impl CallEngine {
             pending_reorder: None,
             reorder_generation: 0,
             stability: config.stability,
-            tracks: tracks.clone(),
             messages_tx: messages_tx.clone(),
             roster: Vec::new(),
-            members_snapshot: Vec::new(),
-            identity_map: HashMap::new(),
-            member_identities: HashMap::new(),
-            constraints: HashMap::new(),
-            pending_tracks: HashMap::new(),
             local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
             installed_keys: HashMap::new(),
-            pending_keys: HashMap::new(),
             raised_hands: HashMap::new(),
-            pool: HashMap::new(),
-            connection_generation: 0,
-            degraded_keys: HashSet::new(),
             ended: false,
         };
         let task = rt::spawn(actor.run(
             memberships,
             messages_rx,
+            pool_inbox,
             config.raised_hands,
             config.reactions,
         ));
@@ -563,11 +464,7 @@ impl CallEngine {
         member_id: &str,
         kind: MediaStreamKind,
     ) -> Option<Arc<dyn RemoteTrackHandle>> {
-        self.tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .get(&(member_id.to_owned(), kind))
-            .cloned()
+        self.tracks.get(member_id, kind)
     }
 
     /// Receive-side RTP counters for a participant's stream.
@@ -603,10 +500,7 @@ impl CallEngine {
         if streams.is_empty() {
             return Vec::new();
         }
-        let tracks: Vec<Option<Arc<dyn RemoteTrackHandle>>> = {
-            let map = self.tracks.lock().expect("track map mutex poisoned");
-            streams.iter().map(|key| map.get(key).cloned()).collect()
-        };
+        let tracks = self.tracks.get_many(streams);
         // Unbounded on purpose: libwebrtc serialises stats collection on its
         // own thread. `futures_util::stream::iter(..).buffered(n)` is the
         // drop-in if a call size ever makes that a problem.
@@ -631,43 +525,10 @@ impl CallEngine {
     }
 }
 
-/// A pooled connection to one focus.
-struct ManagedConnection {
-    /// Backend that opened (and re-opens) this connection. `None` for the
-    /// adopted own-focus connection, which the engine never re-opens.
-    backend: Option<Arc<dyn MediaTransport>>,
-    /// Members whose media lives on this focus, per the latest snapshot.
-    members: HashSet<String>,
-    /// Whether this is the focus we publish on.
-    is_own: bool,
-    state: ConnState,
-    /// Bumped every time a live connection is installed; events carrying an
-    /// older generation belong to a replaced connection and are dropped.
-    generation: u64,
-    /// Bumped whenever the member set changes; invalidates pending idle-close
-    /// timers.
-    idle_generation: u64,
-}
-
-enum ConnState {
-    Connecting {
-        attempt: u32,
-    },
-    Up {
-        // Arc, not Box: publish/apply-constraints calls run in spawned tasks
-        // that need shared ownership while the entry stays in the pool.
-        connection: Arc<dyn TransportConnection>,
-    },
-    Backoff {
-        attempt: u32,
-    },
-}
-
 struct Actor {
-    transports: Vec<Arc<dyn MediaTransport>>,
+    /// The call's media connections, and the identity mapping over them.
+    pool: MediaPool,
     own_member_id: String,
-    ctx: ConnectionContext,
-    own_connection_key: Option<String>,
     events_tx: broadcast::Sender<CallEvent>,
     participants_tx: watch::Sender<Vec<Participant>>,
     tiles_tx: watch::Sender<TileRoster>,
@@ -687,23 +548,10 @@ struct Actor {
     pending_reorder: Option<u64>,
     reorder_generation: u64,
     stability: StabilityConfig,
-    tracks: TrackMap,
-    /// Handed to connection forwarders and timers so everything funnels into
-    /// the same mailbox.
+    /// Handed to publishes and timers so everything funnels into the same
+    /// mailbox.
     messages_tx: mpsc::UnboundedSender<ActorMessage>,
     roster: Vec<Participant>,
-    /// The latest membership snapshot, kept for pool reconciliation.
-    members_snapshot: Vec<JoinedMembership>,
-    /// Transport identity → `member_id`.
-    identity_map: HashMap<String, String>,
-    /// `member_id` → transport identity (the reverse of `identity_map`),
-    /// for pushing constraints at a member's connection.
-    member_identities: HashMap<String, String>,
-    /// Latest constraints per stream, with a generation counter that
-    /// invalidates superseded debounce timers.
-    constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
-    /// Media that arrived before its membership, flushed when it lands.
-    pending_tracks: PendingTracks,
     /// Last frame-encryption state reported per member.
     ///
     /// Only so the log line can name the transition. A bare "is MissingKey"
@@ -720,24 +568,11 @@ struct Actor {
     /// participant. Without it a `MissingKey` is unattributable from outside: a
     /// key that never arrived and a rotation still in flight look identical.
     installed_keys: HashMap<String, Vec<u8>>,
-    /// Imported key indices awaiting their membership, in arrival order.
-    ///
-    /// A `Vec`, not a single index: at join a member can be handed more than one
-    /// index before their sticky membership lands (their first key plus a
-    /// rotation, say), and keeping only the latest silently dropped the others —
-    /// so the host saw one `KeyImported` where the core had imported several, and
-    /// could not tell which index the transport actually held.
-    pending_keys: HashMap<String, Vec<u8>>,
     /// `member_id` → when they raised their hand, as the core last reported.
     /// Kept for members not yet on the roster too: the core learns of a hand
     /// and of the membership it belongs to through different channels, and a
     /// hand that arrives first must not be lost.
     raised_hands: HashMap<String, u64>,
-    pool: HashMap<String, ManagedConnection>,
-    connection_generation: u64,
-    /// Connections currently impaired (reconnecting or failing to connect);
-    /// media is reported degraded while this is non-empty.
-    degraded_keys: HashSet<String>,
     ended: bool,
 }
 
@@ -788,6 +623,7 @@ impl Actor {
         mut self,
         mut memberships: watch::Receiver<Vec<JoinedMembership>>,
         mut messages: mpsc::UnboundedReceiver<ActorMessage>,
+        mut pool_inbox: mpsc::UnboundedReceiver<PoolMessage>,
         mut raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
         mut reactions: Option<broadcast::Receiver<ReceivedReaction>>,
     ) {
@@ -825,6 +661,11 @@ impl Actor {
                     Some(reaction) => self.apply_reaction(reaction),
                     None => reactions = None,
                 },
+                // Never closes: the pool holds a sender for its own timers.
+                Some(message) = pool_inbox.recv() => {
+                    let events = self.pool.handle(message);
+                    self.apply_pool_events(events);
+                }
                 message = messages.recv() => match message {
                     Some(ActorMessage::Shutdown { ack }) => {
                         self.end(EndedReason::Left);
@@ -842,95 +683,15 @@ impl Actor {
     fn handle_message(&mut self, message: ActorMessage) {
         match message {
             ActorMessage::AdoptConnection { connection, events } => {
-                self.adopt_connection(connection, events);
-            }
-            ActorMessage::Connection {
-                connection_key,
-                generation,
-                event,
-            } => {
-                let current = self.pool.get(&connection_key).map(|entry| entry.generation);
-                if current != Some(generation) {
-                    log::trace!("dropping event of replaced connection {connection_key}");
-                    return;
-                }
-                self.handle_connection_event(&connection_key, event);
-            }
-            ActorMessage::ConnectionEnded {
-                connection_key,
-                generation,
-            } => {
-                self.connection_down(&connection_key, generation, "connection event stream ended");
-            }
-            ActorMessage::ConnectFinished {
-                connection_key,
-                attempt,
-                result,
-            } => {
-                self.connect_finished(&connection_key, attempt, result);
-            }
-            ActorMessage::RetryConnect {
-                connection_key,
-                attempt,
-            } => {
-                let Some(entry) = self.pool.get_mut(&connection_key) else {
-                    return;
-                };
-                if !matches!(entry.state, ConnState::Backoff { attempt: a } if a == attempt) {
-                    return;
-                }
-                if entry.members.is_empty() && !entry.is_own {
-                    self.pool.remove(&connection_key);
-                    self.clear_degraded(&connection_key);
-                    return;
-                }
-                self.start_connect(&connection_key, attempt);
-            }
-            ActorMessage::CloseIfIdle {
-                connection_key,
-                idle_generation,
-            } => {
-                let Some(entry) = self.pool.get(&connection_key) else {
-                    return;
-                };
-                if entry.idle_generation != idle_generation
-                    || !entry.members.is_empty()
-                    || entry.is_own
-                {
-                    return;
-                }
-                log::debug!("closing idle connection {connection_key}");
-                if let Some(entry) = self.pool.remove(&connection_key)
-                    && let ConnState::Up { connection } = entry.state
-                {
-                    rt::spawn(async move {
-                        if let Err(error) = connection.close().await {
-                            log::debug!("closing idle connection failed: {error}");
-                        }
-                    });
-                }
-                self.clear_degraded(&connection_key);
+                self.pool.adopt_own_connection(connection, events);
             }
             ActorMessage::KeyImported {
                 identity,
                 key_index,
-            } => match self.identity_map.get(&identity) {
-                Some(member_id) => {
-                    let member_id = member_id.clone();
-                    self.record_installed_key(&member_id, key_index);
-                    self.emit(CallEvent::KeyImported {
-                        member_id,
-                        key_index,
-                    });
-                }
-                None => {
-                    // To-device keys regularly beat sticky memberships.
-                    let pending = self.pending_keys.entry(identity).or_default();
-                    if !pending.contains(&key_index) {
-                        pending.push(key_index);
-                    }
-                }
-            },
+            } => {
+                let events = self.pool.key_imported(identity, key_index);
+                self.apply_pool_events(events);
+            }
             ActorMessage::KeyDiscarded(report) => {
                 log::warn!(
                     "media key index {:?} for member {} refused: {} (from {}/{})",
@@ -951,15 +712,7 @@ impl Actor {
             ActorMessage::Publish { options, respond } => {
                 // Local tracks always go to the focus we announced in our
                 // membership — that is where peers subscribe to us.
-                let connection = self
-                    .pool
-                    .values()
-                    .find(|entry| entry.is_own)
-                    .and_then(|entry| match &entry.state {
-                        ConnState::Up { connection } => Some(connection.clone()),
-                        _ => None,
-                    });
-                match connection {
+                match self.pool.own_connection() {
                     Some(connection) => {
                         // The publish itself is awaited off-actor so a slow SFU
                         // does not stall every other message; the actor learns
@@ -1057,38 +810,7 @@ impl Actor {
                 member_id,
                 kind,
                 constraints,
-            } => {
-                let entry = self
-                    .constraints
-                    .entry((member_id.clone(), kind))
-                    .or_insert((constraints, 0));
-                entry.0 = constraints;
-                entry.1 += 1;
-                let generation = entry.1;
-                let messages = self.messages_tx.clone();
-                rt::spawn(async move {
-                    rt::sleep(CONSTRAINTS_DEBOUNCE).await;
-                    let _ = messages.send(ActorMessage::ApplyConstraints {
-                        member_id,
-                        kind,
-                        generation,
-                    });
-                });
-            }
-            ActorMessage::ApplyConstraints {
-                member_id,
-                kind,
-                generation,
-            } => {
-                // Only the newest timer applies; older ones were superseded.
-                if self
-                    .constraints
-                    .get(&(member_id.clone(), kind))
-                    .is_some_and(|(_, current)| *current == generation)
-                {
-                    self.apply_constraints_now(&member_id, kind);
-                }
-            }
+            } => self.pool.set_constraints(member_id, kind, constraints),
             ActorMessage::SpeakerTimer {
                 member_id,
                 generation,
@@ -1125,449 +847,6 @@ impl Actor {
         }
     }
 
-    /// Push the resolved constraints for one stream to the connection its
-    /// member lives on. No-op while the member, its identity, or its
-    /// connection is missing — [`Actor::add_stream`] and reconnects re-apply.
-    fn apply_constraints_now(&mut self, member_id: &str, kind: MediaStreamKind) {
-        let Some((constraints, _)) = self.constraints.get(&(member_id.to_owned(), kind)) else {
-            return;
-        };
-        let resolved = constraints.resolve(kind);
-        let Some(identity) = self.member_identities.get(member_id).cloned() else {
-            return;
-        };
-        let connection = self
-            .pool
-            .values()
-            .find(|entry| entry.members.contains(member_id))
-            .and_then(|entry| match &entry.state {
-                ConnState::Up { connection } => Some(connection.clone()),
-                _ => None,
-            });
-        let Some(connection) = connection else {
-            return;
-        };
-        let kind_copy = kind;
-        rt::spawn(async move {
-            if let Err(error) = connection
-                .apply_constraints(&identity, kind_copy, resolved)
-                .await
-            {
-                log::warn!("applying constraints for {identity} ({kind_copy:?}) failed: {error}");
-            }
-        });
-    }
-
-    /// Re-apply every stored constraint for members living on `key` (used
-    /// after a transport-level reconnect: subscription settings are
-    /// server-side state of the connection).
-    fn reapply_connection_constraints(&mut self, key: &str) {
-        let Some(entry) = self.pool.get(key) else {
-            return;
-        };
-        let members = entry.members.clone();
-        let keys: Vec<(String, MediaStreamKind)> = self
-            .constraints
-            .keys()
-            .filter(|(member_id, _)| members.contains(member_id))
-            .cloned()
-            .collect();
-        for (member_id, kind) in keys {
-            self.apply_constraints_now(&member_id, kind);
-        }
-    }
-
-    // ---- connection pool ----------------------------------------------
-
-    fn adopt_connection(
-        &mut self,
-        connection: Box<dyn TransportConnection>,
-        events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    ) {
-        let key = connection.connection_key().to_owned();
-        self.connection_generation += 1;
-        let generation = self.connection_generation;
-        let members = self.members_on_key(&key);
-        self.pool.insert(
-            key.clone(),
-            ManagedConnection {
-                backend: None,
-                members,
-                is_own: true,
-                state: ConnState::Up {
-                    connection: Arc::from(connection),
-                },
-                generation,
-                idle_generation: 0,
-            },
-        );
-        self.spawn_forwarder(key, generation, events);
-    }
-
-    /// Sync the pool with the latest snapshot: update per-connection member
-    /// sets, schedule idle closes, open connections for new focus groups.
-    fn reconcile_pool(&mut self) {
-        let mut desired: HashMap<String, (Arc<dyn MediaTransport>, HashSet<String>)> =
-            HashMap::new();
-        for member in &self.members_snapshot {
-            if let Some((backend, key)) = select_transport(&self.transports, member) {
-                desired
-                    .entry(key)
-                    .or_insert_with(|| (backend, HashSet::new()))
-                    .1
-                    .insert(member.member_id.clone());
-            }
-        }
-
-        log::debug!(
-            "focus grouping: {}",
-            desired
-                .iter()
-                .map(|(key, (_, members))| format!("{key} -> {} member(s)", members.len()))
-                .collect::<Vec<_>>()
-                .join(", "),
-        );
-
-        let keys: Vec<String> = self.pool.keys().cloned().collect();
-        for key in keys {
-            let members = desired.remove(&key).map(|(_, m)| m).unwrap_or_default();
-            let entry = self.pool.get_mut(&key).expect("pool key just listed");
-            entry.members = members;
-            // Any member-set change invalidates pending idle timers; an empty
-            // set (re)arms one.
-            entry.idle_generation += 1;
-            if entry.members.is_empty() && !entry.is_own {
-                log::debug!("peer focus {key} has no members left; arming the idle timer");
-                let idle_generation = entry.idle_generation;
-                let messages = self.messages_tx.clone();
-                let key = key.clone();
-                rt::spawn(async move {
-                    rt::sleep(IDLE_GRACE).await;
-                    let _ = messages.send(ActorMessage::CloseIfIdle {
-                        connection_key: key,
-                        idle_generation,
-                    });
-                });
-            }
-        }
-
-        for (key, (backend, members)) in desired {
-            // The own focus is established by the caller and adopted; never
-            // race it with an engine-initiated connect.
-            if self.own_connection_key.as_deref() == Some(key.as_str()) {
-                continue;
-            }
-            log::info!(
-                "connecting to peer focus {key} for {} member(s)",
-                members.len(),
-            );
-            self.pool.insert(
-                key.clone(),
-                ManagedConnection {
-                    backend: Some(backend),
-                    members,
-                    is_own: false,
-                    state: ConnState::Connecting { attempt: 0 },
-                    generation: 0,
-                    idle_generation: 0,
-                },
-            );
-            self.start_connect(&key, 0);
-        }
-    }
-
-    /// Spawn a connect attempt for an existing pool entry.
-    fn start_connect(&mut self, key: &str, attempt: u32) {
-        let Some(entry) = self.pool.get_mut(key) else {
-            return;
-        };
-        let Some(backend) = entry.backend.clone() else {
-            return;
-        };
-        entry.state = ConnState::Connecting { attempt };
-
-        let ctx = self.ctx.clone();
-        let messages = self.messages_tx.clone();
-        let key = key.to_owned();
-        rt::spawn(async move {
-            let result = backend.connect(&key, &ctx).await;
-            let _ = messages.send(ActorMessage::ConnectFinished {
-                connection_key: key,
-                attempt,
-                result,
-            });
-        });
-    }
-
-    fn connect_finished(&mut self, key: &str, attempt: u32, result: ConnectOutcome) {
-        let close_stray = |result: ConnectOutcome| {
-            if let Ok((connection, _events)) = result {
-                rt::spawn(async move {
-                    let _ = connection.close().await;
-                });
-            }
-        };
-
-        let (still_needed, matches_attempt) = match self.pool.get(key) {
-            // The group emptied and was removed while connecting.
-            None => (false, false),
-            Some(entry) => (
-                !entry.members.is_empty() || entry.is_own,
-                matches!(entry.state, ConnState::Connecting { attempt: a } if a == attempt),
-            ),
-        };
-        if !matches_attempt {
-            close_stray(result);
-            return;
-        }
-        if !still_needed {
-            self.pool.remove(key);
-            self.clear_degraded(key);
-            close_stray(result);
-            return;
-        }
-
-        match result {
-            Ok((connection, events)) => {
-                self.connection_generation += 1;
-                let generation = self.connection_generation;
-                let entry = self.pool.get_mut(key).expect("entry checked above");
-                entry.generation = generation;
-                entry.state = ConnState::Up {
-                    connection: Arc::from(connection),
-                };
-                log::info!("media connection up: {key}");
-                self.spawn_forwarder(key.to_owned(), generation, events);
-                self.clear_degraded(key);
-            }
-            Err(error) => {
-                log::warn!("connecting to {key} failed (attempt {attempt}): {error}");
-                self.mark_degraded(key);
-                let next = attempt + 1;
-                let entry = self.pool.get_mut(key).expect("entry checked above");
-                entry.state = ConnState::Backoff { attempt: next };
-                let delay = backoff_delay(next);
-                let messages = self.messages_tx.clone();
-                let key = key.to_owned();
-                rt::spawn(async move {
-                    rt::sleep(delay).await;
-                    let _ = messages.send(ActorMessage::RetryConnect {
-                        connection_key: key,
-                        attempt: next,
-                    });
-                });
-            }
-        }
-    }
-
-    /// A live connection is gone (transport `Closed` event or its event
-    /// stream ending). Own focus ⇒ the call is over; peer focus ⇒ tear down
-    /// its members' streams and reconnect while still needed.
-    fn connection_down(&mut self, key: &str, generation: u64, message: &str) {
-        let Some(entry) = self.pool.get(key) else {
-            return;
-        };
-        if entry.generation != generation || !matches!(entry.state, ConnState::Up { .. }) {
-            return;
-        }
-
-        if entry.is_own {
-            log::warn!("own-focus connection {key} is gone: {message}");
-            self.pool.remove(key);
-            self.end(EndedReason::ConnectionClosed {
-                message: message.to_owned(),
-            });
-            return;
-        }
-
-        log::warn!("peer-focus connection {key} is gone ({message}); reconnecting");
-        let members: Vec<String> = entry.members.iter().cloned().collect();
-        for member_id in members {
-            self.remove_all_streams(&member_id);
-        }
-        self.mark_degraded(key);
-
-        let entry = self.pool.get_mut(key).expect("entry checked above");
-        if entry.members.is_empty() {
-            self.pool.remove(key);
-            self.clear_degraded(key);
-            return;
-        }
-        entry.state = ConnState::Backoff { attempt: 0 };
-        let messages = self.messages_tx.clone();
-        let key = key.to_owned();
-        rt::spawn(async move {
-            rt::sleep(backoff_delay(0)).await;
-            let _ = messages.send(ActorMessage::RetryConnect {
-                connection_key: key,
-                attempt: 0,
-            });
-        });
-    }
-
-    fn spawn_forwarder(
-        &self,
-        connection_key: String,
-        generation: u64,
-        mut events: mpsc::UnboundedReceiver<ConnectionEvent>,
-    ) {
-        let forward = self.messages_tx.clone();
-        rt::spawn(async move {
-            while let Some(event) = events.recv().await {
-                if forward
-                    .send(ActorMessage::Connection {
-                        connection_key: connection_key.clone(),
-                        generation,
-                        event,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            let _ = forward.send(ActorMessage::ConnectionEnded {
-                connection_key,
-                generation,
-            });
-        });
-    }
-
-    /// The members whose media lives on `key`, per the latest snapshot.
-    fn members_on_key(&self, key: &str) -> HashSet<String> {
-        self.members_snapshot
-            .iter()
-            .filter(|member| {
-                select_transport(&self.transports, member)
-                    .is_some_and(|(_, member_key)| member_key == key)
-            })
-            .map(|member| member.member_id.clone())
-            .collect()
-    }
-
-    // ---- connection events ---------------------------------------------
-
-    fn handle_connection_event(&mut self, connection_key: &str, event: ConnectionEvent) {
-        match event {
-            ConnectionEvent::RemoteJoined { identity } => {
-                if !self.identity_map.contains_key(&identity) {
-                    // Either their membership is still propagating (buffered
-                    // media will flush when it lands) or the participant does
-                    // not belong to this call. Diagnostics only.
-                    log::debug!(
-                        "remote participant {identity} on {connection_key} has no known membership"
-                    );
-                    self.emit(CallEvent::UnknownParticipant { identity });
-                }
-            }
-            ConnectionEvent::RemoteLeft { .. } => {
-                // Roster truth is the membership; a transport-level leave on
-                // its own changes nothing (tracks get their own events).
-            }
-            ConnectionEvent::TrackAdded {
-                identity,
-                kind,
-                track,
-            } => match self.identity_map.get(&identity).cloned() {
-                Some(member_id) => self.add_stream(&member_id, kind, track),
-                None => {
-                    log::debug!(
-                        "buffering {kind:?} track of unknown identity {identity} on {connection_key}"
-                    );
-                    self.pending_tracks
-                        .entry(identity)
-                        .or_default()
-                        .push((kind, track));
-                }
-            },
-            ConnectionEvent::TrackRemoved { identity, kind } => {
-                match self.identity_map.get(&identity).cloned() {
-                    Some(member_id) => self.remove_stream(&member_id, kind),
-                    None => {
-                        if let Some(pending) = self.pending_tracks.get_mut(&identity) {
-                            pending.retain(|(pending_kind, _)| *pending_kind != kind);
-                        }
-                    }
-                }
-            }
-            ConnectionEvent::TrackMuted { identity, kind } => {
-                self.set_muted(&identity, kind, true);
-            }
-            ConnectionEvent::TrackUnmuted { identity, kind } => {
-                self.set_muted(&identity, kind, false);
-            }
-            ConnectionEvent::ActiveSpeakers { speakers } => {
-                // Speakers with no known membership are dropped: a level we
-                // cannot attribute to a member is not actionable.
-                let speakers: Vec<SpeakingMember> = speakers
-                    .iter()
-                    .filter_map(|speaker| {
-                        self.identity_map
-                            .get(&speaker.identity)
-                            .map(|member_id| SpeakingMember {
-                                member_id: member_id.clone(),
-                                level: speaker.level,
-                            })
-                    })
-                    .collect();
-                // Not sampled here: the SFU decides who is speaking and sends one
-                // update for the whole call per `update_interval` (LiveKit default
-                // 500 ms), smoothed over two intervals. That bounds how often the
-                // raw set — and with it the tile flag and the roster — can change.
-                //
-                // Timers are armed before the event goes out, so a consumer
-                // woken by it finds the hysteresis already running.
-                let raw: HashSet<String> = speakers.iter().map(|s| s.member_id.clone()).collect();
-                self.apply_raw_speakers(raw);
-                self.emit(CallEvent::ActiveSpeakers { speakers });
-            }
-            ConnectionEvent::EncryptionStateChanged { identity, state } => {
-                match self.identity_map.get(&identity).cloned() {
-                    Some(member_id) => {
-                        let diagnostic = self.encryption_diagnostic(&member_id, state);
-                        let previous = self.encryption_states.insert(member_id.clone(), state);
-                        if state.is_failure() {
-                            log::warn!(
-                                "frame encryption {state:?} for {member_id} (was {previous:?}), \
-                                 {diagnostic:?}"
-                            );
-                        } else {
-                            log::info!(
-                                "frame encryption {state:?} for {member_id} (was {previous:?})"
-                            );
-                        }
-                        self.emit(CallEvent::FrameEncryptionState {
-                            member_id,
-                            state,
-                            diagnostic,
-                        });
-                    }
-                    None => {
-                        // No membership to attribute it to; `UnknownParticipant`
-                        // already covers that case on its own.
-                        log::debug!(
-                            "encryption state {state:?} for unmapped identity {identity} on {connection_key}"
-                        );
-                    }
-                }
-            }
-            ConnectionEvent::Reconnecting => self.mark_degraded(connection_key),
-            ConnectionEvent::Reconnected => {
-                self.clear_degraded(connection_key);
-                // Subscription settings are server-side connection state; a
-                // resumed connection may have lost them.
-                self.reapply_connection_constraints(connection_key);
-            }
-            ConnectionEvent::Closed { message } => {
-                let generation = self
-                    .pool
-                    .get(connection_key)
-                    .map(|entry| entry.generation)
-                    .unwrap_or_default();
-                self.connection_down(connection_key, generation, &message);
-            }
-        }
-    }
-
     // ---- roster ----------------------------------------------------------
 
     fn apply_snapshot(&mut self, snapshot: Vec<JoinedMembership>) {
@@ -1594,15 +873,90 @@ impl Actor {
             self.add_member(member);
         }
 
-        self.members_snapshot = snapshot;
-        self.reconcile_pool();
+        // After the roster, so media the pool releases for a member who just
+        // joined (buffered tracks and keys) finds their entry.
+        let events = self.pool.apply_snapshot(&snapshot);
+        self.apply_pool_events(events);
         self.publish_roster();
 
-        log::debug!(
-            "roster reconciled: {} participant(s), {} with a transport identity",
-            self.roster.len(),
-            self.identity_map.len(),
-        );
+        log::debug!("roster reconciled: {} participant(s)", self.roster.len());
+    }
+
+    /// Put what the pool reports onto the roster and the event stream.
+    fn apply_pool_events(&mut self, events: Vec<PoolEvent>) {
+        for event in events {
+            match event {
+                PoolEvent::StreamAdded { member_id, kind } => self.add_stream(&member_id, kind),
+                PoolEvent::StreamRemoved { member_id, kind } => {
+                    self.remove_stream(&member_id, kind);
+                }
+                PoolEvent::StreamMuted {
+                    member_id,
+                    kind,
+                    muted,
+                } => self.set_member_muted(&member_id, kind, muted),
+                PoolEvent::ActiveSpeakers { speakers } => {
+                    let speakers: Vec<SpeakingMember> = speakers
+                        .into_iter()
+                        .map(|speaker| SpeakingMember {
+                            member_id: speaker.member_id,
+                            level: speaker.level,
+                        })
+                        .collect();
+                    // Not sampled here: the SFU decides who is speaking and
+                    // sends one update for the whole call per
+                    // `update_interval` (LiveKit default 500 ms), smoothed over
+                    // two intervals. That bounds how often the raw set — and
+                    // with it the tile flag and the roster — can change.
+                    //
+                    // Timers are armed before the event goes out, so a consumer
+                    // woken by it finds the hysteresis already running.
+                    let raw: HashSet<String> =
+                        speakers.iter().map(|s| s.member_id.clone()).collect();
+                    self.apply_raw_speakers(raw);
+                    self.emit(CallEvent::ActiveSpeakers { speakers });
+                }
+                PoolEvent::EncryptionStateChanged { member_id, state } => {
+                    self.encryption_state_changed(member_id, state);
+                }
+                PoolEvent::KeyImported {
+                    member_id,
+                    key_index,
+                } => {
+                    self.record_installed_key(&member_id, key_index);
+                    self.emit(CallEvent::KeyImported {
+                        member_id,
+                        key_index,
+                    });
+                }
+                PoolEvent::UnknownParticipant { identity } => {
+                    self.emit(CallEvent::UnknownParticipant { identity });
+                }
+                PoolEvent::Degraded(degraded) => {
+                    self.emit(CallEvent::MediaConnectionState { degraded });
+                }
+                PoolEvent::OwnConnectionLost { message } => {
+                    self.end(EndedReason::ConnectionClosed { message });
+                }
+            }
+        }
+    }
+
+    fn encryption_state_changed(&mut self, member_id: String, state: FrameEncryptionState) {
+        let diagnostic = self.encryption_diagnostic(&member_id, state);
+        let previous = self.encryption_states.insert(member_id.clone(), state);
+        if state.is_failure() {
+            log::warn!(
+                "frame encryption {state:?} for {member_id} (was {previous:?}), {diagnostic:?}"
+            );
+        } else {
+            log::info!("frame encryption {state:?} for {member_id} (was {previous:?})");
+        }
+        self.emit(CallEvent::FrameEncryptionState {
+            member_id,
+            state,
+            diagnostic,
+        });
     }
 
     /// The streams `member_id` should start out with: for our own membership,
@@ -1628,26 +982,12 @@ impl Actor {
     }
 
     fn add_member(&mut self, member: &JoinedMembership) {
-        let reachable = select_transport(&self.transports, member).is_some();
-        let identity = self
-            .transports
-            .iter()
-            .find_map(|backend| backend.remote_identity(member));
-
-        match &identity {
-            Some(identity) => log::debug!(
-                "member {} ({}) joined the roster as {identity}, reachable={reachable}",
-                member.member_id,
-                member.sender,
-            ),
-            // Their media arrives under an identity nothing maps back, so it
-            // will be buffered forever rather than surfacing as their stream.
-            None => log::warn!(
-                "member {} ({}) has no transport identity; their media cannot be attributed",
-                member.member_id,
-                member.sender,
-            ),
-        }
+        let reachable = self.pool.is_reachable(member);
+        log::debug!(
+            "member {} ({}) joined the roster, reachable={reachable}",
+            member.member_id,
+            member.sender,
+        );
 
         let hand_raised_at_ms = self.raised_hands.get(&member.member_id).copied();
         // Our own publications outlive any single membership: they can go up
@@ -1689,32 +1029,6 @@ impl Actor {
                 self.emit(CallEvent::StreamMuted {
                     member_id: member.member_id.clone(),
                     kind: stream.kind,
-                });
-            }
-        }
-
-        if let Some(identity) = identity {
-            self.identity_map
-                .insert(identity.clone(), member.member_id.clone());
-            self.member_identities
-                .insert(member.member_id.clone(), identity.clone());
-
-            // Media and keys that arrived before this membership.
-            if let Some(pending) = self.pending_tracks.remove(&identity) {
-                log::debug!(
-                    "flushing {} buffered track(s) onto member {}",
-                    pending.len(),
-                    member.member_id,
-                );
-                for (kind, track) in pending {
-                    self.add_stream(&member.member_id.clone(), kind, track);
-                }
-            }
-            for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
-                self.record_installed_key(&member.member_id.clone(), key_index);
-                self.emit(CallEvent::KeyImported {
-                    member_id: member.member_id.clone(),
-                    key_index,
                 });
             }
         }
@@ -1811,29 +1125,12 @@ impl Actor {
     fn remove_member(&mut self, member_id: &str) {
         self.roster
             .retain(|participant| participant.member_id != member_id);
-        // Read the identity out before dropping the mappings, so the
-        // identity-keyed buffers can be cleared too. They used to be left behind
-        // on every departure: a stale index could then resurface against a later
-        // member that happened to reuse the identity, and in a long-lived process
-        // the maps only ever grew.
-        let identity = self.member_identities.remove(member_id);
-        if let Some(identity) = &identity {
-            self.pending_keys.remove(identity);
-            self.pending_tracks.remove(identity);
-        }
+        // The pool forgets their identity, buffers, constraints and tracks
+        // when it applies the same snapshot.
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
         self.speaking.remove(member_id);
         self.speakers.remove(member_id);
-        self.identity_map.retain(|_, mapped| mapped != member_id);
-        // A rejoining member gets a fresh member_id, so their constraints
-        // die with the membership.
-        self.constraints
-            .retain(|(member, _), _| member != member_id);
-        self.tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .retain(|(track_member, _), _| track_member != member_id);
         self.emit(CallEvent::ParticipantLeft {
             member_id: member_id.to_owned(),
         });
@@ -1879,23 +1176,14 @@ impl Actor {
         self.publish_roster();
     }
 
-    fn add_stream(
-        &mut self,
-        member_id: &str,
-        kind: MediaStreamKind,
-        track: Arc<dyn RemoteTrackHandle>,
-    ) {
-        self.tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .insert((member_id.to_owned(), kind), track);
-
+    /// A remote stream the pool subscribed; its handle is in the pool's
+    /// [`RemoteTracks`].
+    fn add_stream(&mut self, member_id: &str, kind: MediaStreamKind) {
         let Some(participant) = self.roster.iter_mut().find(|p| p.member_id == member_id) else {
             return;
         };
         if participant.streams.iter().any(|stream| stream.kind == kind) {
-            // Same stream re-announced (e.g. events replayed on attach); the
-            // handle above is refreshed, but it is not a new stream.
+            // Already on the roster; not a new stream.
             return;
         }
         participant.streams.push(StreamState { kind, muted: false });
@@ -1904,21 +1192,9 @@ impl Actor {
             kind,
         });
         self.publish_roster();
-
-        // A fresh subscription starts with server-default settings; push the
-        // stored constraints at it immediately (no debounce — nothing to
-        // coalesce with).
-        if self.constraints.contains_key(&(member_id.to_owned(), kind)) {
-            self.apply_constraints_now(member_id, kind);
-        }
     }
 
     fn remove_stream(&mut self, member_id: &str, kind: MediaStreamKind) {
-        self.tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .remove(&(member_id.to_owned(), kind));
-
         let Some(participant) = self.roster.iter_mut().find(|p| p.member_id == member_id) else {
             return;
         };
@@ -1931,25 +1207,6 @@ impl Actor {
             });
             self.publish_roster();
         }
-    }
-
-    fn remove_all_streams(&mut self, member_id: &str) {
-        let kinds: Vec<MediaStreamKind> = self
-            .roster
-            .iter()
-            .find(|p| p.member_id == member_id)
-            .map(|p| p.streams.iter().map(|stream| stream.kind).collect())
-            .unwrap_or_default();
-        for kind in kinds {
-            self.remove_stream(member_id, kind);
-        }
-    }
-
-    fn set_muted(&mut self, identity: &str, kind: MediaStreamKind, muted: bool) {
-        let Some(member_id) = self.identity_map.get(identity).cloned() else {
-            return;
-        };
-        self.set_member_muted(&member_id, kind, muted);
     }
 
     /// Mute state keyed by member rather than transport identity, so it serves
@@ -1978,20 +1235,7 @@ impl Actor {
         self.publish_roster();
     }
 
-    // ---- health / end ------------------------------------------------------
-
-    fn mark_degraded(&mut self, key: &str) {
-        let was_clear = self.degraded_keys.is_empty();
-        if self.degraded_keys.insert(key.to_owned()) && was_clear {
-            self.emit(CallEvent::MediaConnectionState { degraded: true });
-        }
-    }
-
-    fn clear_degraded(&mut self, key: &str) {
-        if self.degraded_keys.remove(key) && self.degraded_keys.is_empty() {
-            self.emit(CallEvent::MediaConnectionState { degraded: false });
-        }
-    }
+    // ---- end ---------------------------------------------------------------
 
     /// Emit [`CallEvent::Ended`] once and close all pooled peer-focus
     /// connections. The adopted own-focus connection is never closed by the
@@ -2002,17 +1246,7 @@ impl Actor {
         }
         self.ended = true;
         self.emit(CallEvent::Ended { reason });
-        for (_, entry) in self.pool.drain() {
-            if let ConnState::Up { connection } = entry.state
-                && !entry.is_own
-            {
-                rt::spawn(async move {
-                    if let Err(error) = connection.close().await {
-                        log::debug!("closing connection on call end failed: {error}");
-                    }
-                });
-            }
-        }
+        self.pool.close();
     }
 
     fn emit(&self, event: CallEvent) {
@@ -2183,24 +1417,9 @@ impl Actor {
     }
 }
 
-/// First backend (in preference order) that can serve any of the member's
-/// published transports, with the resulting connection key.
-fn select_transport(
-    transports: &[Arc<dyn MediaTransport>],
-    member: &JoinedMembership,
-) -> Option<(Arc<dyn MediaTransport>, String)> {
-    for backend in transports {
-        for transport in &member.transports {
-            if let Some(key) = backend.connection_key(transport) {
-                return Some((backend.clone(), key));
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
@@ -2214,6 +1433,7 @@ mod tests {
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::*;
+    use matrix_rtc_transport::pool::{CONSTRAINTS_DEBOUNCE, IDLE_GRACE};
     use matrix_rtc_transport::{
         AudioFrame, LocalTrackHandle, OwnMemberClaims, SpeakingParticipant, VideoSourceConfig,
     };
@@ -2269,7 +1489,17 @@ mod tests {
             Some(format!("id-{}", member.member_id))
         }
 
-        async fn connect(&self, connection_key: &str, _ctx: &ConnectionContext) -> ConnectOutcome {
+        async fn connect(
+            &self,
+            connection_key: &str,
+            _ctx: &ConnectionContext,
+        ) -> Result<
+            (
+                Box<dyn TransportConnection>,
+                mpsc::UnboundedReceiver<ConnectionEvent>,
+            ),
+            TransportError,
+        > {
             self.state
                 .connects
                 .lock()
