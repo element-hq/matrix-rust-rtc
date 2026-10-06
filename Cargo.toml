@@ -22,7 +22,7 @@ resolver = "2"
 # livekit and matrix-sdk crates could not be published anyway — they pin matrix-sdk
 # by git rev, which the registry rejects.
 [workspace.package]
-version = "0.4.0-rc.1"
+version = "0.5.0-rc.1"
 edition = "2024"
 license = "AGPL-3.0-only OR LicenseRef-Element-Commercial"
 

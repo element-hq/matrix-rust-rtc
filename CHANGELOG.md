@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.1 - 2026-10-06
+
 ### Breaking
 
 - `matrix-rtc-media` is renamed `matrix-rtc-call-sdk`, and `LiveKitCall`, `open_slot`, `attach_livekit` and the examples and e2e test move there from `matrix-rtc-livekit` (features `livekit` and `matrix-sdk`), leaving `matrix-rtc-livekit` the transport alone, without a `matrix-sdk` feature.
