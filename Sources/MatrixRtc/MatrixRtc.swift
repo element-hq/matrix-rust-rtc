@@ -2222,8 +2222,7 @@ public func FfiConverterTypeMatrixBackend_lower(_ value: MatrixBackend) -> Unsaf
  * unified event stream, per-stream constraints, frame streams, and local
  * publications — with no transport types on the surface.
  *
- * End it with [`MediaSession::disconnect`]; leaving the slot itself stays a
- * manager concern (`RtcSessionManagerHandle::leave`).
+ * Ends with the call; [`MediaSession::disconnect`] ends it while staying joined.
  */
 public protocol MediaSessionProtocol: AnyObject, Sendable {
     
@@ -2235,9 +2234,7 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
     func audioStream(memberId: String, kind: FfiStreamKind)  -> AudioFrameStream?
     
     /**
-     * End the media session: emits `Ended { Left }`, closes every
-     * peer-focus connection, then the own-focus one. Leave the slot via the
-     * manager separately.
+     * End the media session while staying joined. Not needed after leaving.
      *
      * (Named `disconnect` rather than `close`: uniffi already gives every
      * Kotlin object an `AutoCloseable.close()` for handle disposal, and a
@@ -2250,7 +2247,7 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
      * our media key under it).
      *
      * The MSC4195 pseudonymous hash, or — in
-     * [`FfiElementCallCompat::StateEvents`](crate::FfiElementCallCompat::StateEvents)
+     * [`FfiMembershipFormat::RoomState`](crate::FfiMembershipFormat::RoomState)
      * — the plain `{user}:{device}` string that generation's authorisation
      * service mints.
      */
@@ -2397,8 +2394,7 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
  * unified event stream, per-stream constraints, frame streams, and local
  * publications — with no transport types on the surface.
  *
- * End it with [`MediaSession::disconnect`]; leaving the slot itself stays a
- * manager concern (`RtcSessionManagerHandle::leave`).
+ * Ends with the call; [`MediaSession::disconnect`] ends it while staying joined.
  */
 open class MediaSession: MediaSessionProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -2467,9 +2463,7 @@ open func audioStream(memberId: String, kind: FfiStreamKind) -> AudioFrameStream
 }
     
     /**
-     * End the media session: emits `Ended { Left }`, closes every
-     * peer-focus connection, then the own-focus one. Leave the slot via the
-     * manager separately.
+     * End the media session while staying joined. Not needed after leaving.
      *
      * (Named `disconnect` rather than `close`: uniffi already gives every
      * Kotlin object an `AutoCloseable.close()` for handle disposal, and a
@@ -2497,7 +2491,7 @@ open func disconnect()async throws   {
      * our media key under it).
      *
      * The MSC4195 pseudonymous hash, or — in
-     * [`FfiElementCallCompat::StateEvents`](crate::FfiElementCallCompat::StateEvents)
+     * [`FfiMembershipFormat::RoomState`](crate::FfiMembershipFormat::RoomState)
      * — the plain `{user}:{device}` string that generation's authorisation
      * service mints.
      */
@@ -2862,11 +2856,23 @@ public func FfiConverterTypeMediaSession_lower(_ value: MediaSession) -> UnsafeM
 
 
 
+/**
+ * A slot's joined roster, pulled with an async [`Self::next`] like the media
+ * frame streams.
+ */
 public protocol MembershipSnapshotSubscriptionProtocol: AnyObject, Sendable {
     
-    func nextSnapshot() throws  -> [JoinedMembership]?
+    /**
+     * The current roster on the first call, then the next one that differs.
+     * `None` once the room is shut down or dropped.
+     */
+    func next() async  -> [JoinedMembership]?
     
 }
+/**
+ * A slot's joined roster, pulled with an async [`Self::next`] like the media
+ * frame streams.
+ */
 open class MembershipSnapshotSubscription: MembershipSnapshotSubscriptionProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
 
@@ -2919,11 +2925,26 @@ open class MembershipSnapshotSubscription: MembershipSnapshotSubscriptionProtoco
     
 
     
-open func nextSnapshot()throws  -> [JoinedMembership]?  {
-    return try  FfiConverterOptionSequenceTypeJoinedMembership.lift(try rustCallWithError(FfiConverterTypeMatrixRtcFfiError_lift) {
-    uniffi_matrix_rtc_ffi_fn_method_membershipsnapshotsubscription_next_snapshot(self.uniffiClonePointer(),$0
-    )
-})
+    /**
+     * The current roster on the first call, then the next one that differs.
+     * `None` once the room is shut down or dropped.
+     */
+open func next()async  -> [JoinedMembership]?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_membershipsnapshotsubscription_next(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionSequenceTypeJoinedMembership.lift,
+            errorHandler: nil
+            
+        )
 }
     
 
@@ -3167,6 +3188,585 @@ public func FfiConverterTypeRoomSink_lower(_ value: RoomSink) -> UnsafeMutableRa
 
 
 /**
+ * Our participation in one call slot. Over after [`leave`](Self::leave), after
+ * its room shuts down, or once dropped; joining again yields a new one. Dropping
+ * it sends no leave: the keep-alive stops, and the membership expires through
+ * its delayed leave unless the slot is joined again, which leaves it first.
+ */
+public protocol RtcCallProtocol: AnyObject, Sendable {
+    
+    func isLive()  -> Bool
+    
+    /**
+     * Leaves the slot; the call is over and its media stopped at once, even
+     * when the send fails — the delayed leave then removes the membership.
+     */
+    func leave(params: FfiLeaveSessionParams) async throws 
+    
+    /**
+     * Lowers our hand by redacting the annotation. A no-op when it is down.
+     */
+    func lowerHand() async throws 
+    
+    func memberCount() async  -> UInt64
+    
+    /**
+     * Our `member.id` in this participation.
+     */
+    func memberId()  -> String
+    
+    /**
+     * The event id of our current membership event, or `None` once over.
+     * Moves on every sticky refresh, so read it at the moment of use.
+     */
+    func membershipEventId() async  -> String?
+    
+    /**
+     * Raises our hand. Idempotent while it is up; the hand follows our
+     * membership across sticky refreshes on its own.
+     */
+    func raiseHand() async throws 
+    
+    /**
+     * The slot's raised hands, oldest first.
+     */
+    func raisedHands() async  -> [FfiRaisedHand]
+    
+    func roomId()  -> String
+    
+    /**
+     * Sends an Element Call emoji reaction. `name` is what peers pick a sound
+     * by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
+     * sent. Returns the event id.
+     *
+     * Fails inside the send cooldown (Element Call's three seconds by
+     * default), since peers would drop the reaction anyway.
+     */
+    func sendReaction(emoji: String, name: String) async throws  -> String
+    
+    func slotId()  -> String
+    
+    /**
+     * The slot's joined roster as it changes; see
+     * [`RtcRoom::subscribe_membership_snapshots`].
+     */
+    func subscribeMembershipSnapshots() async  -> MembershipSnapshotSubscription
+    
+    /**
+     * Resolves once the call is over (left, slot closed, room closed), with
+     * why. A host running its own media tears it down here. Never resolves
+     * for a call dropped without leaving.
+     */
+    func waitForEnd() async  -> FfiLeaveReason
+    
+}
+/**
+ * Our participation in one call slot. Over after [`leave`](Self::leave), after
+ * its room shuts down, or once dropped; joining again yields a new one. Dropping
+ * it sends no leave: the keep-alive stops, and the membership expires through
+ * its delayed leave unless the slot is joined again, which leaves it first.
+ */
+open class RtcCall: RtcCallProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_matrix_rtc_ffi_fn_clone_rtccall(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_matrix_rtc_ffi_fn_free_rtccall(pointer, $0) }
+    }
+
+    
+
+    
+open func isLive() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_is_live(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Leaves the slot; the call is over and its media stopped at once, even
+     * when the send fails — the delayed leave then removes the membership.
+     */
+open func leave(params: FfiLeaveSessionParams)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_leave(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeFfiLeaveSessionParams_lower(params)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
+    
+    /**
+     * Lowers our hand by redacting the annotation. A no-op when it is down.
+     */
+open func lowerHand()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_lower_hand(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
+    
+open func memberCount()async  -> UInt64  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_member_count(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_u64,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_u64,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Our `member.id` in this participation.
+     */
+open func memberId() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_member_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The event id of our current membership event, or `None` once over.
+     * Moves on every sticky refresh, so read it at the moment of use.
+     */
+open func membershipEventId()async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_membership_event_id(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Raises our hand. Idempotent while it is up; the hand follows our
+     * membership across sticky refreshes on its own.
+     */
+open func raiseHand()async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_raise_hand(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
+    
+    /**
+     * The slot's raised hands, oldest first.
+     */
+open func raisedHands()async  -> [FfiRaisedHand]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_raised_hands(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeFfiRaisedHand.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+open func roomId() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_room_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Sends an Element Call emoji reaction. `name` is what peers pick a sound
+     * by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
+     * sent. Returns the event id.
+     *
+     * Fails inside the send cooldown (Element Call's three seconds by
+     * default), since peers would drop the reaction anyway.
+     */
+open func sendReaction(emoji: String, name: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_send_reaction(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(emoji),FfiConverterString.lower(name)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
+    
+open func slotId() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_slot_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The slot's joined roster as it changes; see
+     * [`RtcRoom::subscribe_membership_snapshots`].
+     */
+open func subscribeMembershipSnapshots()async  -> MembershipSnapshotSubscription  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_subscribe_membership_snapshots(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_pointer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_pointer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeMembershipSnapshotSubscription_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Resolves once the call is over (left, slot closed, room closed), with
+     * why. A host running its own media tears it down here. Never resolves
+     * for a call dropped without leaving.
+     */
+open func waitForEnd()async  -> FfiLeaveReason  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtccall_wait_for_end(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFfiLeaveReason_lift,
+            errorHandler: nil
+            
+        )
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRtcCall: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = RtcCall
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcCall {
+        return RtcCall(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: RtcCall) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RtcCall {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: RtcCall, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRtcCall_lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcCall {
+    return try FfiConverterTypeRtcCall.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRtcCall_lower(_ value: RtcCall) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeRtcCall.lower(value)
+}
+
+
+
+
+
+
+/**
+ * One per Matrix session, over the host's backend. Creating it does no I/O;
+ * the library holds nothing about a room until the host opens one.
+ */
+public protocol RtcClientProtocol: AnyObject, Sendable {
+    
+    /**
+     * Opens a room: the library subscribes to what the room needs in the
+     * given mode and applies its current state. Resolves once that state is
+     * applied, so a `join_call` issued afterwards sees it.
+     *
+     * Opening a room that already has a live room object is an error.
+     * Cancelling the call leaves nothing behind. Dropping the returned room
+     * ends its subscriptions without leaving; `shutdown` leaves first.
+     */
+    func room(roomId: String, options: FfiRoomOptions) async throws  -> RtcRoom
+    
+}
+/**
+ * One per Matrix session, over the host's backend. Creating it does no I/O;
+ * the library holds nothing about a room until the host opens one.
+ */
+open class RtcClient: RtcClientProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_matrix_rtc_ffi_fn_clone_rtcclient(self.pointer, $0) }
+    }
+public convenience init(backend: MatrixBackend) {
+    let pointer =
+        try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_constructor_rtcclient_new(
+        FfiConverterTypeMatrixBackend_lower(backend),$0
+    )
+}
+    self.init(unsafeFromRawPointer: pointer)
+}
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_matrix_rtc_ffi_fn_free_rtcclient(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * Opens a room: the library subscribes to what the room needs in the
+     * given mode and applies its current state. Resolves once that state is
+     * applied, so a `join_call` issued afterwards sees it.
+     *
+     * Opening a room that already has a live room object is an error.
+     * Cancelling the call leaves nothing behind. Dropping the returned room
+     * ends its subscriptions without leaving; `shutdown` leaves first.
+     */
+open func room(roomId: String, options: FfiRoomOptions)async throws  -> RtcRoom  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtcclient_room(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(roomId),FfiConverterTypeFfiRoomOptions_lower(options)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_pointer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_pointer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeRtcRoom_lift,
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeRtcClient: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = RtcClient
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcClient {
+        return RtcClient(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: RtcClient) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RtcClient {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: RtcClient, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRtcClient_lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcClient {
+    return try FfiConverterTypeRtcClient.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeRtcClient_lower(_ value: RtcClient) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeRtcClient.lower(value)
+}
+
+
+
+
+
+
+/**
  * A host-supplied destination for log records.
  *
  * Implementations are called from a single dedicated thread, never from the
@@ -3355,30 +3955,25 @@ public func FfiConverterTypeRtcLogSink_lower(_ value: RtcLogSink) -> UnsafeMutab
 
 
 
-public protocol RtcSessionManagerHandleProtocol: AnyObject, Sendable {
-    
-    /**
-     * Attaches a room: the library subscribes to what the room needs in the
-     * given mode and applies the current state. Resolves once that state is
-     * applied, so a `join` issued afterwards sees it. Attaching a room that
-     * is attached, or still being attached, is an error. Wait for the attach
-     * before detaching the room; cancelling the call ends the attach instead.
-     */
-    func attachRoom(roomId: String, options: FfiAttachOptions) async throws 
+/**
+ * One open room. Everything room-scoped is here; our own participation is on
+ * the [`RtcCall`] that `join_call` returns.
+ */
+public protocol RtcRoomProtocol: AnyObject, Sendable {
     
     /**
      * Closes a slot, by setting its `m.rtc.slot` status to `closed`.
      *
      * Every member of it becomes left as soon as clients apply the new state —
      * this ends the call for everyone, not just for us. Leaving is
-     * [`Self::leave`].
+     * [`RtcCall::leave`].
      */
-    func closeSlot(roomId: String, slotId: String) async throws 
+    func closeSlot(slotId: String) async throws 
     
     /**
-     * A JSON dump of everything the manager and its sessions currently
-     * believe: sessions, room state per room, and every candidate member with
-     * the reason it is or is not projected as joined.
+     * A JSON dump of everything the room currently believes: its room state,
+     * and every candidate member of each slot with the reason it is or is not
+     * projected as joined.
      *
      * For bug reports and for answering "what does Rust think the state is
      * right now?" without a debugger. Contains no key material.
@@ -3386,51 +3981,26 @@ public protocol RtcSessionManagerHandleProtocol: AnyObject, Sendable {
     func debugSnapshot() async throws  -> String
     
     /**
-     * Detaches a room: leaves any session joined in it, then ends the
-     * subscription. Nothing delivered afterwards is applied. Detaching an
-     * unattached room is a no-op.
+     * Joins a call slot, returning our participation in it.
+     *
+     * The SDK generates the `member.id` (read it from [`RtcCall::member_id`]);
+     * hosts do not supply one. MSC4143 requires a fresh `member.id` on every
+     * join, and reusing one is silently destructive: the MSC4195 participant
+     * identity is derived from it, so a repeat join keeps the identity peers
+     * already hold a key for while our key index restarts at 0 — every peer
+     * then decrypts our media with the previous call's key and never recovers.
+     *
+     * The returned call keeps itself alive every 10 seconds, and performs its
+     * key rotations when they fall due, until it leaves or is dropped. Fails
+     * when the room's state holds no open slot of this id, or while the slot
+     * is joined through a live call of this room.
      */
-    func detachRoom(roomId: String) async throws 
+    func joinCall(params: FfiJoinSessionParams) async throws  -> RtcCall
     
     /**
-     * Restarts the keep-alive for one session: reschedules the delayed leave,
-     * and re-sends the membership if its sticky entry is halfway to expiring.
-     *
-     * **Hosts do not need to call this** — [`Self::join`] starts a driver that
-     * does it every 10 seconds, and [`Self::leave`] stops it. It is exported
-     * for hosts that would rather drive the keep-alive from their own scheduler
-     * (a foreground service, a workmanager job), and for tests.
-     *
-     * Returns `false` if there is no joined session for `(room_id, slot_id)`,
-     * which means there is nothing to keep alive.
+     * How many members are joined to a slot, without joining it.
      */
-    func heartbeat(roomId: String, slotId: String) async throws  -> Bool
-    
-    /**
-     * Joins a session in an attached room, returning the `member.id` it
-     * joined as.
-     *
-     * The SDK generates that id; hosts do not supply one. MSC4143 requires a
-     * fresh `member.id` on every join, and reusing one is silently destructive:
-     * the MSC4195 participant identity is derived from it, so a repeat join
-     * keeps the identity peers already hold a key for while our key index
-     * restarts at 0 — every peer then decrypts our media with the previous
-     * call's key and never recovers. Read it back with [`Self::own_member_id`].
-     *
-     * Fails when the room is not attached, or when its state holds no open
-     * slot of this id.
-     */
-    func join(params: FfiJoinSessionParams) async throws  -> String
-    
-    func leave(roomId: String, slotId: String, params: FfiLeaveSessionParams) async throws 
-    
-    /**
-     * Lowers our hand in one session by redacting the annotation. A no-op
-     * when it is down.
-     */
-    func lowerHand(roomId: String, slotId: String) async throws 
-    
-    func memberCount(roomId: String, slotId: String) async throws  -> UInt64?
+    func memberCount(slotId: String) async throws  -> UInt64
     
     /**
      * Opens a slot, by publishing its `m.rtc.slot` state event.
@@ -3448,63 +4018,36 @@ public protocol RtcSessionManagerHandleProtocol: AnyObject, Sendable {
      * `encryption` must be [`FfiSlotEncryption::PerMember`] in an encrypted room
      * and `null` elsewhere; the mismatch resolves the slot closed for everyone.
      */
-    func openSlot(roomId: String, slotId: String, applicationType: String, encryption: FfiSlotEncryption?) async throws 
+    func openSlot(slotId: String, applicationType: String, encryption: FfiSlotEncryption?) async throws 
+    
+    func roomId()  -> String
     
     /**
-     * Our `member.id` in one session, or `None` if there is no such session or
-     * it has not joined.
+     * Leaves every slot joined through this room, then ends its
+     * subscriptions. Every call of the room is over afterwards; a second
+     * shutdown is a no-op.
      *
-     * Changes on every join (MSC4143), so read it when needed rather than
-     * caching what [`Self::join`] returned.
+     * (Named `shutdown` rather than `close`: uniffi already gives every
+     * object a `close()` — Kotlin's `AutoCloseable` — that frees it, which
+     * for a room is dropping it: its subscriptions end and nothing is left.)
      */
-    func ownMemberId(roomId: String, slotId: String) async throws  -> String?
+    func shutdown() async 
     
     /**
-     * The event id of our current membership event in one session, or `None`
-     * if there is no such session or it has not joined. Moves on every sticky
-     * refresh, so read it at the moment of use.
-     */
-    func ownMembershipEventId(roomId: String, slotId: String) async throws  -> String?
-    
-    /**
-     * Raises our hand in one session. Idempotent while it is up; the hand
-     * follows our membership across sticky refreshes on its own.
-     */
-    func raiseHand(roomId: String, slotId: String) async throws 
-    
-    /**
-     * The raised hands of one session, oldest first; empty if there is no
-     * such session.
-     */
-    func raisedHands(roomId: String, slotId: String) async throws  -> [FfiRaisedHand]
-    
-    /**
-     * Sends an Element Call emoji reaction in one session. `name` is what
-     * peers pick a sound by (see [`reaction_catalog`]); only the first
-     * grapheme of `emoji` is sent. Returns the event id.
+     * Observe a slot's joined roster, without joining it.
      *
-     * Fails inside the send cooldown (Element Call's three seconds by
-     * default), since peers would drop the reaction anyway.
+     * The subscription yields the current roster on its first `next()` and
+     * then only on change, so a host can attach at any point without missing
+     * the state it attached to.
      */
-    func sendReaction(roomId: String, slotId: String, emoji: String, name: String) async throws  -> String
-    
-    func sessionCount() async throws  -> UInt64
-    
-    /**
-     * Observe the joined roster of one session.
-     *
-     * Returns `None` if no session exists for `(room_id, slot_id)` — a session
-     * appears when the first member event for that slot arrives, or when this
-     * manager joins it.
-     *
-     * The subscription yields the current roster on its first
-     * `nextSnapshot()` and then only on change, so a host can attach at any
-     * point without missing the state it attached to.
-     */
-    func subscribeMembershipSnapshots(roomId: String, slotId: String) async throws  -> MembershipSnapshotSubscription?
+    func subscribeMembershipSnapshots(slotId: String) async throws  -> MembershipSnapshotSubscription
     
 }
-open class RtcSessionManagerHandle: RtcSessionManagerHandleProtocol, @unchecked Sendable {
+/**
+ * One open room. Everything room-scoped is here; our own participation is on
+ * the [`RtcCall`] that `join_call` returns.
+ */
+open class RtcRoom: RtcRoomProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
 
     /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
@@ -3541,70 +4084,35 @@ open class RtcSessionManagerHandle: RtcSessionManagerHandleProtocol, @unchecked 
     @_documentation(visibility: private)
 #endif
     public func uniffiClonePointer() -> UnsafeMutableRawPointer {
-        return try! rustCall { uniffi_matrix_rtc_ffi_fn_clone_rtcsessionmanagerhandle(self.pointer, $0) }
+        return try! rustCall { uniffi_matrix_rtc_ffi_fn_clone_rtcroom(self.pointer, $0) }
     }
-    /**
-     * One handle per Matrix session, over the host's backend.
-     */
-public convenience init(backend: MatrixBackend) {
-    let pointer =
-        try! rustCall() {
-    uniffi_matrix_rtc_ffi_fn_constructor_rtcsessionmanagerhandle_new(
-        FfiConverterTypeMatrixBackend_lower(backend),$0
-    )
-}
-    self.init(unsafeFromRawPointer: pointer)
-}
+    // No primary constructor declared for this class.
 
     deinit {
         guard let pointer = pointer else {
             return
         }
 
-        try! rustCall { uniffi_matrix_rtc_ffi_fn_free_rtcsessionmanagerhandle(pointer, $0) }
+        try! rustCall { uniffi_matrix_rtc_ffi_fn_free_rtcroom(pointer, $0) }
     }
 
     
 
     
     /**
-     * Attaches a room: the library subscribes to what the room needs in the
-     * given mode and applies the current state. Resolves once that state is
-     * applied, so a `join` issued afterwards sees it. Attaching a room that
-     * is attached, or still being attached, is an error. Wait for the attach
-     * before detaching the room; cancelling the call ends the attach instead.
-     */
-open func attachRoom(roomId: String, options: FfiAttachOptions)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_attach_room(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterTypeFfiAttachOptions_lower(options)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
      * Closes a slot, by setting its `m.rtc.slot` status to `closed`.
      *
      * Every member of it becomes left as soon as clients apply the new state —
      * this ends the call for everyone, not just for us. Leaving is
-     * [`Self::leave`].
+     * [`RtcCall::leave`].
      */
-open func closeSlot(roomId: String, slotId: String)async throws   {
+open func closeSlot(slotId: String)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_close_slot(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_close_slot(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
+                    FfiConverterString.lower(slotId)
                 )
             },
             pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
@@ -3616,9 +4124,9 @@ open func closeSlot(roomId: String, slotId: String)async throws   {
 }
     
     /**
-     * A JSON dump of everything the manager and its sessions currently
-     * believe: sessions, room state per room, and every candidate member with
-     * the reason it is or is not projected as joined.
+     * A JSON dump of everything the room currently believes: its room state,
+     * and every candidate member of each slot with the reason it is or is not
+     * projected as joined.
      *
      * For bug reports and for answering "what does Rust think the state is
      * right now?" without a debugger. Contains no key material.
@@ -3627,7 +4135,7 @@ open func debugSnapshot()async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_debug_snapshot(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_debug_snapshot(
                     self.uniffiClonePointer()
                     
                 )
@@ -3641,138 +4149,53 @@ open func debugSnapshot()async throws  -> String  {
 }
     
     /**
-     * Detaches a room: leaves any session joined in it, then ends the
-     * subscription. Nothing delivered afterwards is applied. Detaching an
-     * unattached room is a no-op.
+     * Joins a call slot, returning our participation in it.
+     *
+     * The SDK generates the `member.id` (read it from [`RtcCall::member_id`]);
+     * hosts do not supply one. MSC4143 requires a fresh `member.id` on every
+     * join, and reusing one is silently destructive: the MSC4195 participant
+     * identity is derived from it, so a repeat join keeps the identity peers
+     * already hold a key for while our key index restarts at 0 — every peer
+     * then decrypts our media with the previous call's key and never recovers.
+     *
+     * The returned call keeps itself alive every 10 seconds, and performs its
+     * key rotations when they fall due, until it leaves or is dropped. Fails
+     * when the room's state holds no open slot of this id, or while the slot
+     * is joined through a live call of this room.
      */
-open func detachRoom(roomId: String)async throws   {
+open func joinCall(params: FfiJoinSessionParams)async throws  -> RtcCall  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_detach_room(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
-     * Restarts the keep-alive for one session: reschedules the delayed leave,
-     * and re-sends the membership if its sticky entry is halfway to expiring.
-     *
-     * **Hosts do not need to call this** — [`Self::join`] starts a driver that
-     * does it every 10 seconds, and [`Self::leave`] stops it. It is exported
-     * for hosts that would rather drive the keep-alive from their own scheduler
-     * (a foreground service, a workmanager job), and for tests.
-     *
-     * Returns `false` if there is no joined session for `(room_id, slot_id)`,
-     * which means there is nothing to keep alive.
-     */
-open func heartbeat(roomId: String, slotId: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_heartbeat(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_i8,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_i8,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
-     * Joins a session in an attached room, returning the `member.id` it
-     * joined as.
-     *
-     * The SDK generates that id; hosts do not supply one. MSC4143 requires a
-     * fresh `member.id` on every join, and reusing one is silently destructive:
-     * the MSC4195 participant identity is derived from it, so a repeat join
-     * keeps the identity peers already hold a key for while our key index
-     * restarts at 0 — every peer then decrypts our media with the previous
-     * call's key and never recovers. Read it back with [`Self::own_member_id`].
-     *
-     * Fails when the room is not attached, or when its state holds no open
-     * slot of this id.
-     */
-open func join(params: FfiJoinSessionParams)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_join(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_join_call(
                     self.uniffiClonePointer(),
                     FfiConverterTypeFfiJoinSessionParams_lower(params)
                 )
             },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-open func leave(roomId: String, slotId: String, params: FfiLeaveSessionParams)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_leave(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId),FfiConverterTypeFfiLeaveSessionParams_lower(params)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
-            liftFunc: { $0 },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_pointer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_pointer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeRtcCall_lift,
             errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
         )
 }
     
     /**
-     * Lowers our hand in one session by redacting the annotation. A no-op
-     * when it is down.
+     * How many members are joined to a slot, without joining it.
      */
-open func lowerHand(roomId: String, slotId: String)async throws   {
+open func memberCount(slotId: String)async throws  -> UInt64  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_lower_hand(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_member_count(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
+                    FfiConverterString.lower(slotId)
                 )
             },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-open func memberCount(roomId: String, slotId: String)async throws  -> UInt64?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_member_count(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionUInt64.lift,
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_u64,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_u64,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterUInt64.lift,
             errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
         )
 }
@@ -3793,13 +4216,13 @@ open func memberCount(roomId: String, slotId: String)async throws  -> UInt64?  {
      * `encryption` must be [`FfiSlotEncryption::PerMember`] in an encrypted room
      * and `null` elsewhere; the mismatch resolves the slot closed for everyone.
      */
-open func openSlot(roomId: String, slotId: String, applicationType: String, encryption: FfiSlotEncryption?)async throws   {
+open func openSlot(slotId: String, applicationType: String, encryption: FfiSlotEncryption?)async throws   {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_open_slot(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_open_slot(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId),FfiConverterString.lower(applicationType),FfiConverterOptionTypeFfiSlotEncryption.lower(encryption)
+                    FfiConverterString.lower(slotId),FfiConverterString.lower(applicationType),FfiConverterOptionTypeFfiSlotEncryption.lower(encryption)
                 )
             },
             pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
@@ -3810,160 +4233,60 @@ open func openSlot(roomId: String, slotId: String, applicationType: String, encr
         )
 }
     
+open func roomId() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtcroom_room_id(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
     /**
-     * Our `member.id` in one session, or `None` if there is no such session or
-     * it has not joined.
+     * Leaves every slot joined through this room, then ends its
+     * subscriptions. Every call of the room is over afterwards; a second
+     * shutdown is a no-op.
      *
-     * Changes on every join (MSC4143), so read it when needed rather than
-     * caching what [`Self::join`] returned.
+     * (Named `shutdown` rather than `close`: uniffi already gives every
+     * object a `close()` — Kotlin's `AutoCloseable` — that frees it, which
+     * for a room is dropping it: its subscriptions end and nothing is left.)
      */
-open func ownMemberId(roomId: String, slotId: String)async throws  -> String?  {
+open func shutdown()async   {
     return
-        try  await uniffiRustCallAsync(
+        try!  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_own_member_id(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionString.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
-     * The event id of our current membership event in one session, or `None`
-     * if there is no such session or it has not joined. Moves on every sticky
-     * refresh, so read it at the moment of use.
-     */
-open func ownMembershipEventId(roomId: String, slotId: String)async throws  -> String?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_own_membership_event_id(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionString.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
-     * Raises our hand in one session. Idempotent while it is up; the hand
-     * follows our membership across sticky refreshes on its own.
-     */
-open func raiseHand(roomId: String, slotId: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_raise_hand(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
-     * The raised hands of one session, oldest first; empty if there is no
-     * such session.
-     */
-open func raisedHands(roomId: String, slotId: String)async throws  -> [FfiRaisedHand]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_raised_hands(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeFfiRaisedHand.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-    /**
-     * Sends an Element Call emoji reaction in one session. `name` is what
-     * peers pick a sound by (see [`reaction_catalog`]); only the first
-     * grapheme of `emoji` is sent. Returns the event id.
-     *
-     * Fails inside the send cooldown (Element Call's three seconds by
-     * default), since peers would drop the reaction anyway.
-     */
-open func sendReaction(roomId: String, slotId: String, emoji: String, name: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_send_reaction(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId),FfiConverterString.lower(emoji),FfiConverterString.lower(name)
-                )
-            },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
-        )
-}
-    
-open func sessionCount()async throws  -> UInt64  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_session_count(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_shutdown(
                     self.uniffiClonePointer()
                     
                 )
             },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_u64,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_u64,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_u64,
-            liftFunc: FfiConverterUInt64.lift,
-            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_void,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_void,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
         )
 }
     
     /**
-     * Observe the joined roster of one session.
+     * Observe a slot's joined roster, without joining it.
      *
-     * Returns `None` if no session exists for `(room_id, slot_id)` — a session
-     * appears when the first member event for that slot arrives, or when this
-     * manager joins it.
-     *
-     * The subscription yields the current roster on its first
-     * `nextSnapshot()` and then only on change, so a host can attach at any
-     * point without missing the state it attached to.
+     * The subscription yields the current roster on its first `next()` and
+     * then only on change, so a host can attach at any point without missing
+     * the state it attached to.
      */
-open func subscribeMembershipSnapshots(roomId: String, slotId: String)async throws  -> MembershipSnapshotSubscription?  {
+open func subscribeMembershipSnapshots(slotId: String)async throws  -> MembershipSnapshotSubscription  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_rtcsessionmanagerhandle_subscribe_membership_snapshots(
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_subscribe_membership_snapshots(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(slotId)
+                    FfiConverterString.lower(slotId)
                 )
             },
-            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionTypeMembershipSnapshotSubscription.lift,
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_pointer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_pointer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeMembershipSnapshotSubscription_lift,
             errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
         )
 }
@@ -3975,20 +4298,20 @@ open func subscribeMembershipSnapshots(roomId: String, slotId: String)async thro
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeRtcSessionManagerHandle: FfiConverter {
+public struct FfiConverterTypeRtcRoom: FfiConverter {
 
     typealias FfiType = UnsafeMutableRawPointer
-    typealias SwiftType = RtcSessionManagerHandle
+    typealias SwiftType = RtcRoom
 
-    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcSessionManagerHandle {
-        return RtcSessionManagerHandle(unsafeFromRawPointer: pointer)
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcRoom {
+        return RtcRoom(unsafeFromRawPointer: pointer)
     }
 
-    public static func lower(_ value: RtcSessionManagerHandle) -> UnsafeMutableRawPointer {
+    public static func lower(_ value: RtcRoom) -> UnsafeMutableRawPointer {
         return value.uniffiClonePointer()
     }
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RtcSessionManagerHandle {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> RtcRoom {
         let v: UInt64 = try readInt(&buf)
         // The Rust code won't compile if a pointer won't fit in a UInt64.
         // We have to go via `UInt` because that's the thing that's the size of a pointer.
@@ -3999,7 +4322,7 @@ public struct FfiConverterTypeRtcSessionManagerHandle: FfiConverter {
         return try lift(ptr!)
     }
 
-    public static func write(_ value: RtcSessionManagerHandle, into buf: inout [UInt8]) {
+    public static func write(_ value: RtcRoom, into buf: inout [UInt8]) {
         // This fiddling is because `Int` is the thing that's the same size as a pointer.
         // The Rust code won't compile if a pointer won't fit in a `UInt64`.
         writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
@@ -4010,15 +4333,15 @@ public struct FfiConverterTypeRtcSessionManagerHandle: FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeRtcSessionManagerHandle_lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcSessionManagerHandle {
-    return try FfiConverterTypeRtcSessionManagerHandle.lift(pointer)
+public func FfiConverterTypeRtcRoom_lift(_ pointer: UnsafeMutableRawPointer) throws -> RtcRoom {
+    return try FfiConverterTypeRtcRoom.lift(pointer)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeRtcSessionManagerHandle_lower(_ value: RtcSessionManagerHandle) -> UnsafeMutableRawPointer {
-    return FfiConverterTypeRtcSessionManagerHandle.lower(value)
+public func FfiConverterTypeRtcRoom_lower(_ value: RtcRoom) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeRtcRoom.lower(value)
 }
 
 
@@ -4631,85 +4954,6 @@ public func FfiConverterTypeVideoFrameStream_lower(_ value: VideoFrameStream) ->
 
 
 /**
- * How a room is attached.
- */
-public struct FfiAttachOptions {
-    /**
-     * Which MatrixRTC generation the room is read and written for. Unset (or
-     * `Off`) is spec-current. One decision for the room: what the library
-     * subscribes to, how it renders our sends, the `member.id` we join with,
-     * how an inbound media key is bound, the SFU identity and the token
-     * endpoint. See [`crate::compat`].
-     */
-    public var elementCallCompat: FfiElementCallCompat?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Which MatrixRTC generation the room is read and written for. Unset (or
-         * `Off`) is spec-current. One decision for the room: what the library
-         * subscribes to, how it renders our sends, the `member.id` we join with,
-         * how an inbound media key is bound, the SFU identity and the token
-         * endpoint. See [`crate::compat`].
-         */elementCallCompat: FfiElementCallCompat? = nil) {
-        self.elementCallCompat = elementCallCompat
-    }
-}
-
-#if compiler(>=6)
-extension FfiAttachOptions: Sendable {}
-#endif
-
-
-extension FfiAttachOptions: Equatable, Hashable {
-    public static func ==(lhs: FfiAttachOptions, rhs: FfiAttachOptions) -> Bool {
-        if lhs.elementCallCompat != rhs.elementCallCompat {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(elementCallCompat)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFfiAttachOptions: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiAttachOptions {
-        return
-            try FfiAttachOptions(
-                elementCallCompat: FfiConverterOptionTypeFfiElementCallCompat.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: FfiAttachOptions, into buf: inout [UInt8]) {
-        FfiConverterOptionTypeFfiElementCallCompat.write(value.elementCallCompat, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiAttachOptions_lift(_ buf: RustBuffer) throws -> FfiAttachOptions {
-    return try FfiConverterTypeFfiAttachOptions.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiAttachOptions_lower(_ value: FfiAttachOptions) -> RustBuffer {
-    return FfiConverterTypeFfiAttachOptions.lower(value)
-}
-
-
-/**
  * A chunk of interleaved 16-bit PCM.
  */
 public struct FfiAudioFrame {
@@ -4895,7 +5139,7 @@ public func FfiConverterTypeFfiAudioSourceConfig_lower(_ value: FfiAudioSourceCo
  * One renderable stream of one membership, with what a UI needs to place
  * and decorate it. `microphone_muted` is the member's microphone; this
  * tile's own stream state is `has_video`. Mirrors
- * [`matrix_rtc_media::CallTile`], where every field is documented.
+ * [`matrix_rtc_call_sdk::CallTile`], where every field is documented.
  */
 public struct FfiCallTile {
     public var memberId: String
@@ -5386,34 +5630,15 @@ public func FfiConverterTypeFfiEventIn_lower(_ value: FfiEventIn) -> RustBuffer 
  */
 public struct FfiJoinSessionParams {
     /**
-     * Room ID. The room must be attached first.
+     * The call slot to join, `m.call#{application_slot_id}`. `None` is the
+     * room-wide call, `room`.
      */
-    public var roomId: String
+    public var applicationSlotId: String?
     /**
-     * Slot ID (e.g., "m.call#ROOM")
+     * What the join publishes on, if anything. Usually
+     * [`FfiJoinTransport::Advertised`].
      */
-    public var slotId: String
-    /**
-     * Application type (e.g., "m.call")
-     */
-    public var application: String
-    /**
-     * The transport to publish on. `None` — the usual case — takes the first
-     * LiveKit transport the homeserver advertises (`rtcTransports` on the
-     * backend); the join fails if there is none. Set it to pin a specific
-     * focus.
-     */
-    public var transport: FfiTransportConfig?
-    /**
-     * Join without publishing — valid per MSC4143, and what a recorder or
-     * other observer wants. `transport` is then ignored.
-     */
-    public var receiveOnly: Bool
-    /**
-     * Transport types this member can receive on. Only read when
-     * `receive_only`; a publishing member advertises its own transport's type.
-     */
-    public var canSubscribe: [String]
+    public var transport: FfiJoinTransport
     /**
      * Optional keep-alive timeout in milliseconds (default: 30000).
      *
@@ -5466,28 +5691,13 @@ public struct FfiJoinSessionParams {
     // declare one manually.
     public init(
         /**
-         * Room ID. The room must be attached first.
-         */roomId: String, 
+         * The call slot to join, `m.call#{application_slot_id}`. `None` is the
+         * room-wide call, `room`.
+         */applicationSlotId: String? = nil, 
         /**
-         * Slot ID (e.g., "m.call#ROOM")
-         */slotId: String, 
-        /**
-         * Application type (e.g., "m.call")
-         */application: String, 
-        /**
-         * The transport to publish on. `None` — the usual case — takes the first
-         * LiveKit transport the homeserver advertises (`rtcTransports` on the
-         * backend); the join fails if there is none. Set it to pin a specific
-         * focus.
-         */transport: FfiTransportConfig? = nil, 
-        /**
-         * Join without publishing — valid per MSC4143, and what a recorder or
-         * other observer wants. `transport` is then ignored.
-         */receiveOnly: Bool = false, 
-        /**
-         * Transport types this member can receive on. Only read when
-         * `receive_only`; a publishing member advertises its own transport's type.
-         */canSubscribe: [String] = [], 
+         * What the join publishes on, if anything. Usually
+         * [`FfiJoinTransport::Advertised`].
+         */transport: FfiJoinTransport, 
         /**
          * Optional keep-alive timeout in milliseconds (default: 30000).
          *
@@ -5529,12 +5739,8 @@ public struct FfiJoinSessionParams {
          * How this session handles Element Call reactions and the raised hand.
          * Unset is enabled with Element Call's three-second window.
          */reactions: FfiReactionsConfig? = nil) {
-        self.roomId = roomId
-        self.slotId = slotId
-        self.application = application
+        self.applicationSlotId = applicationSlotId
         self.transport = transport
-        self.receiveOnly = receiveOnly
-        self.canSubscribe = canSubscribe
         self.keepAliveTimeoutMs = keepAliveTimeoutMs
         self.stickyDurationMs = stickyDurationMs
         self.degradedLifetimeMs = degradedLifetimeMs
@@ -5551,22 +5757,10 @@ extension FfiJoinSessionParams: Sendable {}
 
 extension FfiJoinSessionParams: Equatable, Hashable {
     public static func ==(lhs: FfiJoinSessionParams, rhs: FfiJoinSessionParams) -> Bool {
-        if lhs.roomId != rhs.roomId {
-            return false
-        }
-        if lhs.slotId != rhs.slotId {
-            return false
-        }
-        if lhs.application != rhs.application {
+        if lhs.applicationSlotId != rhs.applicationSlotId {
             return false
         }
         if lhs.transport != rhs.transport {
-            return false
-        }
-        if lhs.receiveOnly != rhs.receiveOnly {
-            return false
-        }
-        if lhs.canSubscribe != rhs.canSubscribe {
             return false
         }
         if lhs.keepAliveTimeoutMs != rhs.keepAliveTimeoutMs {
@@ -5591,12 +5785,8 @@ extension FfiJoinSessionParams: Equatable, Hashable {
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(roomId)
-        hasher.combine(slotId)
-        hasher.combine(application)
+        hasher.combine(applicationSlotId)
         hasher.combine(transport)
-        hasher.combine(receiveOnly)
-        hasher.combine(canSubscribe)
         hasher.combine(keepAliveTimeoutMs)
         hasher.combine(stickyDurationMs)
         hasher.combine(degradedLifetimeMs)
@@ -5615,12 +5805,8 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiJoinSessionParams {
         return
             try FfiJoinSessionParams(
-                roomId: FfiConverterString.read(from: &buf), 
-                slotId: FfiConverterString.read(from: &buf), 
-                application: FfiConverterString.read(from: &buf), 
-                transport: FfiConverterOptionTypeFfiTransportConfig.read(from: &buf), 
-                receiveOnly: FfiConverterBool.read(from: &buf), 
-                canSubscribe: FfiConverterSequenceString.read(from: &buf), 
+                applicationSlotId: FfiConverterOptionString.read(from: &buf), 
+                transport: FfiConverterTypeFfiJoinTransport.read(from: &buf), 
                 keepAliveTimeoutMs: FfiConverterOptionUInt64.read(from: &buf), 
                 stickyDurationMs: FfiConverterOptionUInt64.read(from: &buf), 
                 degradedLifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
@@ -5631,12 +5817,8 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
     }
 
     public static func write(_ value: FfiJoinSessionParams, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.roomId, into: &buf)
-        FfiConverterString.write(value.slotId, into: &buf)
-        FfiConverterString.write(value.application, into: &buf)
-        FfiConverterOptionTypeFfiTransportConfig.write(value.transport, into: &buf)
-        FfiConverterBool.write(value.receiveOnly, into: &buf)
-        FfiConverterSequenceString.write(value.canSubscribe, into: &buf)
+        FfiConverterOptionString.write(value.applicationSlotId, into: &buf)
+        FfiConverterTypeFfiJoinTransport.write(value.transport, into: &buf)
         FfiConverterOptionUInt64.write(value.keepAliveTimeoutMs, into: &buf)
         FfiConverterOptionUInt64.write(value.stickyDurationMs, into: &buf)
         FfiConverterOptionUInt64.write(value.degradedLifetimeMs, into: &buf)
@@ -5884,7 +6066,7 @@ public func FfiConverterTypeFfiLocalState_lower(_ value: FfiLocalState) -> RustB
 
 /**
  * Subscription constraints for one stream of one participant (mirrors
- * `matrix_rtc_media::MediaConstraints` — see its docs for the semantics).
+ * `matrix_rtc_transport::MediaConstraints` — see its docs for the semantics).
  */
 public struct FfiMediaConstraints {
     /**
@@ -6347,7 +6529,7 @@ public func FfiConverterTypeFfiParticipant_lower(_ value: FfiParticipant) -> Rus
 
 
 /**
- * What to publish (mirrors `matrix_rtc_media::PublishOptions`).
+ * What to publish (mirrors `matrix_rtc_transport::PublishOptions`).
  */
 public struct FfiPublishOptions {
     public var kind: FfiStreamKind
@@ -6793,7 +6975,7 @@ public func FfiConverterTypeFfiReactionsConfig_lower(_ value: FfiReactionsConfig
 
 /**
  * Cumulative receive-side RTP counters for one subscribed stream (mirrors
- * `matrix_rtc_media::ReceiveStats`). Obtain via
+ * `matrix_rtc_transport::ReceiveStats`). Obtain via
  * [`MediaSession::receive_stats`](super::MediaSession::receive_stats).
  *
  * These exist because the receive path emits frames at a fixed cadence
@@ -7019,6 +7201,85 @@ public func FfiConverterTypeFfiReceiveStats_lower(_ value: FfiReceiveStats) -> R
 
 
 /**
+ * How a room is opened.
+ */
+public struct FfiRoomOptions {
+    /**
+     * Which MatrixRTC generation the room is read and written for. Unset (or
+     * `Off`) is spec-current. One decision for the room: what the library
+     * subscribes to, how it renders our sends, the `member.id` we join with,
+     * how an inbound media key is bound, the SFU identity and the token
+     * endpoint. See [`crate::compat`].
+     */
+    public var format: FfiMembershipFormat?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Which MatrixRTC generation the room is read and written for. Unset (or
+         * `Off`) is spec-current. One decision for the room: what the library
+         * subscribes to, how it renders our sends, the `member.id` we join with,
+         * how an inbound media key is bound, the SFU identity and the token
+         * endpoint. See [`crate::compat`].
+         */format: FfiMembershipFormat? = nil) {
+        self.format = format
+    }
+}
+
+#if compiler(>=6)
+extension FfiRoomOptions: Sendable {}
+#endif
+
+
+extension FfiRoomOptions: Equatable, Hashable {
+    public static func ==(lhs: FfiRoomOptions, rhs: FfiRoomOptions) -> Bool {
+        if lhs.format != rhs.format {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(format)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiRoomOptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRoomOptions {
+        return
+            try FfiRoomOptions(
+                format: FfiConverterOptionTypeFfiMembershipFormat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiRoomOptions, into buf: inout [UInt8]) {
+        FfiConverterOptionTypeFfiMembershipFormat.write(value.format, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRoomOptions_lift(_ buf: RustBuffer) throws -> FfiRoomOptions {
+    return try FfiConverterTypeFfiRoomOptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRoomOptions_lower(_ value: FfiRoomOptions) -> RustBuffer {
+    return FfiConverterTypeFfiRoomOptions.lower(value)
+}
+
+
+/**
  * What the library wants delivered for one room; see [`MatrixBackend::subscribe_room`].
  */
 public struct FfiRoomSubjects {
@@ -7106,7 +7367,7 @@ public func FfiConverterTypeFfiRoomSubjects_lower(_ value: FfiRoomSubjects) -> R
 /**
  * How much the tile order is damped (R10, R11). A product decision rather
  * than a protocol one, so a host can tune it; the defaults are what
- * `matrix_rtc_media::StabilityConfig` uses.
+ * `matrix_rtc_call_sdk::StabilityConfig` uses.
  */
 public struct FfiStabilityConfig {
     /**
@@ -7930,91 +8191,6 @@ public func FfiConverterTypeFfiToDeviceRecipient_lower(_ value: FfiToDeviceRecip
 
 
 /**
- * FFI-friendly transport configuration for join operations.
- */
-public struct FfiTransportConfig {
-    /**
-     * Transport type (e.g., "livekit")
-     */
-    public var type: String
-    /**
-     * LiveKit service URL (required for livekit transport)
-     */
-    public var livekitServiceUrl: String?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Transport type (e.g., "livekit")
-         */type: String, 
-        /**
-         * LiveKit service URL (required for livekit transport)
-         */livekitServiceUrl: String?) {
-        self.type = type
-        self.livekitServiceUrl = livekitServiceUrl
-    }
-}
-
-#if compiler(>=6)
-extension FfiTransportConfig: Sendable {}
-#endif
-
-
-extension FfiTransportConfig: Equatable, Hashable {
-    public static func ==(lhs: FfiTransportConfig, rhs: FfiTransportConfig) -> Bool {
-        if lhs.type != rhs.type {
-            return false
-        }
-        if lhs.livekitServiceUrl != rhs.livekitServiceUrl {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(type)
-        hasher.combine(livekitServiceUrl)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFfiTransportConfig: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiTransportConfig {
-        return
-            try FfiTransportConfig(
-                type: FfiConverterString.read(from: &buf), 
-                livekitServiceUrl: FfiConverterOptionString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: FfiTransportConfig, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.type, into: &buf)
-        FfiConverterOptionString.write(value.livekitServiceUrl, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiTransportConfig_lift(_ buf: RustBuffer) throws -> FfiTransportConfig {
-    return try FfiConverterTypeFfiTransportConfig.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiTransportConfig_lower(_ value: FfiTransportConfig) -> RustBuffer {
-    return FfiConverterTypeFfiTransportConfig.lower(value)
-}
-
-
-/**
  * A captured I420 frame the host pushes into a video publication.
  */
 public struct FfiVideoFrameData {
@@ -8385,19 +8561,11 @@ public func FfiConverterTypeJoinedMembership_lower(_ value: JoinedMembership) ->
 
 
 /**
- * Identifies the joined slot to attach media to, and how to reach the SFU.
+ * Tuning for a media session. The call says the rest: its room, slot and
+ * `member.id`, the focus its join publishes on, and — through the backend —
+ * who we are.
  */
 public struct MediaSessionConfig {
-    public var roomId: String
-    public var slotId: String
-    public var userId: String
-    public var deviceId: String
-    /**
-     * The MSC4195 authorisation-service URL of the focus we publish on —
-     * the same URL announced in our membership's transport. (Peers' foci
-     * are discovered from their memberships automatically.)
-     */
-    public var livekitServiceUrl: String
     /**
      * How much the tile order is damped. `None` takes the defaults.
      */
@@ -8405,20 +8573,10 @@ public struct MediaSessionConfig {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(roomId: String, slotId: String, userId: String, deviceId: String, 
-        /**
-         * The MSC4195 authorisation-service URL of the focus we publish on —
-         * the same URL announced in our membership's transport. (Peers' foci
-         * are discovered from their memberships automatically.)
-         */livekitServiceUrl: String, 
+    public init(
         /**
          * How much the tile order is damped. `None` takes the defaults.
          */stability: FfiStabilityConfig? = nil) {
-        self.roomId = roomId
-        self.slotId = slotId
-        self.userId = userId
-        self.deviceId = deviceId
-        self.livekitServiceUrl = livekitServiceUrl
         self.stability = stability
     }
 }
@@ -8430,21 +8588,6 @@ extension MediaSessionConfig: Sendable {}
 
 extension MediaSessionConfig: Equatable, Hashable {
     public static func ==(lhs: MediaSessionConfig, rhs: MediaSessionConfig) -> Bool {
-        if lhs.roomId != rhs.roomId {
-            return false
-        }
-        if lhs.slotId != rhs.slotId {
-            return false
-        }
-        if lhs.userId != rhs.userId {
-            return false
-        }
-        if lhs.deviceId != rhs.deviceId {
-            return false
-        }
-        if lhs.livekitServiceUrl != rhs.livekitServiceUrl {
-            return false
-        }
         if lhs.stability != rhs.stability {
             return false
         }
@@ -8452,11 +8595,6 @@ extension MediaSessionConfig: Equatable, Hashable {
     }
 
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(roomId)
-        hasher.combine(slotId)
-        hasher.combine(userId)
-        hasher.combine(deviceId)
-        hasher.combine(livekitServiceUrl)
         hasher.combine(stability)
     }
 }
@@ -8470,21 +8608,11 @@ public struct FfiConverterTypeMediaSessionConfig: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaSessionConfig {
         return
             try MediaSessionConfig(
-                roomId: FfiConverterString.read(from: &buf), 
-                slotId: FfiConverterString.read(from: &buf), 
-                userId: FfiConverterString.read(from: &buf), 
-                deviceId: FfiConverterString.read(from: &buf), 
-                livekitServiceUrl: FfiConverterString.read(from: &buf), 
                 stability: FfiConverterOptionTypeFfiStabilityConfig.read(from: &buf)
         )
     }
 
     public static func write(_ value: MediaSessionConfig, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.roomId, into: &buf)
-        FfiConverterString.write(value.slotId, into: &buf)
-        FfiConverterString.write(value.userId, into: &buf)
-        FfiConverterString.write(value.deviceId, into: &buf)
-        FfiConverterString.write(value.livekitServiceUrl, into: &buf)
         FfiConverterOptionTypeFfiStabilityConfig.write(value.stability, into: &buf)
     }
 }
@@ -8518,9 +8646,9 @@ public struct RtcLogConfig {
      * `"matrix_rtc_core::session=trace,livekit=info,webrtc_sys=warn"`.
      *
      * Targets are module paths, so a directive matches by prefix: the
-     * filterable roots are `matrix_rtc_core`, `matrix_rtc_media`,
-     * `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus third-party `livekit` and
-     * `webrtc_sys`. Empty means "no overrides".
+     * filterable roots are `matrix_rtc_core`, `matrix_rtc_call_sdk`,
+     * `matrix_rtc_transport`, `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus
+     * third-party `livekit` and `webrtc_sys`. Empty means "no overrides".
      */
     public var filter: String
     /**
@@ -8542,9 +8670,9 @@ public struct RtcLogConfig {
          * `"matrix_rtc_core::session=trace,livekit=info,webrtc_sys=warn"`.
          *
          * Targets are module paths, so a directive matches by prefix: the
-         * filterable roots are `matrix_rtc_core`, `matrix_rtc_media`,
-         * `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus third-party `livekit` and
-         * `webrtc_sys`. Empty means "no overrides".
+         * filterable roots are `matrix_rtc_core`, `matrix_rtc_call_sdk`,
+         * `matrix_rtc_transport`, `matrix_rtc_livekit`, `matrix_rtc_ffi`, plus
+         * third-party `livekit` and `webrtc_sys`. Empty means "no overrides".
          */filter: String = "", 
         /**
          * Write to the platform log (logcat on Android, stderr elsewhere).
@@ -8837,7 +8965,7 @@ extension FfiBackendError: Foundation.LocalizedError {
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * An event on the unified call stream (mirrors
- * `matrix_rtc_media::CallEvent`). Consume via
+ * `matrix_rtc_call_sdk::CallEvent`). Consume via
  * [`MediaSession::next_event`](super::MediaSession::next_event).
  */
 
@@ -9115,118 +9243,6 @@ extension FfiCallEvent: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * Which MatrixRTC generation a session speaks, for interoperating with Element
- * Call builds that predate the 2026 MSC4143 rewrite.
- *
- * Chosen when the room is attached, because it decides more than the wire
- * format of one event: the
- * `member.id` we join with, how an inbound media key is bound to a membership,
- * the SFU participant identity, and which authorisation-service endpoint mints
- * our token. Those must agree or the call connects and nothing decrypts.
- *
- * Scaffolding, and meant to be deleted once Element Call catches up. See
- * [`matrix_rtc_bridge::compat`].
- */
-
-public enum FfiElementCallCompat {
-    
-    /**
-     * Current MSC4143 + MSC4354 only. The default, and the only mode that
-     * interoperates with spec-current peers.
-     */
-    case off
-    /**
-     * Element Call as of 2025: MSC4354 sticky events carrying the pre-2026
-     * field names alongside the spec ones.
-     *
-     * Joins stay MSC4143-valid, so a spec-current peer still reads us. Leaves
-     * and media keys cannot be additive — a leave becomes the legacy
-     * bare-sticky-key content and keys go out as
-     * `io.element.call.encryption_keys` *instead of* the spec type — so in this
-     * mode keys are exchanged with legacy peers and not with spec-current ones.
-     */
-    case stickyEvents
-    /**
-     * Element Call before MSC4354: membership as `org.matrix.msc3401.call.member`
-     * **room state**, plain `{user}:{device}` SFU identities, and the
-     * pre-MSC4195 `/sfu/get` token endpoint.
-     *
-     * Nothing about this mode is additive: a call joined this way is visible to
-     * that generation of Element Call and to nobody else.
-     */
-    case stateEvents
-}
-
-
-#if compiler(>=6)
-extension FfiElementCallCompat: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFfiElementCallCompat: FfiConverterRustBuffer {
-    typealias SwiftType = FfiElementCallCompat
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiElementCallCompat {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .off
-        
-        case 2: return .stickyEvents
-        
-        case 3: return .stateEvents
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: FfiElementCallCompat, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .off:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .stickyEvents:
-            writeInt(&buf, Int32(2))
-        
-        
-        case .stateEvents:
-            writeInt(&buf, Int32(3))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiElementCallCompat_lift(_ buf: RustBuffer) throws -> FfiElementCallCompat {
-    return try FfiConverterTypeFfiElementCallCompat.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiElementCallCompat_lower(_ value: FfiElementCallCompat) -> RustBuffer {
-    return FfiConverterTypeFfiElementCallCompat.lower(value)
-}
-
-
-extension FfiElementCallCompat: Equatable, Hashable {}
-
-
-
-
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
  * Why the call ended.
  */
 
@@ -9236,6 +9252,10 @@ public enum FfiEndedReason {
      * We left deliberately.
      */
     case left
+    /**
+     * The slot was closed, which ended the call without us asking.
+     */
+    case slotClosed
     /**
      * The connection to our own focus closed and will not be
      * re-established.
@@ -9261,7 +9281,9 @@ public struct FfiConverterTypeFfiEndedReason: FfiConverterRustBuffer {
         
         case 1: return .left
         
-        case 2: return .connectionClosed(message: try FfiConverterString.read(from: &buf)
+        case 2: return .slotClosed
+        
+        case 3: return .connectionClosed(message: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9276,8 +9298,12 @@ public struct FfiConverterTypeFfiEndedReason: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case let .connectionClosed(message):
+        case .slotClosed:
             writeInt(&buf, Int32(2))
+        
+        
+        case let .connectionClosed(message):
+            writeInt(&buf, Int32(3))
             FfiConverterString.write(message, into: &buf)
             
         }
@@ -9311,7 +9337,7 @@ extension FfiEndedReason: Equatable, Hashable {}
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * What the media layer knows about a frame-encryption failure (mirrors
- * `matrix_rtc_media::FrameEncryptionDiagnostic`).
+ * `matrix_rtc_call_sdk::FrameEncryptionDiagnostic`).
  *
  * The transport's cryptor reports *that* it cannot decrypt, never why. This says
  * whether any key was installed for that participant at all, which splits a
@@ -9416,7 +9442,7 @@ extension FfiFrameEncryptionDiagnostic: Equatable, Hashable {}
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
  * Whether a participant's frames are encrypting and decrypting cleanly
- * (mirrors `matrix_rtc_media::FrameEncryptionState`).
+ * (mirrors `matrix_rtc_transport::FrameEncryptionState`).
  *
  * Reported per participant, not per stream: the frame cryptor is keyed by
  * participant identity, so a failure does not say which of their tracks it
@@ -9522,6 +9548,100 @@ public func FfiConverterTypeFfiFrameEncryptionState_lower(_ value: FfiFrameEncry
 
 
 extension FfiFrameEncryptionState: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * What a join does with transports. Only LiveKit is supported, so every
+ * member says it can subscribe to `livekit`.
+ */
+
+public enum FfiJoinTransport {
+    
+    /**
+     * Publish on the first LiveKit transport the homeserver advertises
+     * (`rtcTransports` on the backend); the join fails if there is none.
+     */
+    case advertised
+    /**
+     * Publish on this LiveKit focus, whatever the homeserver advertises.
+     */
+    case publish(livekitServiceUrl: String
+    )
+    /**
+     * Publish nothing and only receive, as a recorder or other observer does.
+     */
+    case receiveOnly
+}
+
+
+#if compiler(>=6)
+extension FfiJoinTransport: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiJoinTransport: FfiConverterRustBuffer {
+    typealias SwiftType = FfiJoinTransport
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiJoinTransport {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .advertised
+        
+        case 2: return .publish(livekitServiceUrl: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 3: return .receiveOnly
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiJoinTransport, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .advertised:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .publish(livekitServiceUrl):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(livekitServiceUrl, into: &buf)
+            
+        
+        case .receiveOnly:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiJoinTransport_lift(_ buf: RustBuffer) throws -> FfiJoinTransport {
+    return try FfiConverterTypeFfiJoinTransport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiJoinTransport_lower(_ value: FfiJoinTransport) -> RustBuffer {
+    return FfiConverterTypeFfiJoinTransport.lower(value)
+}
+
+
+extension FfiJoinTransport: Equatable, Hashable {}
 
 
 
@@ -9656,6 +9776,118 @@ public func FfiConverterTypeFfiKeyRejection_lower(_ value: FfiKeyRejection) -> R
 
 
 extension FfiKeyRejection: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which MatrixRTC generation a session speaks, for interoperating with Element
+ * Call builds that predate the 2026 MSC4143 rewrite.
+ *
+ * Chosen when the room is opened, because it decides more than the wire
+ * format of one event: the
+ * `member.id` we join with, how an inbound media key is bound to a membership,
+ * the SFU participant identity, and which authorisation-service endpoint mints
+ * our token. Those must agree or the call connects and nothing decrypts.
+ *
+ * Scaffolding, and meant to be deleted once Element Call catches up. See
+ * [`matrix_rtc_core::compat`].
+ */
+
+public enum FfiMembershipFormat {
+    
+    /**
+     * Current MSC4143 + MSC4354 only. The default, and the only mode that
+     * interoperates with spec-current peers.
+     */
+    case current
+    /**
+     * Element Call as of 2025: MSC4354 sticky events carrying the pre-2026
+     * field names alongside the spec ones.
+     *
+     * Joins stay MSC4143-valid, so a spec-current peer still reads us. Leaves
+     * and media keys cannot be additive — a leave becomes the legacy
+     * bare-sticky-key content and keys go out as
+     * `io.element.call.encryption_keys` *instead of* the spec type — so in this
+     * mode keys are exchanged with legacy peers and not with spec-current ones.
+     */
+    case sticky2025
+    /**
+     * Element Call before MSC4354: membership as `org.matrix.msc3401.call.member`
+     * **room state**, plain `{user}:{device}` SFU identities, and the
+     * pre-MSC4195 `/sfu/get` token endpoint.
+     *
+     * Nothing about this mode is additive: a call joined this way is visible to
+     * that generation of Element Call and to nobody else.
+     */
+    case roomState
+}
+
+
+#if compiler(>=6)
+extension FfiMembershipFormat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMembershipFormat: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMembershipFormat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMembershipFormat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .current
+        
+        case 2: return .sticky2025
+        
+        case 3: return .roomState
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiMembershipFormat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .current:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .sticky2025:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .roomState:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMembershipFormat_lift(_ buf: RustBuffer) throws -> FfiMembershipFormat {
+    return try FfiConverterTypeFfiMembershipFormat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMembershipFormat_lower(_ value: FfiMembershipFormat) -> RustBuffer {
+    return FfiConverterTypeFfiMembershipFormat.lower(value)
+}
+
+
+extension FfiMembershipFormat: Equatable, Hashable {}
 
 
 
@@ -9999,7 +10231,7 @@ extension FfiSlotEncryption: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * The kind of media stream (mirrors `matrix_rtc_media::MediaStreamKind`).
+ * The kind of media stream (mirrors `matrix_rtc_transport::MediaStreamKind`).
  */
 
 public enum FfiStreamKind {
@@ -10438,14 +10670,25 @@ public enum MatrixRtcFfiError: Swift.Error {
     case Reaction(String
     )
     /**
-     * The room is not attached (or already is, for `attach_room`).
+     * The room is open already (for `RtcClient::room`), or has been shut down.
      */
     case Attachment(String
+    )
+    /**
+     * The call has left, or its room was shut down; join again for a new one.
+     */
+    case CallOver(String
     )
     /**
      * The host's backend failed a read.
      */
     case Backend(String
+    )
+    /**
+     * The room's state holds no open slot of this id, so the join was
+     * refused; somebody with the power level has to open it first.
+     */
+    case SlotClosed(String
     )
 }
 
@@ -10473,7 +10716,13 @@ public struct FfiConverterTypeMatrixRtcFfiError: FfiConverterRustBuffer {
         case 4: return .Attachment(
             try FfiConverterString.read(from: &buf)
             )
-        case 5: return .Backend(
+        case 5: return .CallOver(
+            try FfiConverterString.read(from: &buf)
+            )
+        case 6: return .Backend(
+            try FfiConverterString.read(from: &buf)
+            )
+        case 7: return .SlotClosed(
             try FfiConverterString.read(from: &buf)
             )
 
@@ -10507,8 +10756,18 @@ public struct FfiConverterTypeMatrixRtcFfiError: FfiConverterRustBuffer {
             FfiConverterString.write(v1, into: &buf)
             
         
-        case let .Backend(v1):
+        case let .CallOver(v1):
             writeInt(&buf, Int32(5))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .Backend(v1):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(v1, into: &buf)
+            
+        
+        case let .SlotClosed(v1):
+            writeInt(&buf, Int32(7))
             FfiConverterString.write(v1, into: &buf)
             
         }
@@ -10935,30 +11194,6 @@ fileprivate struct FfiConverterOptionTypeAudioFrameStream: FfiConverterRustBuffe
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeMembershipSnapshotSubscription: FfiConverterRustBuffer {
-    typealias SwiftType = MembershipSnapshotSubscription?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeMembershipSnapshotSubscription.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeMembershipSnapshotSubscription.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeRtcLogSink: FfiConverterRustBuffer {
     typealias SwiftType = RtcLogSink?
 
@@ -11271,30 +11506,6 @@ fileprivate struct FfiConverterOptionTypeFfiTileRoster: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeFfiTransportConfig: FfiConverterRustBuffer {
-    typealias SwiftType = FfiTransportConfig?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeFfiTransportConfig.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeFfiTransportConfig.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeFfiVideoSourceConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiVideoSourceConfig?
 
@@ -11343,8 +11554,8 @@ fileprivate struct FfiConverterOptionTypeFfiCallEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeFfiElementCallCompat: FfiConverterRustBuffer {
-    typealias SwiftType = FfiElementCallCompat?
+fileprivate struct FfiConverterOptionTypeFfiMembershipFormat: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMembershipFormat?
 
     public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
         guard let value = value else {
@@ -11352,13 +11563,13 @@ fileprivate struct FfiConverterOptionTypeFfiElementCallCompat: FfiConverterRustB
             return
         }
         writeInt(&buf, Int8(1))
-        FfiConverterTypeFfiElementCallCompat.write(value, into: &buf)
+        FfiConverterTypeFfiMembershipFormat.write(value, into: &buf)
     }
 
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
-        case 1: return try FfiConverterTypeFfiElementCallCompat.read(from: &buf)
+        case 1: return try FfiConverterTypeFfiMembershipFormat.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11941,19 +12152,18 @@ public func uniffiForeignFutureHandleCountMatrixRtcFfi() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
- * Attach media to a joined slot: wire frame-key signalling into the core,
+ * Attach media to a joined call: wire frame-key signalling into the core,
  * start the engine (which connects to every peer's focus), and connect the
  * own-focus SFU with per-participant frame E2EE.
  *
- * Preconditions: the room is attached and `join` succeeded for this
- * room/slot. The `member.id` comes from that join — the host neither chooses
- * nor passes it. OpenID tokens for the SFU exchange come from the backend.
+ * The `member.id` comes from the call's join — the host neither chooses nor
+ * passes it. OpenID tokens for the SFU exchange come from the backend.
  */
-public func connectMediaSession(manager: RtcSessionManagerHandle, config: MediaSessionConfig)async throws  -> MediaSession  {
+public func connectMediaSession(call: RtcCall, config: MediaSessionConfig)async throws  -> MediaSession  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_func_connect_media_session(FfiConverterTypeRtcSessionManagerHandle_lower(manager),FfiConverterTypeMediaSessionConfig_lower(config)
+                uniffi_matrix_rtc_ffi_fn_func_connect_media_session(FfiConverterTypeRtcCall_lower(call),FfiConverterTypeMediaSessionConfig_lower(config)
                 )
             },
             pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_pointer,
@@ -12045,7 +12255,7 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_func_connect_media_session() != 32699) {
+    if (uniffi_matrix_rtc_ffi_checksum_func_connect_media_session() != 2400) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_func_dropped_log_record_count() != 56165) {
@@ -12126,10 +12336,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_audio_stream() != 28423) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_disconnect() != 42751) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_disconnect() != 1846) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_local_identity() != 58204) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_local_identity() != 62357) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_local_state() != 56186) {
@@ -12174,7 +12384,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_video_stream() != 53821) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_membershipsnapshotsubscription_next_snapshot() != 31732) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_membershipsnapshotsubscription_next() != 16244) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_roomsink_on_encryption() != 39299) {
@@ -12195,58 +12405,73 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_roomsink_on_timeline_events() != 30554) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_is_live() != 60709) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_leave() != 59173) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_lower_hand() != 18687) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_member_count() != 8093) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_member_id() != 46896) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_membership_event_id() != 8682) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_raise_hand() != 56791) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_raised_hands() != 34024) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_room_id() != 59542) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_send_reaction() != 63547) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_slot_id() != 64029) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_subscribe_membership_snapshots() != 50684) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_wait_for_end() != 2943) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_room() != 42080) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtclogsink_log() != 41057) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_attach_room() != 45319) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_close_slot() != 47104) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_close_slot() != 61509) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_debug_snapshot() != 32333) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_debug_snapshot() != 53964) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_join_call() != 711) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_detach_room() != 57217) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_member_count() != 16306) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_heartbeat() != 32844) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_open_slot() != 36366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_join() != 58855) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_room_id() != 19162) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_leave() != 37753) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_shutdown() != 34775) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_lower_hand() != 7517) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_member_count() != 58282) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_open_slot() != 31710) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_own_member_id() != 22586) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_own_membership_event_id() != 30722) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_raise_hand() != 32864) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_raised_hands() != 43869) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_send_reaction() != 23062) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_session_count() != 35735) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcsessionmanagerhandle_subscribe_membership_snapshots() != 29467) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_subscribe_membership_snapshots() != 48816) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_todevicesink_on_to_device_message() != 45386) {
@@ -12279,7 +12504,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_videoframestream_next() != 63741) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_constructor_rtcsessionmanagerhandle_new() != 10789) {
+    if (uniffi_matrix_rtc_ffi_checksum_constructor_rtcclient_new() != 61803) {
         return InitializationResult.apiChecksumMismatch
     }
 
