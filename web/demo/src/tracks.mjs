@@ -95,7 +95,11 @@ export function sampleVideoHalves(video) {
 
 /**
  * An RMS meter over a remote audio track, on the same i16 scale as the rust
- * peer's `audio_rms` (so the same floor applies). Returns `{ read, stop }`.
+ * peer's `audio_rms` (so the same floor applies). Returns `{ read, stop }`;
+ * `read()` is the loudest ~43 ms window since the previous read. The track is
+ * sampled every 20 ms because Chrome's fake microphone beeps for 20 ms every
+ * 500 ms: one window per read stays phase-locked with the beep and can miss it
+ * for a whole test.
  */
 export function rmsMeter(mediaStreamTrack) {
   const audioContext = new AudioContext();
@@ -105,14 +109,22 @@ export function rmsMeter(mediaStreamTrack) {
   source.connect(analyser);
   const samples = new Float32Array(analyser.fftSize);
 
+  let peak = 0;
+  const sampler = setInterval(() => {
+    analyser.getFloatTimeDomainData(samples);
+    let sum = 0;
+    for (const sample of samples) sum += sample * sample;
+    peak = Math.max(peak, Math.sqrt(sum / samples.length) * 32768);
+  }, 20);
+
   return {
     read() {
-      analyser.getFloatTimeDomainData(samples);
-      let sum = 0;
-      for (const sample of samples) sum += sample * sample;
-      return Math.sqrt(sum / samples.length) * 32768;
+      const value = peak;
+      peak = 0;
+      return value;
     },
     stop() {
+      clearInterval(sampler);
       audioContext.close();
     },
   };
