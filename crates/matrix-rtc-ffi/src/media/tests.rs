@@ -245,7 +245,8 @@ fn stream_stats_dto_zips_request_with_results() {
 fn tile_roster_dto_preserves_order_and_detail() {
     let roster: Vec<_> = (0..5).map(|i| participant(&format!("m{i}"))).collect();
     let ranked =
-        matrix_rtc_call_sdk::derive_tiles(&roster, &Default::default(), &Default::default()).remote;
+        matrix_rtc_call_sdk::derive_tiles(&roster, &Default::default(), &Default::default(), 0)
+            .remote;
     let last = ranked[4].id();
     let w = matrix_rtc_call_sdk::DetailWindow {
         offset: 1,
@@ -269,7 +270,7 @@ fn tile_roster_dto_preserves_order_and_detail() {
 fn local_state_dto_carries_the_share_flag() {
     let mut me = participant("me");
     me.is_local = true;
-    let own = matrix_rtc_call_sdk::derive_tiles(&[me], &Default::default(), &Default::default())
+    let own = matrix_rtc_call_sdk::derive_tiles(&[me], &Default::default(), &Default::default(), 0)
         .own
         .expect("own tile");
     let dto: FfiLocalState = matrix_rtc_call_sdk::LocalState {

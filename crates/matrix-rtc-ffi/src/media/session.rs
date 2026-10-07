@@ -220,6 +220,14 @@ impl MediaSession {
             .set_detail_window(offset, len, also.into_iter().map(Into::into));
     }
 
+    /// Rank tiles by what members are doing only when there are more than
+    /// `tiles` remote tiles; at or below it they keep join order, screen
+    /// shares first, so a small call does not shuffle. What fits on screen is
+    /// a good value (1 in spotlight). Default 0: always rank.
+    pub fn set_ranking_threshold(&self, tiles: u32) {
+        self.engine.set_ranking_threshold(tiles);
+    }
+
     /// Our participant identity on the media plane (the JWT `sub`; peers import
     /// our media key under it).
     ///

@@ -155,10 +155,15 @@ impl Default for DetailWindow {
 /// [`CallTile::speaking`] reports. `ranked_speaking` holds the ones counted as
 /// speaking for the order, after whatever damping the caller applies (R10).
 /// Passing one set for both ranks on the raw signal.
+///
+/// With `ranking_threshold` or fewer remote tiles, the order ignores what
+/// members are doing — hand, speaking, video — so a small call never
+/// shuffles; 0 always ranks.
 pub fn derive_tiles(
     roster: &[Participant],
     speaking: &HashSet<String>,
     ranked_speaking: &HashSet<String>,
+    ranking_threshold: u32,
 ) -> Tiles {
     let mut remote = Vec::with_capacity(roster.len());
     let mut own = None;
@@ -175,7 +180,8 @@ pub fn derive_tiles(
             remote.push(tile(participant, TileKind::ScreenShare, speaking));
         }
     }
-    remote.sort_by_cached_key(|t| rank_key(t, ranked_speaking.contains(&t.member_id)));
+    let by_activity = remote.len() > ranking_threshold as usize;
+    remote.sort_by_cached_key(|t| rank_key(t, by_activity, ranked_speaking.contains(&t.member_id)));
     Tiles { remote, own }
 }
 
@@ -233,7 +239,8 @@ fn stream(p: &Participant, kind: MediaStreamKind) -> Option<&StreamState> {
 /// tie-break that is arbitrary but identical on every client.
 ///
 /// Speaking is `ranked_speaking` — the damped signal — not the tile's own
-/// flag, which is raw.
+/// flag, which is raw. Without `by_activity`, hand, speaking and video drop
+/// out and the order is hero, then join time.
 ///
 /// `member_id` is the tie-break rather than anything local, because two
 /// clients seeing the same call must produce the same order. It is 16 random
@@ -241,6 +248,7 @@ fn stream(p: &Participant, kind: MediaStreamKind) -> Option<&StreamState> {
 #[allow(clippy::type_complexity)]
 fn rank_key(
     t: &CallTile,
+    by_activity: bool,
     ranked_speaking: bool,
 ) -> (
     Reverse<bool>,
@@ -253,9 +261,9 @@ fn rank_key(
 ) {
     (
         Reverse(t.hero),
-        none_last(t.hand_raised_at_ms),
-        Reverse(ranked_speaking),
-        Reverse(t.has_video),
+        none_last(t.hand_raised_at_ms.filter(|_| by_activity)),
+        Reverse(by_activity && ranked_speaking),
+        Reverse(by_activity && t.has_video),
         none_last(t.joined_at_ms),
         t.member_id.clone(),
         match t.kind {
@@ -309,7 +317,7 @@ mod tests {
             publishing(member("a"), MediaStreamKind::ScreenShare, false),
             member("b"),
         ];
-        let tiles = derive_tiles(&roster, &silent(), &silent());
+        let tiles = derive_tiles(&roster, &silent(), &silent(), 0);
         assert_eq!(
             order(&tiles.remote),
             [
@@ -324,7 +332,7 @@ mod tests {
     fn r13_our_own_share_makes_no_tile() {
         let mut me = publishing(member("me"), MediaStreamKind::ScreenShare, false);
         me.is_local = true;
-        let tiles = derive_tiles(&[me], &silent(), &silent());
+        let tiles = derive_tiles(&[me], &silent(), &silent(), 0);
         assert!(tiles.remote.is_empty());
         assert_eq!(tiles.own.as_ref().map(|t| t.kind), Some(TileKind::Person));
     }
@@ -333,7 +341,7 @@ mod tests {
     fn r7_r12_own_tile_is_beside_the_list_and_never_hero() {
         let mut me = member("me");
         me.is_local = true;
-        let tiles = derive_tiles(&[member("a"), me], &silent(), &silent());
+        let tiles = derive_tiles(&[member("a"), me], &silent(), &silent(), 0);
         assert_eq!(order(&tiles.remote), [("a", TileKind::Person)]);
         let own = tiles.own.expect("own tile");
         assert_eq!(own.member_id, "me");
@@ -345,7 +353,7 @@ mod tests {
         let mut hand = member("hand");
         hand.hand_raised_at_ms = Some(1);
         let sharer = publishing(member("share"), MediaStreamKind::ScreenShare, false);
-        let tiles = derive_tiles(&[hand, sharer], &silent(), &silent());
+        let tiles = derive_tiles(&[hand, sharer], &silent(), &silent(), 0);
         assert_eq!(
             tiles.remote[0].id(),
             TileId {
@@ -362,7 +370,7 @@ mod tests {
         late.hand_raised_at_ms = Some(200);
         let mut early = member("early");
         early.hand_raised_at_ms = Some(100);
-        let tiles = derive_tiles(&[late, early], &silent(), &silent());
+        let tiles = derive_tiles(&[late, early], &silent(), &silent(), 0);
         assert_eq!(
             order(&tiles.remote),
             [("early", TileKind::Person), ("late", TileKind::Person)]
@@ -375,7 +383,7 @@ mod tests {
     #[test]
     fn r10_the_flag_is_raw_and_only_the_rank_is_damped() {
         let raw: HashSet<String> = ["b".to_string()].into();
-        let tiles = derive_tiles(&[member("a"), member("b")], &raw, &silent());
+        let tiles = derive_tiles(&[member("a"), member("b")], &raw, &silent(), 0);
         assert_eq!(
             order(&tiles.remote),
             [("a", TileKind::Person), ("b", TileKind::Person)],
@@ -384,7 +392,7 @@ mod tests {
         assert!(tiles.remote[1].speaking, "but already reported speaking");
 
         let ranked: HashSet<String> = ["b".to_string()].into();
-        let tiles = derive_tiles(&[member("a"), member("b")], &silent(), &ranked);
+        let tiles = derive_tiles(&[member("a"), member("b")], &silent(), &ranked, 0);
         assert_eq!(tiles.remote[0].member_id, "b", "still ranked for it");
         assert!(!tiles.remote[0].speaking, "but no longer reported speaking");
     }
@@ -392,7 +400,7 @@ mod tests {
     #[test]
     fn r5_speaking_outranks_silent() {
         let speaking: HashSet<String> = ["b".to_string()].into();
-        let tiles = derive_tiles(&[member("a"), member("b")], &speaking, &speaking);
+        let tiles = derive_tiles(&[member("a"), member("b")], &speaking, &speaking, 0);
         assert_eq!(
             order(&tiles.remote),
             [("b", TileKind::Person), ("a", TileKind::Person)]
@@ -406,13 +414,62 @@ mod tests {
             member("a"),
             publishing(member("b"), MediaStreamKind::Camera, false),
         ];
-        let tiles = derive_tiles(&roster, &silent(), &silent());
+        let tiles = derive_tiles(&roster, &silent(), &silent(), 0);
         assert_eq!(
             order(&tiles.remote),
             [("b", TileKind::Person), ("a", TileKind::Person)]
         );
         assert!(tiles.remote[0].has_video);
         assert!(!tiles.remote[1].has_video);
+    }
+
+    #[test]
+    fn at_or_below_the_threshold_activity_does_not_move_a_tile() {
+        let mut early = member("early");
+        early.joined_at_ms = Some(1000);
+        let mut late = publishing(member("late"), MediaStreamKind::Camera, false);
+        late.joined_at_ms = Some(2000);
+        late.hand_raised_at_ms = Some(1);
+        let speaking: HashSet<String> = ["late".to_string()].into();
+        let tiles = derive_tiles(&[late, early], &speaking, &speaking, 2);
+        assert_eq!(
+            order(&tiles.remote),
+            [("early", TileKind::Person), ("late", TileKind::Person)]
+        );
+        // The flags still report what the member is doing.
+        assert!(tiles.remote[1].speaking);
+    }
+
+    #[test]
+    fn at_or_below_the_threshold_a_hero_still_leads() {
+        let mut early = member("early");
+        early.joined_at_ms = Some(1000);
+        let mut sharer = publishing(member("sharer"), MediaStreamKind::ScreenShare, false);
+        sharer.joined_at_ms = Some(2000);
+        let tiles = derive_tiles(&[early, sharer], &silent(), &silent(), 3);
+        assert_eq!(
+            order(&tiles.remote),
+            [
+                ("sharer", TileKind::ScreenShare),
+                ("early", TileKind::Person),
+                ("sharer", TileKind::Person),
+            ]
+        );
+    }
+
+    #[test]
+    fn above_the_threshold_the_speaker_ranks_first() {
+        let mut early = member("early");
+        early.joined_at_ms = Some(1000);
+        let mut late = member("late");
+        late.joined_at_ms = Some(2000);
+        let speaking: HashSet<String> = ["late".to_string()].into();
+        // Spotlight: one tile shown, so two tiles are ranked.
+        let tiles = derive_tiles(&[early, late], &speaking, &speaking, 1);
+        assert_eq!(
+            order(&tiles.remote),
+            [("late", TileKind::Person), ("early", TileKind::Person)]
+        );
     }
 
     #[test]
@@ -439,7 +496,7 @@ mod tests {
             joined_early,
             sharer,
         ];
-        let tiles = derive_tiles(&roster, &speaking, &speaking);
+        let tiles = derive_tiles(&roster, &speaking, &speaking, 0);
         assert_eq!(
             order(&tiles.remote),
             [
@@ -462,8 +519,8 @@ mod tests {
     #[test]
     fn c2_order_is_total_and_deterministic_without_join_times() {
         let roster = [member("c"), member("a"), member("b")];
-        let first = derive_tiles(&roster, &silent(), &silent());
-        let again = derive_tiles(&roster, &silent(), &silent());
+        let first = derive_tiles(&roster, &silent(), &silent(), 0);
+        let again = derive_tiles(&roster, &silent(), &silent(), 0);
         assert_eq!(first, again);
         assert_eq!(
             order(&first.remote),
@@ -477,13 +534,14 @@ mod tests {
 
     #[test]
     fn r16_camera_identity_survives_a_share_starting_and_stopping() {
-        let before = derive_tiles(&[member("a")], &silent(), &silent());
+        let before = derive_tiles(&[member("a")], &silent(), &silent(), 0);
         let during = derive_tiles(
             &[publishing(member("a"), MediaStreamKind::ScreenShare, false)],
             &silent(),
             &silent(),
+            0,
         );
-        let after = derive_tiles(&[member("a")], &silent(), &silent());
+        let after = derive_tiles(&[member("a")], &silent(), &silent(), 0);
         let camera = |t: &Tiles| {
             t.remote
                 .iter()
@@ -500,6 +558,7 @@ mod tests {
             &[publishing(member("a"), MediaStreamKind::ScreenShare, true)],
             &silent(),
             &silent(),
+            0,
         );
         let share = &tiles.remote[0];
         assert_eq!(share.kind, TileKind::ScreenShare);
@@ -512,7 +571,7 @@ mod tests {
         let unmuted_mic = publishing(member("a"), MediaStreamKind::Microphone, false);
         let muted_mic = publishing(member("b"), MediaStreamKind::Microphone, true);
         let no_mic = member("c");
-        let tiles = derive_tiles(&[unmuted_mic, muted_mic, no_mic], &silent(), &silent());
+        let tiles = derive_tiles(&[unmuted_mic, muted_mic, no_mic], &silent(), &silent(), 0);
         let muted: Vec<(&str, bool)> = tiles
             .remote
             .iter()
@@ -525,7 +584,7 @@ mod tests {
 
     fn ranked(n: usize) -> Vec<CallTile> {
         let roster: Vec<Participant> = (0..n).map(|i| member(&format!("m{i:03}"))).collect();
-        derive_tiles(&roster, &silent(), &silent()).remote
+        derive_tiles(&roster, &silent(), &silent(), 0).remote
     }
 
     fn ids(tiles: &[CallTile]) -> Vec<TileId> {
