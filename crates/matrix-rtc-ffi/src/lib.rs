@@ -217,6 +217,13 @@ pub struct FfiReactionKind {
     pub sound: Option<String>,
 }
 
+/// The SDK release version (e.g. `0.5.0-rc.1`), to show or attach to log
+/// reports.
+#[uniffi::export]
+pub fn sdk_version() -> String {
+    matrix_rtc_core::SDK_VERSION.to_owned()
+}
+
 /// Element Call's reaction catalogue, in the order its picker shows them.
 ///
 /// The names are the interoperable part: a reaction sent with one of these

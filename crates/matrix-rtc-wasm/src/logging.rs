@@ -59,7 +59,10 @@ pub fn init_logging(level: &str, filter: &str) -> Result<(), JsError> {
 
     console_error_panic_hook::set_once();
 
-    log::info!("logging configured: level={level} filter={spec:?}");
+    log::info!(
+        "matrix-rtc {} logging configured: level={level} filter={spec:?}",
+        matrix_rtc_core::SDK_VERSION,
+    );
 
     Ok(())
 }
