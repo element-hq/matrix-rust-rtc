@@ -4,11 +4,13 @@
 # Please see LICENSE in the repository root for full details.
 
 # Synapse for the Element Call interop stack (docker-compose.interop.yml).
-# Same dev homeserver as homeserver.yaml, with two differences and nothing
+# Same dev homeserver as homeserver.yaml, with these differences and nothing
 # else — keep the rest in sync with that file:
 #   1. `server_name` is a name a browser can reach over TLS, because Element
 #      Web derives user IDs and federation discovery from it.
 #   2. No TLS listener: nginx terminates both 443 and 8448 in front.
+#   3. `matrix_rtc` advertises only the legacy `livekit` transport, as Element
+#      Call's interop expects; there is no `m.livekit` entry.
 # NOT for production: open registration, disabled rate limits, well-known dev
 # secrets.
 
@@ -68,13 +70,22 @@ experimental_features:
   msc4222_enabled: true
   # MSC4354: sticky events — the MatrixRTC signalling backbone.
   msc4354_enabled: true
-  # MSC4143: the `/rtc_transports` endpoint that advertises `matrix_rtc`
+  # MSC4143: the `/rtc/transports` endpoint that advertises `matrix_rtc`
   # below. Without it the endpoint 404s and clients have nowhere to discover a
   # focus (our Rust client then needs a hardcoded fallback URL, which is
   # exactly what this stack exists to avoid).
   msc4143_enabled: true
+  # MSC4502 + MSC4512: lk-jwt-service as the application service behind the
+  # proxied `/rtc/livekit/…` C-S endpoints, as in homeserver.yaml. Element Call
+  # probes the delegation endpoint and starts delegating its delayed leaves
+  # once it answers.
+  msc4502_enabled: true
+  msc4512_enabled: true
 
-# The MatrixRTC focus this homeserver advertises over `/rtc_transports`.
+app_service_config_files:
+  - /cfg/lk-jwt-appservice.yaml
+
+# The MatrixRTC focus this homeserver advertises over `/rtc/transports`.
 #
 # Must stay identical to the `org.matrix.msc4143.rtc_foci` entry nginx serves
 # in /.well-known/matrix/client: the two are read by different clients — this

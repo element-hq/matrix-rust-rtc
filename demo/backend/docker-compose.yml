@@ -33,12 +33,12 @@ services:
     volumes:
       - ./data/tls:/certs
 
-  # `latest` keeps us on current experimental-MSC behaviour (msc4354 sticky
-  # events), at the cost of drift risk. If a Synapse release breaks the stack,
-  # pin by digest until fixed: ghcr.io/element-hq/synapse:latest@sha256:<...>
-  # (grab the last good digest from a green CI run's pull log).
+  # Pinned: 1.161.0 is the first release with everything the stack uses —
+  # MSC4354 sticky events, MSC4140's single-delay lookup, and MSC4512
+  # application-service proxying + MSC4502 `is_joined`, which route MSC4195's
+  # C-S endpoints (`/rtc/livekit/…`) to lk-jwt-service. Bump deliberately.
   synapse:
-    image: ghcr.io/element-hq/synapse:latest
+    image: ghcr.io/element-hq/synapse:v1.161.0
     # The service name doubles as server_name: gomatrixserverlib's federation
     # discovery (well-known -> SRV -> <server_name>:8448) resolves it inside
     # the compose network, so lk-jwt-service reaches the TLS listener directly.
@@ -49,6 +49,7 @@ services:
     volumes:
       - ./synapse/homeserver.yaml:/cfg/homeserver.yaml:ro
       - ./synapse/log.config:/cfg/log.config:ro
+      - ./synapse/lk-jwt-appservice.yaml:/cfg/lk-jwt-appservice.yaml:ro
       # Named volume, NOT a bind mount: synapse's sqlite over a macOS/Windows
       # bind mount produces `sqlite3.OperationalError: disk I/O error` under
       # load (observed wedging the whole homeserver mid-test). The volume is
@@ -73,9 +74,13 @@ services:
       retries: 20
       start_period: 15s
 
-  # MatrixRTC authorisation service (MSC4195 /get_token).
+  # MatrixRTC authorisation service (MSC4195). Serves both generations from one
+  # instance: the legacy endpoints clients call directly (`/sfu/get`,
+  # `/get_token`), and — as the application service registered in
+  # synapse/lk-jwt-appservice.yaml — the C-S endpoints Synapse proxies to it
+  # (`/_matrix/client/…/rtc/livekit/{get_token,delegate_delayed_leave}`).
   auth-service:
-    image: ghcr.io/element-hq/lk-jwt-service:0.4.4
+    image: ghcr.io/element-hq/lk-jwt-service:0.8.0
     # lk-jwt uses LIVEKIT_URL for two things at once: the URL it hands back to
     # clients in /get_token responses, AND its own RoomService endpoint for
     # creating the room on the SFU (full-access path). One URL must therefore
@@ -85,25 +90,37 @@ services:
     # the shared namespace is livekit's, which sits on the compose network.
     network_mode: "service:livekit"
     environment:
-      LIVEKIT_JWT_PORT: "6080"
+      LIVEKIT_JWT_BIND: ":6080"
       LIVEKIT_URL: "${LIVEKIT_WS_URL:-ws://localhost:7880}"
       LIVEKIT_KEY: devkey
       LIVEKIT_SECRET: secret
+      # Legacy endpoints only: the application-service path checks room
+      # membership through the homeserver instead.
       LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
+      LIVEKIT_AS_REGISTRATION_FILE: /etc/lk-jwt-service/appservice.yaml
+      LIVEKIT_HS_SERVER_NAME: synapse
+      # `synapse` publishes no .well-known, so say where its C-S API is.
+      LIVEKIT_CS_API_URL_OVERRIDES: "synapse=http://synapse:8008"
       # Synapse's federation listener uses the self-signed cert from init-certs.
       LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
       # Verbose by default: this is a dev/test stack and the auth hop is the
       # most opaque failure point (CI dumps these logs after every run).
       LIVEKIT_LOG_LEVEL: debug
+    volumes:
+      - ./synapse/lk-jwt-appservice.yaml:/etc/lk-jwt-service/appservice.yaml:ro
     depends_on:
       synapse:
         condition: service_healthy
       livekit:
         condition: service_healthy
-    # No healthcheck: 0.4.4 is a FROM-scratch image (no shell, no healthcheck
-    # binary — that only exists on unreleased main). wait-ready.sh probes
-    # http://localhost:6080/healthz from the host instead. Once a release ships
-    # /lk-jwt-service-healthcheck, add it here and drop the host-side probe.
+    # The image's own check (/lk-jwt-service-healthcheck, which reads
+    # LIVEKIT_JWT_BIND), polled faster than its 30 s default so `up --wait`
+    # does not sit in "starting".
+    healthcheck:
+      test: ["CMD", "/lk-jwt-service-healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   livekit:
     image: livekit/livekit-server:v1.10.1
@@ -129,11 +146,14 @@ services:
   # pattern as the first pair; every published port is shifted, and the UDP
   # media ranges must never overlap between the two SFUs.
 
+  # Legacy endpoints only. A homeserver proxies `rtc/livekit` to exactly one
+  # application service and one lk-jwt-service serves one SFU, so a second
+  # focus on the C-S API means a second (federated) homeserver.
   auth-service2:
-    image: ghcr.io/element-hq/lk-jwt-service:0.4.4
+    image: ghcr.io/element-hq/lk-jwt-service:0.8.0
     network_mode: "service:livekit2"
     environment:
-      LIVEKIT_JWT_PORT: "6081"
+      LIVEKIT_JWT_BIND: ":6081"
       LIVEKIT_URL: "${LIVEKIT_WS_URL_2:-ws://localhost:7890}"
       LIVEKIT_KEY: devkey
       LIVEKIT_SECRET: secret
@@ -145,6 +165,12 @@ services:
         condition: service_healthy
       livekit2:
         condition: service_healthy
+    # As auth-service: the image's check, polled faster than its default.
+    healthcheck:
+      test: ["CMD", "/lk-jwt-service-healthcheck"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
 
   livekit2:
     image: livekit/livekit-server:v1.10.1

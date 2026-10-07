@@ -1,0 +1,33 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# lk-jwt-service as an application service (MSC4512 + MSC4502), so Synapse
+# serves MSC4195's C-S endpoints — `/_matrix/client/…/rtc/livekit/get_token`
+# and `…/delegate_delayed_leave` — by proxying them to it. Mounted into both
+# Synapse (app_service_config_files) and lk-jwt-service
+# (LIVEKIT_AS_REGISTRATION_FILE); dev-only tokens, like the rest of the stack.
+#
+# The keys are the unstable-prefixed ones Synapse 1.161 reads; lk-jwt-service's
+# README shows the stable spelling. Modelled on its e2e-tests/docker setup.
+
+id: lk-jwt-service
+as_token: matrix-rtc-dev-as-token
+hs_token: matrix-rtc-dev-hs-token
+sender_localpart: _lk_jwt_service
+# Every local user: the service checks room membership for any of them, without
+# joining rooms itself (the MSC4502 scope below).
+namespaces:
+  users:
+    - exclusive: false
+      regex: ".*"
+# No event traffic: the service only needs the proxied routes below and the
+# is_joined scope, so its README asks for `url: null` — Synapse then pushes no
+# events at it and does not ping it. Dev-only tokens: with the `.*` namespace,
+# whoever holds `as_token` can act as any local user. lk-jwt-service shares
+# the SFU's network namespace, hence `livekit` in the proxy URL.
+url: null
+io.element.msc4502.scopes: ["urn:matrix:client:io.element.msc4502:rooms:is_joined"]
+io.element.msc4512.proxy_prefix: rtc/livekit
+io.element.msc4512.proxy_url: http://livekit:6080

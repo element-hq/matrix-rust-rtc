@@ -4,12 +4,25 @@ A self-contained docker-compose stack providing everything the Rust MatrixRTC
 clients need — used by the `e2e_call` integration test on CI and for local
 development:
 
-- **Synapse** (`ghcr.io/element-hq/synapse:latest`) — homeserver with MSC4354
-  (sticky events) and MSC4140 (delayed events) enabled, rate limits disabled,
-  open registration for throwaway test users.
-- **lk-jwt-service** (`ghcr.io/element-hq/lk-jwt-service:0.4.4`) — the
-  MatrixRTC authorisation service (MSC4195 `/get_token`).
-- **LiveKit SFU** (`livekit/livekit-server:v1.10.1`).
+- **Synapse** (`ghcr.io/element-hq/synapse:v1.161.0`) — homeserver with MSC4354
+  (sticky events), MSC4140 (delayed events) and MSC4143 (`/rtc/transports`,
+  advertising an `m.livekit` and a legacy `livekit` transport) enabled, rate
+  limits disabled, open registration for throwaway test users.
+- **lk-jwt-service** (`ghcr.io/element-hq/lk-jwt-service:0.8.0`) — the
+  MatrixRTC authorisation service (MSC4195). One instance serves both: the
+  legacy endpoints clients call directly (`/sfu/get`, `/get_token`, which
+  every instance serves) and — because this one is registered with Synapse as
+  an application service (`synapse/lk-jwt-appservice.yaml`; MSC4512 proxying,
+  MSC4502 `is_joined`) — the C-S endpoints Synapse proxies to it:
+  `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/{get_token,delegate_delayed_leave}`.
+- **LiveKit SFU** (`livekit/livekit-server:v1.10.1`), with webhooks to
+  lk-jwt-service's `/sfu_webhook` — delegated delayed leaves are sent when the
+  SFU reports a participant gone.
+
+`auth-service2` is a second instance of the same image for the second SFU
+(`livekit2`), not registered as an application service — Synapse proxies
+`rtc/livekit` to one application service, and one lk-jwt-service serves one
+SFU — so only its legacy endpoints are reachable.
 
 No nginx, no TLS on the client side, no federation pair — this is the minimal
 subset of [Element Call's dev backend](https://github.com/element-hq/element-call)
@@ -138,9 +151,9 @@ See [INTEROP.md](./INTEROP.md).
 ## Troubleshooting
 
 - **`up --wait` hangs on synapse** — `docker compose logs synapse`; a config
-  parse error (e.g. an experimental flag renamed by a new `synapse:latest`)
-  shows up there. Pin the image by digest until fixed (see the comment in
-  `docker-compose.yml`).
+  parse error (e.g. an experimental flag renamed by a Synapse bump) shows up
+  there. A Synapse *downgrade* also stops it: the named volume holds a newer
+  schema — `make backend-down` first.
 - **lk-jwt returns 500 on `/get_token`** — usually the federation hop:
   `docker compose logs auth-service` should show the OpenID lookup failing.
   Check that `./data/tls/` contains `synapse.crt`/`synapse.key` and that

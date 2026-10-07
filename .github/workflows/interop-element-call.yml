@@ -12,7 +12,7 @@ name: Element Call interop
 
 on:
   schedule:
-    # Catches drift the pins cannot: the base stack runs `synapse:latest`.
+    # Catches drift the pins cannot: Element Web and Element Call move daily.
     - cron: "20 4 * * *"
   workflow_dispatch:
   pull_request:
