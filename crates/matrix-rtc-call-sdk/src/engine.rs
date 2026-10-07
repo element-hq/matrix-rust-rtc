@@ -168,6 +168,8 @@ enum ActorMessage {
     },
     /// Which tiles get full records; see [`CallEngine::set_detail_window`].
     SetDetailWindow(DetailWindow),
+    /// Rank only above this many tiles; see [`CallEngine::set_ranking_threshold`].
+    SetRankingThreshold(u32),
     /// Close every pooled connection and stop.
     Shutdown {
         ack: oneshot::Sender<()>,
@@ -252,6 +254,7 @@ impl CallEngine {
             tiles_tx,
             local_tx,
             window: DetailWindow::default(),
+            ranking_threshold: 0,
             speaking: HashSet::new(),
             speakers: HashMap::new(),
             last_order: Vec::new(),
@@ -354,6 +357,15 @@ impl CallEngine {
                 len,
                 also: also.into_iter().collect(),
             }));
+    }
+
+    /// Rank tiles by what members are doing only when there are more than
+    /// `tiles` remote tiles; at or below it they keep join order, heroes
+    /// first, so a small call does not shuffle. A hint, not a layout
+    /// contract: what fits on screen is a good value (1 in spotlight).
+    /// Default 0: always rank.
+    pub fn set_ranking_threshold(&self, tiles: u32) {
+        let _ = self.messages.send(ActorMessage::SetRankingThreshold(tiles));
     }
 
     /// Hand the caller-established own-focus connection to the engine, which
@@ -554,6 +566,9 @@ struct Actor {
     local_tx: watch::Sender<Option<LocalState>>,
     /// Which tiles get full records. Defaults to everything.
     window: DetailWindow,
+    /// At or below this many remote tiles, activity does not reorder them.
+    /// 0 always ranks.
+    ranking_threshold: u32,
     /// Members currently counted as speaking for the order — the damped set
     /// the ranking reads (R10). `speakers` holds the raw state driving it,
     /// which is what a tile's own `speaking` flag reports (R11).
@@ -876,6 +891,10 @@ impl Actor {
             }
             ActorMessage::SetDetailWindow(window) => {
                 self.window = window;
+                self.publish_tiles();
+            }
+            ActorMessage::SetRankingThreshold(threshold) => {
+                self.ranking_threshold = threshold;
                 self.publish_tiles();
             }
             // Handled in the run loop (it must break).
@@ -1395,8 +1414,12 @@ impl Actor {
     /// they already hold, minus anyone who left — and the new order when the
     /// window closes, so a burst of rank changes lands as one reorder.
     fn publish_tiles(&mut self) {
-        let Tiles { remote, own } =
-            derive_tiles(&self.roster, &self.raw_speaking(), &self.speaking);
+        let Tiles { remote, own } = derive_tiles(
+            &self.roster,
+            &self.raw_speaking(),
+            &self.speaking,
+            self.ranking_threshold,
+        );
         self.publish_local(own);
 
         let order: Vec<TileId> = remote.iter().map(CallTile::id).collect();
@@ -1434,8 +1457,12 @@ impl Actor {
 
     /// The coalesce window closed: publish the current order (R11).
     fn publish_tiles_reordered(&mut self) {
-        let Tiles { remote, own } =
-            derive_tiles(&self.roster, &self.raw_speaking(), &self.speaking);
+        let Tiles { remote, own } = derive_tiles(
+            &self.roster,
+            &self.raw_speaking(),
+            &self.speaking,
+            self.ranking_threshold,
+        );
         self.publish_local(own);
         self.last_order = remote.iter().map(CallTile::id).collect();
         self.send_tiles(window(&remote, &self.window));
@@ -3957,6 +3984,24 @@ mod tests {
             vec![vec!["a", "b", "c"], vec!["c", "b", "a"]],
             "the old order held with fresh state, then one reorder — never [c, a, b] in between"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn under_the_ranking_threshold_a_hand_does_not_reorder_until_it_drops() {
+        let fx = fixture();
+        fx.engine.set_ranking_threshold(3);
+        with_abc(&fx).await;
+        let seen = observe_orders(&fx);
+
+        fx.raised_hands.send(vec![hand("c", 1)]).unwrap();
+        after(400).await;
+        // Spotlight: one tile shown, so the three are ranked again.
+        fx.engine.set_ranking_threshold(1);
+        after(400).await;
+
+        let mut orders = seen.lock().unwrap().clone();
+        orders.dedup();
+        assert_eq!(orders, vec![vec!["a", "b", "c"], vec!["c", "a", "b"]]);
     }
 
     #[tokio::test(start_paused = true)]
