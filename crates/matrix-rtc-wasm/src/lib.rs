@@ -410,6 +410,13 @@ pub struct WasmRoomOptions {
     pub format: Option<String>,
 }
 
+/// The SDK release version (e.g. `0.5.0-rc.1`), to show or attach to log
+/// reports.
+#[wasm_bindgen(js_name = sdkVersion)]
+pub fn sdk_version() -> String {
+    matrix_rtc_core::SDK_VERSION.to_owned()
+}
+
 /// Element Call's reaction catalogue, as `ReactionKind[]` in the order its
 /// picker shows them. The `sound` of each entry is the base name of the asset
 /// to bundle and play; `reactionSoundFor` resolves a received `name`.

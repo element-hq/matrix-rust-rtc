@@ -27,6 +27,10 @@ mod transport;
 mod upkeep;
 mod wire;
 
+/// The SDK release version (the workspace version every crate shares), for a
+/// host to show or attach to its log reports.
+pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use base_rtc_room::BaseRtcRoom;
 pub use client::{BaseRoom, BaseRtcClient, BaseRtcRoomHandle, OpenError, RoomOptions};
 pub use encryption::types::{

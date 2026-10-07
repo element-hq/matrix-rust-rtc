@@ -178,7 +178,8 @@ pub fn setup_logging(
     install_panic_hook();
 
     log::info!(
-        "logging configured: level={:?} filter={:?} system={} sink={}",
+        "matrix-rtc {} logging configured: level={:?} filter={:?} system={} sink={}",
+        matrix_rtc_core::SDK_VERSION,
         config.level,
         config.filter,
         config.write_to_system,
