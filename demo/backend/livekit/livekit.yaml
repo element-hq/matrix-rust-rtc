@@ -4,8 +4,7 @@
 # Please see LICENSE in the repository root for full details.
 
 # LiveKit SFU config for the dev/test stack, adapted from Element Call's
-# backend/dev_livekit.yaml (webhook section dropped: it only feeds
-# lk-jwt-service's optional sanity-check feature, which is off by default).
+# backend/dev_livekit.yaml.
 
 port: 7880
 bind_addresses:
@@ -22,3 +21,10 @@ keys:
   devkey: secret
 room:
   auto_create: false
+# Participant lifecycle to lk-jwt-service, which needs it for delegated delayed
+# leaves (MSC4195): a disconnect is when it sends the member's leave. It shares
+# this SFU's network namespace, hence localhost. Signed with a key from `keys`.
+webhook:
+  api_key: devkey
+  urls:
+    - http://localhost:6080/sfu_webhook

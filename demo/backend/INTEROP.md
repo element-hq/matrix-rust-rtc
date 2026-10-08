@@ -141,7 +141,7 @@ The two clients discover the authorisation service by different routes:
 | Client | Route | Configured in |
 | ------ | ----- | ------------- |
 | Element Call | `/.well-known/matrix/client` → `org.matrix.msc4143.rtc_foci` | `nginx/interop.conf` |
-| Rust client | MSC4143 `/rtc_transports` (needs `msc4143_enabled`) | `matrix_rtc.transports` in `homeserver.interop.yaml` |
+| Rust client | MSC4143 `/rtc/transports` (needs `msc4143_enabled`) | `matrix_rtc.transports` in `homeserver.interop.yaml` |
 
 Both must name `https://matrix-rtc.m.localhost/livekit/jwt`. If they disagree,
 the two halves of a call select different foci and nothing about the failure

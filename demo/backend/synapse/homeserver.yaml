@@ -68,6 +68,27 @@ experimental_features:
   msc4222_enabled: true
   # MSC4354: sticky events — the MatrixRTC signalling backbone.
   msc4354_enabled: true
+  # MSC4143: `/rtc/transports`, answering with `matrix_rtc.transports` below.
+  msc4143_enabled: true
+  # MSC4502 + MSC4512: let lk-jwt-service, as an application service, check
+  # room membership and serve the proxied `/rtc/livekit/…` C-S endpoints
+  # (MSC4195 get_token and delegated delayed leaves). See lk-jwt-appservice.yaml.
+  msc4502_enabled: true
+  msc4512_enabled: true
+
+app_service_config_files:
+  - /cfg/lk-jwt-appservice.yaml
+
+# The transports this homeserver advertises, most preferred first. MSC4195's
+# current shape names the SFU and leaves tokens to the homeserver's C-S API; the
+# legacy one names the authorisation service. Both point at the first SFU pair,
+# as seen from the host, where the demo stack's clients run.
+matrix_rtc:
+  transports:
+    - type: m.livekit
+      url: "ws://localhost:7880"
+    - type: livekit
+      livekit_service_url: "http://localhost:6080"
 
 # Rate limits effectively disabled so automated tests can log in, join, and
 # re-arm delayed events as fast as they like.

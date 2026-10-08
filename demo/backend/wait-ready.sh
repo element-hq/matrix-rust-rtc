@@ -5,9 +5,9 @@
 # Please see LICENSE in the repository root for full details.
 
 # Host-side readiness probe for the MatrixRTC backend stack. `docker compose up
-# --wait` already gates on the synapse and livekit healthchecks; this exists
-# mainly for lk-jwt-service, whose FROM-scratch image cannot carry a compose
-# healthcheck (no shell, and 0.4.4 predates the healthcheck binary).
+# --wait` already gates on the synapse, livekit and lk-jwt healthchecks; this exists
+# for what healthchecks cannot see from inside a container: that the
+# endpoints answer from the host, where the tests run.
 # With --interop it additionally probes the TLS overlay
 # (docker-compose.interop.yml): the proxied homeserver, the MatrixRTC origin,
 # Element Web, and the Element Call widget Element Web bundles.
@@ -34,6 +34,22 @@ probe() {
 }
 
 probe "synapse" "http://localhost:8008/health"
+# MSC4195's C-S endpoints are proxied by Synapse to lk-jwt-service (as an
+# application service). Unauthenticated, a served endpoint answers 401 and a
+# missing one 404 — the check Element Call makes.
+for _ in $(seq 1 60); do
+  status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    http://localhost:8008/_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave || true)
+  [ "$status" = "401" ] && break
+  sleep 2
+done
+if [ "$status" != "401" ]; then
+  echo "[wait-ready] ERROR: synapse has no /rtc/livekit route for lk-jwt-service (HTTP $status)" >&2
+  exit 1
+fi
+# A 401 shows the route is registered; Synapse answers it before contacting
+# the app service, so lk-jwt-service itself is probed below.
+echo "[wait-ready] rtc/livekit C-S route registered (HTTP 401 unauthenticated)"
 probe "lk-jwt-service" "http://localhost:6080/healthz"
 probe "livekit" "http://localhost:7880/"
 probe "lk-jwt-service-2" "http://localhost:6081/healthz"

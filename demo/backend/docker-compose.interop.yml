@@ -78,6 +78,10 @@ services:
       # server_name changed above, and `*` is what Element Call's own dev
       # backend uses — this stack is loopback-only either way.
       LIVEKIT_FULL_ACCESS_HOMESERVERS: "*"
+      # The application-service half (see synapse/lk-jwt-appservice.yaml)
+      # follows the server_name change too.
+      LIVEKIT_HS_SERVER_NAME: synapse.m.localhost
+      LIVEKIT_CS_API_URL_OVERRIDES: synapse.m.localhost=http://synapse:8008
 
   # Element Web serves the Element Call widget itself, from its own origin at
   # /widgets/element-call/index.html (it depends on

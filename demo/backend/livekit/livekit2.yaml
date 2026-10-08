@@ -23,3 +23,10 @@ keys:
   devkey: secret
 room:
   auto_create: false
+# Participant lifecycle to lk-jwt-service, which needs it for delegated delayed
+# leaves (MSC4195): a disconnect is when it sends the member's leave. It shares
+# this SFU's network namespace, hence localhost. Signed with a key from `keys`.
+webhook:
+  api_key: devkey
+  urls:
+    - http://localhost:6081/sfu_webhook
