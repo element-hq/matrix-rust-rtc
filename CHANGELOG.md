@@ -11,7 +11,7 @@ log only.
 ### Added
 
 - `sdk_version()` (web `sdkVersion()`) returns the SDK release version, for hosts to display or attach to log reports, and logging setup logs it.
-- `set_ranking_threshold(tiles)` keeps tiles in join order, screen shares first, while a call has no more than that many remote tiles, so small calls stop shuffling on speaking, video or a raised hand.
+- `set_ranking_threshold(tiles)` keeps tiles in join order, screen shares first, while a call has no more than that many remote tiles, so small calls stop shuffling on speaking, video or a raised hand; sticky and MSC4143 memberships take their join time from the first member event's `origin_server_ts`.
 
 ## v0.5.0-rc.1 - 2026-10-06
 

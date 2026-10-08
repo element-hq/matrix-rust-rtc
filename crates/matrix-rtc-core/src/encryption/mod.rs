@@ -2045,6 +2045,7 @@ mod tests {
             member_id: "bob-device456-uuid".to_string(),
             membership_event_id: None,
             membership_ts: None,
+            origin_server_ts: None,
             application: "m.call".into(),
             transports: Vec::new(),
             can_subscribe: Vec::new(),
@@ -2561,6 +2562,7 @@ mod tests {
         let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
             membership_ts: Some(1_000),
+            origin_server_ts: None,
             ..bob_membership()
         }]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
@@ -2599,6 +2601,7 @@ mod tests {
         clock.advance(2_000);
         *memberships.lock().unwrap() = vec![JoinedMembership {
             membership_ts: Some(3_000),
+            origin_server_ts: None,
             ..bob_membership()
         }];
         manager
@@ -2648,6 +2651,7 @@ mod tests {
         let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
             membership_ts: Some(1_000),
+            origin_server_ts: None,
             ..bob_membership()
         }]));
         let manager = manager_over(sender.clone(), memberships.clone());
@@ -2659,6 +2663,7 @@ mod tests {
 
         *memberships.lock().unwrap() = vec![JoinedMembership {
             membership_ts: Some(4_000),
+            origin_server_ts: None,
             ..bob_membership()
         }];
         manager
@@ -2683,6 +2688,7 @@ mod tests {
         let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
             membership_ts: Some(1_000),
+            origin_server_ts: None,
             ..bob_membership()
         }]));
         let manager = manager_over(sender.clone(), memberships.clone());

@@ -57,6 +57,9 @@ pub struct RawMemberEventIn {
     /// which is not the same as `false` — that would drop the member in an
     /// encrypted room.
     pub was_encrypted: Option<bool>,
+    /// The event's `origin_server_ts`, when the host has it. Orders tiles by
+    /// join time; see [`RawStickyEvent::origin_server_ts`].
+    pub origin_server_ts: Option<u64>,
     /// The wire event type, e.g. `org.matrix.msc4143.rtc.member`.
     pub event_type: String,
     /// The event's whole `content` object.
@@ -196,6 +199,7 @@ pub fn to_core_member_event(room_id: &str, event: RawMemberEventIn) -> Option<Ra
         sender: event.sender,
         origin,
         event_type: event.event_type,
+        origin_server_ts: event.origin_server_ts,
         content,
     })
 }
@@ -272,6 +276,8 @@ pub fn to_core_state_memberships(
                 // what this is; carrying the MSC3401 type here would only make
                 // the core reject it.
                 event_type: "m.rtc.member".to_owned(),
+                // The join time rides in the content's `created_ts` instead.
+                origin_server_ts: None,
                 content,
             })
         })
@@ -406,6 +412,7 @@ fn to_member_event_in(event: EventIn) -> RawMemberEventIn {
         sender: event.sender,
         sender_device_id: event.encryption.sender_device_id().map(str::to_owned),
         was_encrypted: Some(event.encryption.was_encrypted()),
+        origin_server_ts: Some(event.origin_server_ts),
         event_type: event.event_type,
         content: event.content,
     }
@@ -431,6 +438,7 @@ mod tests {
             sender: "@alice:example.org".to_owned(),
             sender_device_id: Some("ALICEDEVICE".to_owned()),
             was_encrypted: Some(true),
+            origin_server_ts: None,
             event_type: "org.matrix.msc4143.rtc.member".to_owned(),
             content,
         }
@@ -457,6 +465,26 @@ mod tests {
         let transports = converted.content.transports.expect("transports");
         assert_eq!(transports.published.len(), 1);
         assert_eq!(transports.can_subscribe, vec!["livekit".to_owned()]);
+    }
+
+    #[test]
+    fn carries_the_origin_server_ts_to_the_membership() {
+        let mut event = raw(serde_json::json!({
+            "slot_id": "m.call#room",
+            "sticky_key": "MEMBER",
+            "application": { "type": "m.call" },
+            "member": { "id": "MEMBER", "membership": "join" },
+        }));
+        event.origin_server_ts = Some(1234);
+
+        let converted = to_core_member_event("!room:example.org", event).expect("a membership");
+        let crate::RtcMembershipEvent::Joined(joined) =
+            converted.try_into_membership_event().expect("converts")
+        else {
+            panic!("a join");
+        };
+        assert_eq!(joined.origin_server_ts, Some(1234));
+        assert_eq!(joined.membership_ts, None, "never an identity");
     }
 
     #[test]

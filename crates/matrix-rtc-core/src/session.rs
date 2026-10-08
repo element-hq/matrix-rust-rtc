@@ -1364,6 +1364,11 @@ pub struct JoinedMembership {
     /// same device where `member_id` alone cannot. The js-sdk's encryption
     /// manager keys on the same value as `membershipTs`.
     pub membership_ts: Option<u64>,
+    /// `origin_server_ts` of the *latest* member event, when the host reported
+    /// one. Moves on every sticky refresh, like `membership_event_id`; a
+    /// consumer wanting a join time pins the first value it sees. Never an
+    /// identity: keys stay on `(member_id, membership_ts)`.
+    pub origin_server_ts: Option<u64>,
     /// `content.application`; a joined membership always has a `type`.
     pub application: ApplicationInfo,
     /// Transports this member publishes on (`content.transports.published`).

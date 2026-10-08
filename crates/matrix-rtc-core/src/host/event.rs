@@ -127,6 +127,9 @@ pub struct RawStickyEvent {
     pub origin: EventOrigin,
     /// Matrix event type, e.g. `m.rtc.member`.
     pub event_type: String,
+    /// The event's `origin_server_ts`, when the host reports it. Becomes
+    /// [`JoinedMembership::origin_server_ts`].
+    pub origin_server_ts: Option<u64>,
     /// Event content subset needed by the core.
     pub content: RawStickyEventContent,
 }
@@ -340,6 +343,7 @@ impl RawStickyEvent {
             member_id,
             membership_event_id: self.event_id,
             membership_ts: self.content.created_ts,
+            origin_server_ts: self.origin_server_ts,
             application: self.content.application,
             transports: transports
                 .published
@@ -457,6 +461,7 @@ mod tests {
             sender: "@alice:example.org".to_owned(),
             origin: EventOrigin::encrypted(Some("DEVICEID".to_owned())),
             event_type: "m.rtc.member".to_owned(),
+            origin_server_ts: None,
             content,
         }
     }

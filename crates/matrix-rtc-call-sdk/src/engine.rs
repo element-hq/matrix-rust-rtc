@@ -1065,7 +1065,10 @@ impl Actor {
             reachable,
             streams: own_streams.clone(),
             hand_raised_at_ms,
-            joined_at_ms: member.membership_ts,
+            // Pinned here: a member is added once, so a sticky refresh's newer
+            // `origin_server_ts` never moves them. `membership_ts` wins where
+            // the dialect states one (the legacy `created_ts`).
+            joined_at_ms: member.membership_ts.or(member.origin_server_ts),
         });
         self.emit(CallEvent::ParticipantJoined {
             member_id: member.member_id.clone(),
@@ -1760,6 +1763,7 @@ mod tests {
             member_id: member_id.to_owned(),
             membership_event_id: None,
             membership_ts: None,
+            origin_server_ts: None,
             application: "m.call".into(),
             transports: vec![RtcTransport::LiveKit(LiveKitTransport {
                 livekit_service_url: focus.to_owned(),
@@ -3984,6 +3988,27 @@ mod tests {
             vec![vec!["a", "b", "c"], vec!["c", "b", "a"]],
             "the old order held with fresh state, then one reorder — never [c, a, b] in between"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn join_order_is_the_first_event_seen_and_a_refresh_does_not_move_it() {
+        let fx = fixture();
+        let at = |id: &str, ts: u64| JoinedMembership {
+            origin_server_ts: Some(ts),
+            ..member(id, &format!("@{id}:example.org"))
+        };
+        // member_id order would be [a, b]; join order is [b, a].
+        fx.memberships
+            .send(vec![at("a", 2000), at("b", 1000)])
+            .unwrap();
+        wait_until(|| order_ids(&fx) == ["b", "a"]).await;
+
+        // b's sticky refresh carries a later timestamp.
+        fx.memberships
+            .send(vec![at("a", 2000), at("b", 3000)])
+            .unwrap();
+        after(400).await;
+        assert_eq!(order_ids(&fx), ["b", "a"]);
     }
 
     #[tokio::test(start_paused = true)]
