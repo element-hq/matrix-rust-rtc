@@ -132,6 +132,11 @@ required-features = ["matrix-sdk", "testing"]
 name = "interop_peer"
 required-features = ["matrix-sdk", "testing"]
 
+# One participant of the chaos suite (chaos/README.md), driven over stdin.
+[[example]]
+name = "chaos_peer"
+required-features = ["matrix-sdk", "testing"]
+
 # The layered client → room → call flow publishing a video file (see README.md).
 [[example]]
 name = "publish_video"

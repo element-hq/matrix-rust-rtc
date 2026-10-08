@@ -350,6 +350,14 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             .and_then(|session| session.own_membership_event_id())
     }
 
+    /// The `delay_id` of the delayed leave armed for our membership in one
+    /// slot; see [`SlotSession::own_delayed_leave_id`].
+    pub fn own_delayed_leave_id(&self, slot_id: &str) -> Option<String> {
+        self.sessions
+            .get(slot_id)
+            .and_then(|session| session.own_delayed_leave_id())
+    }
+
     /// Re-signals every key one slot already holds to its signal handler.
     ///
     /// Call after installing both the handler and the identity mapper: keys
