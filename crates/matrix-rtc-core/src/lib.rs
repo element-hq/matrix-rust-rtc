@@ -103,6 +103,7 @@ mod tests {
             sender: sender.to_owned(),
             origin: EventOrigin::default(),
             event_type: EVENT_TYPE_RTC_MEMBER.to_owned(),
+            origin_server_ts: None,
             content: RawStickyEventContent {
                 slot_id: slot_id.to_owned(),
                 sticky_key: sticky_key.to_owned(),
@@ -473,6 +474,7 @@ mod tests {
         let stable = joined_event("@alice:example.org", "m.call#room", "alice-device-a");
         let unstable = RawStickyEvent {
             event_type: "org.matrix.msc4143.rtc.member".to_owned(),
+            origin_server_ts: None,
             ..joined_event("@bob:example.org", "m.call#room", "bob-device-a")
         };
 
@@ -489,6 +491,7 @@ mod tests {
 
         let event = RawStickyEvent {
             event_type: "m.not.rtc.member".to_owned(),
+            origin_server_ts: None,
             ..joined_event("@alice:example.org", "m.call#room", "alice-device-a")
         };
 
@@ -999,6 +1002,7 @@ mod tests {
             sender: "@alice:example.org".to_owned(),
             origin: EventOrigin::default(),
             event_type: "m.rtc.member".to_owned(),
+            origin_server_ts: None,
             content: RawStickyEventContent {
                 slot_id: "m.call#room".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),
@@ -1055,6 +1059,7 @@ mod tests {
             sender: "@alice:example.org".to_owned(),
             origin: EventOrigin::default(),
             event_type: "m.rtc.member".to_owned(),
+            origin_server_ts: None,
             content: RawStickyEventContent {
                 slot_id: "m.call#room".to_owned(),
                 sticky_key: "alice-device-a".to_owned(),

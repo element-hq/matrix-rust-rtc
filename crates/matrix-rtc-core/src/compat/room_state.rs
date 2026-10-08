@@ -1276,6 +1276,7 @@ mod tests {
             sender: membership.sender,
             origin: EventOrigin::claimed(membership.claimed_device_id),
             event_type: "m.rtc.member".to_owned(),
+            origin_server_ts: None,
             content,
         };
 

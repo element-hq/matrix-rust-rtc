@@ -58,6 +58,7 @@ fn member_event(
             None => EventOrigin::Unknown,
         },
         event_type: "m.rtc.member".to_owned(),
+        origin_server_ts: None,
         content: RawStickyEventContent {
             slot_id: SLOT.to_owned(),
             sticky_key: member_id.to_owned(),
