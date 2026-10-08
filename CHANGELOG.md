@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.2 - 2026-10-08
+
 ### Added
 
 - `sdk_version()` (web `sdkVersion()`) returns the SDK release version, for hosts to display or attach to log reports, and logging setup logs it.

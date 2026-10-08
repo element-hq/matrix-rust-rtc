@@ -2364,6 +2364,14 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
     func setLocalMuted(kind: FfiStreamKind, muted: Bool) async throws 
     
     /**
+     * Rank tiles by what members are doing only when there are more than
+     * `tiles` remote tiles; at or below it they keep join order, screen
+     * shares first, so a small call does not shuffle. What fits on screen is
+     * a good value (1 in spotlight). Default 0: always rank.
+     */
+    func setRankingThreshold(tiles: UInt32) 
+    
+    /**
      * Retract one of our own publications, so peers drop the stream instead
      * of rendering an empty tile — what a stopped screen share needs, since
      * unlike a camera a screen has no "off" state a mute could represent.
@@ -2749,6 +2757,19 @@ open func setLocalMuted(kind: FfiStreamKind, muted: Bool)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeMediaFfiError_lift
         )
+}
+    
+    /**
+     * Rank tiles by what members are doing only when there are more than
+     * `tiles` remote tiles; at or below it they keep join order, screen
+     * shares first, so a small call does not shuffle. What fits on screen is
+     * a good value (1 in spotlight). Default 0: always rank.
+     */
+open func setRankingThreshold(tiles: UInt32)  {try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_mediasession_set_ranking_threshold(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(tiles),$0
+    )
+}
 }
     
     /**
@@ -12220,6 +12241,16 @@ public func reactionSoundFor(name: String) -> String?  {
 })
 }
 /**
+ * The SDK release version (e.g. `0.5.0-rc.1`), to show or attach to log
+ * reports.
+ */
+public func sdkVersion() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_func_sdk_version($0
+    )
+})
+}
+/**
  * Installs the logger, or reconfigures it if already installed.
  *
  * Safe to call repeatedly: `log::set_logger` can only be called once per
@@ -12268,6 +12299,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_func_reaction_sound_for() != 26431) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_func_sdk_version() != 56977) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_func_setup_logging() != 17783) {
@@ -12376,6 +12410,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_set_local_muted() != 9215) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_set_ranking_threshold() != 56284) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_unpublish() != 65138) {
