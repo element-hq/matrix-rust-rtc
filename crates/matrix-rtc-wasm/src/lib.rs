@@ -652,6 +652,7 @@ impl From<WasmLeaveReason> for matrix_rtc_core::LeaveReason {
         matrix_rtc_core::LeaveReason {
             code: matrix_rtc_core::LeaveCode::from_code(&value.code),
             reason: value.reason,
+            delay_id: None,
         }
     }
 }

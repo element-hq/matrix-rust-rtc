@@ -283,6 +283,14 @@ pub trait MatrixBackend: MaybeSend {
 
     /// Send a delayed event to a Matrix room (MSC4140).
     ///
+    /// **One attempt, bounded by a short timeout (a few seconds), for every
+    /// delayed-event method here.** The core owns the retries: it backs off
+    /// with jitter, knows the delay's deadline, and knows when a retry would be
+    /// unsafe. A host that retries underneath it — matrix-sdk does by default —
+    /// stretches one attempt past the whole delay, retries in lockstep with
+    /// every other client after an outage, and can schedule a second delayed
+    /// state event (that request has no transaction id) that nobody restarts.
+    ///
     /// With `state_key`, the delayed event is a state event; otherwise a
     /// message-like one. Returns the MSC4140 **delay id** on success — the
     /// handle used to restart or cancel the scheduled send. It is not an event
@@ -338,6 +346,24 @@ pub trait MatrixBackend: MaybeSend {
         room_id: String,
         delay_id: String,
     ) -> Result<(), CommandError>;
+
+    /// Send a scheduled delayed event now (MSC4140's `send` action).
+    ///
+    /// Retires the delayed leave of a lost earlier join before joining again:
+    /// sending it ends that membership cleanly, where it might otherwise fire
+    /// after the new join and end that. `M_NOT_FOUND` means it has fired
+    /// already. A host without it answers [`CommandError::NotImplemented`] and
+    /// the core cancels the delay instead.
+    async fn send_delayed_event_now(
+        &self,
+        room_id: String,
+        delay_id: String,
+    ) -> Result<(), CommandError> {
+        let _ = (room_id, delay_id);
+        Err(CommandError::NotImplemented(
+            "send_delayed_event_now".to_owned(),
+        ))
+    }
 
     /// Send one to-device message to a set of devices, reporting the outcome
     /// per recipient.
@@ -602,6 +628,26 @@ impl Subscription for MockToDeviceSubscription {
 #[cfg(any(test, feature = "testing"))]
 pub type RecordedDelayedEvent = (String, String, Option<String>, Value, u64);
 
+/// How a [`MockBackend`] fails an MSC4140 restart or cancel.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MockDelayFailure {
+    /// The homeserver cannot be reached: a plain send error.
+    Unreachable,
+    /// The homeserver no longer has the delay (`M_NOT_FOUND`).
+    Gone,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl MockDelayFailure {
+    fn error(self) -> CommandError {
+        match self {
+            Self::Unreachable => CommandError::from_message("homeserver unreachable"),
+            Self::Gone => CommandError::DelayedEventNotFound("M_NOT_FOUND".to_owned()),
+        }
+    }
+}
+
 /// A backend that records every send and keeps the sinks it was given, so a
 /// test can check what went out and play sets in. Exported under the `testing`
 /// feature.
@@ -634,6 +680,16 @@ pub struct MockBackend {
     pub room_subscription_error: std::sync::Mutex<Option<BackendError>>,
     /// When set, sticky sends fail with this message and are not recorded.
     pub sticky_event_error: std::sync::Mutex<Option<String>>,
+    /// When set, delayed-event restarts fail this way (and are still recorded).
+    pub restart_failure: std::sync::Mutex<Option<MockDelayFailure>>,
+    /// When set, delayed-event cancels fail this way (and are still recorded).
+    pub cancel_failure: std::sync::Mutex<Option<MockDelayFailure>>,
+    /// When set, delayed-event restarts never return, as against a homeserver
+    /// behind a partition that drops packets.
+    pub restart_hangs: std::sync::atomic::AtomicBool,
+    /// Delays sent now (`send_delayed_event_now`), and how such a send fails.
+    pub sent_now_events: std::sync::Mutex<Vec<(String, String)>>,
+    pub send_now_failure: std::sync::Mutex<Option<MockDelayFailure>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -658,6 +714,11 @@ impl Default for MockBackend {
             transports_requests: Default::default(),
             room_subscription_error: Default::default(),
             sticky_event_error: Default::default(),
+            restart_failure: Default::default(),
+            cancel_failure: Default::default(),
+            restart_hangs: Default::default(),
+            sent_now_events: Default::default(),
+            send_now_failure: Default::default(),
         }
     }
 }
@@ -783,7 +844,16 @@ impl MatrixBackend for MockBackend {
             .lock()
             .unwrap()
             .push((room_id, delay_id));
-        Ok(())
+        if self
+            .restart_hangs
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            std::future::pending::<()>().await;
+        }
+        match *self.restart_failure.lock().unwrap() {
+            Some(failure) => Err(failure.error()),
+            None => Ok(()),
+        }
     }
 
     async fn cancel_delayed_event(
@@ -795,7 +865,25 @@ impl MatrixBackend for MockBackend {
             .lock()
             .unwrap()
             .push((room_id, delay_id));
-        Ok(())
+        match *self.cancel_failure.lock().unwrap() {
+            Some(failure) => Err(failure.error()),
+            None => Ok(()),
+        }
+    }
+
+    async fn send_delayed_event_now(
+        &self,
+        room_id: String,
+        delay_id: String,
+    ) -> Result<(), CommandError> {
+        self.sent_now_events
+            .lock()
+            .unwrap()
+            .push((room_id, delay_id));
+        match *self.send_now_failure.lock().unwrap() {
+            Some(failure) => Err(failure.error()),
+            None => Ok(()),
+        }
     }
 
     async fn send_to_device_message(

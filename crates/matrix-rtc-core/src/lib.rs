@@ -12,6 +12,7 @@
 mod base_rtc_room;
 mod client;
 pub mod compat;
+mod delayed_leave;
 mod encryption;
 mod error;
 pub mod executor;
@@ -33,6 +34,7 @@ pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use base_rtc_room::BaseRtcRoom;
 pub use client::{BaseRoom, BaseRtcClient, BaseRtcRoomHandle, OpenError, RoomOptions};
+pub use delayed_leave::{Backoff, BackoffSchedule, LOCAL_RESTART_PERCENT};
 pub use encryption::types::{
     EncryptionConfig, InboundEncryptionKey, KeyMaterialSignal, KeyOrigin, KeyRejection,
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
@@ -77,7 +79,12 @@ pub use wire::wire_event_type;
 /// Test doubles for crates built on the core, behind the `testing` feature.
 #[cfg(feature = "testing")]
 pub mod testing {
-    pub use crate::host::backend::{MockBackend, MockRoomSubscription, MockToDeviceSubscription};
+    pub use crate::host::backend::{
+        MockBackend, MockDelayFailure, MockRoomSubscription, MockToDeviceSubscription,
+    };
+    /// Switches the whole process to the keep-alive policy this one replaced,
+    /// for the chaos suite's comparison.
+    pub use crate::own_membership::legacy_policy::set_enabled as set_legacy_keep_alive;
 }
 
 #[cfg(test)]
@@ -1228,6 +1235,116 @@ mod tests {
         assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
     }
 
+    /// Cut off from the homeserver for longer than the delay, the join notices
+    /// by itself that its membership is gone, tells the session — with the
+    /// delay a later join must retire — and sends nothing more.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_cut_off_for_longer_than_its_delay_reports_its_membership_lost() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+        let armed = sender.delayed_events.lock().unwrap().len();
+        assert_eq!(armed, 1, "the join armed one delay");
+        *sender.restart_failure.lock().unwrap() =
+            Some(crate::host::backend::MockDelayFailure::Unreachable);
+        let sent = sender.sticky_events.lock().unwrap().len();
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            own_membership::DEFAULT_KEEP_ALIVE_TIMEOUT_MS + 1_000,
+        ))
+        .await;
+
+        let reason = auto_leaves.try_recv().expect("the loss is announced");
+        assert_eq!(reason.code, LeaveCode::MembershipLost);
+        assert!(reason.delay_id.is_some(), "with the delay to retire");
+        assert_eq!(
+            sender.sticky_events.lock().unwrap().len(),
+            sent,
+            "no leave sent"
+        );
+        assert!(sender.cancelled_events.lock().unwrap().is_empty());
+        let restarts_at_loss = restarts(&sender);
+        tokio::time::sleep(TICK * 3).await;
+        assert_eq!(
+            restarts(&sender),
+            restarts_at_loss,
+            "nothing more after the loss"
+        );
+    }
+
+    /// The room drops our membership while we believe we are in the call — a
+    /// delayed leave of an earlier join landed after this one, say. Everybody
+    /// else counts us as left, so the session ends for us too, with the delay
+    /// we still hold for the rejoin to retire, and nothing more is sent.
+    #[tokio::test]
+    async fn the_room_dropping_our_membership_ends_the_session() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+        let ours = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+            ..joined_event("@alice:example.org", "m.call#room", "alice-a")
+        };
+
+        // Before our membership has come back, its absence is no loss.
+        room.set_current_sticky_state(Vec::new()).await.unwrap();
+        assert!(auto_leaves.try_recv().is_err(), "not seen yet, not lost");
+
+        room.set_current_sticky_state(vec![ours]).await.unwrap();
+        assert!(auto_leaves.try_recv().is_err());
+        let sent = sender.sticky_events.lock().unwrap().len();
+
+        room.set_current_sticky_state(Vec::new()).await.unwrap();
+
+        let reason = auto_leaves.try_recv().expect("the loss is announced");
+        assert_eq!(reason.code, LeaveCode::MembershipLost);
+        assert!(reason.delay_id.is_some(), "with the delay we still hold");
+        assert_eq!(
+            sender.sticky_events.lock().unwrap().len(),
+            sent,
+            "nothing sent"
+        );
+
+        // A rejoin of the same membership through the same room replaces the
+        // lost join without sending anything for it, and the loss was
+        // announced exactly once.
+        join_as(&mut room, "alice-a").await;
+        assert!(auto_leaves.try_recv().is_err(), "announced exactly once");
+        assert_eq!(
+            sender.sticky_events.lock().unwrap().len(),
+            sent + 1,
+            "only the new join went out"
+        );
+    }
+
+    /// Our own leave takes the machine out of `Joined` first, so the membership
+    /// it removes is not mistaken for a loss.
+    #[tokio::test]
+    async fn our_own_leave_is_not_a_lost_membership() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        join_as(&mut room, "alice-a").await;
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+        let ours = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+            ..joined_event("@alice:example.org", "m.call#room", "alice-a")
+        };
+        room.set_current_sticky_state(vec![ours]).await.unwrap();
+
+        leave_call(&mut room).await;
+        room.set_current_sticky_state(Vec::new()).await.unwrap();
+
+        assert!(auto_leaves.try_recv().is_err());
+    }
+
     /// Only the leaves the session makes on its own are announced; a host that
     /// hung up knows it did.
     #[tokio::test(start_paused = true)]
@@ -1257,6 +1374,8 @@ mod tests {
             assert!(room.upkeep_abort_handle("m.call#room").is_none());
             assert!(room.keep_alive("m.call#room").await);
         });
-        assert_eq!(restarts(&sender), 1);
+        // Ticked straight after the join, nothing is due yet: the restart
+        // waits for its point in the delay, which a host's next tick reaches.
+        assert_eq!(restarts(&sender), 0);
     }
 }

@@ -98,12 +98,16 @@ matrix-rust-sdk are still moving there. The peer accepts `COMPAT=current` and
 
 ## Rejoining
 
-When a peer's delayed leave fires while it is cut off, its membership leaves
-the call. `chaos_peer` then rejoins by itself, as an application would: when
-its own roster entry has vanished while the call has not ended. A call that
-ended (left, slot closed, SFU connection gone) is not rejoined. The rejoin is
-reported as `rejoining` / `joined` events and a `rejoins` count in `status`.
-It is meant to move into the call SDK.
+A client cut off from its homeserver for longer than its delayed leave knows
+by itself that its membership is gone: the library follows the delay's
+lifecycle locally and ends the call with `MembershipLost`, homeserver or not.
+`chaos_peer` then rejoins, as an application would — on an exponential backoff
+with jitter, since the homeserver is likely still down, and retiring the old
+delay first so it cannot end the new membership when it fires late. It rejoins
+after a lost call (`MembershipLost`, `ConnectionClosed`), never after a leave or
+a closed slot. Reported as `call_ended` (`reason`, `rejoining`), then `joined`,
+and a `rejoins` count in `status`. The policy is meant to move into the call
+SDK.
 
 ## Scenarios
 
@@ -120,28 +124,24 @@ delegation endpoint served (Element Call's probe: anything but 404).
 | `short_partition` | one peer cut off < keep-alive | stable; same delay |
 | `long_partition_recovers` | one peer cut off from the HS > keep-alive | the other side sees it leave, then return by itself, re-armed |
 | `lossy_network` | 20% loss on one peer's outgoing traffic for 60s | stable; switch never lapses |
+| `homeserver_outage_is_bridged_by_retries` | Synapse stopped right after a restart, back 20 s later | the host keeps its membership and delay (retries, denser near the deadline); the guest, on the replaced restart pacing (`KEEP_ALIVE_POLICY=legacy`: a restart every 10 s, no early retries; loss detection stays on), loses its — the retries are what saved the call |
+| `homeserver_outage_beyond_two_delays` | Synapse down 75 s | both report the loss while it is down, make no join attempts while offline, then rejoin once it is back |
+| `stale_leave_ends_and_rejoins` | the guest leaks a 3 s delayed leave of its own membership (`leak_delayed_leave`), homeserver healthy | when it lands, the guest ends its call (`membership_lost`) — everybody else counts it as left — and rejoins by itself |
 
 ### Known failures (the hardening backlog)
 
-None: every scenario passes on `main` in `state` mode. Scenarios failing for a
-known reason are `#[ignore]`d with that reason until the fix lands.
+None: every scenario passes in `state` mode. Scenarios failing for a known
+reason are `#[ignore]`d with that reason until the fix lands.
 
-One weakness is masked rather than absent. In
-`homeserver_outage_beyond_keep_alive` both delayed leaves fire, and both peers
-pass only because `chaos_peer` rejoins: the fresh join arms a fresh delay.
-Inside the old session, `OwnMembershipMachine::rearm_if_certainly_fired` arms
-a replacement *while the homeserver is still down*; that fails, marks delayed
-events unsupported, and the next attempt waits
-`DELAYED_LEAVE_PROBE_INTERVAL_MS` (5 minutes). A client that does not rejoin
-is left with a session that believes it is joined, no membership and no
-switch.
+`homeserver_outage_beyond_keep_alive` and `long_partition_recovers` check that
+a peer reports its membership lost *while* it is still cut off. Before the
+library followed the delay's lifecycle locally, a peer only found out once the
+homeserver was back and sync delivered its own leave — and a client that did
+not rejoin was left with a session that believed it was joined, no membership
+and no switch.
 
 ## Next
 
-- **Keep-alive policy.** Restarts due at a share of the delay, retried on an
-  exponential backoff with jitter, and a re-arm only on hard evidence (the
-  homeserver no longer knows the delay) — closes the weakness above for
-  clients that do not rejoin, and is what a rejoin inside the SDK builds on.
 - **Delegated delayed leave.** With the SFU holding the switch, a
   homeserver-only partition must *not* end the membership, while losing the
   SFU must. Adds a `delegated` mode.

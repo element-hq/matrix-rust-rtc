@@ -80,15 +80,27 @@ impl TwoPeerCall {
     /// Provision two users, start both peers and join them to one call.
     /// `env` is passed to both peers (e.g. `MEDIA=none`).
     pub async fn start(stack: &Stack, mode: Mode, env: &[(&str, &str)]) -> Result<Self> {
-        let mut env = env.to_vec();
-        env.push(("COMPAT", mode.compat()));
-        let env = env.as_slice();
+        Self::start_with(stack, mode, env, env).await
+    }
+
+    /// [`Self::start`], with each peer's own environment — to run one peer
+    /// differently from the other in the same call.
+    pub async fn start_with(
+        stack: &Stack,
+        mode: Mode,
+        host_env: &[(&str, &str)],
+        guest_env: &[(&str, &str)],
+    ) -> Result<Self> {
+        let mut host_extra = host_env.to_vec();
+        host_extra.push(("COMPAT", mode.compat()));
+        let mut guest_extra = guest_env.to_vec();
+        guest_extra.push(("COMPAT", mode.compat()));
         let hs = stack.homeserver();
         let host_account = hs.register("host").await?;
         let guest_account = hs.register("guest").await?;
 
         let mut host_env = vec![("ROLE", "host"), ("INVITE", guest_account.user_id.as_str())];
-        host_env.extend_from_slice(env);
+        host_env.extend_from_slice(&host_extra);
         let mut host = stack
             .spawn_peer("host", host_account.clone(), &host_env)
             .await?;
@@ -101,7 +113,7 @@ impl TwoPeerCall {
             .to_owned();
 
         let mut guest_env = vec![("ROLE", "guest"), ("ROOM_ID", room_id.as_str())];
-        guest_env.extend_from_slice(env);
+        guest_env.extend_from_slice(&guest_extra);
         let mut guest = stack.spawn_peer("guest", guest_account, &guest_env).await?;
         guest
             .wait(0, CONVERGE, "guest ready", |e| is_event(e, "ready"))

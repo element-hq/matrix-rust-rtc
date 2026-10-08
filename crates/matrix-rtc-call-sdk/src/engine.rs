@@ -1321,6 +1321,9 @@ impl Actor {
         let own = self.pool.own_connection();
         self.end(match reason.code {
             LeaveCode::SlotClosed => EndedReason::SlotClosed,
+            LeaveCode::MembershipLost => EndedReason::MembershipLost {
+                delay_id: reason.delay_id,
+            },
             _ => EndedReason::Left,
         });
         if let Some(own) = own

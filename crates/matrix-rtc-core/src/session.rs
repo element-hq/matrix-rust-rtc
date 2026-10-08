@@ -23,7 +23,9 @@ use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::membership_listener::MembershipScope;
-use crate::own_membership::{MembershipTimings, OwnMembershipMachine, transport_to_json};
+use crate::own_membership::{
+    MembershipTimings, OwnMembershipMachine, OwnMembershipState, transport_to_json,
+};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 use crate::upkeep::{self, SessionUpkeep};
@@ -138,6 +140,9 @@ pub struct SlotSession<T: MatrixBackend> {
     /// Announces every leave this session makes without the host asking. See
     /// [`SlotSession::subscribe_auto_leaves`].
     auto_leaves_tx: broadcast::Sender<LeaveReason>,
+    /// Whether our own membership of the current join has been in the joined
+    /// set: until it has, its absence is not a loss.
+    own_seen: bool,
     /// Command sender for sending events to the Matrix room.
     backend: Option<Arc<T>>,
     /// Machine for managing our own membership lifecycle (join/leave/keep-alive).
@@ -169,6 +174,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             room_encryption: self.room_encryption,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             auto_leaves_tx: self.auto_leaves_tx.clone(),
+            own_seen: false,
             backend: self.backend.clone(),
             own_membership_machine: None, // Don't clone the machine - it's not cloneable
             upkeep: None,
@@ -202,6 +208,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             room_encryption: RoomEncryption::default(),
             membership_snapshots_tx,
             auto_leaves_tx: broadcast::channel(AUTO_LEAVES_CAPACITY).0,
+            own_seen: false,
             backend,
             own_membership_machine: None,
             upkeep: None,
@@ -375,11 +382,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .expect("validate() refuses a join without a transport");
 
         // Check if already joined with this membership
-        if self
-            .own_membership_machine
-            .as_ref()
-            .is_some_and(|machine| machine.sticky_key() == membership_id)
-        {
+        // A lost join is over; joining again replaces it.
+        if self.own_membership_machine.as_ref().is_some_and(|machine| {
+            machine.sticky_key() == membership_id && machine.state() != OwnMembershipState::Lost
+        }) {
             log::warn!("[{}] already joined as {membership_id}", self.log_tag);
             return Err(JoinError::AlreadyJoined(membership_id));
         }
@@ -413,11 +419,15 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             },
         );
 
+        if let Some(old) = params.supersedes_delayed_leave.clone() {
+            machine.supersede_delayed_leave(old);
+        }
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
         let membership_event_id = machine.join(transports).await?;
 
         // Store the machine
         self.own_membership_machine = Some(Arc::new(machine));
+        self.own_seen = false;
         self.own_participation = Some(OwnParticipation {
             user_id: user_id.clone(),
             device_id: device_id.clone(),
@@ -511,6 +521,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 encryption: self.encryption_manager.clone(),
                 interval: keep_alive_interval,
                 log_tag: self.log_tag.clone(),
+                auto_leaves: self.auto_leaves_tx.clone(),
             }
             .spawn()
         });
@@ -610,7 +621,16 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// Returns `false` if not joined (no membership machine active).
     pub async fn keep_alive(&mut self) -> bool {
         if let Some(machine) = self.own_membership_machine.as_ref() {
-            upkeep::tick(machine, self.encryption_manager.as_ref(), &self.log_tag).await;
+            if machine.state() == OwnMembershipState::Lost {
+                return false;
+            }
+            upkeep::tick(
+                machine,
+                self.encryption_manager.as_ref(),
+                &self.log_tag,
+                &self.auto_leaves_tx,
+            )
+            .await;
             true
         } else {
             log::debug!("[{}] keep-alive ignored: not joined", self.log_tag);
@@ -631,8 +651,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// should read it here rather than supply one, so it cannot drift from the
     /// value the membership was actually published under.
     pub fn own_member_id(&self) -> Option<&str> {
+        // A lost join is over: nothing to leave, and joining again replaces it.
         self.own_membership_machine
             .as_ref()
+            .filter(|machine| machine.state() != OwnMembershipState::Lost)
             .map(|machine| machine.sticky_key())
     }
 
@@ -895,6 +917,16 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// event does — including telling the encryption manager to stop sharing
     /// keys with whoever dropped out.
     async fn refresh(&mut self) {
+        let own_present = self.own_membership_machine.as_ref().map(|machine| {
+            self.candidates.iter().any(|candidate| {
+                candidate.sticky_key == machine.sticky_key()
+                    && self.join_condition(candidate).is_joined()
+            })
+        });
+        if let Some(present) = own_present {
+            self.check_own_membership(present);
+        }
+
         let mut members = Vec::with_capacity(self.candidates.len());
         let mut excluded: Vec<(&str, JoinCondition)> = Vec::new();
 
@@ -987,6 +1019,36 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         } else {
             self.refresh().await;
         }
+    }
+
+    /// Notices the room dropping our membership while we believe we are in the
+    /// call: everybody else now counts us as left, so the call is over for us
+    /// too. The session ends with [`LeaveCode::MembershipLost`], carrying the
+    /// delay we still hold, for the host to rejoin from.
+    ///
+    /// Only for a join whose membership was in the joined set once, and only
+    /// while it is [`OwnMembershipState::Joined`]: our own leave, or a closed
+    /// slot, takes the machine out of that state first. The usual cause is a
+    /// delayed leave landing late — one of an earlier join that the homeserver
+    /// persisted after this one. Relies on the host's contract to deliver
+    /// complete, current room state: a stale snapshot missing us reads as a
+    /// loss, and ends the call.
+    fn check_own_membership(&mut self, present: bool) {
+        let Some(machine) = self.own_membership_machine.as_ref() else {
+            return;
+        };
+        if machine.state() != OwnMembershipState::Joined {
+            return;
+        }
+        if present {
+            self.own_seen = true;
+            return;
+        }
+        if !self.own_seen {
+            return;
+        }
+        machine.lose("the room no longer has our membership while we are in the call");
+        upkeep::report_if_lost(machine, &self.auto_leaves_tx);
     }
 
     /// Leaves without the host asking, and tells it so — even when the send
@@ -1270,6 +1332,12 @@ pub enum LeaveCode {
     DelayedLeave,
     /// The member left because the slot was closed mid-session.
     SlotClosed,
+    /// Our own membership timed out while we were still in the call: the
+    /// dead man's switch was not restarted within its delay, so the
+    /// homeserver sends (or has sent) our leave. Never on the wire — it is
+    /// how a session that ended this way says why, and nothing is sent for it.
+    #[serde(skip)]
+    MembershipLost,
     /// A code defined outside this proposal.
     #[serde(untagged)]
     Other(String),
@@ -1289,12 +1357,15 @@ impl LeaveCode {
         }
     }
 
-    /// The wire `leave_reason.code`; the inverse of [`LeaveCode::from_code`].
+    /// The wire `leave_reason.code`; the inverse of [`LeaveCode::from_code`],
+    /// except for [`LeaveCode::MembershipLost`], which never goes on the wire
+    /// and is not parsed back.
     pub fn as_str(&self) -> &str {
         match self {
             Self::Leave => "leave",
             Self::DelayedLeave => "delayed_leave",
             Self::SlotClosed => "slot_closed",
+            Self::MembershipLost => "membership_lost",
             Self::Other(code) => code,
         }
     }
@@ -1312,12 +1383,21 @@ pub struct LeaveReason {
     /// Optional human-readable explanation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// For [`LeaveCode::MembershipLost`]: the delayed leave still armed when
+    /// the session ended. A later join of the same membership should retire it
+    /// first, or it may fire after that join and end it. Never on the wire.
+    #[serde(skip)]
+    pub delay_id: Option<String>,
 }
 
 impl LeaveReason {
     /// A leave reason carrying just a code.
     pub fn new(code: LeaveCode) -> Self {
-        Self { code, reason: None }
+        Self {
+            code,
+            reason: None,
+            delay_id: None,
+        }
     }
 
     /// A leave reason with a human-readable explanation.
@@ -1325,6 +1405,17 @@ impl LeaveReason {
         Self {
             code,
             reason: Some(reason.into()),
+            delay_id: None,
+        }
+    }
+
+    /// Our membership timed out ([`LeaveCode::MembershipLost`]), with the
+    /// delay that will send (or sent) its leave.
+    pub fn membership_lost(delay_id: Option<String>, reason: impl Into<String>) -> Self {
+        Self {
+            code: LeaveCode::MembershipLost,
+            reason: Some(reason.into()),
+            delay_id,
         }
     }
 }

@@ -70,6 +70,16 @@ pub enum EndedReason {
         /// Transport-provided description (e.g. the LiveKit disconnect reason).
         message: String,
     },
+    /// Our membership timed out while we were still in the call: the dead
+    /// man's switch was not restarted within its delay — the homeserver was
+    /// unreachable — so our leave is out, or goes out once it is back. Joining
+    /// again is the application's call; pass `delay_id` to the join
+    /// (`supersedes_delayed_leave`) so that leave cannot end the new
+    /// membership.
+    MembershipLost {
+        /// The delayed leave still armed when the call ended.
+        delay_id: Option<String>,
+    },
 }
 
 /// An event on the unified call stream.

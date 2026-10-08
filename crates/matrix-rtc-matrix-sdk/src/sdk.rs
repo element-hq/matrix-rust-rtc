@@ -62,16 +62,21 @@ fn command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::from_message(error.to_string())
 }
 
-/// [`command_error`] for the MSC4140 endpoints: `M_UNRECOGNIZED` is a
-/// homeserver without the endpoint, `M_FORBIDDEN` one that switched it off
-/// (matrix.org's "Sending delayed events has been disallowed"). Either makes
-/// the core stop asking for the rest of the session.
+/// [`command_error`] for the MSC4140 endpoints, classified as
+/// [`CommandError::delayed_event_failure`] does for the other hosts:
+/// `M_UNRECOGNIZED` is a homeserver without the endpoint and an `M_FORBIDDEN`
+/// about delayed events one that switched it off (matrix.org's "Sending delayed
+/// events has been disallowed"), either of which makes the core stop asking;
+/// `M_NOT_FOUND` is a delay the homeserver no longer has.
 fn delayed_command_error(error: matrix_sdk::HttpError) -> CommandError {
+    let message = error.to_string();
     match error.client_api_error_kind() {
-        Some(ErrorKind::Unrecognized | ErrorKind::Forbidden) => {
-            CommandError::DelayedEventsNotSupported(error.to_string())
+        Some(ErrorKind::NotFound) => CommandError::DelayedEventNotFound(message),
+        Some(ErrorKind::Unrecognized) => CommandError::DelayedEventsNotSupported(message),
+        Some(ErrorKind::Forbidden) if message.to_ascii_lowercase().contains("delayed") => {
+            CommandError::DelayedEventsNotSupported(message)
         }
-        _ => command_error(error),
+        _ => command_error(message),
     }
 }
 
@@ -94,6 +99,15 @@ fn rtc_request_config() -> matrix_sdk::config::RequestConfig {
     matrix_sdk::config::RequestConfig::new()
         .timeout(Duration::from_secs(15))
         .retry_limit(5)
+}
+
+/// For the MSC4140 delayed-event requests: one attempt, a short timeout. The
+/// core retries them itself, on a jittered backoff that knows the delay's
+/// deadline; see `MatrixBackend::send_delayed_event`.
+fn delayed_request_config() -> matrix_sdk::config::RequestConfig {
+    matrix_sdk::config::RequestConfig::new()
+        .timeout(Duration::from_secs(5))
+        .disable_retry()
 }
 
 /// How long wakes are coalesced before a room's subjects are re-read: a sync
@@ -300,7 +314,7 @@ impl MatrixBackend for SdkMatrixBackend {
                 );
                 self.client
                     .send(request)
-                    .with_request_config(rtc_request_config())
+                    .with_request_config(delayed_request_config())
                     .await
                     .map_err(delayed_command_error)?
                     .delay_id
@@ -315,7 +329,7 @@ impl MatrixBackend for SdkMatrixBackend {
                 );
                 self.client
                     .send(request)
-                    .with_request_config(rtc_request_config())
+                    .with_request_config(delayed_request_config())
                     .await
                     .map_err(delayed_command_error)?
                     .delay_id
@@ -335,7 +349,7 @@ impl MatrixBackend for SdkMatrixBackend {
             update_delayed_event::unstable_v1::Request::new(delay_id, UpdateAction::Restart);
         self.client
             .send(request)
-            .with_request_config(rtc_request_config())
+            .with_request_config(delayed_request_config())
             .await
             .map_err(delayed_command_error)?;
         Ok(())
@@ -350,7 +364,21 @@ impl MatrixBackend for SdkMatrixBackend {
             update_delayed_event::unstable_v1::Request::new(delay_id, UpdateAction::Cancel);
         self.client
             .send(request)
-            .with_request_config(rtc_request_config())
+            .with_request_config(delayed_request_config())
+            .await
+            .map_err(delayed_command_error)?;
+        Ok(())
+    }
+
+    async fn send_delayed_event_now(
+        &self,
+        _room_id: String,
+        delay_id: String,
+    ) -> Result<(), CommandError> {
+        let request = update_delayed_event::unstable_v1::Request::new(delay_id, UpdateAction::Send);
+        self.client
+            .send(request)
+            .with_request_config(delayed_request_config())
             .await
             .map_err(delayed_command_error)?;
         Ok(())
