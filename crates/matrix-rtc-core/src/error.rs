@@ -52,6 +52,17 @@ pub enum CommandError {
     /// events has been disallowed".
     #[error("delayed events not supported by the homeserver: {0}")]
     DelayedEventsNotSupported(String),
+
+    /// The homeserver does not know this delayed event (MSC4140 `M_NOT_FOUND`):
+    /// it fired, was cancelled, or was lost. Hard evidence that the delay is
+    /// gone — for our own delayed leave, that our leave went out.
+    #[error("delayed event not found: {0}")]
+    DelayedEventNotFound(String),
+
+    /// The backend does not implement this optional command; the caller falls
+    /// back to another way, if it has one.
+    #[error("not implemented by the backend: {0}")]
+    NotImplemented(String),
 }
 
 /// Errors that can occur when attempting to join an RTC session.
@@ -107,6 +118,11 @@ impl CommandError {
         message: impl Into<String>,
     ) -> Self {
         let message = message.into();
+        // An unknown delay is a 404 too, but says nothing about support: the
+        // endpoint answered, about one delay.
+        if errcode == Some("M_NOT_FOUND") {
+            return CommandError::DelayedEventNotFound(message);
+        }
         let permanent = match errcode {
             Some("M_UNRECOGNIZED") => true,
             Some("M_FORBIDDEN") => message.to_ascii_lowercase().contains("delayed"),
@@ -123,6 +139,17 @@ impl CommandError {
     /// event, so a client should stop asking rather than retry.
     pub fn is_delayed_events_unsupported(&self) -> bool {
         matches!(self, CommandError::DelayedEventsNotSupported(_))
+    }
+
+    /// Whether the homeserver said the delayed event this was about no longer
+    /// exists ([`CommandError::DelayedEventNotFound`]).
+    pub fn is_delayed_event_gone(&self) -> bool {
+        matches!(self, CommandError::DelayedEventNotFound(_))
+    }
+
+    /// Whether the backend does not implement the command at all.
+    pub fn is_not_implemented(&self) -> bool {
+        matches!(self, CommandError::NotImplemented(_))
     }
 }
 
@@ -155,5 +182,17 @@ mod tests {
 
         let transient = CommandError::delayed_event_failure(None, Some(502), "Bad Gateway");
         assert!(!transient.is_delayed_events_unsupported());
+    }
+
+    #[test]
+    fn an_unknown_delay_is_gone_not_unsupported() {
+        let gone =
+            CommandError::delayed_event_failure(Some("M_NOT_FOUND"), Some(404), "Unknown delay_id");
+        assert!(gone.is_delayed_event_gone());
+        assert!(!gone.is_delayed_events_unsupported());
+
+        // A bare 404 is still the endpoint missing.
+        let missing = CommandError::delayed_event_failure(None, Some(404), "Not Found");
+        assert!(missing.is_delayed_events_unsupported());
     }
 }

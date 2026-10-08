@@ -582,6 +582,7 @@ impl From<CallEvent> for WasmCallEvent {
                     EndedReason::Left => "left".to_owned(),
                     EndedReason::SlotClosed => "slot_closed".to_owned(),
                     EndedReason::ConnectionClosed { message } => message,
+                    EndedReason::MembershipLost { .. } => "membership_lost".to_owned(),
                 },
             },
         }

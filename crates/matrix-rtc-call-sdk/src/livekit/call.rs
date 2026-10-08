@@ -201,6 +201,11 @@ pub struct LiveKitCallOptions {
     /// window reorders are coalesced into. A product decision rather than a
     /// protocol one; see [`StabilityConfig`].
     pub stability: StabilityConfig,
+    /// The delayed leave of an earlier join that ended
+    /// [`EndedReason::MembershipLost`](crate::EndedReason::MembershipLost):
+    /// retired before this join, so it cannot fire after it and end it. The
+    /// join fails while the homeserver cannot be asked; retry it on a backoff.
+    pub supersedes_delayed_leave: Option<String>,
 }
 
 impl Default for LiveKitCallOptions {
@@ -219,6 +224,7 @@ impl Default for LiveKitCallOptions {
             notify: None,
             reactions: None,
             stability: StabilityConfig::default(),
+            supersedes_delayed_leave: None,
         }
     }
 }
@@ -322,6 +328,7 @@ impl LiveKitCall {
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
         join.keep_alive_interval_ms = options.keep_alive_interval_ms;
+        join.supersedes_delayed_leave = options.supersedes_delayed_leave.clone();
         let call = Arc::new(
             room.join_call(CallJoinOptions {
                 join,

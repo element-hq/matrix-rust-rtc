@@ -498,7 +498,7 @@ async fn a_joined_session_keeps_itself_alive() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_keep_alive_interval_is_capped_at_half_the_timeout() {
+async fn a_long_keep_alive_interval_cannot_let_the_delay_lapse() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
@@ -508,7 +508,10 @@ async fn the_keep_alive_interval_is_capped_at_half_the_timeout() {
     let _call = room.join_call(options).await.expect("join");
 
     tokio::time::sleep(Duration::from_millis(4_001)).await;
-    assert_eq!(restarts(&mock), 2);
+    // Restarts are paced by the delay, not the interval: 30 % into it after
+    // each confirmed one (1.2 s, 2.4 s, 3.6 s), so an interval longer than the
+    // delay cannot let it lapse.
+    assert_eq!(restarts(&mock), 3);
 }
 
 #[tokio::test(start_paused = true)]
