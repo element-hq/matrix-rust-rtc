@@ -1,0 +1,22 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# Layered over demo/backend/synapse/homeserver.yaml (Synapse merges repeated
+# --config-path files, later keys winning). Only what differs for clients that
+# live inside the compose network.
+
+# The demo stack's clients run on the host and are told localhost:8008. Synapse
+# advertises this in the login response's `well_known`, and matrix-sdk follows
+# it — so a peer container logging in at synapse:8008 would otherwise switch
+# itself over to a localhost that, from inside the container, has no Synapse.
+public_baseurl: "http://synapse:8008/"
+
+# The same transports as the demo stack, as the peers see them: in-network.
+matrix_rtc:
+  transports:
+    - type: m.livekit
+      url: "ws://livekit:7880"
+    - type: livekit
+      livekit_service_url: "http://livekit:6080"

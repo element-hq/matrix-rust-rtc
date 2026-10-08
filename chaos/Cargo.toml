@@ -1,0 +1,25 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-chaos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Fault-injection end-to-end suite for the MatrixRTC stack: containerised chaos_peer clients against Synapse + LiveKit, with the backend and the network degraded around them."
+
+# The harness only drives docker and talks HTTP to Synapse. The client under
+# test is the `chaos_peer` example of matrix-rtc-call-sdk, a separate binary run
+# in containers — so nothing here links matrix-sdk or libwebrtc, and a plain
+# `cargo test --workspace` compiles this crate in seconds (the scenarios are
+# `#[ignore]`d; they need the stack, see README.md).
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync", "fs"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }

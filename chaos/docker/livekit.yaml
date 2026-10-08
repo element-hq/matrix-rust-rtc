@@ -1,0 +1,29 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# LiveKit SFU for the chaos stack. The demo config pins node_ip to 127.0.0.1
+# for clients on the host; here the peers are containers on the same network,
+# so no node_ip — the SFU advertises its own interface addresses, which is
+# what the peers can reach. Nothing is published to the host.
+
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+rtc:
+  tcp_port: 7881
+  port_range_start: 50100
+  port_range_end: 50200
+  use_external_ip: false
+keys:
+  devkey: secret
+room:
+  auto_create: false
+# Participant lifecycle to lk-jwt-service, which needs it for delegated delayed
+# leaves (MSC4195): a disconnect is when it sends the member's leave. It shares
+# this SFU's network namespace, hence localhost. Signed with a key from `keys`.
+webhook:
+  api_key: devkey
+  urls:
+    - http://localhost:6080/sfu_webhook

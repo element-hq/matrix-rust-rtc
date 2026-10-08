@@ -72,3 +72,6 @@ mobile/android/debuginfo/
 scripts/load-test.sh
 
 scripts/load-test-state.sh
+
+# The chaos peer binary and its build stamp (chaos/build-peer.sh).
+chaos/bin/

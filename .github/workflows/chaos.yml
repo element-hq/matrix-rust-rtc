@@ -1,0 +1,91 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# The chaos suite (chaos/README.md): real clients against Synapse + LiveKit,
+# with the homeserver and the network degraded around them.
+#
+# Nightly it runs every scenario. On demand it runs every scenario, a list of
+# them, or the smoke subset (baseline and homeserver restart, a few minutes).
+# Not on PRs for now.
+
+name: Chaos
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Space-separated test names, e.g. sticky::baseline state::short_partition, or 'smoke' (empty = all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  chaos:
+    name: Chaos scenarios
+    # Pinned, not -latest: the peer binary is built here and run in the
+    # ubuntu:24.04 runtime image, so the two must share a glibc.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Up first and without waiting, so image pulls and Synapse's first boot
+      # overlap the build; the harness waits for health itself (`Stack::up`).
+      - name: Start chaos backend
+        run: docker compose -f chaos/docker/compose.yml -p matrix-rtc-chaos up -d synapse livekit auth-service
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install webrtc-sys system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-dev libsqlite3-dev
+
+      # Same key as the e2e-call job: build-peer.sh builds the same crate with
+      # the same features.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: e2e-call
+
+      - name: Build chaos peer
+        run: chaos/build-peer.sh
+
+      # The dispatch input goes through the environment, never into the script
+      # itself, so it cannot inject shell.
+      - name: Run scenarios
+        env:
+          EVENT: ${{ github.event_name }}
+          SCENARIOS: ${{ inputs.scenarios }}
+        run: |
+          filter=()
+          if [ "$EVENT" = workflow_dispatch ]; then
+            case "$SCENARIOS" in
+              "") ;;
+              smoke) filter=(--exact state::baseline state::homeserver_restart) ;;
+              *) read -ra names <<<"$SCENARIOS"; filter=(--exact "${names[@]}") ;;
+            esac
+          fi
+          cargo test -p matrix-rtc-chaos --test scenarios -- --ignored --test-threads=1 --nocapture "${filter[@]}"
+
+      # Always: the per-peer event streams and client logs are the only way to
+      # read a flaky run after the fact.
+      - name: Upload scenario output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-output
+          path: target/chaos/
+          if-no-files-found: ignore
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f chaos/docker/compose.yml -p matrix-rtc-chaos down -v

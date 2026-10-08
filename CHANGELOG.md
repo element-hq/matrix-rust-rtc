@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- `LiveKitCall::delayed_leave_id()` and `RtcSession::delayed_leave_id()` name the MSC4140 delayed leave protecting a join.
+
 ## v0.5.0-rc.2 - 2026-10-08
 
 ### Added

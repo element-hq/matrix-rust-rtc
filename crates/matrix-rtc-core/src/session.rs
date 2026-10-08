@@ -646,6 +646,17 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .and_then(|machine| machine.membership_event_id())
     }
 
+    /// The MSC4140 `delay_id` of the delayed leave currently armed for our
+    /// membership, or `None` while not joined or while nothing is armed.
+    ///
+    /// Replaced when a fired delay is re-armed, so read it at the moment of
+    /// use. Lets a host or a test look the delay up on the homeserver.
+    pub fn own_delayed_leave_id(&self) -> Option<String> {
+        self.own_membership_machine
+            .as_ref()
+            .and_then(|machine| machine.delayed_event_id())
+    }
+
     /// Follows [`Self::own_membership_event_id`] for this join, which moves on
     /// every sticky refresh; `None` while not joined.
     pub fn subscribe_own_membership_event_id(&self) -> Option<watch::Receiver<Option<String>>> {
