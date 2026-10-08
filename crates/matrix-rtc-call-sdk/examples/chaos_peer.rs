@@ -18,13 +18,16 @@
 //!
 //! ## Rejoining
 //!
-//! When our own membership disappears from the call while the call has not
-//! ended — our delayed leave fired while we were cut off from the homeserver —
-//! this peer leaves and joins again, as an application would. Only then: a
-//! call that *ended* (we left, the slot closed, our SFU connection is gone) is
-//! not rejoined. The policy lives here, at the application level, for now; it
-//! is meant to move into the call SDK (an attempts limit, and an ending that
-//! says the connection was lost).
+//! A call that ends because we *lost* it — our membership timed out while we
+//! were cut off from the homeserver (`MembershipLost`), or our own SFU
+//! connection is gone for good (`ConnectionClosed`) — is joined again, as an
+//! application would, in two stages. First the peer waits until its sync says
+//! the homeserver is reachable again (a messenger app knows it is offline long
+//! before it could rejoin). Then it joins, on an exponential backoff with
+//! jitter, each attempt bounded, retiring the old delayed leave first so it
+//! cannot end the new membership when it fires late. A call we left, or whose
+//! slot closed, is not rejoined. The policy lives here, at the application
+//! level, for now; it is meant to move into the call SDK.
 //!
 //! ## Protocol
 //!
@@ -35,6 +38,7 @@
 //! | `join` | join the call (waits for `EXPECT_ROOM_MEMBERS` room members first) |
 //! | `leave` | leave the call cleanly |
 //! | `snapshot` | emit the roster and the armed delayed leave |
+//! | `leak_delayed_leave [ms]` | shoot ourselves in the foot: arm a second delayed leave of our own membership (default 3000 ms) that nothing tracks or restarts — a leftover landing late, as after a homeserver restart. Room-state format only |
 //! | `quit` | leave if joined, then exit 0 |
 //!
 //! End of stdin is a `quit`, so a harness that kills this process must
@@ -46,14 +50,15 @@
 //! | ----- | ------- |
 //! | `ready` | logged in, syncing, in the room (`room_id`, `user_id`, `device_id`) |
 //! | `joined` | membership published, SFU connected (`membership_id`, `delayed_leave_id`) |
-//! | `join_failed` | a join attempt failed (`message`); a rejoin is retried on a backoff |
+//! | `join_failed` | a join attempt failed (`message`); a rejoin is retried on the backoff |
 //! | `status` | every `STATUS_INTERVAL_MS`: roster, member count, armed `delayed_leave_id`, sync state, `rejoins` |
-//! | `rejoining` | our membership vanished while the call was live; leaving to join again |
 //! | `sync_state` | the sync service changed state |
 //! | `sfu` | an SFU connection transition (`reconnecting`, `reconnected`, `disconnected`) |
 //! | `track_subscribed` | the SFU forwarded a remote audio track (`identity`) |
 //! | `audio` | one window of a peer's decrypted audio (`identity`, `rms`, `tone_440`) |
-//! | `call_ended` | the call ended without a `leave` (`reason`); the process stays up |
+//! | `call_ended` | the call ended without a `leave` (`reason`, and whether it is `rejoining`); the process stays up |
+//! | `rejoin_waiting` | a rejoin is due but sync says the homeserver is unreachable; it waits |
+//! | `leaked_delayed_leave` | `leak_delayed_leave` armed its delay (`delay_id`, `delay_ms`) |
 //! | `left`, `snapshot`, `error` | as named |
 //!
 //! Human-readable logs go to **stderr**, so stdout stays a clean stream.
@@ -74,11 +79,13 @@
 //! | `EXPECT_ROOM_MEMBERS` | `2` |
 //! | `STATUS_INTERVAL_MS` | `1000` |
 //! | `HEARTBEAT_MS` / `STICKY_DURATION_MS` | the `LiveKitCallOptions` defaults |
+//! | `KEEP_ALIVE_POLICY` | `current`; `legacy` runs the restart pacing this one replaced (a restart every 10 s, failures not retried early; loss detection stays on), for comparison |
 
 use std::cell::RefCell;
 use std::env;
 use std::error::Error;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use livekit::{RoomEvent, track::RemoteTrack};
@@ -95,9 +102,14 @@ use matrix_sdk_ui::sync_service::SyncService;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc};
 
-use matrix_rtc_call_sdk::{CallEvent, LiveKitCall, LiveKitCallOptions, open_slot};
-use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
+use matrix_rtc_call_sdk::{
+    CallEvent, EndedReason, LiveKitCall, LiveKitCallOptions, SdkMatrixBackend, open_slot,
+};
+use matrix_rtc_core::MatrixBackend;
+use matrix_rtc_core::compat::{
+    DialectBackend, MembershipFormat, OutboundDialect, RoomStateDialect,
+};
+use matrix_rtc_core::{Backoff, LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::media;
 
 /// Length of one metered audio window. Short enough that a media gap of a few
@@ -108,14 +120,10 @@ const AUDIO_WINDOW: Duration = Duration::from_secs(1);
 /// to emit status.
 const POLL: Duration = Duration::from_millis(200);
 
-/// How long our own membership may be missing from a live call before we
-/// rejoin. Bridges the moment a state event is replaced, so a refresh is not
-/// mistaken for a loss.
-const REJOIN_GRACE: Duration = Duration::from_secs(2);
-
-/// First and longest wait between failed rejoin attempts (doubling).
-const REJOIN_RETRY_MIN: Duration = Duration::from_secs(1);
-const REJOIN_RETRY_MAX: Duration = Duration::from_secs(30);
+/// The longest one join attempt may take. Against a homeserver that drops
+/// packets the requests never fail, they hang; a rejoin waiting on them would
+/// stall the peer instead of backing off.
+const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One protocol line, flushed eagerly: the harness sequences faults on it.
 fn emit(event: serde_json::Value) {
@@ -244,25 +252,33 @@ impl Config {
 
 /// What the peer is meant to be doing, as opposed to what it is doing: a
 /// `join` command makes it want to be in the call until a `leave`, or until
-/// the call ends by itself.
+/// the call ends in a way that is not ours to undo.
 #[derive(Default)]
 struct Intent {
     want_joined: bool,
+    /// Set by a lost call: join again.
+    rejoining: bool,
     rejoins: u32,
-    /// When the next (re)join attempt may run, after a failed one.
+    /// The delayed leave a lost call left armed, retired by the rejoin.
+    supersedes: Option<String>,
+    /// The core's backoff, so the peer retries as the library does.
+    backoff: Backoff,
     retry_at: Option<Instant>,
-    retry_wait: Duration,
+    /// Whether `rejoin_waiting` was reported for the current wait.
+    waiting_reported: bool,
 }
 
 impl Intent {
     fn joined(&mut self) {
+        self.rejoining = false;
+        self.supersedes = None;
+        self.backoff.reset();
         self.retry_at = None;
-        self.retry_wait = REJOIN_RETRY_MIN;
+        self.waiting_reported = false;
     }
 
     fn failed(&mut self) {
-        self.retry_wait = (self.retry_wait.max(REJOIN_RETRY_MIN / 2) * 2).min(REJOIN_RETRY_MAX);
-        self.retry_at = Some(Instant::now() + self.retry_wait);
+        self.retry_at = Some(Instant::now() + Duration::from_millis(self.backoff.next_wait_ms()));
     }
 
     fn may_try(&self) -> bool {
@@ -273,6 +289,11 @@ impl Intent {
 async fn run() -> Result<(), Box<dyn Error>> {
     let cfg = Config::from_env()?;
     let http = reqwest::Client::new();
+    match env::var("KEEP_ALIVE_POLICY").as_deref() {
+        Err(_) | Ok("current") => {}
+        Ok("legacy") => matrix_rtc_core::testing::set_legacy_keep_alive(true),
+        Ok(other) => return Err(format!("unknown KEEP_ALIVE_POLICY {other:?}").into()),
+    }
 
     // The sync service is bound for the whole run: dropping it stops the
     // membership/key traffic the call depends on.
@@ -330,27 +351,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
             while let Ok(window) = active.audio_rx.try_recv() {
                 emit(window);
             }
-            if active.membership_lost() {
-                emit(serde_json::json!({
-                    "event": "rejoining",
-                    "reason": "our membership left the call while it was live",
-                }));
-                if let Some(active) = joined.take()
-                    && let Err(error) = active.leave().await
-                {
-                    // The membership is already gone; the SFU side may be too.
-                    eprintln!(
-                        "[peer] leave before rejoin: {}",
-                        error_chain(error.as_ref())
-                    );
-                }
-                intent.rejoins += 1;
-            }
         }
-        if joined.is_none() && intent.want_joined && intent.rejoins > 0 && intent.may_try() {
-            match join_call(&cfg, &room, &http).await {
+        let rejoin_due =
+            joined.is_none() && intent.want_joined && intent.rejoining && intent.may_try();
+        // Stage one: while sync cannot reach the homeserver, nothing else will;
+        // wait for it rather than spend attempts.
+        let online = sync_state.borrow().as_str() == "Running";
+        if rejoin_due && !online && !intent.waiting_reported {
+            intent.waiting_reported = true;
+            emit(serde_json::json!({
+                "event": "rejoin_waiting",
+                "sync": sync_state.borrow().clone(),
+            }));
+        }
+        if rejoin_due && online {
+            match join_call(&cfg, &room, &http, intent.supersedes.clone()).await {
                 Ok(active) => {
                     intent.joined();
+                    intent.rejoins += 1;
                     joined = Some(active);
                 }
                 Err(error) => {
@@ -384,7 +402,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             continue;
                         }
                         intent.want_joined = true;
-                        match join_call(&cfg, &room, &http).await {
+                        match join_call(&cfg, &room, &http, None).await {
                             Ok(active) => {
                                 intent.joined();
                                 joined = Some(active);
@@ -422,6 +440,24 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         emit(serde_json::json!({ "event": "snapshot", "snapshot": snapshot }));
                     }
                     "quit" => break,
+                    leak if leak.starts_with("leak_delayed_leave") => {
+                        let delay_ms = leak
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|ms| ms.parse().ok())
+                            .unwrap_or(3_000);
+                        match leak_delayed_leave(&cfg, &client, &room, delay_ms).await {
+                            Ok(delay_id) => emit(serde_json::json!({
+                                "event": "leaked_delayed_leave",
+                                "delay_id": delay_id,
+                                "delay_ms": delay_ms,
+                            })),
+                            Err(error) => emit(serde_json::json!({
+                                "event": "error",
+                                "message": format!("leak_delayed_leave: {}", error_chain(error.as_ref())),
+                            })),
+                        }
+                    }
                     other => eprintln!("[peer] unknown command {other:?}"),
                 }
             }
@@ -445,14 +481,35 @@ async fn run() -> Result<(), Box<dyn Error>> {
                         emit(serde_json::json!({ "event": "sfu", "state": state, "reason": reason }));
                     }
                     Some(Observed::Ended(reason)) => {
-                        // Over without us leaving: not ours to undo. Keep the
-                        // process (and its Matrix client) up, since what the stack
+                        // Over without us leaving. A lost call is joined again;
+                        // anything else is not ours to undo. Either way the
+                        // process (and its Matrix client) stays up: what the stack
                         // does next, unprompted, is what the harness watches.
-                        intent.want_joined = false;
+                        let (code, supersedes, rejoin) = match &reason {
+                            EndedReason::MembershipLost { delay_id } => {
+                                ("membership_lost", delay_id.clone(), true)
+                            }
+                            EndedReason::ConnectionClosed { .. } => ("connection_closed", None, true),
+                            EndedReason::SlotClosed => ("slot_closed", None, false),
+                            EndedReason::Left => ("left", None, false),
+                        };
                         if let Some(active) = joined.take() {
+                            // Dropped, not left: dropping sends nothing, and the
+                            // armed delay ends the membership by itself.
                             active.stop_meters();
                         }
-                        emit(serde_json::json!({ "event": "call_ended", "reason": reason }));
+                        if rejoin {
+                            intent.rejoining = true;
+                            intent.supersedes = supersedes;
+                        } else {
+                            intent.want_joined = false;
+                        }
+                        emit(serde_json::json!({
+                            "event": "call_ended",
+                            "reason": code,
+                            "detail": format!("{reason:?}"),
+                            "rejoining": rejoin && intent.want_joined,
+                        }));
                     }
                 }
             }
@@ -481,33 +538,9 @@ struct Joined {
     meters: Vec<tokio::task::JoinHandle<()>>,
     audio_tx: mpsc::UnboundedSender<serde_json::Value>,
     audio_rx: mpsc::UnboundedReceiver<serde_json::Value>,
-    /// Whether our own membership has reached the roster yet: before it has,
-    /// its absence is not a loss.
-    seen_self: bool,
-    missing_since: Option<Instant>,
 }
 
 impl Joined {
-    /// Whether our own membership has been missing from this live call for
-    /// longer than [`REJOIN_GRACE`], after having been there.
-    ///
-    /// The roster has an entry for us only while our membership is in the
-    /// session, so its absence is the membership's absence.
-    fn membership_lost(&mut self) -> bool {
-        if self.call.participants().iter().any(|p| p.is_local) {
-            self.seen_self = true;
-            self.missing_since = None;
-            return false;
-        }
-        if !self.seen_self {
-            return false;
-        }
-        self.missing_since
-            .get_or_insert_with(Instant::now)
-            .elapsed()
-            >= REJOIN_GRACE
-    }
-
     fn stop_meters(&self) {
         for meter in &self.meters {
             meter.abort();
@@ -527,7 +560,7 @@ enum Observed {
     /// An SFU connection transition, with the reason where there is one.
     Sfu(&'static str, Option<String>),
     /// The call ended without us leaving.
-    Ended(String),
+    Ended(EndedReason),
 }
 
 /// The next event of a joined call worth reporting, or `None` after [`POLL`]
@@ -544,10 +577,12 @@ async fn next_call_event(joined: Option<&mut Joined>) -> Option<Observed> {
     tokio::select! {
         biased;
         event = call_events.recv() => match event {
-            Ok(CallEvent::Ended { reason }) => Some(Observed::Ended(format!("{reason:?}"))),
+            Ok(CallEvent::Ended { reason }) => Some(Observed::Ended(reason)),
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => None,
             Err(broadcast::error::RecvError::Closed) => {
-                Some(Observed::Ended("call event stream closed".to_owned()))
+                Some(Observed::Ended(EndedReason::ConnectionClosed {
+                    message: "call event stream closed".to_owned(),
+                }))
             }
         },
         event = tokio::time::timeout(POLL, call.events().recv()) => match event {
@@ -626,10 +661,26 @@ fn spawn_audio_meter(
     })
 }
 
+/// [`join_once`], bounded by [`JOIN_TIMEOUT`].
 async fn join_call(
     cfg: &Config,
     room: &matrix_sdk::Room,
     http: &reqwest::Client,
+    supersedes_delayed_leave: Option<String>,
+) -> Result<Joined, Box<dyn Error>> {
+    tokio::time::timeout(
+        JOIN_TIMEOUT,
+        join_once(cfg, room, http, supersedes_delayed_leave),
+    )
+    .await
+    .map_err(|_| format!("the join did not complete within {JOIN_TIMEOUT:?}"))?
+}
+
+async fn join_once(
+    cfg: &Config,
+    room: &matrix_sdk::Room,
+    http: &reqwest::Client,
+    supersedes_delayed_leave: Option<String>,
 ) -> Result<Joined, Box<dyn Error>> {
     let call = LiveKitCall::join(
         room,
@@ -644,6 +695,7 @@ async fn join_call(
             format: cfg.format,
             keep_alive_interval_ms: cfg.keep_alive_interval_ms,
             sticky_duration_ms: cfg.sticky_duration_ms,
+            supersedes_delayed_leave,
             ..LiveKitCallOptions::default()
         },
     )
@@ -668,9 +720,45 @@ async fn join_call(
         meters: Vec::new(),
         audio_tx,
         audio_rx,
-        seen_self: false,
-        missing_since: None,
     })
+}
+
+/// Arms a delayed leave of our own membership that nothing restarts, routed
+/// exactly as the core routes its own: the late leftover a homeserver can
+/// send after a restart, made on purpose. When it fires, the room drops our
+/// membership while we are joined.
+async fn leak_delayed_leave(
+    cfg: &Config,
+    client: &Client,
+    room: &matrix_sdk::Room,
+    delay_ms: u64,
+) -> Result<String, Box<dyn Error>> {
+    if cfg.format != MembershipFormat::RoomState {
+        return Err("only the room-state format is supported for now".into());
+    }
+    let user_id = client.user_id().ok_or("not logged in")?.to_string();
+    let device_id = client.device_id().ok_or("no device")?.to_string();
+    let room_id = room.room_id().to_string();
+    let backend = DialectBackend::new(Arc::new(SdkMatrixBackend::new(client.clone())));
+    backend.set_dialect(
+        &room_id,
+        OutboundDialect::State(RoomStateDialect::new(
+            user_id,
+            device_id,
+            room_id.clone(),
+            cfg.slot_id.clone(),
+        )),
+    );
+    // An empty leave: in this format, `{}` on our state key.
+    Ok(backend
+        .send_delayed_event(
+            room_id,
+            "m.rtc.member".to_owned(),
+            None,
+            serde_json::json!({}),
+            delay_ms,
+        )
+        .await?)
 }
 
 /// Log in and start syncing. The account is one device old, so it self-signs

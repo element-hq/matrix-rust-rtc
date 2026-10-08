@@ -204,6 +204,14 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         self.inner.cancel_delayed_event(room_id, delay_id).await
     }
 
+    async fn send_delayed_event_now(
+        &self,
+        room_id: String,
+        delay_id: String,
+    ) -> Result<(), CommandError> {
+        self.inner.send_delayed_event_now(room_id, delay_id).await
+    }
+
     async fn send_to_device_message(
         &self,
         recipients: Vec<ToDeviceRecipient>,

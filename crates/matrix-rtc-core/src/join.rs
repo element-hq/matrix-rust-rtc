@@ -147,10 +147,11 @@ pub struct JoinSessionParams {
     /// Defaults to `DEFAULT_KEEP_ALIVE_TIMEOUT_MS` if not specified.
     pub keep_alive_timeout_ms: Option<u64>,
 
-    /// How often the session's upkeep ticks the keep-alive, in milliseconds.
+    /// The longest the session's upkeep sleeps between keep-alive wake-ups, in
+    /// milliseconds; it wakes earlier whenever something is due.
     ///
     /// Defaults to `DEFAULT_KEEP_ALIVE_INTERVAL_MS`; clamped to half the
-    /// keep-alive timeout, so one late tick does not end the membership.
+    /// keep-alive timeout.
     pub keep_alive_interval_ms: Option<u64>,
 
     /// How long the homeserver should keep our membership in the sticky map,
@@ -174,6 +175,12 @@ pub struct JoinSessionParams {
     ///
     /// If not provided, defaults to `EncryptionConfig::default()`.
     pub encryption_config: Option<EncryptionConfig>,
+
+    /// The delayed leave of an earlier join of this membership that ended
+    /// [`LeaveCode::MembershipLost`](crate::LeaveCode::MembershipLost), to
+    /// retire before joining. The join fails, and can be retried, while the
+    /// homeserver cannot be asked.
+    pub supersedes_delayed_leave: Option<String>,
 }
 
 impl JoinSessionParams {
@@ -194,7 +201,16 @@ impl JoinSessionParams {
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
+            supersedes_delayed_leave: None,
         }
+    }
+
+    /// Retires `delay_id` — the delayed leave a lost earlier join of this
+    /// membership left armed ([`LeaveReason::delay_id`](crate::LeaveReason)) —
+    /// before joining, so it cannot fire after this join and end it.
+    pub fn supersedes_delayed_leave(mut self, delay_id: impl Into<String>) -> Self {
+        self.supersedes_delayed_leave = Some(delay_id.into());
+        self
     }
 
     /// Joins the application's slot `{application}#{application_slot_id}`.

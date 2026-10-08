@@ -63,6 +63,9 @@ scenarios!(
     short_partition,
     long_partition_recovers,
     lossy_network,
+    homeserver_outage_is_bridged_by_retries,
+    homeserver_outage_beyond_two_delays,
+    stale_leave_ends_and_rejoins,
 );
 
 /// The backend the scenarios assume is the backend that is running: the
@@ -222,6 +225,53 @@ fn assert_membership_stable(peer: &Peer, since: usize, count: u64) -> Result<()>
     Ok(())
 }
 
+/// The peer reports, after `since`, that its call ended because its
+/// membership timed out — within the keep-alive (plus slack), which it can
+/// only know locally when the homeserver is out of reach.
+async fn wait_membership_lost(peer: &Peer, since: usize) -> Result<()> {
+    peer.wait(
+        since,
+        KEEP_ALIVE + Duration::from_secs(15),
+        "membership lost while cut off from the homeserver",
+        |e| is_event(e, "call_ended") && e["reason"] == "membership_lost",
+    )
+    .await
+    .map(|_| ())
+}
+
+/// How many `name` events the peer reported since `since`.
+fn count_events(peer: &Peer, since: usize, name: &str) -> usize {
+    peer.events_since(since)
+        .iter()
+        .filter(|e| is_event(&e.value, name))
+        .count()
+}
+
+/// Waits until the homeserver confirms a fresh restart of the peer's delayed
+/// leave, and returns when it saw it — the moment that delay has the most of
+/// its period ahead.
+async fn wait_restart(hs: &Homeserver, peer: &Peer) -> Result<tokio::time::Instant> {
+    let id = peer
+        .delayed_leave_id()
+        .ok_or_else(|| format!("[{}] has no delayed leave armed", peer.name))?;
+    let since_ts =
+        |delay: Option<matrix_rtc_chaos::DelayedEvent>| delay.and_then(|d| d.delayed_since_ts());
+    let first = since_ts(hs.delayed_event(&peer.account, &id).await?);
+    let deadline = tokio::time::Instant::now() + KEEP_ALIVE;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let now = since_ts(hs.delayed_event(&peer.account, &id).await?);
+        if now.is_some() && now != first {
+            return Ok(tokio::time::Instant::now());
+        }
+    }
+    Err(format!(
+        "[{}] delayed leave {id} was not restarted within {KEEP_ALIVE:?}",
+        peer.name
+    )
+    .into())
+}
+
 /// The peer heard the 440 Hz tone in every audio window since `since`, and in
 /// at least `min_windows` of them.
 fn assert_audio_continuous(peer: &Peer, since: usize, min_windows: usize) -> Result<()> {
@@ -295,14 +345,19 @@ async fn homeserver_restart(stack: &Stack, mode: Mode) -> Result<()> {
 }
 
 /// Synapse is down for longer than the keep-alive. Both delayed leaves are
-/// overdue when it comes back, so the homeserver fires them; the peers must
-/// then notice, rejoin and re-arm on their own, and see each other again.
-/// The rejoin is `chaos_peer`'s own, at the application level.
+/// overdue when it comes back, so the homeserver fires them. Each peer must
+/// notice its membership is lost *while the homeserver is still down* — it
+/// cannot hear about it — then rejoin and re-arm on its own once it is back,
+/// and see the other again. The rejoin is `chaos_peer`'s own, at the
+/// application level.
 async fn homeserver_outage_beyond_keep_alive(stack: &Stack, mode: Mode) -> Result<()> {
     let hs = stack.homeserver();
     let call = TwoPeerCall::start(stack, mode, &[("MEDIA", "none")]).await?;
+    let outage = [call.host.cursor(), call.guest.cursor()];
     stack.stop("synapse").await?;
-    tokio::time::sleep(KEEP_ALIVE + Duration::from_secs(15)).await;
+    for (i, peer) in [&call.host, &call.guest].into_iter().enumerate() {
+        wait_membership_lost(peer, outage[i]).await?;
+    }
     let since = [call.host.cursor(), call.guest.cursor()];
     stack.start("synapse").await?;
 
@@ -370,7 +425,9 @@ async fn long_partition_recovers(stack: &Stack, mode: Mode) -> Result<()> {
     let call = TwoPeerCall::start(stack, mode, &[("MEDIA", "none")]).await?;
     let since = call.host.cursor();
 
+    let cut_off = call.guest.cursor();
     call.guest.partition(Partition::Homeserver).await?;
+    wait_membership_lost(&call.guest, cut_off).await?;
     call.host
         .wait_members(since, 1, KEEP_ALIVE + Duration::from_secs(15))
         .await?;
@@ -396,6 +453,142 @@ async fn lossy_network(stack: &Stack, mode: Mode) -> Result<()> {
     call.guest.clear_netem().await?;
 
     assert_membership_stable(&call.host, since, 2)?;
+    wait_switch_armed(&hs, &call.guest, RECOVER).await?;
+    Ok(())
+}
+
+/// Synapse goes away for most of one delay and is back with seconds to spare.
+/// The host keeps its membership: its failed restarts are retried, denser as
+/// the deadline nears, and one lands in those seconds. The guest runs the
+/// restart pacing this one replaced — a restart every 10 s, failures not
+/// retried early; its loss detection stays on — and loses its membership in
+/// the same outage. Together: the retries are what saved the host's call.
+///
+/// Timing-sensitive by design: Synapse must be back (it takes a few seconds
+/// to start) before the host's deadline, 30 s after its last restart, and
+/// still down at the guest's second attempt, 20 s after its last. Slow CI can
+/// push the restart past the host's deadline.
+async fn homeserver_outage_is_bridged_by_retries(stack: &Stack, mode: Mode) -> Result<()> {
+    let hs = stack.homeserver();
+    let call = TwoPeerCall::start_with(
+        stack,
+        mode,
+        &[("MEDIA", "none")],
+        &[("MEDIA", "none"), ("KEEP_ALIVE_POLICY", "legacy")],
+    )
+    .await?;
+    let host_delay = call.host.delayed_leave_id();
+    // Start right after a confirmed restart: the host's deadline is then a
+    // full delay away, and the guest's last restart at most 10 s back.
+    let restarted = wait_restart(&hs, &call.host).await?;
+    let since = [call.host.cursor(), call.guest.cursor()];
+    stack.stop("synapse").await?;
+    // Back 20 s on, ready a few seconds later: after the guest's second
+    // attempt at the latest, with the host's deadline still seconds away.
+    tokio::time::sleep_until(restarted + Duration::from_secs(20)).await;
+    stack.start("synapse").await?;
+
+    let id = wait_switch_armed(&hs, &call.host, RECOVER).await?;
+    if host_delay.as_deref() != Some(id.as_str()) {
+        return Err(format!("host's delay changed ({host_delay:?} -> {id}): it was lost").into());
+    }
+    if count_events(&call.host, since[0], "call_ended") > 0 {
+        return Err("the host's call ended: the retries did not bridge the outage".into());
+    }
+    call.guest
+        .wait(
+            since[1],
+            RECOVER,
+            "the legacy policy losing the guest's membership",
+            |e| is_event(e, "call_ended") && e["reason"] == "membership_lost",
+        )
+        .await?;
+    Ok(())
+}
+
+/// Synapse is gone for well over two delays. Each peer notices that its
+/// membership is lost while the homeserver is down, then waits — a messenger
+/// knows it is offline, and spends no join attempts on a homeserver it cannot
+/// reach — and rejoins once sync is back, retiring its old delay first.
+async fn homeserver_outage_beyond_two_delays(stack: &Stack, mode: Mode) -> Result<()> {
+    let hs = stack.homeserver();
+    let call = TwoPeerCall::start(stack, mode, &[("MEDIA", "none")]).await?;
+    let outage = [call.host.cursor(), call.guest.cursor()];
+    stack.stop("synapse").await?;
+    let down_at = tokio::time::Instant::now();
+    for (i, peer) in [&call.host, &call.guest].into_iter().enumerate() {
+        wait_membership_lost(peer, outage[i]).await?;
+    }
+    let lost = [call.host.cursor(), call.guest.cursor()];
+    tokio::time::sleep_until(down_at + KEEP_ALIVE * 2 + Duration::from_secs(15)).await;
+
+    // Stage one: offline, so no joins — one attempt is tolerated, for a sync
+    // that had not noticed yet.
+    for (i, peer) in [&call.host, &call.guest].into_iter().enumerate() {
+        let joined = count_events(peer, lost[i], "joined");
+        let failed = count_events(peer, lost[i], "join_failed");
+        if joined > 0 || failed > 1 {
+            return Err(format!(
+                "[{}] tried to join while offline ({joined} joined, {failed} failed)",
+                peer.name
+            )
+            .into());
+        }
+    }
+
+    // Stage two: back online, both rejoin and see each other, freshly armed.
+    let back = [call.host.cursor(), call.guest.cursor()];
+    stack.start("synapse").await?;
+    for (i, peer) in [&call.host, &call.guest].into_iter().enumerate() {
+        peer.wait(back[i], RECOVER, "rejoined after the outage", |e| {
+            is_event(e, "joined")
+        })
+        .await?;
+        peer.wait_members(back[i], 2, RECOVER).await?;
+        wait_switch_armed(&hs, peer, RECOVER).await?;
+    }
+    Ok(())
+}
+
+/// The homeserver is fine, and a delayed leave nobody tracks lands anyway — a
+/// leftover of an earlier join, as a homeserver restart can send late. The
+/// guest arms one on purpose. When it fires, the room drops the guest's
+/// membership while the guest believes it is joined: everybody else counts it
+/// as left, so the guest must end its call too, then rejoin by itself.
+async fn stale_leave_ends_and_rejoins(stack: &Stack, mode: Mode) -> Result<()> {
+    let hs = stack.homeserver();
+    let mut call = TwoPeerCall::start(stack, mode, &[("MEDIA", "none")]).await?;
+    let since = [call.host.cursor(), call.guest.cursor()];
+
+    call.guest.send("leak_delayed_leave 3000").await?;
+    call.guest
+        .wait(
+            since[1],
+            Duration::from_secs(10),
+            "the leaked delay armed",
+            |e| is_event(e, "leaked_delayed_leave"),
+        )
+        .await?;
+    call.guest
+        .wait(
+            since[1],
+            Duration::from_secs(20),
+            "the call ended when the stale leave landed",
+            |e| is_event(e, "call_ended") && e["reason"] == "membership_lost",
+        )
+        .await?;
+    let ended = call.guest.cursor();
+    call.guest
+        .wait(ended, RECOVER, "rejoined after the stale leave", |e| {
+            is_event(e, "joined")
+        })
+        .await?;
+    // Cursors from after the rejoin: statuses from before the loss already
+    // show two members.
+    let rejoined = [call.host.cursor(), call.guest.cursor()];
+    for (i, peer) in [&call.host, &call.guest].into_iter().enumerate() {
+        peer.wait_members(rejoined[i], 2, RECOVER).await?;
+    }
     wait_switch_armed(&hs, &call.guest, RECOVER).await?;
     Ok(())
 }

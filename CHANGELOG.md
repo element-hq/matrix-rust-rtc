@@ -11,6 +11,18 @@ log only.
 ### Added
 
 - `LiveKitCall::delayed_leave_id()` and `RtcSession::delayed_leave_id()` name the MSC4140 delayed leave protecting a join.
+- A call whose membership is gone while we are still in it ends with `EndedReason::MembershipLost { delay_id }` (FFI: `ConnectionClosed`; web: `"membership_lost"`): at the delayed leave's deadline, on `M_NOT_FOUND`, or when the room drops our membership.
+- `supersedes_delayed_leave` on a Rust join sends the delay a lost call left armed before joining again (`MatrixBackend::send_delayed_event_now`, cancelled where a host lacks it).
+
+### Fixed
+
+- The dead man's switch is restarted at 30 % of its delay and retried on a jittered exponential backoff, denser near its deadline, instead of a fixed interval and a five-minute probe.
+- The matrix-sdk backend sends delayed-event requests once with a 5 s timeout, leaving the retries to the core.
+- A call whose own SFU connection is gone for good stops restarting its delayed leave, so its membership ends instead of lingering without media.
+
+### Breaking
+
+- Rust: `EndedReason`, `LeaveCode`, `OwnMembershipState` and `CommandError` gain variants, and `LeaveReason`, `JoinSessionParams`, `JoinOptions` and `LiveKitCallOptions` gain fields.
 
 ## v0.5.0-rc.2 - 2026-10-08
 

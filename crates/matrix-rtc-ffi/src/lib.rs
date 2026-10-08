@@ -114,6 +114,7 @@ impl From<FfiLeaveReason> for matrix_rtc_core::LeaveReason {
         matrix_rtc_core::LeaveReason {
             code: matrix_rtc_core::LeaveCode::from_code(&value.code),
             reason: value.reason,
+            delay_id: None,
         }
     }
 }
@@ -1242,9 +1243,15 @@ mod tests {
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
 
+        // Restarts follow the delay — 30 % into it — and the interval caps
+        // the sleeps, so a short delay is what makes them frequent.
+        let params = FfiJoinSessionParams {
+            keep_alive_timeout_ms: Some(200),
+            ..join_params()
+        };
         let _call = room
             .clone()
-            .join_call_every(join_params(), Some(Duration::from_millis(50)))
+            .join_call_every(params, Some(Duration::from_millis(50)))
             .await
             .expect("join");
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1252,7 +1259,7 @@ mod tests {
         let beats = beats(&mock);
         assert!(
             beats >= 2,
-            "saw {beats} beats over 300ms at a 50ms interval"
+            "saw {beats} beats over 300ms with a 200ms delay"
         );
     }
 

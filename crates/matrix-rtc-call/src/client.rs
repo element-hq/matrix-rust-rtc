@@ -85,13 +85,17 @@ pub struct JoinOptions {
     pub transport: JoinTransport,
     pub encryption_config: Option<EncryptionConfig>,
     pub keep_alive_timeout_ms: Option<u64>,
-    /// How often the session restarts its delayed leave; `None` is
+    /// The longest the session sleeps between keep-alive wake-ups; `None` is
     /// [`DEFAULT_KEEP_ALIVE_INTERVAL_MS`](matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS).
-    /// Clamped to half the keep-alive timeout, so one late tick does not end
-    /// the membership.
+    /// Restarts themselves follow the delay; see
+    /// [`OwnMembershipMachine::keep_alive`](matrix_rtc_core::OwnMembershipMachine::keep_alive).
     pub keep_alive_interval_ms: Option<u64>,
     pub sticky_duration_ms: Option<u64>,
     pub degraded_lifetime_ms: Option<u64>,
+    /// The delayed leave a lost earlier participation left armed
+    /// ([`LeaveReason::delay_id`]), retired before joining; see
+    /// [`JoinSessionParams::supersedes_delayed_leave`].
+    pub supersedes_delayed_leave: Option<String>,
 }
 
 impl JoinOptions {
@@ -108,6 +112,7 @@ impl JoinOptions {
             keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
+            supersedes_delayed_leave: None,
         }
     }
 
@@ -447,6 +452,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             keep_alive_interval_ms,
             sticky_duration_ms,
             degraded_lifetime_ms,
+            supersedes_delayed_leave,
         } = options;
 
         if let Some(application_type) = application.application_type()
@@ -486,6 +492,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             sticky_duration_ms,
             degraded_lifetime_ms,
             encryption_config,
+            supersedes_delayed_leave,
         };
         // The `member.id` and our sends' dialect, in the room's format.
         if let Some(handle) = &self.handle {
@@ -655,6 +662,24 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     /// Our `member.id` in this participation.
     pub fn member_id(&self) -> &str {
         &self.member_id
+    }
+
+    /// Stops keeping this participation alive without leaving: the delayed
+    /// leave is no longer restarted, so it fires within its delay and the
+    /// homeserver ends the membership. For an owner whose call is over for
+    /// another reason — its media connection gone for good — with the
+    /// homeserver possibly unreachable, where an explicit leave could fail or
+    /// land late.
+    pub fn stop_keep_alive(&self) {
+        if let Some(upkeep) = &self.upkeep {
+            upkeep.abort();
+        }
+    }
+
+    /// A handle doing what [`Self::stop_keep_alive`] does, for a task that
+    /// does not hold the session.
+    pub fn keep_alive_handle(&self) -> Option<AbortHandle> {
+        self.upkeep.clone()
     }
 
     /// What this participation publishes on, as its join resolved it.

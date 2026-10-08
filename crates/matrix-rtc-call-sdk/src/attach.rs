@@ -17,15 +17,17 @@ use std::sync::Arc;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::compat::MembershipFormat;
+use matrix_rtc_core::executor;
 use matrix_rtc_core::{MatrixBackend, RtcIdentityMapper, TransportIntent};
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
     TransportConnection, TransportError,
 };
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::RecvError;
 
 use crate::engine::{CallEngine, EngineConfig, StabilityConfig};
-use crate::event::CallEvent;
+use crate::event::{CallEvent, EndedReason};
 
 /// What [`attach_media`] needs besides the call, the transport and the key
 /// handler.
@@ -162,6 +164,29 @@ where
         memberships,
     );
     let events = engine.subscribe_events();
+
+    // A call whose own focus is gone for good is over, but the core would go
+    // on restarting the delayed leave and keep a membership with no media in
+    // the call for everyone else. Stop restarting it instead of sending a
+    // leave: the homeserver may be unreachable too, and the delay ends the
+    // membership by itself within one delay.
+    if let Some(keep_alive) = call.keep_alive_handle() {
+        let mut ended = engine.subscribe_events();
+        executor::spawn(async move {
+            loop {
+                match ended.recv().await {
+                    Ok(CallEvent::Ended {
+                        reason: EndedReason::ConnectionClosed { .. },
+                    }) => {
+                        keep_alive.abort();
+                        break;
+                    }
+                    Ok(CallEvent::Ended { .. }) | Err(RecvError::Closed) => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                }
+            }
+        });
+    }
 
     // Imported keys surface as `CallEvent::KeyImported`, refused ones as
     // `CallEvent::KeyDiscarded` — the only way the reason a key was rejected

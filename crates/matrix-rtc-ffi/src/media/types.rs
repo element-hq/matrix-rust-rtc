@@ -696,6 +696,16 @@ impl FfiCallEvent {
                     matrix_rtc_call_sdk::EndedReason::ConnectionClosed { message } => {
                         FfiEndedReason::ConnectionClosed { message }
                     }
+                    // Reported as a lost connection rather than a new variant,
+                    // which would break every host's exhaustive switch; a
+                    // dedicated variant comes with the next app-facing change.
+                    matrix_rtc_call_sdk::EndedReason::MembershipLost { .. } => {
+                        FfiEndedReason::ConnectionClosed {
+                            message: "membership lost: our membership left the call while we \
+                                      were still in it"
+                                .to_owned(),
+                        }
+                    }
                 },
             },
         })

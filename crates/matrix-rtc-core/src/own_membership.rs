@@ -13,7 +13,7 @@
 //! 1. **Schedule delayed leave FIRST** - This is the safety net. If the client dies at any
 //!    point, the delayed leave will fire and clean up our membership.
 //! 2. **Send join membership** - Send the sticky join event to announce our presence.
-//! 3. **Heartbeat** - Periodically restart the delayed leave to extend the timeout.
+//! 3. **Keep-alive** - Restart the delayed leave before it fires, retrying on a backoff.
 //!
 //! This ensures that if the client crashes or loses connection, the delayed leave will
 //! automatically clean up after the timeout period, preventing ghost memberships.
@@ -24,7 +24,7 @@
 //! [`OwnMembershipMachine::keep_alive`] has to tend both:
 //!
 //! - The **delayed leave** (`keep_alive_timeout_ms`, seconds) is the dead man's
-//!   switch above. Its timer is pushed back out on every tick via MSC4140's
+//!   switch above. Its timer is pushed back out, 30 % into it, via MSC4140's
 //!   `restart` action — never cancel-and-recreate, which leaves a window with
 //!   nothing armed and can leak a delay that then marks us departed mid-call.
 //! - The **sticky-map entry** (`sticky_duration_ms`, an hour by default) is how
@@ -34,7 +34,20 @@
 //! Tending only the first produces a membership that vanishes mid-call with a
 //! perfectly healthy keep-alive; tending only the second leaves a ghost
 //! membership behind when the client dies. The slot session's upkeep
-//! (`upkeep.rs`) ticks it on an interval while joined.
+//! (`upkeep.rs`) wakes it when [`OwnMembershipMachine::next_due_at_ms`] says
+//! something is due.
+//!
+//! # Knowing that we left, without being told
+//!
+//! The delay's lifecycle is followed locally: it fires a full delay after the
+//! last restart the homeserver confirmed. Once that moment passes without a
+//! confirmed restart — the homeserver is unreachable, say — our leave has gone
+//! out, or will the moment the homeserver is back. The membership is then
+//! [`OwnMembershipState::Lost`] and the session ends; so it is too when a
+//! restart is answered with `M_NOT_FOUND`. Nothing is sent at that point: the
+//! homeserver is most likely down, and a leave retried into a later rejoin
+//! would end the rejoin. The armed delay does the leaving; a later join
+//! retires it first ([`OwnMembershipMachine::supersede_delayed_leave`]).
 //!
 //! # When the homeserver has no delayed events
 //!
@@ -61,9 +74,17 @@ use tokio::sync::{Mutex as AsyncMutex, watch};
 // is the same API over `Date.now()`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::time::{SystemTime, UNIX_EPOCH};
+// The keep-alive's own clock: monotonic, and natively tokio's, so it follows
+// paused time in tests as the upkeep's sleeps do.
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
+// Gated like the tokio `time` feature in Cargo.toml: by architecture.
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
+use crate::delayed_leave::{Backoff, LOCAL_RESTART_PERCENT};
 use crate::error::CommandError;
 use crate::host::backend::MatrixBackend;
 use crate::host::event::RawStickyEventContent;
@@ -73,14 +94,37 @@ use crate::transport::{MemberTransports, RtcTransport};
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 
-/// How long to wait before asking a homeserver that just refused a delayed event
-/// whether it has changed its mind (5 minutes).
-///
-/// Only used when the refusal was *unclassified* — a plain send failure that may
-/// well have been a network blip. A homeserver that said so in as many words
-/// ([`CommandError::is_delayed_events_unsupported`]) is never probed again for
-/// the life of the session.
-const DELAYED_LEAVE_PROBE_INTERVAL_MS: u64 = 5 * 60 * 1000;
+/// The shortest the upkeep sleeps between keep-alive wake-ups.
+const MIN_WAKE_MS: u64 = 50;
+
+/// The shortest wait before retrying a failed restart near the deadline.
+const MIN_RETRY_MS: u64 = 500;
+
+/// The keep-alive policy this one replaced — a restart every
+/// [`legacy_policy::INTERVAL_MS`], failures not retried before the next — for
+/// the chaos suite to compare against. Off unless a test turns it on.
+/// Process-global: for a separate process such as `chaos_peer`; in-process
+/// tests must not flip it, or they change every other test's machines.
+pub mod legacy_policy {
+    /// The old fixed interval.
+    pub const INTERVAL_MS: u64 = 10_000;
+
+    #[cfg(feature = "testing")]
+    static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Turns the old policy on or off for the whole process.
+    #[cfg(feature = "testing")]
+    pub fn set_enabled(on: bool) {
+        ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn enabled() -> bool {
+        #[cfg(feature = "testing")]
+        return ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(feature = "testing"))]
+        false
+    }
+}
 
 /// Wall-clock milliseconds since the Unix epoch.
 ///
@@ -128,6 +172,12 @@ pub enum OwnMembershipState {
     Leaving,
     /// Successfully left, keep-alive canceled.
     Left,
+    /// Our membership timed out while we were still in the call: no restart
+    /// was confirmed within the delay, the homeserver no longer has it, or the
+    /// room dropped our membership.
+    /// Its leave is out, or goes out once the homeserver is reachable. Final:
+    /// the session ends, and only a new join brings us back.
+    Lost,
 }
 
 /// Information about the active keep-alive delayed event.
@@ -158,11 +208,9 @@ pub enum DelayedLeaveSupport {
     /// A delayed leave was armed successfully at least once.
     Supported,
     /// The last arm failed. `permanent` distinguishes a homeserver that said so
-    /// in as many words from one that merely failed; `last_probe_ms` paces the
-    /// retries in the latter case.
+    /// in as many words from one that merely failed; the latter is retried on
+    /// the backoff.
     Unsupported {
-        /// Unix ms of the last arm attempt.
-        last_probe_ms: u64,
         /// Whether the failure was classified as "this will never work".
         permanent: bool,
     },
@@ -184,7 +232,7 @@ impl DelayedLeaveSupport {
 /// that quietly drops out every thirty seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MembershipTimings {
-    /// How long the delayed leave waits before firing, restarted on every beat.
+    /// How long the delayed leave waits before firing; restarted 30 % into it.
     pub keep_alive_timeout_ms: u64,
     /// How long the homeserver keeps our sticky-map entry.
     pub sticky_duration_ms: u64,
@@ -208,7 +256,7 @@ impl Default for MembershipTimings {
 /// It implements the dead man's switch strategy:
 /// 1. Schedule delayed leave membership event (safety net)
 /// 2. Send join membership sticky event
-/// 3. Heartbeat (every n seconds) -> restarts the delayed leave
+/// 3. Keep-alive -> restarts the delayed leave 30 % into its delay
 ///
 /// The delayed leave is scheduled FIRST because it's safer - if the client dies at any
 /// point, worst case we're cleaning up our membership.
@@ -268,6 +316,26 @@ pub struct OwnMembershipMachine<T: MatrixBackend> {
     /// flight could re-send the join content after the leave content and put
     /// us back in the call.
     sending: AsyncMutex<()>,
+    /// A delayed leave of an earlier join of this membership, to retire before
+    /// joining; see [`Self::supersede_delayed_leave`].
+    superseded: Mutex<Option<String>>,
+    /// Retries of the delayed leave (restart, or arm when none is armed).
+    retry: Mutex<Backoff>,
+    /// Retries of the sticky refresh.
+    sticky_retry: Mutex<Backoff>,
+    /// When the last restart was attempted, successful or not; only
+    /// [`legacy_policy`] paces by it.
+    last_attempt_ms: AtomicU64,
+    /// Whether the loss was announced, so it is announced once.
+    loss_reported: std::sync::atomic::AtomicBool,
+    /// The clock's anchor: `epoch` read as wall-clock `epoch_wall_ms`. The
+    /// keep-alive's deadlines are measured from it on the monotonic clock, so
+    /// a wall-clock jump cannot move them.
+    epoch: Instant,
+    epoch_wall_ms: u64,
+    /// Added to the clock, so a test can move time without sleeping.
+    #[cfg(test)]
+    clock_offset_ms: AtomicU64,
 }
 
 /// The membership event we last put in the sticky map, and when.
@@ -320,7 +388,43 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             last_sticky: Arc::new(Mutex::new(None)),
             latest_event_id: watch::Sender::new(None),
             sending: AsyncMutex::new(()),
+            superseded: Mutex::new(None),
+            retry: Mutex::new(Backoff::default()),
+            sticky_retry: Mutex::new(Backoff::default()),
+            epoch: Instant::now(),
+            epoch_wall_ms: now_ms(),
+            last_attempt_ms: AtomicU64::new(now_ms()),
+            loss_reported: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            clock_offset_ms: AtomicU64::new(0),
         }
+    }
+
+    /// The clock everything here is decided on: Unix ms, advanced
+    /// monotonically from the machine's creation.
+    fn now(&self) -> u64 {
+        let now = self.epoch_wall_ms + self.epoch.elapsed().as_millis() as u64;
+        #[cfg(test)]
+        return now + self.clock_offset_ms.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        now
+    }
+
+    /// Moves this machine's clock forward.
+    #[cfg(test)]
+    pub(crate) fn advance_clock_ms(&self, ms: u64) {
+        self.clock_offset_ms.fetch_add(ms, Ordering::Relaxed);
+    }
+
+    /// Retire `delay_id` before the next [`Self::join`]: the delayed leave of an
+    /// earlier join of this membership that ended [`OwnMembershipState::Lost`].
+    ///
+    /// Left alone, it may fire *after* the new join — a homeserver coming back
+    /// sends its overdue delays as soon as it can — and end the membership we
+    /// just made. The join cancels it first; `M_NOT_FOUND` means it fired
+    /// already, which is as good.
+    pub fn supersede_delayed_leave(&self, delay_id: String) {
+        *self.superseded.lock().unwrap() = Some(delay_id);
     }
 
     /// Creates a new own membership machine with the default keep-alive timeout.
@@ -446,6 +550,42 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             *state_guard = OwnMembershipState::Joining;
         }
 
+        // Step 0: retire the delayed leave of an earlier join of this
+        // membership, or it may end this one when it fires. Sent now, so the
+        // old membership ends with its leave; cancelled where the host cannot
+        // send one.
+        let superseded = self.superseded.lock().unwrap().take();
+        if let Some(old) = superseded {
+            let retired = match self
+                .backend
+                .send_delayed_event_now(room_id.clone(), old.clone())
+                .await
+            {
+                Err(error) if error.is_not_implemented() => {
+                    self.backend
+                        .cancel_delayed_event(room_id.clone(), old.clone())
+                        .await
+                }
+                sent => sent,
+            };
+            match retired {
+                Ok(()) => log::info!("[{room_id}] retired the earlier delayed leave {old}"),
+                Err(error) if error.is_delayed_event_gone() => {
+                    log::info!("[{room_id}] the earlier delayed leave {old} has already fired")
+                }
+                Err(error) => {
+                    // Not joining: the old leave could still land after us. The
+                    // caller retries with the delay it still holds.
+                    *self.state.lock().unwrap() = OwnMembershipState::NotJoined;
+                    log::warn!(
+                        "[{room_id}] join deferred: the earlier delayed leave could not be \
+                         retired yet ({error})"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
         // Step 1: Schedule delayed leave event FIRST (safety net)
         // If client dies at any point, worst case we're cleaning up.
         // **We await this to ensure the delayed event is scheduled before proceeding.**
@@ -457,7 +597,10 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         );
 
         // Schedule the delayed leave (Step 1 of dead man's switch)
-        // This returns the event_id on success
+        // This returns the event_id on success. The homeserver's timer starts
+        // at the request at the earliest, so the local deadline counts from
+        // before it, never later than the server's.
+        let armed_at = self.now();
         match self
             .backend
             .send_delayed_event(
@@ -472,12 +615,14 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             // Store the delayed event ID for later cancellation
             Ok(delayed_event_id) => {
                 *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+                self.retry.lock().unwrap().reset();
                 let mut info_guard = self.keep_alive_info.lock().unwrap();
                 *info_guard = Some(KeepAliveInfo {
                     delayed_event_id,
                     timeout_ms: keep_alive_timeout_ms,
-                    last_restart_ms: now_ms(),
+                    last_restart_ms: armed_at,
                 });
+                self.last_attempt_ms.store(armed_at, Ordering::Relaxed);
             }
             // Not fatal: the dead man's switch is a cleanup optimisation, not a
             // precondition for being in the call. Join without it, and let the
@@ -488,6 +633,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             // can happen; see `published_lifetime_ms`.
             Err(error) => {
                 self.mark_delayed_leave_unsupported(&error);
+                self.retry.lock().unwrap().failed(self.now());
                 self.published_lifetime_ms
                     .store(self.degraded_lifetime_ms, Ordering::Relaxed);
                 log::warn!(
@@ -537,7 +683,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             let mut guard = self.last_sticky.lock().unwrap();
             *guard = Some(SentSticky {
                 content: join_content,
-                sent_at_ms: now_ms(),
+                sent_at_ms: self.now(),
             });
         }
         self.latest_event_id.send_replace(Some(event_id.clone()));
@@ -560,11 +706,9 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     ///
     /// A homeserver that named the reason ([`CommandError::DelayedEventsNotSupported`])
     /// is taken at its word and never asked again; anything else may have been a
-    /// blip, so the heartbeat re-probes on
-    /// [`DELAYED_LEAVE_PROBE_INTERVAL_MS`].
+    /// blip, so it is asked again on the backoff.
     fn mark_delayed_leave_unsupported(&self, error: &CommandError) {
         *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Unsupported {
-            last_probe_ms: now_ms(),
             permanent: error.is_delayed_events_unsupported(),
         };
     }
@@ -617,8 +761,29 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         let slot_id = self.slot_id.clone();
         let sticky_key = self.sticky_key.clone();
 
+        // A lost membership is already out of the call, and the homeserver may
+        // be unreachable: tidy up locally and send nothing. A leave retried into
+        // a later rejoin would end it.
+        if self.state() == OwnMembershipState::Lost {
+            *self.last_sticky.lock().unwrap() = None;
+            self.latest_event_id.send_replace(None);
+            *self.state.lock().unwrap() = OwnMembershipState::Left;
+            log::info!("[{room_id}] left a lost membership locally; nothing sent");
+            return Ok(());
+        }
+
         // A voluntary leave with no stated cause is MSC4143's plain `leave` code.
-        let leave_reason = Some(leave_reason.unwrap_or_else(|| LeaveReason::new(LeaveCode::Leave)));
+        // `MembershipLost` never goes on the wire; a host echoing it leaves
+        // plainly, with its explanation.
+        let leave_reason = Some(match leave_reason {
+            None => LeaveReason::new(LeaveCode::Leave),
+            Some(reason) if reason.code == LeaveCode::MembershipLost => LeaveReason {
+                code: LeaveCode::Leave,
+                reason: reason.reason,
+                delay_id: None,
+            },
+            Some(reason) => reason,
+        });
         let leave_content = serde_json::to_value(RawStickyEventContent::for_leave(
             slot_id.clone(),
             sticky_key.clone(),
@@ -691,37 +856,57 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         Ok(())
     }
 
-    /// Restarts the keep-alive: pushes the delayed leave's timer back out, and
-    /// re-sends the membership if its sticky entry is nearing expiry.
+    /// Tends the keep-alive: restarts the delayed leave when due, re-sends the
+    /// membership if its sticky entry is nearing expiry, and notices when the
+    /// membership has timed out ([`OwnMembershipState::Lost`]).
     ///
-    /// Ticked on an interval by the session's upkeep while joined.
+    /// Woken by the session's upkeep when [`Self::next_due_at_ms`] says so; a
+    /// wake-up with nothing due does nothing, so waking early is harmless.
     ///
-    /// Uses MSC4140's `restart` action rather than cancel-then-reschedule. That
-    /// matters for three reasons: it is one request instead of two; there is
-    /// never a moment with no delayed leave armed; and it cannot leak a delay.
-    /// A leaked delay is not benign — nobody restarts it, so it fires, and
-    /// because the sticky map resolves conflicts by *last to expire* (MSC4354),
-    /// its leave out-expires our live membership and marks us departed while we
-    /// are still in the call.
+    /// The restart falls due [`LOCAL_RESTART_PERCENT`] into the delay after the
+    /// last confirmed one. A failed restart is retried on an exponential backoff
+    /// with jitter, brought forward to the delay's deadline. The delay itself is
+    /// never replaced while we are joined: a restart can fail while it sits
+    /// there perfectly armed, and a second one would leak — nobody restarts it,
+    /// so it fires and marks us departed mid-call.
     ///
-    /// Fire-and-forget (no `Result`): a failure is retried on the next tick.
-    /// A no-op unless joined, so a tick that waited out a leave sends nothing.
+    /// Instead its lifecycle is followed: past the deadline with no confirmed
+    /// restart, or answered with `M_NOT_FOUND`, our leave is out and the
+    /// membership is [`OwnMembershipState::Lost`]. Nothing is sent then; see
+    /// the module documentation.
+    ///
+    /// Uses MSC4140's `restart` action rather than cancel-then-reschedule: one
+    /// request, never a moment with nothing armed, and no leaked delay.
+    ///
+    /// Fire-and-forget (no `Result`). A no-op unless joined, so a wake-up that
+    /// waited out a leave sends nothing.
     pub async fn keep_alive(&self) {
         let _sending = self.sending.lock().await;
         if self.state() != OwnMembershipState::Joined {
             return;
         }
+        log::trace!("[{}] keep-alive", self.room_id);
+
+        // Two independent clocks expire our membership: the delayed leave
+        // first, then the sticky-map entry. In that order, and the refresh
+        // bounded by whatever falls due next, so a slow homeserver answering
+        // the refresh can never keep the restart from being tried.
+        self.tend_delayed_leave().await;
+        if self.state() == OwnMembershipState::Joined {
+            let until = self.next_due_at_ms();
+            let _ = self.within(until, self.refresh_sticky_if_due()).await;
+        }
+    }
+
+    /// The delayed-leave half of [`Self::keep_alive`]: restart when due, retry
+    /// on the backoff, arm when none is armed, notice the deadline passing.
+    async fn tend_delayed_leave(&self) {
         let room_id = self.room_id.clone();
-        log::trace!("[{}] restarting keep-alive", room_id);
-
-        // Two independent clocks expire our membership, and the heartbeat tends
-        // both: the sticky-map entry here, and the delayed leave below.
-        self.refresh_sticky_if_due().await;
-
-        let Some(event_id) = self.delayed_event_id() else {
-            // Nothing armed (not joined, or a previous arm failed). Arming one
-            // is the safe move: without it a crash leaves a ghost behind.
-            if self.state() == OwnMembershipState::Joined && self.delayed_leave_probe_due() {
+        let now = self.now();
+        let Some(info) = self.keep_alive_info.lock().unwrap().clone() else {
+            // Nothing armed: the homeserver refused one. Arming one is the safe
+            // move — without it a crash leaves a ghost behind.
+            if self.delayed_leave_probe_due(now) {
                 let was_degraded = !self.delayed_leave_supported();
                 match self.schedule_delayed_leave().await {
                     // The membership lifetime stays where the join left it. It
@@ -736,6 +921,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                     Ok(()) => {}
                     Err(error) => {
                         self.mark_delayed_leave_unsupported(&error);
+                        self.retry.lock().unwrap().failed(now);
                         log::warn!("[{room_id}] Failed to arm a delayed leave: {error:?}");
                     }
                 }
@@ -743,91 +929,212 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             return;
         };
 
-        match self
-            .backend
-            .restart_delayed_event(room_id.clone(), event_id.clone())
-            .await
-        {
+        let deadline = info.last_restart_ms.saturating_add(info.timeout_ms);
+        if now >= deadline {
+            self.lose(&format!(
+                "no restart of delayed leave {} was confirmed within its {}ms delay",
+                info.delayed_event_id, info.timeout_ms,
+            ));
+            return;
+        }
+        if !self.restart_due(&info, now) {
+            return;
+        }
+
+        self.last_attempt_ms.store(now, Ordering::Relaxed);
+        let restart = self.within_deadline(
+            self.backend
+                .restart_delayed_event(room_id.clone(), info.delayed_event_id.clone()),
+        );
+        let Some(restarted) = restart.await else {
+            self.lose(&format!(
+                "the restart of delayed leave {} was not answered before its deadline",
+                info.delayed_event_id,
+            ));
+            return;
+        };
+        match restarted {
             Ok(()) => {
+                self.retry.lock().unwrap().reset();
                 let mut guard = self.keep_alive_info.lock().unwrap();
-                if let Some(info) = guard.as_mut()
-                    && info.delayed_event_id == event_id
+                if let Some(current) = guard.as_mut()
+                    && current.delayed_event_id == info.delayed_event_id
                 {
-                    info.last_restart_ms = now_ms();
+                    current.last_restart_ms = now;
                 }
             }
+            Err(error) if error.is_delayed_event_gone() => {
+                self.lose(&format!(
+                    "the homeserver no longer has delayed leave {}: it fired",
+                    info.delayed_event_id,
+                ));
+            }
             Err(error) => {
-                // Retry on the next beat rather than replacing it: a restart can
-                // fail transiently while the delay is still perfectly armed, and
-                // scheduling a second one would leak the first.
+                let mut retry = self.retry.lock().unwrap();
+                if legacy_policy::enabled() {
+                    // The policy before this one: no retry before the next beat.
+                    retry.reset();
+                } else {
+                    // From the failure, not the attempt: a request that took
+                    // its whole timeout must still be followed by a jittered
+                    // wait, or the retries go out back to back.
+                    let failed_at = self.now();
+                    retry.failed(failed_at);
+                    // Denser, not sparser, as the deadline nears: never wait
+                    // more than half the time left. A homeserver back with
+                    // seconds to spare must find a retry in those seconds.
+                    let left = deadline.saturating_sub(failed_at);
+                    retry.clamp_to(failed_at, failed_at + (left / 2).max(MIN_RETRY_MS));
+                }
                 log::warn!(
-                    "[{room_id}] Failed to restart delayed leave {event_id}: {error:?}. \
-                     Retrying on the next heartbeat.",
+                    "[{room_id}] Failed to restart delayed leave {}: {error:?}. Retrying at {:?} \
+                     (deadline {deadline}).",
+                    info.delayed_event_id,
+                    retry.retry_due_at_ms(),
                 );
-                self.rearm_if_certainly_fired().await;
             }
         }
     }
 
-    /// Whether it is worth asking the homeserver for a delayed leave again.
+    /// Runs `request` until it completes or the armed delay's deadline passes,
+    /// whichever comes first; `None` if the deadline won. Unbounded while
+    /// nothing is armed, and off a runtime.
     ///
-    /// Always, unless it has already refused one: a homeserver that refused in
-    /// as many words is never asked again, and one that merely failed is asked
-    /// at [`DELAYED_LEAVE_PROBE_INTERVAL_MS`] rather than on every beat, so a
-    /// permanently-off endpoint is not hammered every ten seconds for the
-    /// length of a call.
-    fn delayed_leave_probe_due(&self) -> bool {
+    /// The request is dropped at the deadline, which cancels it. A homeserver
+    /// cut off by a partition does not refuse requests, it never answers them,
+    /// and the host's own timeouts and retries can outlast the whole delay.
+    pub(crate) async fn within_deadline<F: std::future::Future>(
+        &self,
+        request: F,
+    ) -> Option<F::Output> {
+        let deadline = self
+            .keep_alive_info
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|info| info.last_restart_ms.saturating_add(info.timeout_ms));
+        self.within(deadline, request).await
+    }
+
+    /// Runs `request` until it completes or `until_ms` passes; `None` if time
+    /// ran out. Unbounded without `until_ms`, and off a runtime (a host ticking
+    /// us itself has no timer to race against; its own cadence bounds the
+    /// wait there).
+    async fn within<F: std::future::Future>(
+        &self,
+        until_ms: Option<u64>,
+        request: F,
+    ) -> Option<F::Output> {
+        let Some(until_ms) = until_ms.filter(|_| crate::executor::can_spawn()) else {
+            return Some(request.await);
+        };
+        let left = std::time::Duration::from_millis(until_ms.saturating_sub(self.now()));
+        tokio::select! {
+            output = request => Some(output),
+            _ = crate::executor::sleep(left) => None,
+        }
+    }
+
+    /// Whether the delayed leave `info` describes is due a restart at `now`: a
+    /// pending retry once it is due, otherwise [`LOCAL_RESTART_PERCENT`] into
+    /// the delay after the last confirmed restart.
+    fn restart_due(&self, info: &KeepAliveInfo, now: u64) -> bool {
+        if legacy_policy::enabled() {
+            return now >= self.legacy_restart_at();
+        }
+        match self.retry.lock().unwrap().retry_due_at_ms() {
+            Some(due) => now >= due,
+            None => now >= Self::restart_at(info),
+        }
+    }
+
+    /// Under [`legacy_policy`]: one attempt per beat, successful or not.
+    fn legacy_restart_at(&self) -> u64 {
+        self.last_attempt_ms.load(Ordering::Relaxed) + legacy_policy::INTERVAL_MS
+    }
+
+    fn restart_at(info: &KeepAliveInfo) -> u64 {
+        info.last_restart_ms
+            .saturating_add(info.timeout_ms * LOCAL_RESTART_PERCENT / 100)
+    }
+
+    /// Whether a loss is to be announced now: true once per machine, the
+    /// first time it is asked after the membership was lost.
+    pub(crate) fn take_loss_report(&self) -> bool {
+        self.state() == OwnMembershipState::Lost && !self.loss_reported.swap(true, Ordering::SeqCst)
+    }
+
+    /// The membership is gone; see [`OwnMembershipState::Lost`].
+    pub(crate) fn lose(&self, why: &str) {
+        *self.state.lock().unwrap() = OwnMembershipState::Lost;
+        log::warn!(
+            "[{}] our membership is lost: {why}. Nothing more is sent for this join.",
+            self.room_id,
+        );
+    }
+
+    /// When the next [`Self::keep_alive`] has something to do for the delayed
+    /// leave — a restart, a retry, the delay's deadline, an arm — or `None`
+    /// while not joined.
+    ///
+    /// The sticky refresh is not in it: its lifetime is an hour, and it is
+    /// checked on every wake-up, which the upkeep's interval caps. A refresh
+    /// that drove the wake-ups would turn a tiny lifetime into a busy loop.
+    pub fn next_due_at_ms(&self) -> Option<u64> {
+        if self.state() != OwnMembershipState::Joined {
+            return None;
+        }
+        let now = self.now();
+        let mut due: Vec<u64> = Vec::new();
+        match self.keep_alive_info.lock().unwrap().as_ref() {
+            Some(info) if legacy_policy::enabled() => {
+                due.push(self.legacy_restart_at());
+                due.push(info.last_restart_ms.saturating_add(info.timeout_ms));
+            }
+            Some(info) => {
+                let retry = self.retry.lock().unwrap().retry_due_at_ms();
+                due.push(retry.unwrap_or_else(|| Self::restart_at(info)));
+                due.push(info.last_restart_ms.saturating_add(info.timeout_ms));
+            }
+            None if self.delayed_leave_probe_due(now) => due.push(now),
+            None => {
+                if let Some(retry) = self.retry.lock().unwrap().retry_due_at_ms()
+                    && !matches!(
+                        self.delayed_leave_support(),
+                        DelayedLeaveSupport::Unsupported {
+                            permanent: true,
+                            ..
+                        }
+                    )
+                {
+                    due.push(retry);
+                }
+            }
+        }
+        due.into_iter().min()
+    }
+
+    /// How long until [`Self::next_due_at_ms`], at most `cap`; `cap` while
+    /// nothing is due. Never less than [`MIN_WAKE_MS`], so nothing that keeps
+    /// being due can turn the upkeep into a busy loop.
+    pub fn next_due_in(&self, cap: std::time::Duration) -> std::time::Duration {
+        let floor = std::time::Duration::from_millis(MIN_WAKE_MS);
+        let wait = match self.next_due_at_ms() {
+            Some(due) => std::time::Duration::from_millis(due.saturating_sub(self.now())),
+            None => cap,
+        };
+        wait.min(cap).max(floor)
+    }
+
+    /// Whether it is worth asking the homeserver for a delayed leave again:
+    /// never once it refused in as many words, otherwise when the backoff
+    /// allows.
+    fn delayed_leave_probe_due(&self, now: u64) -> bool {
         match self.delayed_leave_support() {
-            DelayedLeaveSupport::Unknown | DelayedLeaveSupport::Supported => true,
             DelayedLeaveSupport::Unsupported {
                 permanent: true, ..
             } => false,
-            DelayedLeaveSupport::Unsupported {
-                last_probe_ms,
-                permanent: false,
-            } => now_ms().saturating_sub(last_probe_ms) >= DELAYED_LEAVE_PROBE_INTERVAL_MS,
-        }
-    }
-
-    /// Arms a fresh delayed leave, but only once the old one *must* be gone.
-    ///
-    /// A restart can keep failing for two very different reasons: the delay
-    /// vanished (it fired, or the server forgot it), in which case we are
-    /// unprotected and must re-arm; or the request keeps failing while the delay
-    /// sits there armed, in which case arming a second one leaks the first and
-    /// gets us marked as departed when it fires.
-    ///
-    /// The two are told apart by the clock rather than by the error: a delay
-    /// cannot still be pending once its full delay period has elapsed since the
-    /// last successful restart. Waiting for that moment makes the re-arm
-    /// leak-free without needing to interpret the server's error.
-    async fn rearm_if_certainly_fired(&self) {
-        let Some(info) = self.keep_alive_info.lock().unwrap().clone() else {
-            return;
-        };
-        if now_ms().saturating_sub(info.last_restart_ms) <= info.timeout_ms {
-            // It may well still be armed; leave it alone and retry the restart.
-            return;
-        }
-
-        let room_id = self.room_id.clone();
-        log::warn!(
-            "[{room_id}] Delayed leave {} has not been restarted for longer than its {}ms \
-             delay, so it has already fired; arming a replacement.",
-            info.delayed_event_id,
-            info.timeout_ms,
-        );
-        {
-            let mut guard = self.keep_alive_info.lock().unwrap();
-            *guard = None;
-        }
-        if let Err(error) = self.schedule_delayed_leave().await {
-            // Recorded so the probing slows down and the host can see that this
-            // call is unprotected. The membership lifetime does *not* follow —
-            // it was fixed at join and cannot be shortened now; see
-            // `published_lifetime_ms`.
-            self.mark_delayed_leave_unsupported(&error);
-            log::warn!("[{room_id}] Failed to arm a replacement delayed leave: {error:?}");
+            _ => self.retry.lock().unwrap().may_attempt(now),
         }
     }
 
@@ -850,8 +1157,9 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         // due and what it re-publishes — a refresh that stated a different
         // duration is what MSC4354 asks clients not to do.
         let lifetime_ms = self.membership_lifetime_ms();
-        let elapsed = now_ms().saturating_sub(sticky.sent_at_ms);
-        if elapsed < lifetime_ms / 2 {
+        let now = self.now();
+        let elapsed = now.saturating_sub(sticky.sent_at_ms);
+        if elapsed < lifetime_ms / 2 || !self.sticky_retry.lock().unwrap().may_attempt(now) {
             return;
         }
 
@@ -873,6 +1181,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             // The refresh replaces our entry in the sticky map, so from here on
             // *this* is the event a peer's reaction must relate to.
             Ok(event_id) => {
+                self.sticky_retry.lock().unwrap().reset();
                 self.latest_event_id.send_replace(Some(event_id));
                 let mut guard = self.last_sticky.lock().unwrap();
                 // Only advance the clock if we are still tracking the same
@@ -882,13 +1191,14 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 if let Some(current) = guard.as_mut()
                     && current.content == sticky.content
                 {
-                    current.sent_at_ms = now_ms();
+                    current.sent_at_ms = self.now();
                 }
             }
             Err(error) => {
+                self.sticky_retry.lock().unwrap().failed(now);
                 log::warn!(
-                    "[{room_id}] Failed to refresh sticky membership: {error:?}. \
-                     Retrying on the next heartbeat.",
+                    "[{room_id}] Failed to refresh sticky membership: {error:?}. Retrying on \
+                     the backoff.",
                 );
             }
         }
@@ -918,6 +1228,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         let delayed_content = self.build_delayed_leave_content(&slot_id, &sticky_key);
 
         // Schedule the delayed event and await its completion
+        let armed_at = self.now();
         let delayed_event_id = self
             .backend
             .send_delayed_event(
@@ -932,12 +1243,14 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         // Store the event ID
         {
             *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+            self.retry.lock().unwrap().reset();
             let mut info_guard = self.keep_alive_info.lock().unwrap();
             *info_guard = Some(KeepAliveInfo {
                 delayed_event_id,
                 timeout_ms: keep_alive_timeout_ms,
-                last_restart_ms: now_ms(),
+                last_restart_ms: armed_at,
             });
+            self.last_attempt_ms.store(armed_at, Ordering::Relaxed);
         }
 
         log::trace!("[{}] Delayed leave scheduled successfully", room_id);
@@ -949,12 +1262,16 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
-    use crate::host::backend::{MockBackend, NoopBackend, ToDeviceDelivery, ToDeviceRecipient};
+    use crate::host::backend::{
+        MockBackend, MockDelayFailure, NoopBackend, ToDeviceDelivery, ToDeviceRecipient,
+    };
     use crate::transport::RawRtcTransport;
 
     const APPLICATION_TYPE: &str = "m.call";
+
+    /// When a default local switch's restart falls due after the last one.
+    const RESTART_POINT_MS: u64 = DEFAULT_KEEP_ALIVE_TIMEOUT_MS * LOCAL_RESTART_PERCENT / 100;
 
     #[test]
     fn test_machine_starts_not_joined() {
@@ -1187,6 +1504,7 @@ mod tests {
             .delayed_event_id()
             .expect("join arms a delayed leave");
 
+        machine.advance_clock_ms(RESTART_POINT_MS);
         machine.keep_alive().await;
 
         // The beat restarts the existing delay in place: one request, the same
@@ -1228,48 +1546,292 @@ mod tests {
             .expect("join should succeed");
         let delay_id = machine.delayed_event_id().expect("armed by join");
 
-        // The mock fails every restart. The delay was armed moments ago, so it
-        // cannot have fired yet: keep it and retry next beat.
+        // The mock fails every restart. The delay is well inside its period,
+        // so it cannot have fired yet: keep it and retry on the backoff.
+        machine.advance_clock_ms(RESTART_POINT_MS);
         machine.keep_alive().await;
 
         assert_eq!(*sender.scheduled.lock().unwrap(), 1, "no replacement armed");
         assert_eq!(machine.delayed_event_id(), Some(delay_id));
+        assert_eq!(machine.state(), OwnMembershipState::Joined);
     }
 
-    /// Once a full delay period has passed with no successful restart, the old
-    /// delay must have fired, so arming a replacement is leak-free — and
-    /// necessary, or we are left with no dead man's switch at all.
+    /// The restart of a local switch falls due 30 % into its delay, not on
+    /// every wake-up.
     #[tokio::test]
-    async fn a_delay_that_must_have_fired_is_replaced() {
+    async fn a_local_restart_falls_due_at_thirty_percent_of_the_delay() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+
+        machine.advance_clock_ms(RESTART_POINT_MS - 100);
+        machine.keep_alive().await;
+        assert!(
+            mock.restarted_events.lock().unwrap().is_empty(),
+            "not due yet"
+        );
+
+        machine.advance_clock_ms(100);
+        machine.keep_alive().await;
+        assert_eq!(mock.restarted_events.lock().unwrap().len(), 1);
+    }
+
+    /// A restart the homeserver cannot answer is retried on the backoff, and
+    /// the retry is never planned past the delay's deadline.
+    #[tokio::test]
+    async fn a_failed_restart_is_retried_before_the_deadline() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        *mock.restart_failure.lock().unwrap() = Some(MockDelayFailure::Unreachable);
+
+        let joined_at = machine.now();
+        machine.advance_clock_ms(RESTART_POINT_MS);
+        machine.keep_alive().await;
+
+        let due = machine.next_due_at_ms().expect("still joined");
+        let now = machine.now();
+        assert!(due > now, "the retry waits");
+        assert!(
+            due <= now + 1_500,
+            "the first retry is within the first backoff step"
+        );
+        assert!(due <= joined_at + DEFAULT_KEEP_ALIVE_TIMEOUT_MS);
+    }
+
+    /// Past the delay's deadline with no confirmed restart, our leave is out:
+    /// the membership is lost, and nothing is sent for it — the homeserver is
+    /// most likely unreachable.
+    #[tokio::test]
+    async fn a_switch_not_restarted_within_its_delay_loses_the_membership() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        *mock.restart_failure.lock().unwrap() = Some(MockDelayFailure::Unreachable);
+        let delay_id = machine.delayed_event_id().unwrap();
+        let sent_before = mock.sticky_events.lock().unwrap().len();
+
+        machine.advance_clock_ms(DEFAULT_KEEP_ALIVE_TIMEOUT_MS);
+        machine.keep_alive().await;
+
+        assert_eq!(machine.state(), OwnMembershipState::Lost);
+        assert_eq!(machine.next_due_at_ms(), None, "nothing more to do");
+        assert_eq!(
+            machine.delayed_event_id(),
+            Some(delay_id),
+            "kept for a rejoin"
+        );
+        assert_eq!(
+            mock.delayed_events.lock().unwrap().len(),
+            1,
+            "no replacement"
+        );
+        assert!(
+            mock.cancelled_events.lock().unwrap().is_empty(),
+            "nothing cancelled"
+        );
+        assert_eq!(
+            mock.sticky_events.lock().unwrap().len(),
+            sent_before,
+            "no leave sent"
+        );
+    }
+
+    /// A homeserver behind a partition never answers. A restart waiting on it
+    /// must not carry us past the deadline: the membership is lost on time.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_that_never_returns_loses_the_membership_at_the_deadline() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        mock.restart_hangs.store(true, Ordering::Relaxed);
+
+        machine.advance_clock_ms(RESTART_POINT_MS);
+        machine.keep_alive().await;
+
+        assert_eq!(machine.state(), OwnMembershipState::Lost);
+        assert_eq!(
+            mock.restarted_events.lock().unwrap().len(),
+            1,
+            "it was tried"
+        );
+    }
+
+    /// The send timing against a homeserver that refuses every restart: the
+    /// first attempt at the restart point, then jittered retries whose waits
+    /// never exceed half the time left — denser as the deadline nears — all
+    /// before the deadline, and nothing once the membership is lost.
+    #[tokio::test]
+    async fn failed_restarts_are_retried_ever_denser_until_the_deadline() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        *mock.restart_failure.lock().unwrap() = Some(MockDelayFailure::Unreachable);
+        let joined_at = machine.now();
+        let deadline = joined_at + DEFAULT_KEEP_ALIVE_TIMEOUT_MS;
+
+        let mut attempts = Vec::new();
+        while machine.state() == OwnMembershipState::Joined {
+            let due = machine.next_due_at_ms().expect("joined");
+            machine.advance_clock_ms(due.saturating_sub(machine.now()));
+            let before = mock.restarted_events.lock().unwrap().len();
+            machine.keep_alive().await;
+            if mock.restarted_events.lock().unwrap().len() > before {
+                attempts.push(machine.now());
+            }
+        }
+
+        assert_eq!(machine.state(), OwnMembershipState::Lost);
+        assert!(
+            attempts[0].abs_diff(joined_at + RESTART_POINT_MS) <= 100,
+            "first attempt at the restart point: {attempts:?}",
+        );
+        assert!(attempts.len() >= 5, "retried, not given up: {attempts:?}");
+        assert!(attempts.iter().all(|t| *t < deadline), "{attempts:?}");
+        for pair in attempts.windows(2) {
+            let (prev, next) = (pair[0], pair[1]);
+            let gap = next - prev;
+            let ceiling = ((deadline - prev) / 2).max(MIN_RETRY_MS) + 100;
+            assert!(gap <= ceiling, "gap {gap} after {prev} exceeds {ceiling}");
+            assert!(gap >= 400, "gap {gap} below the backoff's floor");
+        }
+
+        let total = mock.restarted_events.lock().unwrap().len();
+        machine.advance_clock_ms(60_000);
+        machine.keep_alive().await;
+        assert_eq!(
+            mock.restarted_events.lock().unwrap().len(),
+            total,
+            "nothing after the loss"
+        );
+    }
+
+    /// One request at a time: a second wake-up while a restart hangs waits for
+    /// it rather than sending another.
+    #[tokio::test(start_paused = true)]
+    async fn never_two_restarts_in_flight() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        mock.restart_hangs.store(true, Ordering::Relaxed);
+        machine.advance_clock_ms(RESTART_POINT_MS);
+
+        tokio::join!(machine.keep_alive(), machine.keep_alive());
+
+        assert_eq!(mock.restarted_events.lock().unwrap().len(), 1);
+        assert_eq!(machine.state(), OwnMembershipState::Lost);
+    }
+
+    /// A restart answered with `M_NOT_FOUND` is hard evidence that the delay
+    /// fired: the membership is lost at once.
+    #[tokio::test]
+    async fn a_restart_the_homeserver_cannot_find_loses_the_membership() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        *mock.restart_failure.lock().unwrap() = Some(MockDelayFailure::Gone);
+
+        machine.advance_clock_ms(RESTART_POINT_MS);
+        machine.keep_alive().await;
+
+        assert_eq!(machine.state(), OwnMembershipState::Lost);
+    }
+
+    /// A join that supersedes a lost one retires the old delay first, so it
+    /// cannot fire after the join and end it.
+    #[tokio::test]
+    async fn a_superseded_delay_is_retired_before_the_join() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.supersede_delayed_leave("old-delay".to_owned());
+
+        machine.join(MemberTransports::default()).await.unwrap();
+
+        assert_eq!(
+            *mock.sent_now_events.lock().unwrap(),
+            vec![("!room:example.org".to_owned(), "old-delay".to_owned())],
+            "the old leave is sent, ending the old membership cleanly",
+        );
+        assert!(mock.cancelled_events.lock().unwrap().is_empty());
+        assert_eq!(machine.state(), OwnMembershipState::Joined);
+    }
+
+    /// A host that cannot send a delay now cancels it instead: as safe
+    /// against the old leave landing after the join.
+    #[tokio::test]
+    async fn a_host_without_send_now_cancels_the_superseded_delay() {
+        // `CancelFailsSender` leaves `send_delayed_event_now` at its default and
+        // answers every cancel with a plain error, so reaching that error is
+        // the proof the fallback ran.
         let sender = Arc::new(CancelFailsSender::default());
-        // A zero-length delay has always "already fired".
-        let machine = OwnMembershipMachine::new(
+        let machine = OwnMembershipMachine::with_default_timeout(
             sender.clone(),
             "!room:example.org".to_string(),
             "m.call#room".to_string(),
             "alice-device-a".to_string(),
             APPLICATION_TYPE.to_string(),
-            MembershipTimings {
-                keep_alive_timeout_ms: 0,
-                ..MembershipTimings::default()
-            },
         );
-        machine
+        machine.supersede_delayed_leave("old-delay".to_owned());
+
+        let error = machine
             .join(MemberTransports::default())
             .await
-            .expect("join should succeed");
+            .expect_err("the cancel failed, so the join waits");
+        assert!(error.to_string().contains("M_NOT_FOUND"), "{error}");
+        assert_eq!(*sender.scheduled.lock().unwrap(), 0, "nothing armed");
+    }
 
-        // Let real time pass the (zero) delay, so the check has unambiguously
-        // elapsed rather than sitting exactly on the boundary.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+    /// An old delay the homeserver no longer has has fired: as good as retired.
+    #[tokio::test]
+    async fn a_superseded_delay_that_already_fired_does_not_stop_the_join() {
+        let mock = Arc::new(MockBackend::new());
+        *mock.send_now_failure.lock().unwrap() = Some(MockDelayFailure::Gone);
+        let machine = test_machine(mock.clone());
+        machine.supersede_delayed_leave("old-delay".to_owned());
+
+        machine.join(MemberTransports::default()).await.unwrap();
+
+        assert_eq!(machine.state(), OwnMembershipState::Joined);
+    }
+
+    /// While the old delay cannot be retired, joining could be undone by it:
+    /// the join fails, sends nothing, and keeps it for the retry.
+    #[tokio::test]
+    async fn a_join_waits_until_the_superseded_delay_is_retired() {
+        let mock = Arc::new(MockBackend::new());
+        *mock.send_now_failure.lock().unwrap() = Some(MockDelayFailure::Unreachable);
+        let machine = test_machine(mock.clone());
+        machine.supersede_delayed_leave("old-delay".to_owned());
+
+        assert!(machine.join(MemberTransports::default()).await.is_err());
+        assert_eq!(machine.state(), OwnMembershipState::NotJoined);
+        assert!(mock.delayed_events.lock().unwrap().is_empty());
+        assert!(mock.sticky_events.lock().unwrap().is_empty());
+
+        // The caller retries with the delay it still holds, as a rejoin does.
+        *mock.send_now_failure.lock().unwrap() = None;
+        machine.supersede_delayed_leave("old-delay".to_owned());
+        machine.join(MemberTransports::default()).await.unwrap();
+        assert_eq!(mock.sent_now_events.lock().unwrap().len(), 2, "asked again");
+    }
+
+    /// The upkeep sleeps until something is due: the restart while all is
+    /// well; the retry, and in any case the deadline, after a failure.
+    #[tokio::test]
+    async fn next_due_names_the_restart_then_the_retry() {
+        let mock = Arc::new(MockBackend::new());
+        let machine = test_machine(mock.clone());
+        machine.join(MemberTransports::default()).await.unwrap();
+        let joined_at = machine.now();
+
+        let due = machine.next_due_at_ms().unwrap();
+        assert!(due.abs_diff(joined_at + RESTART_POINT_MS) <= 100, "{due}");
+
+        *mock.restart_failure.lock().unwrap() = Some(MockDelayFailure::Unreachable);
+        machine.advance_clock_ms(RESTART_POINT_MS);
         machine.keep_alive().await;
-
-        assert_eq!(
-            *sender.scheduled.lock().unwrap(),
-            2,
-            "the fired delay should have been replaced"
-        );
-        assert!(machine.delayed_event_id().is_some());
+        let retry = machine.next_due_at_ms().unwrap();
+        assert!(retry < joined_at + DEFAULT_KEEP_ALIVE_TIMEOUT_MS);
     }
 
     fn test_machine(mock_sender: Arc<MockBackend>) -> OwnMembershipMachine<MockBackend> {
@@ -1709,12 +2271,9 @@ mod tests {
             .expect("join should succeed");
         assert!(!machine.delayed_leave_supported());
 
-        // Backdate the probe so the retry is due without waiting out the
-        // interval, then let the homeserver start accepting them.
-        *machine.delayed_support.lock().unwrap() = DelayedLeaveSupport::Unsupported {
-            last_probe_ms: 0,
-            permanent: false,
-        };
+        // Past the first backoff step, then let the homeserver start
+        // accepting them.
+        machine.advance_clock_ms(2_000);
         sender.accepts_now.store(true, Ordering::Relaxed);
 
         machine.keep_alive().await;
