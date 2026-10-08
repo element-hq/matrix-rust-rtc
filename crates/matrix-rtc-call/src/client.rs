@@ -679,6 +679,20 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .own_membership_event_id(&self.slot_id)
     }
 
+    /// The MSC4140 `delay_id` of the delayed leave protecting this
+    /// participation, or `None` once it is over or while nothing is armed.
+    /// Replaced when a fired delay is re-armed, so read it at the moment of use.
+    pub async fn delayed_leave_id(&self) -> Option<String> {
+        if !self.is_live() {
+            return None;
+        }
+        self.state
+            .lock()
+            .await
+            .rtc()
+            .own_delayed_leave_id(&self.slot_id)
+    }
+
     pub async fn member_count(&self) -> usize {
         self.subscribe_memberships().await.borrow().len()
     }

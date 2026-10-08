@@ -542,6 +542,12 @@ impl LiveKitCall {
         self.call.member_id()
     }
 
+    /// The MSC4140 `delay_id` of the delayed leave protecting this join; see
+    /// [`RtcSession::delayed_leave_id`](matrix_rtc_call::RtcSession::delayed_leave_id).
+    pub async fn delayed_leave_id(&self) -> Option<String> {
+        self.call.delayed_leave_id().await
+    }
+
     /// Number of members (including ourselves) currently joined to the slot,
     /// as signalled over sticky membership events.
     pub async fn member_count(&self) -> usize {

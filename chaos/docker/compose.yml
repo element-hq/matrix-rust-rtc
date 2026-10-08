@@ -1,0 +1,136 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# The chaos suite's stack: the demo backend's Synapse + lk-jwt-service +
+# LiveKit, rearranged so the *clients* live inside the compose network too.
+#
+# That is the point of a separate file. In demo/backend the test clients run on
+# the host, so the SFU advertises 127.0.0.1 and lk-jwt hands out
+# ws://localhost:7880. Here every participant is its own `peer` container, so a
+# fault — a partition, netem loss, SIGKILL — hits exactly one of them, and
+# every URL a peer is given must resolve from inside the network.
+#
+# Only Synapse's client API is published (on 18008, so this can run next to a
+# `make backend-up` stack): the harness provisions users and inspects delayed
+# events through it. Everything else is reached in-network. See ../README.md.
+
+name: matrix-rtc-chaos
+
+volumes:
+  synapse-data:
+  tls:
+
+services:
+  init-certs:
+    image: alpine/openssl:3.3.2
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        [ -f /certs/synapse.key ] || openssl req -x509 -newkey rsa:2048 -nodes \
+          -keyout /certs/synapse.key -out /certs/synapse.crt -days 3650 \
+          -subj "/CN=synapse" -addext "subjectAltName=DNS:synapse"
+    volumes:
+      - tls:/certs
+
+  # Same config as the demo stack: the service name is the server_name, and the
+  # sqlite DB lives in a named volume, so `docker restart synapse` — the
+  # suite's bread-and-butter fault — keeps every account, room and delayed
+  # event.
+  #
+  # The demo stack's pin. 1.161.0 is also what the suite's probes need: MSC4140's
+  # `GET /delayed_events/{delay_id}` (element-hq/synapse#19926) first shipped
+  # there. CHAOS_SYNAPSE_IMAGE runs the suite against another build.
+  synapse:
+    image: ${CHAOS_SYNAPSE_IMAGE:-ghcr.io/element-hq/synapse:v1.161.0}
+    # The demo config plus a small overlay; see synapse-chaos.yaml.
+    command:
+      - run
+      - --config-path=/cfg/homeserver.yaml
+      - --config-path=/cfg/synapse-chaos.yaml
+    environment:
+      UID: "0"
+      GID: "0"
+    volumes:
+      - ../../demo/backend/synapse/homeserver.yaml:/cfg/homeserver.yaml:ro
+      - ./synapse-chaos.yaml:/cfg/synapse-chaos.yaml:ro
+      - ../../demo/backend/synapse/lk-jwt-appservice.yaml:/cfg/lk-jwt-appservice.yaml:ro
+      - ../../demo/backend/synapse/log.config:/cfg/log.config:ro
+      - synapse-data:/data
+      - tls:/data/tls:ro
+    ports:
+      - "18008:8008"
+    depends_on:
+      init-certs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:8008/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  # Shares the SFU's network namespace, as in the demo stack. LIVEKIT_URL is
+  # both what peers are told to dial and what lk-jwt itself uses to create the
+  # room, so it has to be a name that resolves in both places — the service
+  # name does, where the demo stack's `localhost` only worked from the host.
+  # Also the application service behind Synapse's `/rtc/livekit/…` C-S
+  # endpoints, exactly as in the demo stack (same registration file).
+  auth-service:
+    image: ghcr.io/element-hq/lk-jwt-service:0.8.0
+    network_mode: "service:livekit"
+    environment:
+      LIVEKIT_JWT_BIND: ":6080"
+      LIVEKIT_URL: ws://livekit:7880
+      LIVEKIT_KEY: devkey
+      LIVEKIT_SECRET: secret
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
+      LIVEKIT_AS_REGISTRATION_FILE: /etc/lk-jwt-service/appservice.yaml
+      LIVEKIT_HS_SERVER_NAME: synapse
+      LIVEKIT_CS_API_URL_OVERRIDES: synapse=http://synapse:8008
+      LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
+      LIVEKIT_LOG_LEVEL: debug
+    volumes:
+      - ../../demo/backend/synapse/lk-jwt-appservice.yaml:/etc/lk-jwt-service/appservice.yaml:ro
+    depends_on:
+      synapse:
+        condition: service_healthy
+      livekit:
+        condition: service_healthy
+
+  livekit:
+    image: livekit/livekit-server:v1.10.1
+    command: --config /etc/livekit.yaml
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7880/"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # One participant. Never started by `up`: the harness runs one container
+  # per peer with `docker compose run --name chaos-<peer>`, talks to it over
+  # stdin/stdout, and applies faults with `docker exec` (hence NET_ADMIN, for
+  # iptables and tc). The binary is mounted rather than baked in, so a rebuild
+  # of chaos_peer needs no image rebuild; see ../build-peer.sh.
+  peer:
+    profiles: ["peer"]
+    build:
+      context: .
+      target: runtime
+    image: matrix-rtc-chaos-peer
+    cap_add:
+      - NET_ADMIN
+    stdin_open: true
+    volumes:
+      - ../bin:/opt/chaos:ro
+    environment:
+      HOMESERVER_URL: http://synapse:8008
+      LIVEKIT_SERVICE_URL: http://livekit:6080
+      RUST_LOG: ${CHAOS_PEER_LOG:-info,matrix_rtc_core=debug,matrix_rtc_call=debug,matrix_rtc_call_sdk=debug,matrix_rtc_livekit=debug,matrix_sdk=warn,livekit=warn,webrtc_sys=warn}
+    depends_on:
+      auth-service:
+        condition: service_started
