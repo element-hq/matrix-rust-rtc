@@ -16,6 +16,7 @@ use matrix_rtc_core::MaybeSend;
 
 use crate::connection::TransportError;
 use crate::frame::{AudioFrame, VideoFrame};
+use crate::stats::SendStats;
 use crate::stream::MediaStreamKind;
 
 /// PCM format the application will push into an audio publication.
@@ -155,5 +156,14 @@ pub trait LocalTrackHandle: MaybeSend {
         Err(TransportError::Unsupported(
             "this publication does not accept video frames".into(),
         ))
+    }
+
+    /// Per-layer send statistics for a video publication: what is encoded,
+    /// at which size, and which layers dynacast has paused.
+    ///
+    /// `None` for audio, before the first report, or from a transport that
+    /// exposes no send counters; the default. See [`SendStats`].
+    async fn send_stats(&self) -> Option<SendStats> {
+        None
     }
 }

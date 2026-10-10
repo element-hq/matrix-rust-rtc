@@ -35,7 +35,7 @@ use tokio::sync::Mutex as TokioMutex;
 use matrix_rtc_transport::{AudioFrame, LocalTrackHandle, VideoFrame};
 
 use super::MediaFfiError;
-use super::types::FfiStreamKind;
+use super::types::{FfiSendStats, FfiStreamKind};
 
 /// A chunk of interleaved 16-bit PCM.
 #[derive(Clone, Debug, uniffi::Record)]
@@ -361,6 +361,13 @@ impl FfiLocalTrack {
                 timestamp_us: frame.timestamp_us,
             })
             .map_err(|error| MediaFfiError::Transport(error.to_string()))
+    }
+
+    /// Per-layer send statistics for a video publication: each layer's
+    /// size, frame rate and bytes, and whether dynacast has paused it.
+    /// `None` for audio and before the first report.
+    pub async fn send_stats(&self) -> Option<FfiSendStats> {
+        self.inner.send_stats().await.map(Into::into)
     }
 }
 

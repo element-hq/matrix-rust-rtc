@@ -35,7 +35,7 @@ use livekit::webrtc::audio_source::native::NativeAudioSource;
 use livekit::webrtc::audio_stream::native::NativeAudioStream;
 use livekit::webrtc::native::frame_cryptor::EncryptionState as LkEncryptionState;
 use livekit::webrtc::prelude::AudioFrame as LkAudioFrame;
-use livekit::webrtc::stats::RtcStats;
+use livekit::webrtc::stats::{QualityLimitationReason, RtcStats};
 use livekit::webrtc::video_frame::{
     I420Buffer as LkI420Buffer, VideoBuffer, VideoFrame as LkVideoFrame,
     VideoRotation as LkVideoRotation,
@@ -50,8 +50,9 @@ use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
-    QualityLimit, ReceiveStats, RemoteTrackHandle, ResolvedConstraints, SpeakingParticipant,
-    StreamDemand, TransportConnection, TransportError, VideoDetail, VideoFrame, VideoRotation,
+    QualityLimit, QualityLimitation, ReceiveStats, RemoteTrackHandle, ResolvedConstraints,
+    SendLayerStats, SendStats, SpeakingParticipant, StreamDemand, TransportConnection,
+    TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
 use crate::identity::pseudonymous_identity;
@@ -635,6 +636,54 @@ impl LocalTrackHandle for LiveKitLocalTrack {
             buffer,
         });
         Ok(())
+    }
+
+    async fn send_stats(&self) -> Option<SendStats> {
+        if !matches!(self.source, LocalSource::Video(_)) {
+            return None;
+        }
+        let stats = match self.track.get_stats().await {
+            Ok(stats) => stats,
+            Err(error) => {
+                log::debug!("could not read send stats: {error}");
+                return None;
+            }
+        };
+        // One `OutboundRtp` entry per simulcast encoding (RTX rides inside
+        // its media stream's entry, unlike on the receive side).
+        let mut layers: Vec<SendLayerStats> = stats
+            .iter()
+            .filter_map(|entry| match entry {
+                RtcStats::OutboundRtp(outbound) => Some(SendLayerStats {
+                    rid: outbound.outbound.rid.clone(),
+                    frame_width: outbound.outbound.frame_width,
+                    frame_height: outbound.outbound.frame_height,
+                    frames_per_second: outbound.outbound.frames_per_second,
+                    frames_encoded: u64::from(outbound.outbound.frames_encoded),
+                    bytes_sent: outbound.sent.bytes_sent,
+                    active: outbound.outbound.active,
+                    quality_limitation: match outbound.outbound.quality_limitation_reason {
+                        QualityLimitationReason::None => QualityLimitation::None,
+                        QualityLimitationReason::Cpu => QualityLimitation::Cpu,
+                        QualityLimitationReason::Bandwidth => QualityLimitation::Bandwidth,
+                        QualityLimitationReason::Other => QualityLimitation::Other,
+                    },
+                }),
+                _ => None,
+            })
+            .collect();
+        if layers.is_empty() {
+            return None;
+        }
+        // A paused layer reports no current size, so order by the rid
+        // LiveKit assigns smallest-first (`q`, `h`, `f`) rather than by height.
+        layers.sort_by_key(|layer| match layer.rid.as_str() {
+            "q" => 0,
+            "h" => 1,
+            "f" => 2,
+            _ => 3,
+        });
+        Some(SendStats { layers })
     }
 }
 

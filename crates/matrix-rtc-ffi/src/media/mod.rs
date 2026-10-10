@@ -53,8 +53,8 @@ pub use session::{MediaSession, MediaSessionConfig, connect_media_session};
 pub use types::{
     FfiAudioSourceConfig, FfiCallEvent, FfiEndedReason, FfiFrameEncryptionDiagnostic,
     FfiFrameEncryptionState, FfiKeyRejection, FfiMediaConstraints, FfiParticipant,
-    FfiPublishOptions, FfiQualityLimit, FfiReceiveStats, FfiStreamKind, FfiStreamState,
-    FfiVideoDetail, FfiVideoSourceConfig,
+    FfiPublishOptions, FfiQualityLimit, FfiQualityLimitation, FfiReceiveStats, FfiSendLayerStats,
+    FfiSendStats, FfiStreamKind, FfiStreamState, FfiVideoDetail, FfiVideoSourceConfig,
 };
 
 /// Errors produced by the media layer of the FFI.
