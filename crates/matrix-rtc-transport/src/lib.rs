@@ -50,5 +50,5 @@ pub use keys::{
     ParticipantKey, SwitchCompleteListener,
 };
 pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
-pub use stats::ReceiveStats;
+pub use stats::{QualityLimitation, ReceiveStats, SendLayerStats, SendStats};
 pub use stream::MediaStreamKind;

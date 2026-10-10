@@ -46,6 +46,7 @@
 //! ```
 
 mod provision;
+mod simulcast;
 
 use std::env;
 use std::error::Error;
@@ -160,29 +161,42 @@ enum Scenario {
     SlotClosed,
 }
 
-/// Use `ALICE`/`BOB` (+`_PW`) when supplied (long-lived stacks with closed
-/// registration); otherwise register fresh throwaway users for this run.
 async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn Error>> {
-    if let (Ok(alice), Ok(bob)) = (env::var("ALICE"), env::var("BOB")) {
-        return Ok((
-            Credentials {
-                user: alice,
-                password: env::var("ALICE_PW").map_err(|_| "ALICE is set but ALICE_PW is not")?,
-            },
-            Credentials {
-                user: bob,
-                password: env::var("BOB_PW").map_err(|_| "BOB is set but BOB_PW is not")?,
-            },
-        ));
-    }
-
-    let http = reqwest::Client::builder()
-        .danger_accept_invalid_certs(cfg.insecure_tls)
-        .build()?;
-    let suffix = provision::run_suffix();
-    let alice = provision::register_user(&http, &cfg.homeserver, "alice", &suffix).await?;
-    let bob = provision::register_user(&http, &cfg.homeserver, "bob", &suffix).await?;
+    let [alice, bob] = credentials_for(cfg, ["alice", "bob"]).await?;
     Ok((alice, bob))
+}
+
+/// Use `ALICE`/`BOB`/... (+`_PW`) when every one of them is supplied
+/// (long-lived stacks with closed registration); otherwise register fresh
+/// throwaway users for this run.
+async fn credentials_for<const N: usize>(
+    cfg: &Config,
+    names: [&str; N],
+) -> Result<[Credentials; N], Box<dyn Error>> {
+    let supplied: Vec<_> = names
+        .iter()
+        .filter_map(|name| env::var(name.to_uppercase()).ok())
+        .collect();
+    let mut users = Vec::with_capacity(N);
+    if supplied.len() == N {
+        for (name, user) in names.iter().zip(supplied) {
+            let var = format!("{}_PW", name.to_uppercase());
+            let password = env::var(&var)
+                .map_err(|_| format!("{} is set but {var} is not", name.to_uppercase()))?;
+            users.push(Credentials { user, password });
+        }
+    } else {
+        let http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(cfg.insecure_tls)
+            .build()?;
+        let suffix = provision::run_suffix();
+        for name in names {
+            users.push(provision::register_user(&http, &cfg.homeserver, name, &suffix).await?);
+        }
+    }
+    Ok(users
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("one credential per name")))
 }
 
 /// Log in and start the sync service. Sliding sync enables the sticky-events
@@ -237,10 +251,10 @@ async fn login_and_sync(cfg: &Config, who: &Credentials) -> Result<SyncedClient,
 /// and invites `invitee`. Returns the new room id.
 async fn create_encrypted_room(
     client: &Client,
-    invitee: &UserId,
+    invitees: &[&UserId],
 ) -> Result<OwnedRoomId, Box<dyn Error>> {
     let mut request = CreateRoomRequest::new();
-    request.invite = vec![invitee.to_owned()];
+    request.invite = invitees.iter().map(|&id| id.to_owned()).collect();
     // `org.matrix.msc3401.call.member` is a *state* event, so `state_default`
     // (50) gates it and only the room creator could publish a membership — the
     // invitee, at PL 0, would fail their join with `M_FORBIDDEN`. Real Element
@@ -468,6 +482,15 @@ fn init_test_process() {
 }
 
 fn harness(scenario: Scenario, compat: MembershipFormat) {
+    run_to_completion(OVERALL_DEADLINE, |cfg| run(cfg, scenario, compat));
+}
+
+/// Run one end-to-end flow on a fresh runtime, panicking on failure or when
+/// it outlives `deadline`.
+fn run_to_completion<F>(deadline: Duration, flow: impl FnOnce(Config) -> F)
+where
+    F: std::future::Future<Output = Result<(), Box<dyn Error>>>,
+{
     init_test_process();
     let cfg = Config::from_env();
 
@@ -475,12 +498,10 @@ fn harness(scenario: Scenario, compat: MembershipFormat) {
         .enable_all()
         .build()
         .expect("failed to build tokio runtime");
-    let outcome = runtime.block_on(async {
-        tokio::time::timeout(OVERALL_DEADLINE, run(cfg, scenario, compat)).await
-    });
+    let outcome = runtime.block_on(async { tokio::time::timeout(deadline, flow(cfg)).await });
 
     match outcome {
-        Err(_) => panic!("e2e call did not finish within {OVERALL_DEADLINE:?}"),
+        Err(_) => panic!("e2e call did not finish within {deadline:?}"),
         Ok(Err(error)) => panic!("e2e call failed: {error}"),
         Ok(Ok(())) => {}
     }
@@ -500,7 +521,7 @@ async fn run(
     let alice_client = alice.client.clone();
 
     // 2. Alice creates the encrypted room and invites bob.
-    let room_id = create_encrypted_room(&alice.client, &bob_id).await?;
+    let room_id = create_encrypted_room(&alice.client, &[&bob_id]).await?;
     println!("[alice] created encrypted room {room_id}, invited {bob_id}");
 
     // 3. Both sync the new room; bob accepts the invite, and we wait for the
@@ -860,6 +881,8 @@ async fn wait_for_remote_track(
 /// Abort-on-drop guard for the synthetic video capture task.
 struct VideoPublisher {
     task: tokio::task::JoinHandle<()>,
+    /// The publication, for reading its send statistics.
+    track: std::sync::Arc<dyn matrix_rtc_transport::LocalTrackHandle>,
 }
 
 impl Drop for VideoPublisher {
@@ -868,19 +891,20 @@ impl Drop for VideoPublisher {
     }
 }
 
-// 640x360 so livekit publishes a regular multi-layer simulcast track; below
-// 480px the SDK emits a single-encoding simulcast (rid "q" only), a shape
-// worth keeping out of a correctness test.
-const PATTERN_WIDTH: u32 = 640;
-const PATTERN_HEIGHT: u32 = 360;
+// The size mobile captures at since plan 023: livekit encodes it as three
+// simulcast layers, 240x180, 480x360 and 960x720.
+const PATTERN: VideoSourceConfig = VideoSourceConfig {
+    width: 960,
+    height: 720,
+};
 
 /// An I420 frame whose left half is bright (Y=235) and right half dark
 /// (Y=16) — a split that survives VP8 compression comfortably.
-fn pattern_frame() -> VideoFrame {
-    let width = PATTERN_WIDTH as usize;
-    let height = PATTERN_HEIGHT as usize;
-    let chroma_width = PATTERN_WIDTH.div_ceil(2) as usize;
-    let chroma_height = PATTERN_HEIGHT.div_ceil(2) as usize;
+fn pattern_frame(size: VideoSourceConfig) -> VideoFrame {
+    let width = size.width as usize;
+    let height = size.height as usize;
+    let chroma_width = size.width.div_ceil(2) as usize;
+    let chroma_height = size.height.div_ceil(2) as usize;
 
     let mut data_y = vec![16u8; width * height];
     for row in data_y.chunks_exact_mut(width) {
@@ -888,10 +912,10 @@ fn pattern_frame() -> VideoFrame {
     }
     VideoFrame {
         buffer: I420Buffer {
-            width: PATTERN_WIDTH,
-            height: PATTERN_HEIGHT,
+            width: size.width,
+            height: size.height,
             data_y,
-            stride_y: PATTERN_WIDTH,
+            stride_y: size.width,
             data_u: vec![128u8; chroma_width * chroma_height],
             stride_u: chroma_width as u32,
             data_v: vec![128u8; chroma_width * chroma_height],
@@ -905,18 +929,24 @@ fn pattern_frame() -> VideoFrame {
 /// Publish the pattern as a camera track at ~15 fps through the
 /// transport-agnostic publish path.
 async fn publish_pattern_video(call: &LiveKitCall) -> Result<VideoPublisher, Box<dyn Error>> {
-    let track = call
-        .publish(PublishOptions::camera(VideoSourceConfig {
-            width: PATTERN_WIDTH,
-            height: PATTERN_HEIGHT,
-        }))
-        .await?;
+    publish_pattern(call, PublishOptions::camera(PATTERN)).await
+}
+
+/// Publish the pattern with `options` (its size included) and feed it at
+/// ~15 fps until the returned guard drops.
+async fn publish_pattern(
+    call: &LiveKitCall,
+    options: PublishOptions,
+) -> Result<VideoPublisher, Box<dyn Error>> {
+    let size = options.video.ok_or("a pattern needs a video source")?;
+    let track = call.publish(options).await?;
+    let capture = track.clone();
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(66));
         let mut captured = 0u64;
         loop {
             ticker.tick().await;
-            if let Err(error) = track.capture_video(pattern_frame()) {
+            if let Err(error) = capture.capture_video(pattern_frame(size)) {
                 eprintln!("[alice] video capture failed after {captured} frames: {error}");
                 break;
             }
@@ -927,7 +957,7 @@ async fn publish_pattern_video(call: &LiveKitCall) -> Result<VideoPublisher, Box
             }
         }
     });
-    Ok(VideoPublisher { task })
+    Ok(VideoPublisher { task, track })
 }
 
 /// Mean luma of the left and right halves of a frame, honouring the stride.

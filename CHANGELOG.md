@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- A local video publication reports send statistics per simulcast layer (size, frame rate, bytes, whether dynacast paused it), as `LocalTrackHandle::send_stats` and `FfiLocalTrack::send_stats`.
+
 ## v0.5.0-rc.2 - 2026-10-08
 
 ### Added

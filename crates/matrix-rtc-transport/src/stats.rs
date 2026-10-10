@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! Receive-side statistics for a subscribed remote track.
+//! Receive-side statistics for a subscribed remote track, and send-side
+//! statistics for each encoded layer of a local video publication.
 //!
 //! These exist to make one specific failure diagnosable from outside the
 //! library. The receive path produces frames at a fixed cadence whether or not
@@ -27,6 +28,11 @@
 //!   with [`ReceiveStats::packets_lost`] or `jitter` rising.
 //!
 //! Sample twice and compare: every field is a monotonic total, not a rate.
+//!
+//! On the send side, [`SendStats`] lists one entry per simulcast layer, so a
+//! publisher can see what it encodes: each layer's size and frame rate, whether
+//! the SFU still wants it ([`SendLayerStats::active`] — dynacast pauses a layer
+//! no subscriber asks for), and why the encoder is cutting quality.
 //!
 //! [`ConnectionEvent::EncryptionStateChanged`]: crate::ConnectionEvent::EncryptionStateChanged
 
@@ -64,4 +70,44 @@ pub struct ReceiveStats {
     /// How many separate times concealment kicked in — a better gap counter
     /// than the sample totals, which one long outage inflates.
     pub concealment_events: u64,
+}
+
+/// Why the encoder is currently sending less than it was asked to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QualityLimitation {
+    #[default]
+    None,
+    /// The device cannot encode fast enough.
+    Cpu,
+    /// The network estimate is too low for the requested bitrate.
+    Bandwidth,
+    Other,
+}
+
+/// One encoded layer of a local video publication.
+///
+/// Counters (`frames_encoded`, `bytes_sent`) are cumulative since publishing;
+/// sizes and frame rate are the encoder's current output.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SendLayerStats {
+    /// The simulcast layer id (`q`, `h`, `f` on LiveKit), empty for a
+    /// single-layer publication.
+    pub rid: String,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub frames_per_second: f64,
+    pub frames_encoded: u64,
+    /// Payload bytes sent on this layer.
+    pub bytes_sent: u64,
+    /// Whether the layer is being encoded. `false` once the SFU reports that
+    /// no subscriber wants it (dynacast); flat `frames_encoded` agrees.
+    pub active: bool,
+    pub quality_limitation: QualityLimitation,
+}
+
+/// Send-side statistics for a local video publication, one entry per encoded
+/// layer, smallest first.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SendStats {
+    pub layers: Vec<SendLayerStats>,
 }

@@ -461,6 +461,78 @@ impl From<matrix_rtc_transport::ReceiveStats> for FfiReceiveStats {
     }
 }
 
+/// Why the encoder is sending less than it was asked to (mirrors
+/// `matrix_rtc_transport::QualityLimitation`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiQualityLimitation {
+    None,
+    /// The device cannot encode fast enough.
+    Cpu,
+    /// The network estimate is too low.
+    Bandwidth,
+    Other,
+}
+
+impl From<matrix_rtc_transport::QualityLimitation> for FfiQualityLimitation {
+    fn from(reason: matrix_rtc_transport::QualityLimitation) -> Self {
+        use matrix_rtc_transport::QualityLimitation as Q;
+        match reason {
+            Q::None => Self::None,
+            Q::Cpu => Self::Cpu,
+            Q::Bandwidth => Self::Bandwidth,
+            Q::Other => Self::Other,
+        }
+    }
+}
+
+/// One encoded layer of a local video publication (mirrors
+/// `matrix_rtc_transport::SendLayerStats`). `frames_encoded` and `bytes_sent`
+/// are cumulative; sizes and frame rate are the encoder's current output.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiSendLayerStats {
+    /// The simulcast layer id (`q`, `h`, `f`), empty for a single layer.
+    pub rid: String,
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub frames_per_second: f64,
+    pub frames_encoded: u64,
+    pub bytes_sent: u64,
+    /// `false` once no subscriber wants the layer and the SFU paused it
+    /// (dynacast).
+    pub active: bool,
+    pub quality_limitation: FfiQualityLimitation,
+}
+
+/// Send-side statistics for a local video publication, one entry per encoded
+/// layer, smallest first. Obtain via [`FfiLocalTrack::send_stats`].
+///
+/// [`FfiLocalTrack::send_stats`]: super::FfiLocalTrack::send_stats
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiSendStats {
+    pub layers: Vec<FfiSendLayerStats>,
+}
+
+impl From<matrix_rtc_transport::SendStats> for FfiSendStats {
+    fn from(stats: matrix_rtc_transport::SendStats) -> Self {
+        Self {
+            layers: stats
+                .layers
+                .into_iter()
+                .map(|layer| FfiSendLayerStats {
+                    rid: layer.rid,
+                    frame_width: layer.frame_width,
+                    frame_height: layer.frame_height,
+                    frames_per_second: layer.frames_per_second,
+                    frames_encoded: layer.frames_encoded,
+                    bytes_sent: layer.bytes_sent,
+                    active: layer.active,
+                    quality_limitation: layer.quality_limitation.into(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// One of a participant's streams, named for a request: the pair
 /// `(member_id, kind)`, of any kind.
 ///

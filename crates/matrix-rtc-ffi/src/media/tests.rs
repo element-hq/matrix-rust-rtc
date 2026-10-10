@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use super::session::{MediaSessionConfig, connect_media_session};
 use super::types::{
-    FfiLocalState, FfiMediaConstraints, FfiStreamKind, FfiStreamRef, FfiTileId, FfiTileRoster,
-    FfiVideoDetail, zip_stream_stats,
+    FfiLocalState, FfiMediaConstraints, FfiQualityLimitation, FfiSendStats, FfiStreamKind,
+    FfiStreamRef, FfiTileId, FfiTileRoster, FfiVideoDetail, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 
@@ -170,6 +170,39 @@ fn constraint_dtos_fold_like_the_core_model() {
     ));
     let resolved = constraints.resolve(matrix_rtc_transport::MediaStreamKind::Camera);
     assert_eq!(resolved.demand, matrix_rtc_transport::StreamDemand::Paused);
+}
+
+#[test]
+fn send_stats_dtos_keep_every_layer_in_order() {
+    use matrix_rtc_transport::{QualityLimitation, SendLayerStats, SendStats};
+
+    let layer = |rid: &str, height: u32, active: bool| SendLayerStats {
+        rid: rid.to_owned(),
+        frame_width: height * 4 / 3,
+        frame_height: height,
+        active,
+        ..Default::default()
+    };
+    let mut top = layer("f", 720, false);
+    top.quality_limitation = QualityLimitation::Bandwidth;
+    let stats: FfiSendStats = SendStats {
+        layers: vec![layer("q", 180, true), layer("h", 360, true), top],
+    }
+    .into();
+
+    let shape: Vec<_> = stats
+        .layers
+        .iter()
+        .map(|l| (l.rid.as_str(), l.frame_height, l.active))
+        .collect();
+    assert_eq!(
+        shape,
+        [("q", 180, true), ("h", 360, true), ("f", 720, false)]
+    );
+    assert_eq!(
+        stats.layers[2].quality_limitation,
+        FfiQualityLimitation::Bandwidth
+    );
 }
 
 // ---- tile DTOs (spec 002) ------------------------------------------------------
