@@ -18,7 +18,8 @@ process can be `SIGKILL`ed without taking the harness with it.
 | Path | What it is |
 | --- | --- |
 | `crates/matrix-rtc-call-sdk/examples/chaos_peer.rs` | The client: one participant, driven over stdin, reporting JSON events on stdout (protocol in its module docs). |
-| `docker/compose.yml` | The stack. Synapse (config shared with `demo/backend`), lk-jwt, LiveKit, and the `peer` service the harness runs once per participant. |
+| `docker/compose.yml` | The stack. Synapse (config shared with `demo/backend`), a second federating Synapse (`synapse2`), lk-jwt, LiveKit, and the `peer` service the harness runs once per participant. |
+| `docker/synapse-*.yaml` | The overlays on the demo Synapse config: in-network URLs, federation inside compose, and what makes `synapse2` a different server. |
 | `docker/Dockerfile` | `runtime` (what a peer runs in: ubuntu 24.04 + iptables + tc) and `builder` (for non-Linux hosts). |
 | `build-peer.sh` | Builds `chaos_peer` into `chaos/bin/` (native on Linux, in `builder` elsewhere). |
 | `src/` | The harness: the stack, peers, faults, and the homeserver probes. Never links the SDK. |
@@ -34,7 +35,8 @@ cargo test -p matrix-rtc-chaos --test scenarios -- --ignored --nocapture --exact
 ```
 
 The harness brings the stack up itself (`matrix-rtc-chaos` compose project,
-Synapse on `localhost:18008`, so it coexists with `make backend-up`) and leaves
+Synapse on `localhost:18008` and `synapse2` on `localhost:18009`, so it
+coexists with `make backend-up`) and leaves
 it running for the next run. Tear down with
 `docker compose -f chaos/docker/compose.yml -p matrix-rtc-chaos down -v`.
 
@@ -127,11 +129,19 @@ delegation endpoint served (Element Call's probe: anything but 404).
 | `homeserver_outage_is_bridged_by_retries` | Synapse stopped right after a restart, back 20 s later | the host keeps its membership and delay (retries, denser near the deadline); the guest, on the replaced restart pacing (`KEEP_ALIVE_POLICY=legacy`: a restart every 10 s, no early retries; loss detection stays on), loses its — the retries are what saved the call |
 | `homeserver_outage_beyond_two_delays` | Synapse down 75 s | both report the loss while it is down, make no join attempts while offline, then rejoin once it is back |
 | `stale_leave_ends_and_rejoins` | the guest leaks a 3 s delayed leave of its own membership (`leak_delayed_leave`), homeserver healthy | when it lands, the guest ends its call (`membership_lost`) — everybody else counts it as left — and rejoins by itself |
+| `federated_join` | none; a third peer on `synapse2` joins | three members everywhere; every peer hears every other |
+| `federated_join_during_outage` | Synapse stopped right after a restart, back 20 s later; the `synapse2` peer joins meanwhile | the local pair never notices; within the federation catch-up bound (90 s) everybody sees three members and hears everybody; the host's timeline of the remote's arrival (on the SFU, member, key, audio) is printed |
 
 ### Known failures (the hardening backlog)
 
-None: every scenario passes in `state` mode. Scenarios failing for a known
-reason are `#[ignore]`d with that reason until the fix lands.
+Every scenario passes in `state` mode except one:
+
+- `federated_join_during_outage` fails on its last check: host and guest never
+  hear the remote. The remote sends its media key while `synapse` is down, the
+  send fails, and the core only re-addresses an unreached recipient when the
+  call's membership changes, which it does not after the homeserver is back.
+  The remote is a member within seconds of `synapse` returning, but stays
+  undecryptable for good. Fix: retry unreached recipients on a backoff.
 
 `homeserver_outage_beyond_keep_alive` and `long_partition_recovers` check that
 a peer reports its membership lost *while* it is still cut off. Before the
@@ -146,11 +156,8 @@ and no switch.
   homeserver-only partition must *not* end the membership, while losing the
   SFU must. Adds a `delegated` mode.
 - **Sticky events**, once the spec and the implementations settle.
-- **Federation.** A second, federated homeserver; a peer on it joins while the
-  first homeserver is down, forcing a key rotation nobody on the first can
-  hear about. Invariants: the local pair keeps decrypting each other
-  throughout, and every pair decrypts both ways within a bound once the
-  homeserver is back.
+- **More federation faults**: a partition between the two homeservers, an
+  outage of `synapse2`, a remote peer cut off from its own homeserver.
 - **Toxiproxy** in front of Synapse for slow or broken responses (5xx, resets,
   bandwidth caps), distinct from a clean restart.
 - **SFU and lk-jwt restarts**; an observer-only peer for ghost-membership

@@ -22,7 +22,9 @@ use crate::{Account, Homeserver, Peer, Result};
 
 const PROJECT: &str = "matrix-rtc-chaos";
 const HOMESERVER: &str = "http://localhost:18008";
-const BACKEND: [&str; 3] = ["synapse", "livekit", "auth-service"];
+/// The federated homeserver's client API, published on its own port.
+const HOMESERVER2: &str = "http://localhost:18009";
+const BACKEND: [&str; 4] = ["synapse", "synapse2", "livekit", "auth-service"];
 
 pub struct Stack {
     compose_file: PathBuf,
@@ -64,8 +66,15 @@ impl Stack {
         Ok(stack)
     }
 
+    /// The call's own homeserver, `synapse`.
     pub fn homeserver(&self) -> Homeserver {
-        Homeserver::new(HOMESERVER)
+        Homeserver::new("synapse", HOMESERVER)
+    }
+
+    /// The second homeserver, `synapse2`, federating with the first: for
+    /// participants who are not on the call's server.
+    pub fn homeserver2(&self) -> Homeserver {
+        Homeserver::new("synapse2", HOMESERVER2)
     }
 
     /// Where this scenario's logs go; also written to by [`Stack::dump_logs`].
@@ -74,7 +83,8 @@ impl Stack {
     }
 
     /// Start a peer container. `env` is on top of the compose defaults; the
-    /// account's credentials are added here.
+    /// account's credentials and homeserver are added here (`env` may still
+    /// override the homeserver).
     pub async fn spawn_peer(
         &self,
         name: &str,
@@ -98,7 +108,11 @@ impl Stack {
             ])
             .args(["--name", &container])
             .args(["-e", &format!("MX_USER={}", account.localpart)])
-            .args(["-e", &format!("MX_PASSWORD={}", account.password)]);
+            .args(["-e", &format!("MX_PASSWORD={}", account.password)])
+            .args([
+                "-e",
+                &format!("HOMESERVER_URL=http://{}:8008", account.service),
+            ]);
         for (key, value) in env {
             command.args(["-e", &format!("{key}={value}")]);
         }
@@ -143,17 +157,21 @@ impl Stack {
         self.wait_ready().await
     }
 
-    /// Synapse's client API from the host, and lk-jwt from inside the SFU's
-    /// namespace (its FROM-scratch image has no healthcheck of its own, and it
-    /// is deliberately not published).
+    /// Both homeservers' client APIs from the host, and lk-jwt from inside the
+    /// SFU's namespace (its FROM-scratch image has no healthcheck of its own,
+    /// and it is deliberately not published).
     async fn wait_ready(&self) -> Result<()> {
-        let hs = self.homeserver();
         let deadline = Instant::now() + Duration::from_secs(120);
-        while !hs.is_up().await {
-            if Instant::now() > deadline {
-                return Err("synapse did not come up within 120s".into());
+        for (name, hs) in [
+            ("synapse", self.homeserver()),
+            ("synapse2", self.homeserver2()),
+        ] {
+            while !hs.is_up().await {
+                if Instant::now() > deadline {
+                    return Err(format!("{name} did not come up within 120s").into());
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
         while self
             .compose(&[

@@ -1,0 +1,23 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# Layered over both chaos homeservers (`synapse` and `synapse2`), so they can
+# federate with each other inside the compose network. Synapse merges repeated
+# --config-path files shallowly: each top-level key here replaces the base's.
+
+# The default blocks outbound requests to private ranges, and compose networks
+# live in one (172.16.0.0/12): without this the servers never reach each other.
+ip_range_blacklist: []
+
+# Both servers present the suite's self-signed certificate on 8448.
+federation_verify_certificates: false
+
+# A destination that failed is backed off for at least 10 minutes by default,
+# so after a homeserver outage federation would sit idle far past any scenario.
+# Synapse also sweeps destinations owing catch-up every 60 s, which bounds how
+# long a queued event or to-device message waits once the peer is back.
+federation:
+  destination_min_retry_interval: 2s
+  destination_max_retry_interval: 10s

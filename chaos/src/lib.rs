@@ -10,6 +10,8 @@
 //! `LiveKitCall` facade over core, matrix-sdk backend and transport), and
 //! injects faults around them:
 //! homeserver restarts and outages, per-peer partitions and netem, SIGKILL.
+//! A second homeserver federating with the first hosts participants who are
+//! not on the call's own server.
 //!
 //! Scenarios live in `tests/scenarios.rs` and judge the stack by what the
 //! peers report (their JSON event streams) and by what the homeserver says
@@ -24,6 +26,10 @@ mod stack;
 pub use homeserver::{Account, DelayedEvent, Homeserver, now_ms};
 pub use peer::{Partition, Peer};
 pub use stack::Stack;
+
+/// How long a fresh call may take to converge. Generous: the first join after
+/// a stack start includes Synapse warming up and key upload.
+pub const CONVERGE: Duration = Duration::from_secs(120);
 
 use std::time::Duration;
 
@@ -72,10 +78,6 @@ pub struct TwoPeerCall {
     pub guest: Peer,
 }
 
-/// How long a fresh two-peer call may take to converge. Generous: the first
-/// join after a stack start includes Synapse warming up and key upload.
-const CONVERGE: Duration = Duration::from_secs(120);
-
 impl TwoPeerCall {
     /// Provision two users, start both peers and join them to one call.
     /// `env` is passed to both peers (e.g. `MEDIA=none`).
@@ -91,50 +93,116 @@ impl TwoPeerCall {
         host_env: &[(&str, &str)],
         guest_env: &[(&str, &str)],
     ) -> Result<Self> {
-        let mut host_extra = host_env.to_vec();
-        host_extra.push(("COMPAT", mode.compat()));
-        let mut guest_extra = guest_env.to_vec();
-        guest_extra.push(("COMPAT", mode.compat()));
         let hs = stack.homeserver();
         let host_account = hs.register("host").await?;
         let guest_account = hs.register("guest").await?;
-
-        let mut host_env = vec![("ROLE", "host"), ("INVITE", guest_account.user_id.as_str())];
-        host_env.extend_from_slice(&host_extra);
-        let mut host = stack
-            .spawn_peer("host", host_account.clone(), &host_env)
-            .await?;
-        let ready = host
-            .wait(0, CONVERGE, "host ready", |e| is_event(e, "ready"))
-            .await?;
-        let room_id = ready["room_id"]
-            .as_str()
-            .ok_or("host's ready event has no room_id")?
-            .to_owned();
-
-        let mut guest_env = vec![("ROLE", "guest"), ("ROOM_ID", room_id.as_str())];
-        guest_env.extend_from_slice(&guest_extra);
-        let mut guest = stack.spawn_peer("guest", guest_account, &guest_env).await?;
-        guest
-            .wait(0, CONVERGE, "guest ready", |e| is_event(e, "ready"))
-            .await?;
-
-        host.send("join").await?;
-        guest.send("join").await?;
-        for peer in [&host, &guest] {
-            // A refused join says so at once; waiting out CONVERGE would only
-            // report "no 2 members".
-            let settled = peer
-                .wait(0, CONVERGE, "2 members", |e| {
-                    status_member_count(e) == Some(2) || is_event(e, "join_failed")
-                })
-                .await?;
-            if is_event(&settled, "join_failed") {
-                return Err(format!("[{}] join failed: {}", peer.name, settled["message"]).into());
-            }
-        }
+        let invite = guest_account.user_id.clone();
+        let (mut host, room_id) = spawn_host(stack, mode, host_account, &invite, host_env).await?;
+        let mut guest =
+            spawn_guest(stack, mode, "guest", guest_account, &room_id, guest_env).await?;
+        join_and_wait(&mut [&mut host, &mut guest], 2).await?;
         Ok(Self { host, guest })
     }
+}
+
+/// A call on `synapse` with a third participant from the federated
+/// `synapse2`: `host` and `guest` are joined (two members) when this returns;
+/// `remote` is in the *room* already — it accepted the invite over
+/// federation, so `synapse` was up for that — but joins the *call* only when
+/// the scenario sends it `join`. All three share the one SFU.
+pub struct FederatedCall {
+    pub host: Peer,
+    pub guest: Peer,
+    pub remote: Peer,
+}
+
+impl FederatedCall {
+    /// Provision the three users (two on `synapse`, one on `synapse2`), start
+    /// all peers, and join `host` and `guest` to the call. `env` goes to all.
+    pub async fn start(stack: &Stack, mode: Mode, env: &[(&str, &str)]) -> Result<Self> {
+        let hs = stack.homeserver();
+        let host_account = hs.register("host").await?;
+        let guest_account = hs.register("guest").await?;
+        let remote_account = stack.homeserver2().register("remote").await?;
+        let invite = format!("{},{}", guest_account.user_id, remote_account.user_id);
+        let (mut host, room_id) = spawn_host(stack, mode, host_account, &invite, env).await?;
+        let mut guest = spawn_guest(stack, mode, "guest", guest_account, &room_id, env).await?;
+        // Its `join` waits until its homeserver sees all three in the room.
+        let mut remote_env = env.to_vec();
+        remote_env.push(("EXPECT_ROOM_MEMBERS", "3"));
+        let remote =
+            spawn_guest(stack, mode, "remote", remote_account, &room_id, &remote_env).await?;
+        join_and_wait(&mut [&mut host, &mut guest], 2).await?;
+        Ok(Self {
+            host,
+            guest,
+            remote,
+        })
+    }
+}
+
+/// Start the peer that creates the encrypted room and invites `invite` (a
+/// comma-separated list); returns it once ready, with the room's id.
+async fn spawn_host(
+    stack: &Stack,
+    mode: Mode,
+    account: Account,
+    invite: &str,
+    env: &[(&str, &str)],
+) -> Result<(Peer, String)> {
+    let mut full = vec![("ROLE", "host"), ("INVITE", invite)];
+    full.extend_from_slice(env);
+    full.push(("COMPAT", mode.compat()));
+    let host = stack.spawn_peer("host", account, &full).await?;
+    let ready = host
+        .wait(0, CONVERGE, "host ready", |e| is_event(e, "ready"))
+        .await?;
+    let room_id = ready["room_id"]
+        .as_str()
+        .ok_or("host's ready event has no room_id")?
+        .to_owned();
+    Ok((host, room_id))
+}
+
+/// Start a peer that accepts its invite to `room_id`; returns it once it is
+/// in the room (ready), not yet in the call.
+async fn spawn_guest(
+    stack: &Stack,
+    mode: Mode,
+    name: &str,
+    account: Account,
+    room_id: &str,
+    env: &[(&str, &str)],
+) -> Result<Peer> {
+    let mut full = vec![("ROLE", "guest"), ("ROOM_ID", room_id)];
+    full.extend_from_slice(env);
+    full.push(("COMPAT", mode.compat()));
+    let peer = stack.spawn_peer(name, account, &full).await?;
+    peer.wait(0, CONVERGE, &format!("{name} ready"), |e| {
+        is_event(e, "ready")
+    })
+    .await?;
+    Ok(peer)
+}
+
+/// Send `join` to every peer, then wait until each reports `count` members.
+async fn join_and_wait(peers: &mut [&mut Peer], count: u64) -> Result<()> {
+    for peer in peers.iter_mut() {
+        peer.send("join").await?;
+    }
+    for peer in peers.iter() {
+        // A refused join says so at once; waiting out CONVERGE would only
+        // report "no N members".
+        let settled = peer
+            .wait(0, CONVERGE, &format!("{count} members"), |e| {
+                status_member_count(e) == Some(count) || is_event(e, "join_failed")
+            })
+            .await?;
+        if is_event(&settled, "join_failed") {
+            return Err(format!("[{}] join failed: {}", peer.name, settled["message"]).into());
+        }
+    }
+    Ok(())
 }
 
 /// Whether `event` is a protocol event of this name.

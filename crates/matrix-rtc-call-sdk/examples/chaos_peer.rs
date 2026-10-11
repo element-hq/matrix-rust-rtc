@@ -55,6 +55,10 @@
 //! | `sync_state` | the sync service changed state |
 //! | `sfu` | an SFU connection transition (`reconnecting`, `reconnected`, `disconnected`) |
 //! | `track_subscribed` | the SFU forwarded a remote audio track (`identity`) |
+//! | `unknown_participant` | the SFU has a participant (`identity`) we have no membership for yet |
+//! | `participant_joined` | a member joined the call (`member_id`, `user_id`) |
+//! | `key_imported` | a member's media key was accepted (`member_id`, `identity`, `key_index`) |
+//! | `frame_encryption` | a member's frames changed decryption state (`member_id`, `state`, `diagnostic`) |
 //! | `audio` | one window of a peer's decrypted audio (`identity`, `rms`, `tone_440`) |
 //! | `call_ended` | the call ended without a `leave` (`reason`, and whether it is `rejoining`); the process stays up |
 //! | `rejoin_waiting` | a rejoin is due but sync says the homeserver is unreachable; it waits |
@@ -477,6 +481,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
                             active.audio_tx.clone(),
                         ));
                     }
+                    Some(Observed::Call(line)) => emit(line),
                     Some(Observed::Sfu(state, reason)) => {
                         emit(serde_json::json!({ "event": "sfu", "state": state, "reason": reason }));
                     }
@@ -561,6 +566,8 @@ enum Observed {
     Sfu(&'static str, Option<String>),
     /// The call ended without us leaving.
     Ended(EndedReason),
+    /// A call event reported as is, already shaped as a protocol line.
+    Call(serde_json::Value),
 }
 
 /// The next event of a joined call worth reporting, or `None` after [`POLL`]
@@ -578,6 +585,38 @@ async fn next_call_event(joined: Option<&mut Joined>) -> Option<Observed> {
         biased;
         event = call_events.recv() => match event {
             Ok(CallEvent::Ended { reason }) => Some(Observed::Ended(reason)),
+            // What a late joiner looks like from here: on the SFU before its
+            // membership, decryptable only once its key lands.
+            Ok(CallEvent::UnknownParticipant { identity }) => Some(Observed::Call(
+                serde_json::json!({ "event": "unknown_participant", "identity": identity }),
+            )),
+            Ok(CallEvent::ParticipantJoined { member_id, user_id }) => {
+                Some(Observed::Call(serde_json::json!({
+                    "event": "participant_joined",
+                    "member_id": member_id,
+                    "user_id": user_id,
+                })))
+            }
+            Ok(CallEvent::KeyImported {
+                member_id,
+                identity,
+                key_index,
+            }) => Some(Observed::Call(serde_json::json!({
+                "event": "key_imported",
+                "member_id": member_id,
+                "identity": identity,
+                "key_index": key_index,
+            }))),
+            Ok(CallEvent::FrameEncryptionState {
+                member_id,
+                state,
+                diagnostic,
+            }) => Some(Observed::Call(serde_json::json!({
+                "event": "frame_encryption",
+                "member_id": member_id,
+                "state": format!("{state:?}"),
+                "diagnostic": format!("{diagnostic:?}"),
+            }))),
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => None,
             Err(broadcast::error::RecvError::Closed) => {
                 Some(Observed::Ended(EndedReason::ConnectionClosed {

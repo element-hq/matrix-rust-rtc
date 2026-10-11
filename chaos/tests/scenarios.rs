@@ -14,13 +14,19 @@
 use std::time::Duration;
 
 use matrix_rtc_chaos::{
-    HEARTBEAT, Homeserver, KEEP_ALIVE, Mode, Partition, Peer, Result, Stack, TwoPeerCall, is_event,
-    now_ms, status_member_count,
+    CONVERGE, FederatedCall, HEARTBEAT, Homeserver, KEEP_ALIVE, Mode, Partition, Peer, Result,
+    Stack, TwoPeerCall, is_event, now_ms, status_member_count,
 };
 
 /// How long the call may take to be whole again once a fault clears: a missed
 /// keep-alive window, one heartbeat to notice, and slack for sync to deliver.
 const RECOVER: Duration = Duration::from_secs(KEEP_ALIVE.as_secs() + HEARTBEAT.as_secs() + 15);
+
+/// How long federation may take to deliver once both homeservers are up:
+/// Synapse retries a destination it backed off from on its 60 s catch-up
+/// sweep at the latest, the overlay caps the backoff itself at 10 s
+/// (`docker/synapse-federation.yaml`), plus slack for sync to deliver.
+const FEDERATION_CATCH_UP: Duration = Duration::from_secs(90);
 
 /// One `#[test]` per scenario and mode, as `<mode>::<scenario>`: every fault
 /// is run against each way the client keeps its membership.
@@ -66,6 +72,8 @@ scenarios!(
     homeserver_outage_is_bridged_by_retries,
     homeserver_outage_beyond_two_delays,
     stale_leave_ends_and_rejoins,
+    federated_join,
+    federated_join_during_outage,
 );
 
 /// The backend the scenarios assume is the backend that is running: the
@@ -163,13 +171,37 @@ async fn wait_switch_armed(hs: &Homeserver, peer: &Peer, timeout: Duration) -> R
 
 /// Wait for the peer to hear the 440 Hz tone, and return the cursor after it:
 /// the first window after subscribing is often silent or partial, and counting
-/// it would be a gap the stack never had.
+/// it would be a gap the stack never had. For a call with one other sender.
 async fn wait_tone(peer: &Peer) -> Result<usize> {
-    peer.wait(0, RECOVER, "the 440 Hz tone", |e| {
-        is_event(e, "audio") && e["tone_440"].as_f64().unwrap_or(0.0) >= 0.5
-    })
+    peer.wait(0, RECOVER, "the 440 Hz tone", |e| is_tone(e, None))
+        .await?;
+    Ok(peer.cursor())
+}
+
+/// [`wait_tone`] from one sender (`identity`, its LiveKit identity): with
+/// several senders, one audible peer must not hide an undecryptable one.
+async fn wait_tone_from(peer: &Peer, identity: &str, timeout: Duration) -> Result<usize> {
+    peer.wait(
+        0,
+        timeout,
+        &format!("the 440 Hz tone from {identity}"),
+        |e| is_tone(e, Some(identity)),
+    )
     .await?;
     Ok(peer.cursor())
+}
+
+/// An `audio` window carrying the tone, from `identity` if given.
+fn is_tone(event: &serde_json::Value, identity: Option<&str>) -> bool {
+    is_event(event, "audio")
+        && identity.is_none_or(|identity| event["identity"] == identity)
+        && event["tone_440"].as_f64().unwrap_or(0.0) >= 0.5
+}
+
+/// The LiveKit identity the peer joined with.
+fn identity(peer: &Peer) -> Result<String> {
+    peer.identity()
+        .ok_or_else(|| format!("[{}] has not joined", peer.name).into())
 }
 
 /// Wait for the homeserver to confirm a restart of the peer's (same) delay
@@ -239,6 +271,35 @@ async fn wait_membership_lost(peer: &Peer, since: usize) -> Result<()> {
     .map(|_| ())
 }
 
+/// The call never ended (nor the peer died) since `since`.
+fn assert_no_call_ended(peer: &Peer, since: usize) -> Result<()> {
+    match peer
+        .events_since(since)
+        .into_iter()
+        .find(|e| is_event(&e.value, "call_ended") || is_event(&e.value, "exited"))
+    {
+        Some(ended) => Err(format!("[{}] call ended: {}", peer.name, ended.value).into()),
+        None => Ok(()),
+    }
+}
+
+/// Every status since `since` is joined with at least `floor` members: the
+/// call may grow, but nobody already in it was seen leaving.
+fn assert_members_never_below(peer: &Peer, since: usize, floor: u64) -> Result<()> {
+    for event in peer.events_since(since) {
+        if is_event(&event.value, "status")
+            && status_member_count(&event.value).is_none_or(|n| n < floor)
+        {
+            return Err(format!(
+                "[{}] fewer than {floor} members: {}",
+                peer.name, event.value
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// How many `name` events the peer reported since `since`.
 fn count_events(peer: &Peer, since: usize, name: &str) -> usize {
     peer.events_since(since)
@@ -273,12 +334,34 @@ async fn wait_restart(hs: &Homeserver, peer: &Peer) -> Result<tokio::time::Insta
 }
 
 /// The peer heard the 440 Hz tone in every audio window since `since`, and in
-/// at least `min_windows` of them.
+/// at least `min_windows` of them. For a call with one other sender.
 fn assert_audio_continuous(peer: &Peer, since: usize, min_windows: usize) -> Result<()> {
+    audio_continuous(peer, since, None, min_windows)
+}
+
+/// [`assert_audio_continuous`] for the windows of one sender.
+fn assert_audio_continuous_from(
+    peer: &Peer,
+    since: usize,
+    identity: &str,
+    min_windows: usize,
+) -> Result<()> {
+    audio_continuous(peer, since, Some(identity), min_windows)
+}
+
+fn audio_continuous(
+    peer: &Peer,
+    since: usize,
+    identity: Option<&str>,
+    min_windows: usize,
+) -> Result<()> {
     let windows: Vec<_> = peer
         .events_since(since)
         .into_iter()
-        .filter(|e| is_event(&e.value, "audio"))
+        .filter(|e| {
+            is_event(&e.value, "audio")
+                && identity.is_none_or(|identity| e.value["identity"] == identity)
+        })
         .collect();
     if windows.len() < min_windows {
         return Err(format!(
@@ -591,4 +674,203 @@ async fn stale_leave_ends_and_rejoins(stack: &Stack, mode: Mode) -> Result<()> {
     }
     wait_switch_armed(&hs, &call.guest, RECOVER).await?;
     Ok(())
+}
+
+/// A participant on the federated `synapse2` joins a call hosted on
+/// `synapse`, with nothing degraded: the control for the scenario below.
+/// Everybody sees three members, and every peer hears every other, across the
+/// federation link and the shared SFU.
+async fn federated_join(stack: &Stack, mode: Mode) -> Result<()> {
+    let (hs, hs2) = (stack.homeserver(), stack.homeserver2());
+    let mut call = FederatedCall::start(stack, mode, &[]).await?;
+    let (host_id, guest_id) = (identity(&call.host)?, identity(&call.guest)?);
+    wait_tone_from(&call.guest, &host_id, RECOVER).await?;
+    wait_tone_from(&call.host, &guest_id, RECOVER).await?;
+    let since = [
+        call.host.cursor(),
+        call.guest.cursor(),
+        call.remote.cursor(),
+    ];
+
+    call.remote.send("join").await?;
+    let peers = [&call.host, &call.guest, &call.remote];
+    for (i, peer) in peers.into_iter().enumerate() {
+        peer.wait_members(since[i], 3, CONVERGE).await?;
+    }
+    let remote_id = identity(&call.remote)?;
+    for (peer, from) in [
+        (&call.host, &remote_id),
+        (&call.guest, &remote_id),
+        (&call.remote, &host_id),
+        (&call.remote, &guest_id),
+    ] {
+        wait_tone_from(peer, from, FEDERATION_CATCH_UP).await?;
+    }
+    wait_switch_armed(&hs2, &call.remote, RECOVER).await?;
+    for (i, peer) in peers.into_iter().enumerate() {
+        if i < 2 {
+            wait_switch_armed(&hs, peer, RECOVER).await?;
+        }
+        assert_no_call_ended(peer, since[i])?;
+    }
+    Ok(())
+}
+
+/// The case a homeserver hiccup cannot paper over: while `synapse` is down
+/// (inside everybody's keep-alive), a participant from the federated
+/// `synapse2` joins. Its homeserver, the token service and the SFU are all up,
+/// so it gets in and its media reaches the others at once, but its membership
+/// and its media key can only reach them through `synapse`.
+///
+/// The local pair must not notice; once `synapse` is back, federation must
+/// catch up and everybody must hear everybody. The host's timeline of the
+/// remote's arrival is printed, so the window in which the remote was on the
+/// SFU but undecryptable is a number in every run's output.
+async fn federated_join_during_outage(stack: &Stack, mode: Mode) -> Result<()> {
+    let (hs, hs2) = (stack.homeserver(), stack.homeserver2());
+    let mut call = FederatedCall::start(stack, mode, &[]).await?;
+    let (host_id, guest_id) = (identity(&call.host)?, identity(&call.guest)?);
+    let audio_since = [
+        wait_tone_from(&call.guest, &host_id, RECOVER).await?,
+        wait_tone_from(&call.host, &guest_id, RECOVER).await?,
+    ];
+    // Start right after a confirmed restart, as in
+    // `homeserver_outage_is_bridged_by_retries`: back 20 s on keeps host and
+    // guest inside their delay.
+    let restarted = wait_restart(&hs, &call.host).await?;
+    let back_at = restarted + Duration::from_secs(20);
+    let since = [
+        call.host.cursor(),
+        call.guest.cursor(),
+        call.remote.cursor(),
+    ];
+    let stopped = tokio::time::Instant::now();
+    let stopped_ms = now_ms();
+    stack.stop("synapse").await?;
+
+    call.remote.send("join").await?;
+    let joined = call
+        .remote
+        .wait(
+            since[2],
+            Duration::from_secs(15),
+            "joined during the outage",
+            |e| is_event(e, "joined") || is_event(e, "join_failed"),
+        )
+        .await?;
+    if is_event(&joined, "join_failed") {
+        return Err(format!(
+            "[remote] join failed during the outage: {}",
+            joined["message"]
+        )
+        .into());
+    }
+    let remote_id = joined["identity"]
+        .as_str()
+        .ok_or("the remote's joined event has no identity")?
+        .to_owned();
+    // Proof the case happened: the host has the remote on the SFU while its
+    // homeserver, the only way to its membership, is still down.
+    call.host
+        .wait(
+            since[0],
+            back_at.saturating_duration_since(tokio::time::Instant::now()),
+            "the remote on the SFU while synapse is down",
+            |e| {
+                (is_event(e, "track_subscribed") || is_event(e, "unknown_participant"))
+                    && e["identity"] == remote_id.as_str()
+            },
+        )
+        .await?;
+    tokio::time::sleep_until(back_at).await;
+    stack.start("synapse").await?;
+
+    for peer in [&call.host, &call.guest] {
+        wait_switch_restarted_after(&hs, peer, stopped_ms, RECOVER).await?;
+    }
+    wait_switch_armed(&hs2, &call.remote, RECOVER).await?;
+    let peers = [&call.host, &call.guest, &call.remote];
+    for (i, peer) in peers.into_iter().enumerate() {
+        peer.wait_members(since[i], 3, FEDERATION_CATCH_UP).await?;
+    }
+    wait_tone_from(&call.remote, &host_id, FEDERATION_CATCH_UP).await?;
+    wait_tone_from(&call.remote, &guest_id, FEDERATION_CATCH_UP).await?;
+
+    // The local pair never noticed.
+    assert_audio_continuous_from(&call.guest, audio_since[0], &host_id, 20)?;
+    assert_audio_continuous_from(&call.host, audio_since[1], &guest_id, 20)?;
+    for (i, peer) in peers.into_iter().enumerate() {
+        assert_no_call_ended(peer, since[i])?;
+        if i < 2 {
+            assert_members_never_below(peer, since[i], 2)?;
+        }
+    }
+
+    // Last, because this is where the window closes: the remote decrypts for
+    // the local peers only once its key has crossed the federation link.
+    let heard = [
+        wait_tone_from(&call.host, &remote_id, FEDERATION_CATCH_UP).await,
+        wait_tone_from(&call.guest, &remote_id, FEDERATION_CATCH_UP).await,
+    ];
+    print_arrival(
+        &call.host,
+        since[0],
+        stopped,
+        back_at,
+        &remote_id,
+        &call.remote,
+    );
+    for result in heard {
+        result?;
+    }
+    Ok(())
+}
+
+/// Print when `peer` saw each step of `remote`'s arrival, in seconds since the
+/// outage began: on the SFU, unknown, a member, its key, its audio.
+fn print_arrival(
+    peer: &Peer,
+    since: usize,
+    stopped: tokio::time::Instant,
+    back_at: tokio::time::Instant,
+    remote_id: &str,
+    remote: &Peer,
+) {
+    let events = peer.events_since(since);
+    let first = |pred: &dyn Fn(&serde_json::Value) -> bool| {
+        events
+            .iter()
+            .find(|e| pred(&e.value))
+            .map(|e| format!("{:6.1}s", (e.at - stopped.into_std()).as_secs_f64()))
+            .unwrap_or_else(|| "  never".to_owned())
+    };
+    let by_identity = |name: &'static str| {
+        move |e: &serde_json::Value| is_event(e, name) && e["identity"] == remote_id
+    };
+    let steps = [
+        (
+            "on the SFU (track_subscribed)",
+            first(&by_identity("track_subscribed")),
+        ),
+        (
+            "unknown participant",
+            first(&by_identity("unknown_participant")),
+        ),
+        (
+            "member (participant_joined)",
+            first(&|e| {
+                is_event(e, "participant_joined") && e["user_id"] == remote.account.user_id.as_str()
+            }),
+        ),
+        ("key imported", first(&by_identity("key_imported"))),
+        ("tone heard", first(&|e| is_tone(e, Some(remote_id)))),
+    ];
+    eprintln!(
+        "[{}] arrival of {remote_id}, since synapse stopped (back at {:.1}s):",
+        peer.name,
+        (back_at - stopped).as_secs_f64()
+    );
+    for (step, at) in steps {
+        eprintln!("[{}]   {at}  {step}", peer.name);
+    }
 }

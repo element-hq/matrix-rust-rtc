@@ -39,7 +39,7 @@ jobs:
       # Up first and without waiting, so image pulls and Synapse's first boot
       # overlap the build; the harness waits for health itself (`Stack::up`).
       - name: Start chaos backend
-        run: docker compose -f chaos/docker/compose.yml -p matrix-rtc-chaos up -d synapse livekit auth-service
+        run: docker compose -f chaos/docker/compose.yml -p matrix-rtc-chaos up -d synapse synapse2 livekit auth-service
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable

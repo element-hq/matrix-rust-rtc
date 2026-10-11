@@ -12,14 +12,16 @@
 # fault — a partition, netem loss, SIGKILL — hits exactly one of them, and
 # every URL a peer is given must resolve from inside the network.
 #
-# Only Synapse's client API is published (on 18008, so this can run next to a
-# `make backend-up` stack): the harness provisions users and inspects delayed
-# events through it. Everything else is reached in-network. See ../README.md.
+# Only the homeservers' client APIs are published (on 18008 and 18009, so this
+# can run next to a `make backend-up` stack): the harness provisions users and
+# inspects delayed events through them. Everything else is reached in-network.
+# See ../README.md.
 
 name: matrix-rtc-chaos
 
 volumes:
   synapse-data:
+  synapse2-data:
   tls:
 
 services:
@@ -49,12 +51,14 @@ services:
     command:
       - run
       - --config-path=/cfg/homeserver.yaml
+      - --config-path=/cfg/synapse-federation.yaml
       - --config-path=/cfg/synapse-chaos.yaml
     environment:
       UID: "0"
       GID: "0"
     volumes:
       - ../../demo/backend/synapse/homeserver.yaml:/cfg/homeserver.yaml:ro
+      - ./synapse-federation.yaml:/cfg/synapse-federation.yaml:ro
       - ./synapse-chaos.yaml:/cfg/synapse-chaos.yaml:ro
       - ../../demo/backend/synapse/lk-jwt-appservice.yaml:/cfg/lk-jwt-appservice.yaml:ro
       - ../../demo/backend/synapse/log.config:/cfg/log.config:ro
@@ -72,12 +76,47 @@ services:
       retries: 30
       start_period: 10s
 
+  # A second homeserver federating with `synapse`, for participants who are
+  # not on the call's own server. Same build, config and certificate; its own
+  # name, data (database, signing key — generated on first start) and port.
+  # Not lk-jwt's application service. See synapse2-chaos.yaml.
+  synapse2:
+    image: ${CHAOS_SYNAPSE_IMAGE:-ghcr.io/element-hq/synapse:v1.161.0}
+    command:
+      - run
+      - --config-path=/cfg/homeserver.yaml
+      - --config-path=/cfg/synapse-federation.yaml
+      - --config-path=/cfg/synapse2-chaos.yaml
+    environment:
+      UID: "0"
+      GID: "0"
+    volumes:
+      - ../../demo/backend/synapse/homeserver.yaml:/cfg/homeserver.yaml:ro
+      - ./synapse-federation.yaml:/cfg/synapse-federation.yaml:ro
+      - ./synapse2-chaos.yaml:/cfg/synapse2-chaos.yaml:ro
+      - ../../demo/backend/synapse/log.config:/cfg/log.config:ro
+      - synapse2-data:/data
+      - tls:/data/tls:ro
+    ports:
+      - "18009:8008"
+    depends_on:
+      init-certs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:8008/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
   # Shares the SFU's network namespace, as in the demo stack. LIVEKIT_URL is
   # both what peers are told to dial and what lk-jwt itself uses to create the
   # room, so it has to be a name that resolves in both places — the service
   # name does, where the demo stack's `localhost` only worked from the host.
   # Also the application service behind Synapse's `/rtc/livekit/…` C-S
-  # endpoints, exactly as in the demo stack (same registration file).
+  # endpoints, exactly as in the demo stack (same registration file). Users of
+  # both homeservers get full access: a federated participant may be the one
+  # who creates the LiveKit room.
   auth-service:
     image: ghcr.io/element-hq/lk-jwt-service:0.8.0
     network_mode: "service:livekit"
@@ -86,16 +125,18 @@ services:
       LIVEKIT_URL: ws://livekit:7880
       LIVEKIT_KEY: devkey
       LIVEKIT_SECRET: secret
-      LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
+      LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse,synapse2
       LIVEKIT_AS_REGISTRATION_FILE: /etc/lk-jwt-service/appservice.yaml
       LIVEKIT_HS_SERVER_NAME: synapse
-      LIVEKIT_CS_API_URL_OVERRIDES: synapse=http://synapse:8008
+      LIVEKIT_CS_API_URL_OVERRIDES: synapse=http://synapse:8008,synapse2=http://synapse2:8008
       LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
       LIVEKIT_LOG_LEVEL: debug
     volumes:
       - ../../demo/backend/synapse/lk-jwt-appservice.yaml:/etc/lk-jwt-service/appservice.yaml:ro
     depends_on:
       synapse:
+        condition: service_healthy
+      synapse2:
         condition: service_healthy
       livekit:
         condition: service_healthy
@@ -127,6 +168,7 @@ services:
     stdin_open: true
     volumes:
       - ../bin:/opt/chaos:ro
+    # HOMESERVER_URL is the default; the harness sets each peer's own.
     environment:
       HOMESERVER_URL: http://synapse:8008
       LIVEKIT_SERVICE_URL: http://livekit:6080

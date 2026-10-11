@@ -20,6 +20,10 @@ use crate::Result;
 #[derive(Clone, Debug)]
 pub struct Account {
     pub user_id: String,
+    /// The compose service of the account's homeserver (`synapse`,
+    /// `synapse2`): its in-network host name, which a peer dials and a
+    /// partition cuts.
+    pub service: &'static str,
     pub localpart: String,
     pub password: String,
     /// The harness's device, for inspection only; the peer logs in separately.
@@ -51,6 +55,7 @@ impl DelayedEvent {
 
 #[derive(Clone)]
 pub struct Homeserver {
+    service: &'static str,
     base: String,
     http: reqwest::Client,
 }
@@ -58,8 +63,11 @@ pub struct Homeserver {
 static ACCOUNT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl Homeserver {
-    pub(crate) fn new(base: &str) -> Self {
+    /// `service` is the compose service, `base` its client API as published
+    /// to the host.
+    pub(crate) fn new(service: &'static str, base: &str) -> Self {
         Self {
+            service,
             base: base.trim_end_matches('/').to_owned(),
             http: reqwest::Client::new(),
         }
@@ -96,6 +104,7 @@ impl Homeserver {
                 .as_str()
                 .ok_or("register response has no access_token")?
                 .to_owned(),
+            service: self.service,
             localpart,
             password,
         })

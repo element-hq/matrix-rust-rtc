@@ -32,7 +32,7 @@ use crate::{Account, Result, status_member_count};
 pub enum Partition {
     /// Everything: homeserver, SFU, authorisation service.
     All,
-    /// The homeserver only; media keeps flowing through the SFU.
+    /// The peer's own homeserver only; media keeps flowing through the SFU.
     Homeserver,
 }
 
@@ -206,6 +206,18 @@ impl Peer {
         .await
     }
 
+    /// The LiveKit identity of the latest join, as other peers' `audio` and
+    /// `track_subscribed` events name it.
+    pub fn identity(&self) -> Option<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|e| e.value["event"] == "joined")
+            .and_then(|e| e.value["identity"].as_str().map(str::to_owned))
+    }
+
     /// The armed `delay_id` from the latest status, if joined and armed.
     pub fn delayed_leave_id(&self) -> Option<String> {
         self.latest_status()?["delayed_leave_id"]
@@ -225,12 +237,13 @@ impl Peer {
     pub async fn partition(&self, what: Partition) -> Result<()> {
         let rules = match what {
             Partition::All => {
-                "iptables -A CHAOS -i eth0 -j DROP && iptables -A CHAOS -o eth0 -j DROP"
+                "iptables -A CHAOS -i eth0 -j DROP && iptables -A CHAOS -o eth0 -j DROP".to_owned()
             }
-            Partition::Homeserver => {
-                "ip=$(getent hosts synapse | cut -d' ' -f1) && \
-                 iptables -A CHAOS -s \"$ip\" -j DROP && iptables -A CHAOS -d \"$ip\" -j DROP"
-            }
+            Partition::Homeserver => format!(
+                "ip=$(getent hosts {} | cut -d' ' -f1) && \
+                 iptables -A CHAOS -s \"$ip\" -j DROP && iptables -A CHAOS -d \"$ip\" -j DROP",
+                self.account.service
+            ),
         };
         self.exec_sh(&format!("{CHAOS_CHAIN} && {rules}")).await
     }

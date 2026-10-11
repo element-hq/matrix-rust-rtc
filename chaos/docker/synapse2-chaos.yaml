@@ -1,0 +1,25 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+# The second, federated homeserver: the demo config, synapse-federation.yaml,
+# then this. Only what makes it a different server.
+
+# The service name, as for `synapse`: other servers reach it at synapse2:8448
+# (no .well-known, no SRV, so the default federation port).
+server_name: "synapse2"
+
+# What the login response advertises; see synapse-chaos.yaml.
+public_baseurl: "http://synapse2:8008/"
+
+# lk-jwt-service is `synapse`'s application service, not this one's.
+app_service_config_files: []
+
+# The same SFU as `synapse` advertises: a federated call shares one LiveKit.
+matrix_rtc:
+  transports:
+    - type: m.livekit
+      url: "ws://livekit:7880"
+    - type: livekit
+      livekit_service_url: "http://livekit:6080"
