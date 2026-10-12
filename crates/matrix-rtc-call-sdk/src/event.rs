@@ -77,10 +77,22 @@ pub enum EndedReason {
 /// `PartialEq` but not `Eq`: an audio level is an `f32`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CallEvent {
-    /// A membership joined the call (including our own).
-    ParticipantJoined { member_id: String, user_id: String },
-    /// A membership left the call or expired.
-    ParticipantLeft { member_id: String },
+    /// A membership joined while we were in the call: one per device, our
+    /// own other devices included. Never for the members already present when
+    /// our own membership lands, or lands again after lapsing.
+    ParticipantJoined {
+        member_id: String,
+        user_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
+    },
+    /// A membership left, or expired, while we were in the call. Never for
+    /// the change that removes our own membership, nor after the call ended.
+    ParticipantLeft {
+        member_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
+    },
     /// A participant's stream became available; frames can be obtained now.
     StreamStarted {
         member_id: String,

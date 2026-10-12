@@ -17,6 +17,10 @@
 //! the roster and the event stream never disagree about it. Only the *own*
 //! focus ending (adopted via [`CallEngine::adopt_own_connection`]) ends the
 //! call; a peer focus is the pool's to reconnect.
+//!
+//! The roster is the whole call; joins and leaves on the event stream are only
+//! the changes made while we are in it, so the roster we arrive to is never
+//! announced.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -267,6 +271,7 @@ impl CallEngine {
             encryption_states: HashMap::new(),
             installed_keys: HashMap::new(),
             raised_hands: HashMap::new(),
+            in_call: false,
             ended: false,
         };
         let task = rt::spawn(actor.run(
@@ -607,6 +612,11 @@ struct Actor {
     /// and of the membership it belongs to through different channels, and a
     /// hand that arrives first must not be lost.
     raised_hands: HashMap<String, u64>,
+    /// Whether the last applied snapshot held our own membership. Joins and
+    /// leaves are announced only between two snapshots that both do: the
+    /// roster we find on arrival, or on return after our membership lapsed,
+    /// was there before us and is not news.
+    in_call: bool,
     ended: bool,
 }
 
@@ -907,12 +917,25 @@ impl Actor {
     // ---- roster ----------------------------------------------------------
 
     fn apply_snapshot(&mut self, snapshot: Vec<JoinedMembership>) {
+        // Announced only while we are in the call on both sides of the change,
+        // and never after it ended for us (see `in_call`). A snapshot without
+        // us is the slot closing or our membership lapsing: the roster follows
+        // it, silently.
+        let in_call = snapshot
+            .iter()
+            .any(|member| member.member_id == self.own_member_id);
+        let announce = self.in_call && in_call && !self.ended;
+        self.in_call = in_call;
+
         // Departures first, so a member_id rejoining in the same snapshot
         // (new membership, same key space) starts clean.
         let current_ids: Vec<String> = snapshot
             .iter()
             .map(|member| member.member_id.clone())
             .collect();
+        // The roster becomes exactly the snapshot's members, so this is the
+        // count after the change, whichever event carries it.
+        let participant_count = current_ids.iter().collect::<HashSet<_>>().len() as u32;
         let departed: Vec<Participant> = self
             .roster
             .iter()
@@ -920,14 +943,17 @@ impl Actor {
             .cloned()
             .collect();
         for participant in departed {
-            self.remove_member(&participant.member_id);
+            self.remove_member(
+                &participant.member_id,
+                announce.then_some(participant_count),
+            );
         }
 
         for member in &snapshot {
             if self.roster.iter().any(|p| p.member_id == member.member_id) {
                 continue;
             }
-            self.add_member(member);
+            self.add_member(member, announce.then_some(participant_count));
         }
 
         // After the roster, so media the pool releases for a member who just
@@ -1040,7 +1066,8 @@ impl Actor {
         streams
     }
 
-    fn add_member(&mut self, member: &JoinedMembership) {
+    /// `announce` carries the participant count when the join is news.
+    fn add_member(&mut self, member: &JoinedMembership, announce: Option<u32>) {
         let reachable = self.pool.is_reachable(member);
         log::debug!(
             "member {} ({}) joined the roster, reachable={reachable}",
@@ -1070,10 +1097,13 @@ impl Actor {
             // the dialect states one (the legacy `created_ts`).
             joined_at_ms: member.membership_ts.or(member.origin_server_ts),
         });
-        self.emit(CallEvent::ParticipantJoined {
-            member_id: member.member_id.clone(),
-            user_id: member.sender.clone(),
-        });
+        if let Some(participant_count) = announce {
+            self.emit(CallEvent::ParticipantJoined {
+                member_id: member.member_id.clone(),
+                user_id: member.sender.clone(),
+                participant_count,
+            });
+        }
         if let Some(raised_at_ms) = hand_raised_at_ms {
             self.emit(CallEvent::HandRaised {
                 member_id: member.member_id.clone(),
@@ -1184,7 +1214,8 @@ impl Actor {
         }
     }
 
-    fn remove_member(&mut self, member_id: &str) {
+    /// `announce` carries the participant count when the departure is news.
+    fn remove_member(&mut self, member_id: &str, announce: Option<u32>) {
         self.roster
             .retain(|participant| participant.member_id != member_id);
         // The pool forgets their identity, buffers, constraints and tracks
@@ -1193,9 +1224,12 @@ impl Actor {
         self.encryption_states.remove(member_id);
         self.speaking.remove(member_id);
         self.speakers.remove(member_id);
-        self.emit(CallEvent::ParticipantLeft {
-            member_id: member_id.to_owned(),
-        });
+        if let Some(participant_count) = announce {
+            self.emit(CallEvent::ParticipantLeft {
+                member_id: member_id.to_owned(),
+                participant_count,
+            });
+        }
     }
 
     // ---- streams ----------------------------------------------------------
@@ -1846,11 +1880,15 @@ mod tests {
     async fn the_first_subscriber_sees_events_from_before_it_subscribed() {
         let fx = unsubscribed_fixture(StabilityConfig::default());
 
+        in_call(&fx).await;
         fx.memberships
-            .send(vec![member("bob", "@bob:example.org")])
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
             .unwrap();
         fx.engine.notify_key_imported("id-bob", 0);
-        wait_until(|| fx.engine.participants().len() == 1).await;
+        wait_until(|| fx.engine.participants().len() == 2).await;
         tokio::task::yield_now().await;
 
         let mut events = fx.engine.subscribe_events();
@@ -1859,6 +1897,7 @@ mod tests {
             CallEvent::ParticipantJoined {
                 member_id: "bob".to_owned(),
                 user_id: "@bob:example.org".to_owned(),
+                participant_count: 2,
             }
         );
         assert_eq!(
@@ -1894,14 +1933,14 @@ mod tests {
             ])
             .unwrap();
 
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            seen.push(next_event(&mut fx.events).await);
-        }
-        assert!(seen.contains(&CallEvent::HandRaised {
-            member_id: "bob".to_owned(),
-            raised_at_ms: 42,
-        }));
+        // The only event: the roster we arrive to announces no joins.
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::HandRaised {
+                member_id: "bob".to_owned(),
+                raised_at_ms: 42,
+            }
+        );
         let bob = fx
             .engine
             .participants()
@@ -1950,6 +1989,28 @@ mod tests {
             .await
             .expect("timed out waiting for a call event")
             .expect("event channel closed")
+    }
+
+    /// Land our own membership: the roster every later change is announced
+    /// against.
+    async fn in_call(fx: &Fixture) {
+        fx.memberships
+            .send(vec![member("own", "@alice:example.org")])
+            .unwrap();
+        rostered(fx, &["own"]).await;
+    }
+
+    /// Wait until every one of `member_ids` is on the roster. The roster we
+    /// arrive to is not announced, so this, not the event stream, is how a
+    /// test sees a snapshot land.
+    async fn rostered(fx: &Fixture, member_ids: &[&str]) {
+        wait_until(|| {
+            let roster = fx.engine.participants();
+            member_ids
+                .iter()
+                .all(|id| roster.iter().any(|p| p.member_id == *id))
+        })
+        .await;
     }
 
     /// Poll until `predicate` holds (paused-clock tests auto-advance timers).
@@ -2023,20 +2084,10 @@ mod tests {
             ])
             .unwrap();
 
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantJoined {
-                member_id: "own".to_owned(),
-                user_id: "@alice:example.org".to_owned(),
-            }
-        );
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantJoined {
-                member_id: "bob".to_owned(),
-                user_id: "@bob:example.org".to_owned(),
-            }
-        );
+        // The roster we arrive to is not news: no join is announced for it,
+        // ours included.
+        rostered(&fx, &["own", "bob"]).await;
+        assert!(fx.events.try_recv().is_err());
 
         let participants = fx.engine.participants();
         assert_eq!(participants.len(), 2);
@@ -2052,9 +2103,144 @@ mod tests {
         assert_eq!(connect_count(&fx, OWN_FOCUS), 0);
     }
 
+    /// Another device of ours is a participant of its own, and its arrival
+    /// is news like anyone else's.
+    #[tokio::test]
+    async fn a_second_device_of_ours_is_announced() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("own-2", "@alice:example.org"),
+            ])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "own-2".to_owned(),
+                user_id: "@alice:example.org".to_owned(),
+                participant_count: 2,
+            }
+        );
+    }
+
+    /// One snapshot can carry a departure and an arrival: both are announced,
+    /// each with the count after the whole change.
+    #[tokio::test]
+    async fn a_swap_announces_both_with_the_count_after_it() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantLeft {
+                member_id: "bob".to_owned(),
+                participant_count: 2,
+            }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "carol".to_owned(),
+                user_id: "@carol:example.org".to_owned(),
+                participant_count: 2,
+            }
+        );
+    }
+
+    /// While our own membership is missing — lapsed before its refresh, or
+    /// the slot closing — the roster follows the snapshots silently, and the
+    /// one that brings us back is a new arrival roster, not news.
+    #[tokio::test]
+    async fn nothing_is_announced_while_our_membership_is_missing() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 1).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        rostered(&fx, &["own", "bob", "carol"]).await;
+        assert!(fx.events.try_recv().is_err());
+
+        // Back in the call, changes are news again.
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantLeft {
+                member_id: "carol".to_owned(),
+                participant_count: 2,
+            }
+        );
+    }
+
+    /// Once the call has ended for us, the roster may still be torn down by
+    /// later snapshots, but none of it is announced.
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_announced_after_the_call_ended() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+
+        fx.ended
+            .send_replace(Some(LeaveReason::new(LeaveCode::SlotClosed)));
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::Ended {
+                reason: EndedReason::SlotClosed,
+            }
+        );
+
+        fx.memberships
+            .send(vec![member("own", "@alice:example.org")])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 1).await;
+        assert!(fx.events.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn member_without_supported_transport_is_unreachable() {
-        let mut fx = fixture();
+        let fx = fixture();
         let mut eve = member("eve", "@eve:example.org");
         eve.transports = vec![RtcTransport::Unsupported(
             matrix_rtc_core::UnsupportedTransport {
@@ -2064,7 +2250,7 @@ mod tests {
         )];
         fx.memberships.send(vec![eve]).unwrap();
 
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["eve"]).await;
         let participants = fx.engine.participants();
         assert!(!participants[0].reachable);
     }
@@ -2075,7 +2261,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         let connection = adopt(&fx);
         connection
@@ -2139,6 +2325,7 @@ mod tests {
     #[tokio::test]
     async fn early_media_waits_for_its_membership() {
         let mut fx = fixture();
+        in_call(&fx).await;
         let connection = adopt(&fx);
 
         // Track and key arrive before the sticky membership.
@@ -2152,7 +2339,10 @@ mod tests {
         fx.engine.notify_key_imported("id-bob", 3);
 
         fx.memberships
-            .send(vec![member("bob", "@bob:example.org")])
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
             .unwrap();
 
         assert_eq!(
@@ -2160,6 +2350,7 @@ mod tests {
             CallEvent::ParticipantJoined {
                 member_id: "bob".to_owned(),
                 user_id: "@bob:example.org".to_owned(),
+                participant_count: 2,
             }
         );
         // The buffered track and key both flush on the membership; their
@@ -2186,6 +2377,7 @@ mod tests {
     #[tokio::test]
     async fn every_early_key_surfaces_once_the_membership_lands() {
         let mut fx = fixture();
+        in_call(&fx).await;
 
         fx.engine.notify_key_imported("id-bob", 0);
         fx.engine.notify_key_imported("id-bob", 1);
@@ -2193,7 +2385,10 @@ mod tests {
         fx.engine.notify_key_imported("id-bob", 1);
 
         fx.memberships
-            .send(vec![member("bob", "@bob:example.org")])
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
             .unwrap();
 
         assert_eq!(
@@ -2201,6 +2396,7 @@ mod tests {
             CallEvent::ParticipantJoined {
                 member_id: "bob".to_owned(),
                 user_id: "@bob:example.org".to_owned(),
+                participant_count: 2,
             }
         );
         assert_eq!(
@@ -2227,24 +2423,32 @@ mod tests {
     #[tokio::test]
     async fn a_departure_forgets_the_keys_buffered_against_its_identity() {
         let mut fx = fixture();
+        in_call(&fx).await;
 
         fx.memberships
-            .send(vec![member("bob", "@bob:example.org")])
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
             .unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::ParticipantJoined {
                 member_id: "bob".to_owned(),
                 user_id: "@bob:example.org".to_owned(),
+                participant_count: 2,
             }
         );
 
         // Bob leaves, and a key for his identity lands late.
-        fx.memberships.send(Vec::new()).unwrap();
+        fx.memberships
+            .send(vec![member("own", "@alice:example.org")])
+            .unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::ParticipantLeft {
                 member_id: "bob".to_owned(),
+                participant_count: 1,
             }
         );
         fx.engine.notify_key_imported("id-bob", 7);
@@ -2252,13 +2456,17 @@ mod tests {
         // Bob rejoins under a fresh member id, as MSC4143 requires. The stale
         // index must not be attributed to the new participation.
         fx.memberships
-            .send(vec![member("bob-2", "@bob:example.org")])
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob-2", "@bob:example.org"),
+            ])
             .unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::ParticipantJoined {
                 member_id: "bob-2".to_owned(),
                 user_id: "@bob:example.org".to_owned(),
+                participant_count: 2,
             }
         );
     }
@@ -2269,7 +2477,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         let connection = adopt(&fx);
         connection
@@ -2301,7 +2509,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         fx.engine.notify_key_imported("id-bob", 4);
         assert_eq!(
@@ -2369,7 +2577,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         let connection = adopt(&fx);
         connection
@@ -2399,7 +2607,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         let connection = adopt(&fx);
         connection
@@ -2462,7 +2670,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
 
         // RTP arriving, nothing decoding: the exact case that is invisible at
         // the frame level, because frames are produced either way.
@@ -2663,7 +2871,7 @@ mod tests {
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
 
         let connection = adopt(&fx);
         connection
@@ -2687,10 +2895,14 @@ mod tests {
     #[tokio::test]
     async fn departure_cleans_up_roster_and_tracks() {
         let mut fx = fixture();
+        in_call(&fx).await;
         fx.memberships
-            .send(vec![member("bob", "@bob:example.org")])
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+            ])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
 
         let connection = adopt(&fx);
         connection
@@ -2700,16 +2912,20 @@ mod tests {
                 track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
             })
             .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined
         let _ = next_event(&mut fx.events).await; // StreamStarted
 
-        fx.memberships.send(Vec::new()).unwrap();
+        fx.memberships
+            .send(vec![member("own", "@alice:example.org")])
+            .unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::ParticipantLeft {
                 member_id: "bob".to_owned(),
+                participant_count: 1,
             }
         );
-        assert!(fx.engine.participants().is_empty());
+        assert_eq!(fx.engine.participants().len(), 1);
         assert!(
             fx.engine
                 .remote_track("bob", MediaStreamKind::Microphone)
@@ -2764,8 +2980,7 @@ mod tests {
                 member_on("bob", "@bob:example.org", PEER_FOCUS),
             ])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["own", "bob"]).await;
 
         // The engine connects to bob's focus by itself...
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
@@ -2812,7 +3027,7 @@ mod tests {
         fx.memberships
             .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
         peer_sender(&fx, PEER_FOCUS)
@@ -2860,16 +3075,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_peer_connection_closes_after_grace() {
-        let mut fx = fixture();
+        let fx = fixture();
         fx.memberships
             .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
 
         // Bob leaves; the connection lingers for the grace period, then closes.
         fx.memberships.send(Vec::new()).unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantLeft
+        wait_until(|| fx.engine.participants().is_empty()).await;
         assert!(!closed(&fx, PEER_FOCUS));
         wait_until(|| closed(&fx, PEER_FOCUS)).await;
         assert_eq!(connect_count(&fx, PEER_FOCUS), 1);
@@ -2877,18 +3092,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn returning_member_cancels_idle_close() {
-        let mut fx = fixture();
+        let fx = fixture();
         let bob = || member_on("bob", "@bob:example.org", PEER_FOCUS);
         fx.memberships.send(vec![bob()]).unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
 
         // Bob flaps: leaves and returns within the grace period.
         fx.memberships.send(Vec::new()).unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantLeft
+        wait_until(|| fx.engine.participants().is_empty()).await;
         tokio::time::sleep(IDLE_GRACE / 2).await;
         fx.memberships.send(vec![bob()]).unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["bob"]).await;
 
         // Well past the original grace deadline the connection is still the
         // first one, never closed or re-opened.
@@ -2907,13 +3122,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantJoined {
-                member_id: "own".to_owned(),
-                user_id: "@own:example.org".to_owned(),
-            }
-        );
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -2959,13 +3168,7 @@ mod tests {
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
 
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantJoined {
-                member_id: "own".to_owned(),
-                user_id: "@own:example.org".to_owned(),
-            }
-        );
+        // Our own arrival is not announced; its streams still are.
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::StreamStarted {
@@ -3011,13 +3214,7 @@ mod tests {
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
 
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantJoined {
-                member_id: "own".to_owned(),
-                user_id: "@own:example.org".to_owned(),
-            }
-        );
+        // Our own arrival is not announced; its streams still are.
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::StreamStarted {
@@ -3056,7 +3253,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3065,24 +3262,13 @@ mod tests {
             .expect("publish should succeed");
         let _ = next_event(&mut fx.events).await; // StreamStarted
 
+        // Neither our lapse nor our return is announced.
         fx.memberships.send(Vec::new()).unwrap();
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantLeft {
-                member_id: "own".to_owned(),
-            }
-        );
+        wait_until(|| fx.engine.participants().is_empty()).await;
 
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantJoined {
-                member_id: "own".to_owned(),
-                user_id: "@own:example.org".to_owned(),
-            }
-        );
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::StreamStarted {
@@ -3115,7 +3301,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3178,7 +3364,7 @@ mod tests {
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
 
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::StreamStarted {
@@ -3215,7 +3401,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3257,7 +3443,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3318,7 +3504,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3380,7 +3566,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3428,7 +3614,7 @@ mod tests {
         fx.memberships
             .send(vec![member("own", "@own:example.org")])
             .unwrap();
-        let _ = next_event(&mut fx.events).await; // ParticipantJoined
+        rostered(&fx, &["own"]).await;
         let _connection = adopt(&fx);
 
         fx.engine
@@ -3508,11 +3694,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn constraints_are_debounced_and_apply_the_latest_value() {
-        let mut fx = fixture();
+        let fx = fixture();
         fx.memberships
             .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
 
         // Two rapid updates: only the final state reaches the transport.
@@ -3554,11 +3740,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn constraints_reapply_on_stream_start_and_reconnect() {
-        let mut fx = fixture();
+        let fx = fixture();
         fx.memberships
             .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
 
         fx.engine.set_constraints(
@@ -3602,7 +3788,7 @@ mod tests {
         fx.memberships
             .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
             .unwrap();
-        let _ = next_event(&mut fx.events).await;
+        rostered(&fx, &["bob"]).await;
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
         let own = adopt(&fx);
 

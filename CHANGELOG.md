@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- `ParticipantJoined` and `ParticipantLeft` now report only arrivals and departures while we are in the call, never the roster we join, lapse or return to, and carry `participant_count`, the memberships after the change.
+
 ### Added
 
 - A local video publication reports send statistics per simulcast layer (size, frame rate, bytes, whether dynacast paused it), as `LocalTrackHandle::send_stats` and `FfiLocalTrack::send_stats`.
