@@ -71,6 +71,8 @@ pub struct CallTile {
     /// to this flag (R11), so a tile can be speaking and not move.
     pub speaking: bool,
     pub hand_raised_at_ms: Option<u64>,
+    /// See [`Participant::hand_raised_position`].
+    pub hand_raised_position: Option<u32>,
     pub joined_at_ms: Option<u64>,
     pub reachable: bool,
 }
@@ -225,6 +227,7 @@ fn tile(p: &Participant, kind: TileKind, speaking: &HashSet<String>) -> CallTile
         microphone_muted: stream(p, MediaStreamKind::Microphone).is_none_or(|s| s.muted),
         speaking: speaking.contains(&p.member_id),
         hand_raised_at_ms: p.hand_raised_at_ms,
+        hand_raised_position: p.hand_raised_position,
         joined_at_ms: p.joined_at_ms,
         reachable: p.reachable,
     }
@@ -291,6 +294,7 @@ mod tests {
             reachable: true,
             streams: vec![],
             hand_raised_at_ms: None,
+            hand_raised_position: None,
             joined_at_ms: None,
         }
     }

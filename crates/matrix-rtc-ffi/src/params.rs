@@ -154,6 +154,11 @@ pub struct FfiReactionsConfig {
     /// 3000). A send inside it fails without reaching the homeserver.
     #[uniffi(default = 3000)]
     pub send_cooldown_ms: u64,
+    /// How old a received reaction may be, in milliseconds (default 10000),
+    /// by our clock against its server timestamp. Older ones, such as those a
+    /// sync catching up delivers, are dropped as stale.
+    #[uniffi(default = 10000)]
+    pub max_age_ms: u64,
 }
 
 impl From<FfiReactionsConfig> for matrix_rtc_call::ReactionsConfig {
@@ -162,6 +167,7 @@ impl From<FfiReactionsConfig> for matrix_rtc_call::ReactionsConfig {
             enabled: value.enabled,
             active_window_ms: value.active_window_ms,
             send_cooldown_ms: value.send_cooldown_ms,
+            max_age_ms: value.max_age_ms,
         }
     }
 }

@@ -341,6 +341,7 @@ fn to_wasm_participant(
         reachable: participant.reachable,
         rtc_identity,
         hand_raised_at_ms: participant.hand_raised_at_ms,
+        hand_raised_position: participant.hand_raised_position,
         streams: participant
             .streams
             .iter()
@@ -374,6 +375,8 @@ struct WasmParticipant {
     /// When the participant raised their hand (ms since the epoch); `None`
     /// while it is down.
     hand_raised_at_ms: Option<u64>,
+    /// Place in the raised-hand queue, 1 for the earliest; `None` while down.
+    hand_raised_position: Option<u32>,
 }
 
 /// A call event, as JS sees it: `{ type, ...fields }`, snake_case throughout

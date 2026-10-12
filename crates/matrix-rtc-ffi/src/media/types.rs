@@ -62,8 +62,12 @@ pub struct FfiParticipant {
     pub reachable: bool,
     pub streams: Vec<FfiStreamState>,
     /// When this participant raised their hand (ms since the epoch), or
-    /// `None` while it is down. Sort ascending to order speakers.
+    /// `None` while it is down.
     pub hand_raised_at_ms: Option<u64>,
+    /// Place in the raised-hand queue, 1 for the earliest, among participants
+    /// on the roster; `None` while the hand is down. Read this rather than
+    /// sorting `hand_raised_at_ms`: the core owns the order.
+    pub hand_raised_position: Option<u32>,
 }
 
 impl From<matrix_rtc_call_sdk::Participant> for FfiParticipant {
@@ -75,6 +79,7 @@ impl From<matrix_rtc_call_sdk::Participant> for FfiParticipant {
             is_local: participant.is_local,
             reachable: participant.reachable,
             hand_raised_at_ms: participant.hand_raised_at_ms,
+            hand_raised_position: participant.hand_raised_position,
             streams: participant
                 .streams
                 .into_iter()
@@ -180,6 +185,8 @@ pub struct FfiCallTile {
     /// damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
     pub speaking: bool,
     pub hand_raised_at_ms: Option<u64>,
+    /// See `FfiParticipant.hand_raised_position`.
+    pub hand_raised_position: Option<u32>,
     pub reachable: bool,
 }
 
@@ -197,6 +204,7 @@ impl From<matrix_rtc_call_sdk::CallTile> for FfiCallTile {
             microphone_muted: t.microphone_muted,
             speaking: t.speaking,
             hand_raised_at_ms: t.hand_raised_at_ms,
+            hand_raised_position: t.hand_raised_position,
             reachable: t.reachable,
         }
     }
@@ -646,19 +654,24 @@ pub enum FfiCallEvent {
         sender_device_id: Option<String>,
         reason: FfiKeyRejection,
     },
-    /// A participant raised their hand. Also on the roster as
-    /// `FfiParticipant.hand_raised_at_ms`.
+    /// A participant raised their hand while we are in the call, ours
+    /// included: the cue for a sound. Not sent for the hands up when we
+    /// arrive, a member arriving with a hand up, or a hand that stays up
+    /// across a membership refresh. The state is
+    /// `FfiParticipant.hand_raised_at_ms` / `hand_raised_position`.
     HandRaised {
         member_id: String,
         raised_at_ms: u64,
     },
-    /// A participant lowered their hand, or left with it up.
+    /// A participant lowered their hand, or left with it up, while we are in
+    /// the call.
     HandLowered { member_id: String },
     /// A participant sent an emoji reaction. Transient: show `emoji` for a
     /// few seconds (Element Call uses three) and, if reaction sounds are on,
     /// play the asset named by `sound` (`clap`, `party`, …, `generic` for a
     /// name outside the catalogue; see `reactionCatalog()`). `None` is a
-    /// silent reaction.
+    /// silent reaction. Sent only while we are in the call and for a recent
+    /// reaction (`FfiReactionsConfig.max_age_ms`), never as a replayed burst.
     Reaction {
         member_id: String,
         emoji: String,

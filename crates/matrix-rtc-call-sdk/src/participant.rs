@@ -42,6 +42,11 @@ pub struct Participant {
     /// server's clock), or `None` while it is down. Sort ascending to queue
     /// speakers in the order they asked; see `matrix_rtc_call::reactions`.
     pub hand_raised_at_ms: Option<u64>,
+    /// This participant's place in the raised-hand queue, 1 for the earliest,
+    /// counting participants on the roster only; `None` while the hand is
+    /// down. The core's order (`RtcCall::raised_hands`), so a host never
+    /// re-sorts `hand_raised_at_ms` itself.
+    pub hand_raised_position: Option<u32>,
     /// When this participation began (ms since the epoch), when the dialect
     /// states it. `None` for a native MSC4143 membership, which carries no
     /// join time; see `JoinedMembership::membership_ts`.

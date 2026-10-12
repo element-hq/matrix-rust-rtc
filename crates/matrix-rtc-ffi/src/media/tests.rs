@@ -216,6 +216,7 @@ fn participant(id: &str) -> matrix_rtc_call_sdk::Participant {
         reachable: true,
         streams: vec![],
         hand_raised_at_ms: None,
+        hand_raised_position: None,
         joined_at_ms: None,
     }
 }
