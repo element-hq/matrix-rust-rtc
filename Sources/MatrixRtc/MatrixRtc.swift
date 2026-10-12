@@ -931,6 +931,13 @@ public protocol FfiLocalTrackProtocol: AnyObject, Sendable {
     
     func kind()  -> FfiStreamKind
     
+    /**
+     * Per-layer send statistics for a video publication: each layer's
+     * size, frame rate and bytes, and whether dynacast has paused it.
+     * `None` for audio and before the first report.
+     */
+    func sendStats() async  -> FfiSendStats?
+    
 }
 /**
  * A live local publication: push captured frames into it. Obtained from
@@ -1032,6 +1039,29 @@ open func kind() -> FfiStreamKind  {
     uniffi_matrix_rtc_ffi_fn_method_ffilocaltrack_kind(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Per-layer send statistics for a video publication: each layer's
+     * size, frame rate and bytes, and whether dynacast has paused it.
+     * `None` for audio and before the first report.
+     */
+open func sendStats()async  -> FfiSendStats?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_ffilocaltrack_send_stats(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeFfiSendStats.lift,
+            errorHandler: nil
+            
+        )
 }
     
 
@@ -7386,6 +7416,211 @@ public func FfiConverterTypeFfiRoomSubjects_lower(_ value: FfiRoomSubjects) -> R
 
 
 /**
+ * One encoded layer of a local video publication (mirrors
+ * `matrix_rtc_transport::SendLayerStats`). `frames_encoded` and `bytes_sent`
+ * are cumulative; sizes and frame rate are the encoder's current output.
+ */
+public struct FfiSendLayerStats {
+    /**
+     * The simulcast layer id (`q`, `h`, `f`), empty for a single layer.
+     */
+    public var rid: String
+    public var frameWidth: UInt32
+    public var frameHeight: UInt32
+    public var framesPerSecond: Double
+    public var framesEncoded: UInt64
+    public var bytesSent: UInt64
+    /**
+     * `false` once no subscriber wants the layer and the SFU paused it
+     * (dynacast).
+     */
+    public var active: Bool
+    public var qualityLimitation: FfiQualityLimitation
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The simulcast layer id (`q`, `h`, `f`), empty for a single layer.
+         */rid: String, frameWidth: UInt32, frameHeight: UInt32, framesPerSecond: Double, framesEncoded: UInt64, bytesSent: UInt64, 
+        /**
+         * `false` once no subscriber wants the layer and the SFU paused it
+         * (dynacast).
+         */active: Bool, qualityLimitation: FfiQualityLimitation) {
+        self.rid = rid
+        self.frameWidth = frameWidth
+        self.frameHeight = frameHeight
+        self.framesPerSecond = framesPerSecond
+        self.framesEncoded = framesEncoded
+        self.bytesSent = bytesSent
+        self.active = active
+        self.qualityLimitation = qualityLimitation
+    }
+}
+
+#if compiler(>=6)
+extension FfiSendLayerStats: Sendable {}
+#endif
+
+
+extension FfiSendLayerStats: Equatable, Hashable {
+    public static func ==(lhs: FfiSendLayerStats, rhs: FfiSendLayerStats) -> Bool {
+        if lhs.rid != rhs.rid {
+            return false
+        }
+        if lhs.frameWidth != rhs.frameWidth {
+            return false
+        }
+        if lhs.frameHeight != rhs.frameHeight {
+            return false
+        }
+        if lhs.framesPerSecond != rhs.framesPerSecond {
+            return false
+        }
+        if lhs.framesEncoded != rhs.framesEncoded {
+            return false
+        }
+        if lhs.bytesSent != rhs.bytesSent {
+            return false
+        }
+        if lhs.active != rhs.active {
+            return false
+        }
+        if lhs.qualityLimitation != rhs.qualityLimitation {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(rid)
+        hasher.combine(frameWidth)
+        hasher.combine(frameHeight)
+        hasher.combine(framesPerSecond)
+        hasher.combine(framesEncoded)
+        hasher.combine(bytesSent)
+        hasher.combine(active)
+        hasher.combine(qualityLimitation)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSendLayerStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSendLayerStats {
+        return
+            try FfiSendLayerStats(
+                rid: FfiConverterString.read(from: &buf), 
+                frameWidth: FfiConverterUInt32.read(from: &buf), 
+                frameHeight: FfiConverterUInt32.read(from: &buf), 
+                framesPerSecond: FfiConverterDouble.read(from: &buf), 
+                framesEncoded: FfiConverterUInt64.read(from: &buf), 
+                bytesSent: FfiConverterUInt64.read(from: &buf), 
+                active: FfiConverterBool.read(from: &buf), 
+                qualityLimitation: FfiConverterTypeFfiQualityLimitation.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiSendLayerStats, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.rid, into: &buf)
+        FfiConverterUInt32.write(value.frameWidth, into: &buf)
+        FfiConverterUInt32.write(value.frameHeight, into: &buf)
+        FfiConverterDouble.write(value.framesPerSecond, into: &buf)
+        FfiConverterUInt64.write(value.framesEncoded, into: &buf)
+        FfiConverterUInt64.write(value.bytesSent, into: &buf)
+        FfiConverterBool.write(value.active, into: &buf)
+        FfiConverterTypeFfiQualityLimitation.write(value.qualityLimitation, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSendLayerStats_lift(_ buf: RustBuffer) throws -> FfiSendLayerStats {
+    return try FfiConverterTypeFfiSendLayerStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSendLayerStats_lower(_ value: FfiSendLayerStats) -> RustBuffer {
+    return FfiConverterTypeFfiSendLayerStats.lower(value)
+}
+
+
+/**
+ * Send-side statistics for a local video publication, one entry per encoded
+ * layer, smallest first. Obtain via [`FfiLocalTrack::send_stats`].
+ *
+ * [`FfiLocalTrack::send_stats`]: super::FfiLocalTrack::send_stats
+ */
+public struct FfiSendStats {
+    public var layers: [FfiSendLayerStats]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(layers: [FfiSendLayerStats]) {
+        self.layers = layers
+    }
+}
+
+#if compiler(>=6)
+extension FfiSendStats: Sendable {}
+#endif
+
+
+extension FfiSendStats: Equatable, Hashable {
+    public static func ==(lhs: FfiSendStats, rhs: FfiSendStats) -> Bool {
+        if lhs.layers != rhs.layers {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(layers)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSendStats: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSendStats {
+        return
+            try FfiSendStats(
+                layers: FfiConverterSequenceTypeFfiSendLayerStats.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiSendStats, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFfiSendLayerStats.write(value.layers, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSendStats_lift(_ buf: RustBuffer) throws -> FfiSendStats {
+    return try FfiConverterTypeFfiSendStats.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSendStats_lower(_ value: FfiSendStats) -> RustBuffer {
+    return FfiConverterTypeFfiSendStats.lower(value)
+}
+
+
+/**
  * How much the tile order is damped (R10, R11). A product decision rather
  * than a protocol one, so a host can tune it; the defaults are what
  * `matrix_rtc_call_sdk::StabilityConfig` uses.
@@ -8992,9 +9227,21 @@ extension FfiBackendError: Foundation.LocalizedError {
 
 public enum FfiCallEvent {
     
-    case participantJoined(memberId: String, userId: String
+    /**
+     * Someone joined while we were in the call; see the core's `CallEvent`.
+     */
+    case participantJoined(memberId: String, userId: String, 
+        /**
+         * Memberships in the call after this change, ourselves included.
+         */participantCount: UInt32
     )
-    case participantLeft(memberId: String
+    /**
+     * Someone left while we were in the call; see the core's `CallEvent`.
+     */
+    case participantLeft(memberId: String, 
+        /**
+         * Memberships in the call after this change, ourselves included.
+         */participantCount: UInt32
     )
     /**
      * Frames for this stream can be obtained now (via `audio_stream` /
@@ -9091,10 +9338,10 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .participantJoined(memberId: try FfiConverterString.read(from: &buf), userId: try FfiConverterString.read(from: &buf)
+        case 1: return .participantJoined(memberId: try FfiConverterString.read(from: &buf), userId: try FfiConverterString.read(from: &buf), participantCount: try FfiConverterUInt32.read(from: &buf)
         )
         
-        case 2: return .participantLeft(memberId: try FfiConverterString.read(from: &buf)
+        case 2: return .participantLeft(memberId: try FfiConverterString.read(from: &buf), participantCount: try FfiConverterUInt32.read(from: &buf)
         )
         
         case 3: return .streamStarted(memberId: try FfiConverterString.read(from: &buf), kind: try FfiConverterTypeFfiStreamKind.read(from: &buf)
@@ -9144,15 +9391,17 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .participantJoined(memberId,userId):
+        case let .participantJoined(memberId,userId,participantCount):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterString.write(userId, into: &buf)
+            FfiConverterUInt32.write(participantCount, into: &buf)
             
         
-        case let .participantLeft(memberId):
+        case let .participantLeft(memberId,participantCount):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(memberId, into: &buf)
+            FfiConverterUInt32.write(participantCount, into: &buf)
             
         
         case let .streamStarted(memberId,kind):
@@ -10068,6 +10317,100 @@ public func FfiConverterTypeFfiQualityLimit_lower(_ value: FfiQualityLimit) -> R
 
 
 extension FfiQualityLimit: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why the encoder is sending less than it was asked to (mirrors
+ * `matrix_rtc_transport::QualityLimitation`).
+ */
+
+public enum FfiQualityLimitation {
+    
+    case none
+    /**
+     * The device cannot encode fast enough.
+     */
+    case cpu
+    /**
+     * The network estimate is too low.
+     */
+    case bandwidth
+    case other
+}
+
+
+#if compiler(>=6)
+extension FfiQualityLimitation: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiQualityLimitation: FfiConverterRustBuffer {
+    typealias SwiftType = FfiQualityLimitation
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiQualityLimitation {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .none
+        
+        case 2: return .cpu
+        
+        case 3: return .bandwidth
+        
+        case 4: return .other
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiQualityLimitation, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .none:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .cpu:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .bandwidth:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .other:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQualityLimitation_lift(_ buf: RustBuffer) throws -> FfiQualityLimitation {
+    return try FfiConverterTypeFfiQualityLimitation.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiQualityLimitation_lower(_ value: FfiQualityLimitation) -> RustBuffer {
+    return FfiConverterTypeFfiQualityLimitation.lower(value)
+}
+
+
+extension FfiQualityLimitation: Equatable, Hashable {}
 
 
 
@@ -11479,6 +11822,30 @@ fileprivate struct FfiConverterOptionTypeFfiReceiveStats: FfiConverterRustBuffer
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiSendStats: FfiConverterRustBuffer {
+    typealias SwiftType = FfiSendStats?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiSendStats.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiSendStats.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiStabilityConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiStabilityConfig?
 
@@ -11814,6 +12181,31 @@ fileprivate struct FfiConverterSequenceTypeFfiReactionKind: FfiConverterRustBuff
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiReactionKind.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiSendLayerStats: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiSendLayerStats]
+
+    public static func write(_ value: [FfiSendLayerStats], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiSendLayerStats.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiSendLayerStats] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiSendLayerStats]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiSendLayerStats.read(from: &buf))
         }
         return seq
     }
@@ -12320,6 +12712,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_ffilocaltrack_kind() != 32144) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_ffilocaltrack_send_stats() != 27823) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_own_user_id() != 52059) {
