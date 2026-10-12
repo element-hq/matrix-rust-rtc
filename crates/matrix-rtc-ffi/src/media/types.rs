@@ -586,12 +586,18 @@ pub(super) fn zip_stream_stats(
 /// [`MediaSession::next_event`](super::MediaSession::next_event).
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiCallEvent {
+    /// Someone joined while we were in the call; see the core's `CallEvent`.
     ParticipantJoined {
         member_id: String,
         user_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
     },
+    /// Someone left while we were in the call; see the core's `CallEvent`.
     ParticipantLeft {
         member_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
     },
     /// Frames for this stream can be obtained now (via `audio_stream` /
     /// `video_stream`).
@@ -612,10 +618,7 @@ pub enum FfiCallEvent {
         kind: FfiStreamKind,
     },
     /// This participant's media is decryptable from here on.
-    KeyImported {
-        member_id: String,
-        key_index: u8,
-    },
+    KeyImported { member_id: String, key_index: u8 },
     /// Frame encryption state for a participant's media changed.
     ///
     /// Anything but `Ok` means their frames are not decoding. The RTP may
@@ -650,9 +653,7 @@ pub enum FfiCallEvent {
         raised_at_ms: u64,
     },
     /// A participant lowered their hand, or left with it up.
-    HandLowered {
-        member_id: String,
-    },
+    HandLowered { member_id: String },
     /// A participant sent an emoji reaction. Transient: show `emoji` for a
     /// few seconds (Element Call uses three) and, if reaction sounds are on,
     /// play the asset named by `sound` (`clap`, `party`, …, `generic` for a
@@ -666,17 +667,11 @@ pub enum FfiCallEvent {
     },
     /// A transport-level participant with no signalled membership; it gets
     /// no subscription. Diagnostics only.
-    UnknownParticipant {
-        identity: String,
-    },
+    UnknownParticipant { identity: String },
     /// Media health: `degraded` while any transport connection reconnects.
-    MediaConnectionState {
-        degraded: bool,
-    },
+    MediaConnectionState { degraded: bool },
     /// The call is over; no further events follow.
-    Ended {
-        reason: FfiEndedReason,
-    },
+    Ended { reason: FfiEndedReason },
 }
 
 impl FfiCallEvent {
@@ -689,10 +684,22 @@ impl FfiCallEvent {
     pub(super) fn relayed(event: matrix_rtc_call_sdk::CallEvent) -> Option<Self> {
         use matrix_rtc_call_sdk::CallEvent as Event;
         Some(match event {
-            Event::ParticipantJoined { member_id, user_id } => {
-                Self::ParticipantJoined { member_id, user_id }
-            }
-            Event::ParticipantLeft { member_id } => Self::ParticipantLeft { member_id },
+            Event::ParticipantJoined {
+                member_id,
+                user_id,
+                participant_count,
+            } => Self::ParticipantJoined {
+                member_id,
+                user_id,
+                participant_count,
+            },
+            Event::ParticipantLeft {
+                member_id,
+                participant_count,
+            } => Self::ParticipantLeft {
+                member_id,
+                participant_count,
+            },
             Event::StreamStarted { member_id, kind } => Self::StreamStarted {
                 member_id,
                 kind: kind.into(),

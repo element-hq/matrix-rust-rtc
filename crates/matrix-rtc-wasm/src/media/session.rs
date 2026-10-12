@@ -381,12 +381,18 @@ struct WasmParticipant {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WasmCallEvent {
+    /// Someone joined while we were in the call; see the core's `CallEvent`.
     ParticipantJoined {
         member_id: String,
         user_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
     },
+    /// Someone left while we were in the call; see the core's `CallEvent`.
     ParticipantLeft {
         member_id: String,
+        /// Memberships in the call after this change, ourselves included.
+        participant_count: u32,
     },
     StreamStarted {
         member_id: String,
@@ -491,10 +497,22 @@ fn rejection_code(rejection: &matrix_rtc_core::KeyRejection) -> &'static str {
 impl From<CallEvent> for WasmCallEvent {
     fn from(event: CallEvent) -> Self {
         match event {
-            CallEvent::ParticipantJoined { member_id, user_id } => {
-                Self::ParticipantJoined { member_id, user_id }
-            }
-            CallEvent::ParticipantLeft { member_id } => Self::ParticipantLeft { member_id },
+            CallEvent::ParticipantJoined {
+                member_id,
+                user_id,
+                participant_count,
+            } => Self::ParticipantJoined {
+                member_id,
+                user_id,
+                participant_count,
+            },
+            CallEvent::ParticipantLeft {
+                member_id,
+                participant_count,
+            } => Self::ParticipantLeft {
+                member_id,
+                participant_count,
+            },
             CallEvent::StreamStarted { member_id, kind } => Self::StreamStarted {
                 member_id,
                 kind: stream_kind_str(kind),

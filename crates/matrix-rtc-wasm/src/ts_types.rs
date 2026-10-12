@@ -121,8 +121,8 @@ export interface RtcParticipant {
 
 /** An event on the unified call stream (`onEvent`). */
 export type RtcCallEvent =
-    | { type: "participant_joined"; member_id: string; user_id: string }
-    | { type: "participant_left"; member_id: string }
+    | { type: "participant_joined"; member_id: string; user_id: string; participant_count: number }
+    | { type: "participant_left"; member_id: string; participant_count: number }
     | { type: "stream_started"; member_id: string; kind: RtcStreamKind }
     | { type: "stream_stopped"; member_id: string; kind: RtcStreamKind }
     | { type: "stream_muted"; member_id: string; kind: RtcStreamKind }
