@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.3 - 2026-10-12
+
 ### Breaking
 
 - `ParticipantJoined` and `ParticipantLeft` now report only arrivals and departures while we are in the call, never the roster we join, lapse or return to, and carry `participant_count`, the memberships after the change.
