@@ -5206,10 +5206,6 @@ public struct FfiCallTile {
      */
     public var speaking: Bool
     public var handRaisedAtMs: UInt64?
-    /**
-     * See `FfiParticipant.hand_raised_position`.
-     */
-    public var handRaisedPosition: UInt32?
     public var reachable: Bool
 
     // Default memberwise initializers are never public by default, so we
@@ -5218,10 +5214,7 @@ public struct FfiCallTile {
         /**
          * Speaking now, undamped: what a speaking ring means. Only the order is
          * damped (`FfiStabilityConfig`), so a tile can be speaking and not move.
-         */speaking: Bool, handRaisedAtMs: UInt64?, 
-        /**
-         * See `FfiParticipant.hand_raised_position`.
-         */handRaisedPosition: UInt32?, reachable: Bool) {
+         */speaking: Bool, handRaisedAtMs: UInt64?, reachable: Bool) {
         self.memberId = memberId
         self.kind = kind
         self.userId = userId
@@ -5231,7 +5224,6 @@ public struct FfiCallTile {
         self.microphoneMuted = microphoneMuted
         self.speaking = speaking
         self.handRaisedAtMs = handRaisedAtMs
-        self.handRaisedPosition = handRaisedPosition
         self.reachable = reachable
     }
 }
@@ -5270,9 +5262,6 @@ extension FfiCallTile: Equatable, Hashable {
         if lhs.handRaisedAtMs != rhs.handRaisedAtMs {
             return false
         }
-        if lhs.handRaisedPosition != rhs.handRaisedPosition {
-            return false
-        }
         if lhs.reachable != rhs.reachable {
             return false
         }
@@ -5289,7 +5278,6 @@ extension FfiCallTile: Equatable, Hashable {
         hasher.combine(microphoneMuted)
         hasher.combine(speaking)
         hasher.combine(handRaisedAtMs)
-        hasher.combine(handRaisedPosition)
         hasher.combine(reachable)
     }
 }
@@ -5312,7 +5300,6 @@ public struct FfiConverterTypeFfiCallTile: FfiConverterRustBuffer {
                 microphoneMuted: FfiConverterBool.read(from: &buf), 
                 speaking: FfiConverterBool.read(from: &buf), 
                 handRaisedAtMs: FfiConverterOptionUInt64.read(from: &buf), 
-                handRaisedPosition: FfiConverterOptionUInt32.read(from: &buf), 
                 reachable: FfiConverterBool.read(from: &buf)
         )
     }
@@ -5327,7 +5314,6 @@ public struct FfiConverterTypeFfiCallTile: FfiConverterRustBuffer {
         FfiConverterBool.write(value.microphoneMuted, into: &buf)
         FfiConverterBool.write(value.speaking, into: &buf)
         FfiConverterOptionUInt64.write(value.handRaisedAtMs, into: &buf)
-        FfiConverterOptionUInt32.write(value.handRaisedPosition, into: &buf)
         FfiConverterBool.write(value.reachable, into: &buf)
     }
 }
@@ -6478,15 +6464,9 @@ public struct FfiParticipant {
     public var streams: [FfiStreamState]
     /**
      * When this participant raised their hand (ms since the epoch), or
-     * `None` while it is down.
+     * `None` while it is down. Sort ascending to order speakers.
      */
     public var handRaisedAtMs: UInt64?
-    /**
-     * Place in the raised-hand queue, 1 for the earliest, among participants
-     * on the roster; `None` while the hand is down. Read this rather than
-     * sorting `hand_raised_at_ms`: the core owns the order.
-     */
-    public var handRaisedPosition: UInt32?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -6499,13 +6479,8 @@ public struct FfiParticipant {
          */reachable: Bool, streams: [FfiStreamState], 
         /**
          * When this participant raised their hand (ms since the epoch), or
-         * `None` while it is down.
-         */handRaisedAtMs: UInt64?, 
-        /**
-         * Place in the raised-hand queue, 1 for the earliest, among participants
-         * on the roster; `None` while the hand is down. Read this rather than
-         * sorting `hand_raised_at_ms`: the core owns the order.
-         */handRaisedPosition: UInt32?) {
+         * `None` while it is down. Sort ascending to order speakers.
+         */handRaisedAtMs: UInt64?) {
         self.memberId = memberId
         self.userId = userId
         self.deviceId = deviceId
@@ -6513,7 +6488,6 @@ public struct FfiParticipant {
         self.reachable = reachable
         self.streams = streams
         self.handRaisedAtMs = handRaisedAtMs
-        self.handRaisedPosition = handRaisedPosition
     }
 }
 
@@ -6545,9 +6519,6 @@ extension FfiParticipant: Equatable, Hashable {
         if lhs.handRaisedAtMs != rhs.handRaisedAtMs {
             return false
         }
-        if lhs.handRaisedPosition != rhs.handRaisedPosition {
-            return false
-        }
         return true
     }
 
@@ -6559,7 +6530,6 @@ extension FfiParticipant: Equatable, Hashable {
         hasher.combine(reachable)
         hasher.combine(streams)
         hasher.combine(handRaisedAtMs)
-        hasher.combine(handRaisedPosition)
     }
 }
 
@@ -6578,8 +6548,7 @@ public struct FfiConverterTypeFfiParticipant: FfiConverterRustBuffer {
                 isLocal: FfiConverterBool.read(from: &buf), 
                 reachable: FfiConverterBool.read(from: &buf), 
                 streams: FfiConverterSequenceTypeFfiStreamState.read(from: &buf), 
-                handRaisedAtMs: FfiConverterOptionUInt64.read(from: &buf), 
-                handRaisedPosition: FfiConverterOptionUInt32.read(from: &buf)
+                handRaisedAtMs: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
 
@@ -6591,7 +6560,6 @@ public struct FfiConverterTypeFfiParticipant: FfiConverterRustBuffer {
         FfiConverterBool.write(value.reachable, into: &buf)
         FfiConverterSequenceTypeFfiStreamState.write(value.streams, into: &buf)
         FfiConverterOptionUInt64.write(value.handRaisedAtMs, into: &buf)
-        FfiConverterOptionUInt32.write(value.handRaisedPosition, into: &buf)
     }
 }
 
@@ -6969,12 +6937,6 @@ public struct FfiReactionsConfig {
      * 3000). A send inside it fails without reaching the homeserver.
      */
     public var sendCooldownMs: UInt64
-    /**
-     * How old a received reaction may be, in milliseconds (default 10000),
-     * by our clock against its server timestamp. Older ones, such as those a
-     * sync catching up delivers, are dropped as stale.
-     */
-    public var maxAgeMs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -6991,16 +6953,10 @@ public struct FfiReactionsConfig {
         /**
          * The least time between two reactions we send, in milliseconds (default
          * 3000). A send inside it fails without reaching the homeserver.
-         */sendCooldownMs: UInt64 = UInt64(3000), 
-        /**
-         * How old a received reaction may be, in milliseconds (default 10000),
-         * by our clock against its server timestamp. Older ones, such as those a
-         * sync catching up delivers, are dropped as stale.
-         */maxAgeMs: UInt64 = UInt64(10000)) {
+         */sendCooldownMs: UInt64 = UInt64(3000)) {
         self.enabled = enabled
         self.activeWindowMs = activeWindowMs
         self.sendCooldownMs = sendCooldownMs
-        self.maxAgeMs = maxAgeMs
     }
 }
 
@@ -7020,9 +6976,6 @@ extension FfiReactionsConfig: Equatable, Hashable {
         if lhs.sendCooldownMs != rhs.sendCooldownMs {
             return false
         }
-        if lhs.maxAgeMs != rhs.maxAgeMs {
-            return false
-        }
         return true
     }
 
@@ -7030,7 +6983,6 @@ extension FfiReactionsConfig: Equatable, Hashable {
         hasher.combine(enabled)
         hasher.combine(activeWindowMs)
         hasher.combine(sendCooldownMs)
-        hasher.combine(maxAgeMs)
     }
 }
 
@@ -7045,8 +6997,7 @@ public struct FfiConverterTypeFfiReactionsConfig: FfiConverterRustBuffer {
             try FfiReactionsConfig(
                 enabled: FfiConverterBool.read(from: &buf), 
                 activeWindowMs: FfiConverterUInt64.read(from: &buf), 
-                sendCooldownMs: FfiConverterUInt64.read(from: &buf), 
-                maxAgeMs: FfiConverterUInt64.read(from: &buf)
+                sendCooldownMs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -7054,7 +7005,6 @@ public struct FfiConverterTypeFfiReactionsConfig: FfiConverterRustBuffer {
         FfiConverterBool.write(value.enabled, into: &buf)
         FfiConverterUInt64.write(value.activeWindowMs, into: &buf)
         FfiConverterUInt64.write(value.sendCooldownMs, into: &buf)
-        FfiConverterUInt64.write(value.maxAgeMs, into: &buf)
     }
 }
 
@@ -9336,17 +9286,13 @@ public enum FfiCallEvent {
     case keyDiscarded(memberId: String, keyIndex: UInt8?, senderUserId: String?, senderDeviceId: String?, reason: FfiKeyRejection
     )
     /**
-     * A participant raised their hand while we are in the call, ours
-     * included: the cue for a sound. Not sent for the hands up when we
-     * arrive, a member arriving with a hand up, or a hand that stays up
-     * across a membership refresh. The state is
-     * `FfiParticipant.hand_raised_at_ms` / `hand_raised_position`.
+     * A participant raised their hand. Also on the roster as
+     * `FfiParticipant.hand_raised_at_ms`.
      */
     case handRaised(memberId: String, raisedAtMs: UInt64
     )
     /**
-     * A participant lowered their hand, or left with it up, while we are in
-     * the call.
+     * A participant lowered their hand, or left with it up.
      */
     case handLowered(memberId: String
     )
@@ -9355,8 +9301,7 @@ public enum FfiCallEvent {
      * few seconds (Element Call uses three) and, if reaction sounds are on,
      * play the asset named by `sound` (`clap`, `party`, …, `generic` for a
      * name outside the catalogue; see `reactionCatalog()`). `None` is a
-     * silent reaction. Sent only while we are in the call and for a recent
-     * reaction (`FfiReactionsConfig.max_age_ms`), never as a replayed burst.
+     * silent reaction.
      */
     case reaction(memberId: String, emoji: String, name: String, sound: String?
     )

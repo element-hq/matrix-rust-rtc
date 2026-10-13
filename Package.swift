@@ -6,13 +6,26 @@
 
 import PackageDescription
 
-// Local-development twin of the root Package.swift: points at the xcframework
-// built by `scripts/build-ios-xcframework.sh --swift-out Sources/MatrixRtc`
-// instead of a released zip. Copy it over the root manifest (and do not commit
-// the result) to add the repository as a local package in Xcode.
+// Swift package for the released MatrixRtcFFI.xcframework (media variant:
+// device + Apple Silicon simulator). The two constants below are rewritten by
+// scripts/update-package-swift.sh from the release workflow, which then tags the
+// commit; the zip is the asset attached to that tag's GitHub release, and
+// Sources/MatrixRtc holds the Swift generated for that same build.
+//
+// Add it in Xcode with this repository's URL at a `v*` tag, then add `-ObjC` to
+// the app target's "Other Linker Flags" (libwebrtc's Objective-C categories are
+// otherwise dead-stripped from the static archive). See mobile/PACKAGING.md.
+//
+// For a local build, copy mobile/ios/Debug-Package.swift over this file.
+let version = "0.5.0-rc.3"
+let checksum = "71d27ebb6baa3e92be908d30be97e7626c21007d1d5f1393eb3e677af97e89ca"
+let url = "https://github.com/element-hq/matrix-rust-rtc/releases/download/v\(version)/MatrixRtcFFI.xcframework.zip"
 
-// Keep identical to the root Package.swift, and above `package` (a top-level
-// constant read before its declaration is silently empty in a manifest).
+// What the statically linked libwebrtc inside MatrixRtcFFI.xcframework needs
+// from the system. Declared here so a consumer's link succeeds without knowing
+// libwebrtc's internals; SwiftPM propagates these to the app's link step.
+// (Must precede `package`: a manifest is script-mode Swift, and a top-level
+// constant read before its declaration is silently empty.)
 let matrixRtcLinkerSettings: [LinkerSetting] = [
     .linkedFramework("AVFoundation"),
     .linkedFramework("AudioToolbox"),
@@ -34,10 +47,13 @@ let package = Package(
         .iOS(.v16),
     ],
     products: [
+        // Static (the default): the archive is linked into the app target, so
+        // the app's own `-ObjC` flag applies to it. A dynamic product would
+        // link the archive into a framework without that flag.
         .library(name: "MatrixRtc", targets: ["MatrixRtc"]),
     ],
     targets: [
-        .binaryTarget(name: "MatrixRtcFFI", path: "mobile/ios/build/MatrixRtcFFI.xcframework"),
+        .binaryTarget(name: "MatrixRtcFFI", url: url, checksum: checksum),
         .target(
             name: "MatrixRtc",
             dependencies: ["MatrixRtcFFI"],
