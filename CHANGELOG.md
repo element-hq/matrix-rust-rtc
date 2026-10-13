@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.4 - 2026-10-13
+
 ### Breaking
 
 - `HandRaised` and `HandLowered` now announce only hands raised or lowered while we are in the call, never the hands we arrive to or a member arrives with, and `Reaction` is sent only while we are in the call and for reactions newer than `ReactionsConfig::max_age_ms` (10 s by default).
