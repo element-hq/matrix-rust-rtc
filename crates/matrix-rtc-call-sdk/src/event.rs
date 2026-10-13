@@ -166,19 +166,27 @@ pub enum CallEvent {
         reason: KeyRejection,
     },
     /// A participant raised their hand (Element Call's `m.reaction` annotation
-    /// of their membership). Also set on the roster as
-    /// [`Participant::hand_raised_at_ms`](crate::participant::Participant::hand_raised_at_ms).
+    /// of their membership) while we are in the call — ours included, once the
+    /// homeserver has it. An announcement: not sent for the hands up when we
+    /// arrive, for a member arriving with their hand up, or when a hand that
+    /// stays up moves to a refreshed membership event. The state is on the
+    /// roster as
+    /// [`Participant::hand_raised_at_ms`](crate::participant::Participant::hand_raised_at_ms)
+    /// and [`hand_raised_position`](crate::participant::Participant::hand_raised_position).
     HandRaised {
         member_id: String,
         raised_at_ms: u64,
     },
-    /// A participant lowered their hand, or left with it up.
+    /// A participant lowered their hand, or left with it up, while we are in
+    /// the call.
     HandLowered { member_id: String },
     /// A participant sent an emoji reaction. Transient: show `emoji` for a few
     /// seconds (Element Call uses three) and play `sound` if reaction sounds
     /// are on. The SDK does no audio; `sound` is the base name of the asset
     /// to play (`clap`, `party`, …, or `generic` for an unknown `name`), or
-    /// `None` for a silent reaction.
+    /// `None` for a silent reaction. Sent only while we are in the call, and
+    /// only for a recent reaction (`ReactionsConfig::max_age_ms`), so a sync
+    /// catching up never replays a burst of them.
     Reaction {
         member_id: String,
         emoji: String,

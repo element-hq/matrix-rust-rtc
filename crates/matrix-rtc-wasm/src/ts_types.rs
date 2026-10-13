@@ -117,6 +117,8 @@ export interface RtcParticipant {
     streams: { kind: RtcStreamKind; muted: boolean }[];
     /** When the participant raised their hand (ms since the epoch); `null` while it is down. */
     hand_raised_at_ms: number | null;
+    /** Place in the raised-hand queue, 1 for the earliest; `null` while it is down. Read this rather than sorting. */
+    hand_raised_position: number | null;
 }
 
 /** An event on the unified call stream (`onEvent`). */
@@ -136,9 +138,11 @@ export type RtcCallEvent =
         sender_user_id: string | null; sender_device_id: string | null;
         reason_code: "cleartext" | "not_cross_signed" | "room_mismatch" | "sender_mismatch" | "unverifiable_device" | "device_mismatch";
         reason: string }
+    /** Only for a hand raised while we are in the call; the state is `hand_raised_at_ms` / `hand_raised_position`. */
     | { type: "hand_raised"; member_id: string; raised_at_ms: number }
     | { type: "hand_lowered"; member_id: string }
-    /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`null` = silent). */
+    /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`null` = silent).
+     *  Only while we are in the call, and only for a recent reaction (`reactions.max_age_ms`). */
     | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string | null }
     | { type: "unknown_participant"; identity: string }
     | { type: "media_connection_state"; degraded: boolean }
@@ -209,7 +213,13 @@ export interface JoinParamsIn {
     };
     notify?: { notification_type?: string; mentions?: Record<string, unknown>; lifetime_ms?: number };
     /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */
-    reactions?: { enabled?: boolean; active_window_ms?: number; send_cooldown_ms?: number };
+    reactions?: {
+        enabled?: boolean;
+        active_window_ms?: number;
+        send_cooldown_ms?: number;
+        /** Older received reactions (by our clock) are dropped as stale; default 10 s. */
+        max_age_ms?: number;
+    };
 }
 
 /** `leave`'s parameters (`{}` is a plain hang-up). */

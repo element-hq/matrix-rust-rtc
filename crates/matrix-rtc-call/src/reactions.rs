@@ -67,6 +67,11 @@ pub const RAISED_HAND_KEY: &str = "🖐️";
 /// same member (`REACTION_ACTIVE_TIME_MS`).
 pub const DEFAULT_REACTION_ACTIVE_MS: u64 = 3_000;
 
+/// How old a received reaction may be, by our clock, and still be shown.
+/// Generous next to [`DEFAULT_REACTION_ACTIVE_MS`] to absorb skew between the
+/// server's clock and ours.
+pub const DEFAULT_REACTION_MAX_AGE_MS: u64 = 10_000;
+
 /// How many membership event ids are remembered per member for validating a
 /// reaction against an older one of their events. Refreshes are half an hour
 /// apart by default, so this covers hours of a call; the bound only exists so
@@ -245,6 +250,11 @@ pub struct ReactionsConfig {
     /// inside it fails with [`ReactionError::Cooldown`] rather than reaching
     /// the homeserver, since peers would drop it anyway.
     pub send_cooldown_ms: u64,
+    /// How old a received reaction may be, in milliseconds, by our clock
+    /// against its `origin_server_ts`. An older one is dropped as stale: a
+    /// sync catching up after a network drop delivers a batch of them at
+    /// once, and a reaction is only worth showing (or playing) as it happens.
+    pub max_age_ms: u64,
 }
 
 impl Default for ReactionsConfig {
@@ -253,6 +263,7 @@ impl Default for ReactionsConfig {
             enabled: true,
             active_window_ms: DEFAULT_REACTION_ACTIVE_MS,
             send_cooldown_ms: DEFAULT_REACTION_ACTIVE_MS,
+            max_age_ms: DEFAULT_REACTION_MAX_AGE_MS,
         }
     }
 }
@@ -360,6 +371,12 @@ pub struct RaisedHand {
     /// When it was raised: the reaction's `origin_server_ts`. Sort by this to
     /// queue speakers in the order they asked.
     pub raised_at_ms: u64,
+    /// The hand was first found among a membership's annotations fetched
+    /// through `MatrixBackend::relations`, rather than seen going up: it was
+    /// already up when we looked, so it is not news. Our own hand never is.
+    /// For the call engine only: not serialized, so the bindings never see it.
+    #[serde(skip)]
+    pub from_backfill: bool,
 }
 
 /// An emoji reaction a member just sent.
@@ -643,6 +660,16 @@ impl ReactionsState {
                     return;
                 };
                 let now = self.now();
+                // A timestamp ahead of our clock is skew, not staleness.
+                if now.saturating_sub(event.origin_server_ts) > self.config.max_age_ms {
+                    log::debug!(
+                        "dropping reaction {} from {}: sent at {}, too long ago to show",
+                        event.event_id,
+                        member.member_id,
+                        event.origin_server_ts,
+                    );
+                    return;
+                }
                 if let Some(last) = self.last_reaction_at.get(&member.member_id)
                     && now.saturating_sub(*last) < self.config.active_window_ms
                 {
@@ -677,6 +704,7 @@ impl ReactionsState {
                     sender: member.sender.clone(),
                     reaction_event_id: event.event_id.clone(),
                     raised_at_ms: event.origin_server_ts,
+                    from_backfill: backfill,
                 };
                 match self.raised_hands.get(&member.member_id) {
                     // Our own local echo, or a replay of an event already
@@ -685,9 +713,11 @@ impl ReactionsState {
                     // Two annotations for one member — the re-annotation after a
                     // sticky refresh, or a peer raising twice. The earlier one
                     // is when they *asked*, which is what the ordering is for;
-                    // the later event id is the one a redaction will name.
+                    // the later event id is the one a redaction will name. How
+                    // the hand was first learnt stays as it was.
                     Some(existing) => {
                         let raised_at_ms = existing.raised_at_ms.min(hand.raised_at_ms);
+                        let from_backfill = existing.from_backfill;
                         let newest = if hand.raised_at_ms >= existing.raised_at_ms {
                             hand
                         } else {
@@ -697,6 +727,7 @@ impl ReactionsState {
                             member.member_id.clone(),
                             RaisedHand {
                                 raised_at_ms,
+                                from_backfill,
                                 ..newest
                             },
                         );
@@ -822,6 +853,7 @@ impl ReactionsState {
                 sender: own_user_id.to_owned(),
                 reaction_event_id: reaction_event_id.clone(),
                 raised_at_ms,
+                from_backfill: false,
             },
         );
         self.own_raised_hand = Some(OwnRaisedHand {

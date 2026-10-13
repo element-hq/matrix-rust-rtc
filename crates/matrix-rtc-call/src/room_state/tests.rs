@@ -139,12 +139,24 @@ fn timeline_event(
     }
 }
 
+/// Sent now by the wall clock, so it is fresh whether a test keeps the real
+/// clock or sets an earlier one.
 fn bob_reacts(event_id: &str, target: &str, emoji: &str, name: &str) -> RawTimelineEvent {
+    bob_reacts_at(event_id, target, emoji, name, crate::now_ms())
+}
+
+fn bob_reacts_at(
+    event_id: &str,
+    target: &str,
+    emoji: &str,
+    name: &str,
+    ts: u64,
+) -> RawTimelineEvent {
     timeline_event(
         event_id,
         BOB,
         REACTION_EVENT_TYPE,
-        1_000,
+        ts,
         build_reaction_content(target, emoji, name),
     )
 }
@@ -234,6 +246,43 @@ async fn a_repeat_inside_the_active_window_is_dropped() {
     clock.advance(2_000);
     ingest(&mut call, bob_reacts("$r3", "$bob-member-1", "🎉", "party"));
     assert_eq!(reactions.try_recv().unwrap().emoji, "🎉");
+}
+
+/// A sync catching up delivers old reactions at once; only recent ones are
+/// shown, and a stale one does not hold back the next.
+#[tokio::test]
+async fn a_stale_reaction_is_dropped() {
+    let (mut call, _, _) = joined_call(join_params().into()).await;
+    let clock = TestClock::new(100_000);
+    call.set_clock(clock.clock());
+    let mut reactions = call.subscribe_reactions(SLOT).unwrap();
+    let max_age = ReactionsConfig::default().max_age_ms;
+
+    ingest(
+        &mut call,
+        bob_reacts_at(
+            "$old",
+            "$bob-member-1",
+            "👏",
+            "clapping",
+            100_000 - max_age - 1,
+        ),
+    );
+    assert_eq!(reactions.try_recv().unwrap_err(), TryRecvError::Empty);
+
+    ingest(
+        &mut call,
+        bob_reacts_at("$recent", "$bob-member-1", "🎉", "party", 100_000 - max_age),
+    );
+    assert_eq!(reactions.try_recv().unwrap().emoji, "🎉");
+
+    // Ahead of our clock is skew, not staleness.
+    clock.advance(3_000);
+    ingest(
+        &mut call,
+        bob_reacts_at("$ahead", "$bob-member-1", "🐶", "dog", 105_000),
+    );
+    assert_eq!(reactions.try_recv().unwrap().emoji, "🐶");
 }
 
 #[tokio::test]
@@ -430,7 +479,55 @@ async fn backfill_restores_hands_but_never_replays_reactions() {
     );
 
     assert_eq!(hands(&call), vec![("bob", "$old-hand".to_owned())]);
+    assert!(call.raised_hands(SLOT).unwrap()[0].from_backfill);
     assert_eq!(reactions.try_recv().unwrap_err(), TryRecvError::Empty);
+
+    // Seen live later, the same hand stays one found by backfill.
+    ingest(&mut call, bob_raises("$old-hand", "$bob-member-1", 100));
+    assert!(call.raised_hands(SLOT).unwrap()[0].from_backfill);
+}
+
+#[tokio::test]
+async fn a_hand_seen_going_up_is_not_from_backfill() {
+    let (mut call, _, _) = joined_call(join_params().into()).await;
+    ingest(&mut call, bob_raises("$h1", "$bob-member-1", 5_000));
+    call.raise_hand(SLOT).await.expect("raise");
+
+    assert!(
+        call.raised_hands(SLOT)
+            .unwrap()
+            .iter()
+            .all(|hand| !hand.from_backfill)
+    );
+}
+
+/// A peer's sticky refresh: they raise the hand again on the new membership
+/// event, then redact the old annotation. The hand never drops and keeps the
+/// time it was first raised, so nothing downstream sees it go down and up.
+#[tokio::test]
+async fn a_peers_reannotated_hand_stays_up_with_its_first_time() {
+    let (mut call, _, own_member_id) = joined_call(join_params().into()).await;
+    ingest(&mut call, bob_raises("$h1", "$bob-member-1", 5_000));
+
+    set_roster(
+        &mut call,
+        vec![
+            member_event(ALICE, Some("ALICEDEV"), &own_member_id, "$sticky-1"),
+            member_event(BOB, Some("BOBDEV"), BOB_MEMBER, "$bob-member-2"),
+        ],
+    )
+    .await;
+    let mut watch = call.subscribe_raised_hands(SLOT).unwrap();
+    watch.borrow_and_update();
+
+    ingest(&mut call, bob_raises("$h2", "$bob-member-2", 9_000));
+    call.on_event_redacted("$h1");
+
+    let hand = call.raised_hands(SLOT).unwrap();
+    assert_eq!(hand.len(), 1);
+    assert_eq!(hand[0].raised_at_ms, 5_000);
+    assert_eq!(hand[0].reaction_event_id, "$h2");
+    assert!(watch.borrow().iter().all(|h| h.raised_at_ms == 5_000));
 }
 
 #[tokio::test]

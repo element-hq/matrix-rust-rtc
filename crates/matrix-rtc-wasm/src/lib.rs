@@ -488,6 +488,8 @@ pub struct WasmReactionsConfig {
     pub active_window_ms: u64,
     #[serde(default = "default_reaction_window_ms")]
     pub send_cooldown_ms: u64,
+    #[serde(default = "default_reaction_max_age_ms")]
+    pub max_age_ms: u64,
 }
 
 fn default_true() -> bool {
@@ -498,12 +500,17 @@ fn default_reaction_window_ms() -> u64 {
     matrix_rtc_call::DEFAULT_REACTION_ACTIVE_MS
 }
 
+fn default_reaction_max_age_ms() -> u64 {
+    matrix_rtc_call::DEFAULT_REACTION_MAX_AGE_MS
+}
+
 impl From<WasmReactionsConfig> for matrix_rtc_call::ReactionsConfig {
     fn from(value: WasmReactionsConfig) -> Self {
         matrix_rtc_call::ReactionsConfig {
             enabled: value.enabled,
             active_window_ms: value.active_window_ms,
             send_cooldown_ms: value.send_cooldown_ms,
+            max_age_ms: value.max_age_ms,
         }
     }
 }

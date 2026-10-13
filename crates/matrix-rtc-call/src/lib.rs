@@ -28,10 +28,11 @@ pub use notification::{
     notify_session_started,
 };
 pub use reactions::{
-    ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, DEFAULT_REACTION_ACTIVE_MS, GENERIC_SOUND,
-    KNOWN_REACTIONS, RAISED_HAND_KEY, REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionKind,
-    ReactionSound, ReactionsConfig, ReceivedReaction, RelationLookup, build_raised_hand_content,
-    build_reaction_content, first_grapheme, reaction_kind, sound_for,
+    ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, DEFAULT_REACTION_ACTIVE_MS,
+    DEFAULT_REACTION_MAX_AGE_MS, GENERIC_SOUND, KNOWN_REACTIONS, RAISED_HAND_KEY,
+    REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionKind, ReactionSound, ReactionsConfig,
+    ReceivedReaction, RelationLookup, build_raised_hand_content, build_reaction_content,
+    first_grapheme, reaction_kind, sound_for,
 };
 pub use transports::JoinTransport;
 

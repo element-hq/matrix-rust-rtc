@@ -18,9 +18,9 @@
 //! focus ending (adopted via [`CallEngine::adopt_own_connection`]) ends the
 //! call; a peer focus is the pool's to reconnect.
 //!
-//! The roster is the whole call; joins and leaves on the event stream are only
-//! the changes made while we are in it, so the roster we arrive to is never
-//! announced.
+//! The roster is the whole call; joins, leaves, hands and reactions on the
+//! event stream are only the changes made while we are in it, so the roster
+//! we arrive to, and the hands already up in it, are never announced.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -94,14 +94,15 @@ pub struct EngineConfig {
     pub own_connection_key: Option<String>,
     /// The call layer's raised-hand snapshots
     /// (`RtcCall::subscribe_raised_hands`), merged onto the roster as
-    /// [`Participant::hand_raised_at_ms`] and reported as
-    /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`]. `None` leaves
-    /// every hand down.
+    /// [`Participant::hand_raised_at_ms`] and
+    /// [`Participant::hand_raised_position`], and announced as
+    /// [`CallEvent::HandRaised`] / [`CallEvent::HandLowered`] while we are in
+    /// the call. `None` leaves every hand down.
     pub raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
     /// The call layer's emoji reactions
     /// (`RtcCall::subscribe_reactions`),
-    /// forwarded as [`CallEvent::Reaction`] for members on the roster. `None`
-    /// reports no reactions.
+    /// forwarded as [`CallEvent::Reaction`] for members on the roster while
+    /// we are in the call. `None` reports no reactions.
     pub reactions: Option<broadcast::Receiver<ReceivedReaction>>,
     /// `RtcSession::subscribe_ended`: once `Some`, the engine ends the call
     /// and closes every connection, the own-focus one included.
@@ -270,7 +271,7 @@ impl CallEngine {
             local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
             installed_keys: HashMap::new(),
-            raised_hands: HashMap::new(),
+            raised_hands: Vec::new(),
             in_call: false,
             ended: false,
         };
@@ -607,11 +608,12 @@ struct Actor {
     /// participant. Without it a `MissingKey` is unattributable from outside: a
     /// key that never arrived and a rotation still in flight look identical.
     installed_keys: HashMap<String, Vec<u8>>,
-    /// `member_id` → when they raised their hand, as the core last reported.
+    /// The raised hands as the core last reported them, oldest first: its
+    /// order is the queue that [`Participant::hand_raised_position`] numbers.
     /// Kept for members not yet on the roster too: the core learns of a hand
     /// and of the membership it belongs to through different channels, and a
     /// hand that arrives first must not be lost.
-    raised_hands: HashMap<String, u64>,
+    raised_hands: Vec<RaisedHand>,
     /// Whether the last applied snapshot held our own membership. Joins and
     /// leaves are announced only between two snapshots that both do: the
     /// roster we find on arrival, or on return after our membership lapsed,
@@ -689,7 +691,7 @@ impl Actor {
         self.apply_snapshot(initial);
         if let Some(hands) = raised_hands.as_mut() {
             let initial = hands.borrow_and_update().clone();
-            self.apply_raised_hands(initial);
+            self.apply_raised_hands(initial, false);
         }
 
         let mut memberships_open = true;
@@ -710,7 +712,7 @@ impl Actor {
                             .as_mut()
                             .map(|hands| hands.borrow_and_update().clone())
                             .unwrap_or_default();
-                        self.apply_raised_hands(snapshot);
+                        self.apply_raised_hands(snapshot, true);
                     }
                     Err(_) => raised_hands = None,
                 },
@@ -960,6 +962,7 @@ impl Actor {
         // joined (buffered tracks and keys) finds their entry.
         let events = self.pool.apply_snapshot(&snapshot);
         self.apply_pool_events(events);
+        self.refresh_hand_positions();
         self.publish_roster();
 
         log::debug!("roster reconciled: {} participant(s)", self.roster.len());
@@ -1075,7 +1078,9 @@ impl Actor {
             member.sender,
         );
 
-        let hand_raised_at_ms = self.raised_hands.get(&member.member_id).copied();
+        // Seeded silently: a member arriving with their hand up did not just
+        // raise it. The position is set once the roster is complete.
+        let hand_raised_at_ms = self.hand_raised_at(&member.member_id);
         // Our own publications outlive any single membership: they can go up
         // before the first one lands (the SFU connection is adopted
         // independently of the snapshot) and they survive one being re-created.
@@ -1092,6 +1097,7 @@ impl Actor {
             reachable,
             streams: own_streams.clone(),
             hand_raised_at_ms,
+            hand_raised_position: None,
             // Pinned here: a member is added once, so a sticky refresh's newer
             // `origin_server_ts` never moves them. `membership_ts` wins where
             // the dialect states one (the legacy `created_ts`).
@@ -1102,12 +1108,6 @@ impl Actor {
                 member_id: member.member_id.clone(),
                 user_id: member.sender.clone(),
                 participant_count,
-            });
-        }
-        if let Some(raised_at_ms) = hand_raised_at_ms {
-            self.emit(CallEvent::HandRaised {
-                member_id: member.member_id.clone(),
-                raised_at_ms,
             });
         }
         // After `ParticipantJoined`, so a host sees the same order either way
@@ -1128,35 +1128,52 @@ impl Actor {
 
     // ---- reactions --------------------------------------------------------
 
-    /// Applies the core's raised-hand set: the roster entries change, and each
-    /// hand that went up or down is reported. Hands of members not on the
-    /// roster yet are kept for `add_member`.
-    fn apply_raised_hands(&mut self, hands: Vec<RaisedHand>) {
-        self.raised_hands = hands
-            .into_iter()
-            .map(|hand| (hand.member_id, hand.raised_at_ms))
-            .collect();
+    /// Applies the core's raised-hand set: the roster entries and their queue
+    /// positions change, and each hand that went up or down is announced when
+    /// it is news (see [`CallEvent::HandRaised`]). Hands of members not on the
+    /// roster yet are kept for `add_member`. `announce` is false for the set
+    /// we attach to: those hands were up before us.
+    fn apply_raised_hands(&mut self, hands: Vec<RaisedHand>, announce: bool) {
+        self.raised_hands = hands;
+        let announce = announce && self.in_call && !self.ended;
 
+        let mut changed = false;
         let mut events = Vec::new();
         for participant in &mut self.roster {
-            let now = self.raised_hands.get(&participant.member_id).copied();
+            let hand = self
+                .raised_hands
+                .iter()
+                .find(|hand| hand.member_id == participant.member_id);
+            let now = hand.map(|hand| hand.raised_at_ms);
             if participant.hand_raised_at_ms == now {
                 continue;
             }
+            let was_up = participant.hand_raised_at_ms.is_some();
             participant.hand_raised_at_ms = now;
-            events.push(match now {
-                Some(raised_at_ms) => CallEvent::HandRaised {
+            changed = true;
+            if !announce {
+                continue;
+            }
+            match hand {
+                // Only a hand seen going up: one found by the relations
+                // backfill was already up when we looked. A hand already up
+                // whose time merely moved is no news either.
+                Some(hand) if !was_up && !hand.from_backfill => {
+                    events.push(CallEvent::HandRaised {
+                        member_id: participant.member_id.clone(),
+                        raised_at_ms: hand.raised_at_ms,
+                    });
+                }
+                Some(_) => {}
+                None => events.push(CallEvent::HandLowered {
                     member_id: participant.member_id.clone(),
-                    raised_at_ms,
-                },
-                None => CallEvent::HandLowered {
-                    member_id: participant.member_id.clone(),
-                },
-            });
+                }),
+            }
         }
-        if events.is_empty() {
+        if !changed {
             return;
         }
+        self.refresh_hand_positions();
         // Roster first, events second. This actor runs on a worker thread while
         // a consumer may sit on another, and a consumer woken by `HandRaised`
         // reads `participants()` straight away — it must see the hand there.
@@ -1166,10 +1183,48 @@ impl Actor {
         }
     }
 
-    /// Reports a reaction from a member on the roster. One from a member the
-    /// roster does not hold is dropped: the core validated it against a
-    /// membership, so this is a hand-off race, not a stranger.
+    fn hand_raised_at(&self, member_id: &str) -> Option<u64> {
+        self.raised_hands
+            .iter()
+            .find(|hand| hand.member_id == member_id)
+            .map(|hand| hand.raised_at_ms)
+    }
+
+    /// Numbers the roster's raised hands 1, 2, … in the core's queue order,
+    /// skipping hands of members not on the roster. O(roster + hands), on a
+    /// membership snapshot or a hand change only.
+    fn refresh_hand_positions(&mut self) {
+        let index: HashMap<&str, usize> = self
+            .roster
+            .iter()
+            .enumerate()
+            .map(|(i, participant)| (participant.member_id.as_str(), i))
+            .collect();
+        let mut positions = vec![None; self.roster.len()];
+        let mut next = 1;
+        for hand in &self.raised_hands {
+            if let Some(&i) = index.get(hand.member_id.as_str()) {
+                positions[i] = Some(next);
+                next += 1;
+            }
+        }
+        for (participant, position) in self.roster.iter_mut().zip(positions) {
+            participant.hand_raised_position = position;
+        }
+    }
+
+    /// Reports a reaction from a member on the roster, while we are in the
+    /// call. One from a member the roster does not hold is dropped: the core
+    /// validated it against a membership, so this is a hand-off race, not a
+    /// stranger.
     fn apply_reaction(&mut self, reaction: ReceivedReaction) {
+        if !self.in_call || self.ended {
+            log::debug!(
+                "dropping reaction from {}: we are not in the call",
+                reaction.member_id,
+            );
+            return;
+        }
         if !self
             .roster
             .iter()
@@ -1910,78 +1965,191 @@ mod tests {
         );
     }
 
-    /// A hand and a reaction are keyed by `member_id` like everything else;
-    /// the hand lands on the roster entry (even when it was reported before
-    /// the membership) and both surface as events.
-    #[tokio::test]
-    async fn raised_hands_and_reactions_ride_on_the_roster() {
-        let mut fx = fixture();
+    fn participant(fx: &Fixture, member_id: &str) -> Participant {
+        fx.engine
+            .participants()
+            .into_iter()
+            .find(|p| p.member_id == member_id)
+            .unwrap()
+    }
 
-        // The hand is known before the membership: parked, then applied.
-        fx.raised_hands
-            .send(vec![RaisedHand {
-                member_id: "bob".to_owned(),
-                sender: "@bob:example.org".to_owned(),
-                reaction_event_id: "$hand".to_owned(),
-                raised_at_ms: 42,
-            }])
-            .unwrap();
+    fn reaction_from(member_id: &str) -> ReceivedReaction {
+        ReceivedReaction {
+            member_id: member_id.to_owned(),
+            sender: format!("@{member_id}:example.org"),
+            emoji: "👏".to_owned(),
+            name: "clapping".to_owned(),
+            sound: matrix_rtc_call::ReactionSound::Named("clap".to_owned()),
+        }
+    }
+
+    fn clapped(member_id: &str) -> CallEvent {
+        CallEvent::Reaction {
+            member_id: member_id.to_owned(),
+            emoji: "👏".to_owned(),
+            name: "clapping".to_owned(),
+            sound: Some("clap".to_owned()),
+        }
+    }
+
+    /// The hands up when we arrive, and the hand a member arrives with, are
+    /// state on the roster, not news. The core accepts a live hand only once
+    /// it knows the membership, so a hand that was up before we saw the member
+    /// comes from the relations backfill. The reaction after them is the first
+    /// event: nothing about a hand came before it.
+    #[tokio::test]
+    async fn hands_already_up_are_on_the_roster_but_not_announced() {
+        let mut fx = fixture();
+        let backfilled = |member_id: &str, raised_at_ms: u64| RaisedHand {
+            from_backfill: true,
+            ..hand(member_id, raised_at_ms)
+        };
+
+        // Known before the membership: parked, then applied.
+        fx.raised_hands.send(vec![backfilled("bob", 42)]).unwrap();
         fx.memberships
             .send(vec![
                 member("own", "@alice:example.org"),
                 member("bob", "@bob:example.org"),
             ])
             .unwrap();
+        rostered(&fx, &["own", "bob"]).await;
+        wait_until(|| participant(&fx, "bob").hand_raised_at_ms == Some(42)).await;
+        assert_eq!(participant(&fx, "bob").hand_raised_position, Some(1));
 
-        // The only event: the roster we arrive to announces no joins.
+        // Carol arrives with her hand up.
+        fx.raised_hands
+            .send(vec![backfilled("bob", 42), backfilled("carol", 50)])
+            .unwrap();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "carol".to_owned(),
+                user_id: "@carol:example.org".to_owned(),
+                participant_count: 3,
+            }
+        );
+        wait_until(|| participant(&fx, "carol").hand_raised_position == Some(2)).await;
+
+        fx.reactions.send(reaction_from("bob")).unwrap();
+        assert_eq!(next_event(&mut fx.events).await, clapped("bob"));
+    }
+
+    /// In the call, a hand seen going up is announced; one the relations
+    /// backfill found is not, nor a hand that stays up under a new annotation.
+    /// Lowering is announced and renumbers the queue.
+    #[tokio::test]
+    async fn a_hand_raised_in_the_call_is_announced() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined bob
+        let _ = next_event(&mut fx.events).await; // ParticipantJoined carol
+
+        let bob_backfilled = RaisedHand {
+            from_backfill: true,
+            ..hand("bob", 10)
+        };
+        fx.raised_hands.send(vec![bob_backfilled.clone()]).unwrap();
+        wait_until(|| participant(&fx, "bob").hand_raised_position == Some(1)).await;
+
+        fx.raised_hands
+            .send(vec![bob_backfilled, hand("carol", 20)])
+            .unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::HandRaised {
-                member_id: "bob".to_owned(),
-                raised_at_ms: 42,
-            }
+                member_id: "carol".to_owned(),
+                raised_at_ms: 20,
+            },
+            "bob's backfilled hand was never announced"
         );
-        let bob = fx
-            .engine
-            .participants()
-            .into_iter()
-            .find(|p| p.member_id == "bob")
-            .unwrap();
-        assert_eq!(bob.hand_raised_at_ms, Some(42));
+        assert_eq!(participant(&fx, "carol").hand_raised_position, Some(2));
 
-        fx.reactions
-            .send(ReceivedReaction {
-                member_id: "bob".to_owned(),
-                sender: "@bob:example.org".to_owned(),
-                emoji: "👏".to_owned(),
-                name: "clapping".to_owned(),
-                sound: matrix_rtc_call::ReactionSound::Named("clap".to_owned()),
-            })
-            .unwrap();
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::Reaction {
-                member_id: "bob".to_owned(),
-                emoji: "👏".to_owned(),
-                name: "clapping".to_owned(),
-                sound: Some("clap".to_owned()),
-            }
-        );
-
-        fx.raised_hands.send(Vec::new()).unwrap();
+        fx.raised_hands.send(vec![hand("carol", 20)]).unwrap();
         assert_eq!(
             next_event(&mut fx.events).await,
             CallEvent::HandLowered {
                 member_id: "bob".to_owned(),
             }
         );
-        let bob = fx
-            .engine
-            .participants()
-            .into_iter()
-            .find(|p| p.member_id == "bob")
+        let carol = participant(&fx, "carol");
+        assert_eq!(carol.hand_raised_position, Some(1), "the queue renumbers");
+        assert_eq!(participant(&fx, "bob").hand_raised_position, None);
+
+        // Carol's refresh: the hand moves to a new annotation, same time.
+        fx.raised_hands
+            .send(vec![RaisedHand {
+                reaction_event_id: "$carol-again".to_owned(),
+                ..hand("carol", 20)
+            }])
             .unwrap();
-        assert_eq!(bob.hand_raised_at_ms, None);
+        fx.reactions.send(reaction_from("carol")).unwrap();
+        assert_eq!(next_event(&mut fx.events).await, clapped("carol"));
+    }
+
+    /// A hand of a member not on the roster yet takes no place in the queue,
+    /// and a departure renumbers the rest.
+    #[tokio::test]
+    async fn positions_count_the_roster_only() {
+        let fx = fixture();
+        fx.raised_hands
+            .send(vec![hand("dave", 1), hand("bob", 2), hand("carol", 3)])
+            .unwrap();
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        rostered(&fx, &["own", "bob", "carol"]).await;
+        wait_until(|| participant(&fx, "carol").hand_raised_position == Some(2)).await;
+        assert_eq!(participant(&fx, "bob").hand_raised_position, Some(1));
+        assert_eq!(participant(&fx, "own").hand_raised_position, None);
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("dave", "@dave:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        rostered(&fx, &["dave"]).await;
+        assert_eq!(participant(&fx, "dave").hand_raised_position, Some(1));
+        assert_eq!(participant(&fx, "carol").hand_raised_position, Some(2));
+    }
+
+    /// While our membership is missing, hands and reactions still land on
+    /// the roster (or are dropped) silently.
+    #[tokio::test]
+    async fn no_hand_or_reaction_is_announced_while_our_membership_is_missing() {
+        let mut fx = fixture();
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        rostered(&fx, &["bob"]).await;
+
+        fx.raised_hands.send(vec![hand("bob", 5)]).unwrap();
+        wait_until(|| participant(&fx, "bob").hand_raised_at_ms == Some(5)).await;
+        fx.reactions.send(reaction_from("bob")).unwrap();
+        fx.raised_hands.send(Vec::new()).unwrap();
+        wait_until(|| participant(&fx, "bob").hand_raised_at_ms.is_none()).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(fx.events.try_recv().is_err());
     }
 
     async fn next_event(events: &mut broadcast::Receiver<CallEvent>) -> CallEvent {
@@ -2231,10 +2399,14 @@ mod tests {
             }
         );
 
+        fx.raised_hands.send(vec![hand("bob", 5)]).unwrap();
+        wait_until(|| participant(&fx, "bob").hand_raised_at_ms == Some(5)).await;
+        fx.reactions.send(reaction_from("bob")).unwrap();
         fx.memberships
             .send(vec![member("own", "@alice:example.org")])
             .unwrap();
         wait_until(|| fx.engine.participants().len() == 1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(fx.events.try_recv().is_err());
     }
 
@@ -4017,6 +4189,7 @@ mod tests {
             sender: format!("@{member_id}:example.org"),
             reaction_event_id: format!("${member_id}"),
             raised_at_ms,
+            from_backfill: false,
         }
     }
 
