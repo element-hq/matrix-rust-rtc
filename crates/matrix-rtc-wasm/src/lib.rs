@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use matrix_rtc_call::{CallJoinOptions, JoinTransport, Mentions, NotificationType, NotifyConfig};
+use matrix_rtc_call::{CallJoinOptions, CallKind, GroupNotify, JoinTransport, Mentions};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::{EncryptionConfig, LeaveSessionParams, MatrixBackend, SlotEncryption};
@@ -37,6 +37,7 @@ mod backend;
 mod compat;
 mod logging;
 mod media;
+mod status;
 mod ts_types;
 pub use backend::{JsBackend, WasmRoomSink, WasmToDeviceSink};
 pub use logging::{init_logging, log_event};
@@ -364,6 +365,14 @@ impl WasmRtcCall {
         self.call.lower_hand().await.map_err(js_error)
     }
 
+    /// Where the call is, as `RtcCallStatus`. Changes arrive through the media
+    /// delegate's `onStatus`.
+    #[wasm_bindgen(getter, unchecked_return_type = "RtcCallStatus")]
+    pub fn status(&self) -> Result<JsValue, JsError> {
+        serde_wasm_bindgen::to_value(&status::WasmCallStatus::from(self.call.status()))
+            .map_err(js_error)
+    }
+
     /// The raised hands, oldest first, as `RaisedHand[]`.
     #[wasm_bindgen(js_name = raisedHands, unchecked_return_type = "RaisedHand[]")]
     pub async fn raised_hands(&self) -> Result<JsValue, JsError> {
@@ -468,8 +477,10 @@ pub struct WasmJoinSessionParams {
     #[serde(default)]
     pub encryption_config: Option<WasmEncryptionConfig>,
     /// Ask for an MSC4075 notification to be sent with this join, so other
-    /// devices in the room ring or show an incoming call. Omit — the default —
-    /// to join quietly; pass it only when the user is *starting* the call.
+    /// devices in the room show an incoming call. Omit — the default — to join
+    /// quietly; pass it only when the user is *starting* the call. A group
+    /// call's notification only: ringing belongs to a DM call, which this
+    /// binding does not offer yet.
     #[serde(default)]
     pub notify: Option<WasmNotifyConfig>,
     /// How this session handles Element Call reactions and the raised hand.
@@ -515,16 +526,16 @@ impl From<WasmReactionsConfig> for matrix_rtc_call::ReactionsConfig {
     }
 }
 
-/// WASM-friendly MSC4075 notification request.
+/// WASM-friendly MSC4075 notification request, for a group call.
 #[derive(Debug, Deserialize)]
 pub struct WasmNotifyConfig {
-    /// `"ring"` or `"notification"`.
+    /// `"notification"`. `"ring"` is refused: only a DM call rings.
     pub notification_type: String,
     /// MSC4196 `m.call.intent`, e.g. `"audio"` or `"video"`.
     #[serde(default)]
     pub intent: Option<String>,
-    /// How long the ring stays valid, in milliseconds (default: 30000, capped
-    /// at 120000 because that is what receivers honour).
+    /// How long the notification stays valid, in milliseconds (default:
+    /// 90000, capped at 120000 because that is what receivers honour).
     #[serde(default)]
     pub lifetime_ms: Option<u64>,
     /// Users named individually in `m.mentions`. Usually empty.
@@ -536,18 +547,22 @@ pub struct WasmNotifyConfig {
 }
 
 impl WasmNotifyConfig {
-    fn into_core(self) -> Result<NotifyConfig, JsError> {
-        let notification_type = match self.notification_type.as_str() {
-            "ring" => NotificationType::Ring,
-            "notification" => NotificationType::Notification,
+    fn into_core(self) -> Result<GroupNotify, JsError> {
+        match self.notification_type.as_str() {
+            "notification" => {}
+            "ring" => {
+                return Err(JsError::new(
+                    "notification_type \"ring\": only a DM call rings, and this binding \
+                     joins group calls only; use \"notification\"",
+                ));
+            }
             other => {
                 return Err(JsError::new(&format!(
-                    "unknown notification_type {other:?}: expected ring | notification"
+                    "unknown notification_type {other:?}: expected notification"
                 )));
             }
-        };
-        Ok(NotifyConfig {
-            notification_type,
+        }
+        Ok(GroupNotify {
             intent: self.intent,
             lifetime_ms: self.lifetime_ms,
             mentions: Mentions {
@@ -604,7 +619,9 @@ impl WasmJoinSessionParams {
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        options.notify = self.notify.map(WasmNotifyConfig::into_core).transpose()?;
+        options.kind = CallKind::Group {
+            notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
+        };
         options.reactions = self.reactions.map(Into::into);
         Ok(options)
     }

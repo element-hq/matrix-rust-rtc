@@ -23,6 +23,7 @@ import type {
   MediaDelegate,
   RoomSubjects,
   RtcCallEvent,
+  RtcCallStatus,
   RtcParticipant,
   WasmMediaSession,
   WasmRoomSink,
@@ -108,13 +109,27 @@ export async function smoke(
         return `${event.member_id}/${event.identity}@${event.key_index}`;
       case 'active_speakers':
         return event.speakers.map((speaker) => speaker.member_id).join(',');
-      case 'ended':
-        return event.reason;
       default:
         return event.type;
     }
   };
   void handle;
+
+  // The status discriminates on `type` too, and only `ended` carries a reason.
+  const status: RtcCallStatus = call.status;
+  const describe = (status: RtcCallStatus): string => {
+    switch (status.type) {
+      case 'calling':
+        return status.ring.type === 'ringing' ? `ringing ${status.ring.lifetime_ms}` : 'sending';
+      case 'connected':
+        return `since ${status.since_ms}`;
+      case 'ended':
+        return status.message ?? status.reason;
+      default:
+        return status.type;
+    }
+  };
+  void describe(status);
   void memberId;
 
   await call.leave({ leave_reason: { code: 'leave' } });

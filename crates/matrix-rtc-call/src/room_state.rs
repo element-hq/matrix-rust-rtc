@@ -4,9 +4,10 @@
 // Please see LICENSE in the repository root for full details.
 
 //! [`CallRoomState`]: one room's core [`BaseRtcRoom`] plus the call application's
-//! state in it — reactions and raised hands per slot, ringing on join. It wraps
-//! the two core operations the call acts around (join, leave) and
-//! follows each slot's joined memberships through a core
+//! state in it — reactions and raised hands per slot, the ring and a DM call's
+//! lifecycle ([`crate::direct_call`]) on join. It wraps the two core
+//! operations the call acts around (join, leave) and follows each slot's joined
+//! memberships through a core
 //! [`MembershipListener`](matrix_rtc_core::MembershipListener) registered on
 //! that room alone. The feeder writes into it; hosts reach it through
 //! [`crate::RtcRoom`] and [`crate::RtcCall`].
@@ -14,18 +15,23 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use matrix_rtc_core::compat::DialectBackend;
 use matrix_rtc_core::{
     ApplicationIntake, BaseRtcRoom, CommandError, JoinError, JoinSessionParams, JoinedMembership,
     LeaveError, LeaveSessionParams, MatrixBackend, RawTimelineEvent, RelationsRequest,
 };
 use tokio::sync::{broadcast, watch};
 
-use crate::notification::{NotifyConfig, notify_session_started};
+use crate::direct_call::{
+    CallKind, DECLINE_EVENT_TYPES, DirectCall, DirectCallEnd, DirectCallState, RingJob, callee_of,
+};
+use crate::notification::{NotifyConfig, is_own_participation, notify_session_started};
 use crate::reactions::{
     ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, Clock, REACTION_EVENT_TYPE, RaisedHand,
     ReactionError, ReactionsConfig, ReactionsState, ReceivedReaction, RelationLookup,
     build_raised_hand_content, build_reaction_content, first_grapheme,
 };
+use crate::status::CallStatusCell;
 
 /// Parameters for joining a call: the core's, plus what the call adds.
 #[derive(Clone, Debug)]
@@ -33,14 +39,9 @@ pub(crate) struct CallJoinParams {
     /// The MatrixRTC join itself.
     pub rtc: JoinSessionParams,
 
-    /// Ask for an MSC4075 notification to be sent with this join.
-    ///
-    /// `None` — the default — joins quietly, which is what joining a call
-    /// someone else started does. Set it only when the user is *starting* the
-    /// call: the notification is still suppressed if somebody is already in the
-    /// session, but the intent to summon anyone at all is the application's to
-    /// state.
-    pub notify: Option<NotifyConfig>,
+    /// A group call, with or without a notification, or a DM call, with or
+    /// without a ring. The default is a quiet group join.
+    pub kind: CallKind,
 
     /// How this session handles Element Call reactions and the raised hand.
     ///
@@ -54,7 +55,7 @@ impl CallJoinParams {
     pub fn new(rtc: JoinSessionParams) -> Self {
         Self {
             rtc,
-            notify: None,
+            kind: CallKind::default(),
             reactions: None,
         }
     }
@@ -71,6 +72,18 @@ impl From<JoinSessionParams> for CallJoinParams {
     }
 }
 
+/// What a call join produced beyond the core's.
+pub(crate) struct CallJoined {
+    /// The core join's membership event id.
+    pub member_event_id: String,
+    /// A DM call's lifecycle; `None` for a group call, or a DM that is not
+    /// one-to-one.
+    pub direct: Option<Arc<DirectCall>>,
+    /// The ring to send, once the room's lock is released.
+    pub ring: Option<RingJob>,
+    pub status: Arc<CallStatusCell>,
+}
+
 /// What the core does not already report about our own participation.
 #[derive(Clone, Debug)]
 struct OwnCall {
@@ -83,6 +96,8 @@ struct CallState {
     /// The joined memberships as last published by the core.
     members: Vec<JoinedMembership>,
     own: Option<OwnCall>,
+    /// The current join's DM lifecycle, if it is a DM call.
+    direct: Option<Arc<DirectCall>>,
 }
 
 impl CallState {
@@ -94,12 +109,16 @@ impl CallState {
             reactions,
             members,
             own: None,
+            direct: None,
         }
     }
 
     fn sync_roster(&mut self, members: &[JoinedMembership]) {
         self.members = members.to_vec();
         self.reactions.sync_roster(members);
+        if let Some(direct) = &self.direct {
+            direct.on_roster(members);
+        }
     }
 }
 
@@ -202,30 +221,6 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
             .ok_or_else(|| CommandError::from_message("no backend configured"))
     }
 
-    /// The core join, then the notification if we started the call. Returns
-    /// the core join's membership event id.
-    pub async fn join(&mut self, params: CallJoinParams) -> Result<String, JoinError> {
-        let reactions = params.reactions();
-        let CallJoinParams { rtc, notify, .. } = params;
-        let slot_id = rtc.slot_id.clone();
-
-        let member_event_id = self.rtc.join(rtc.clone()).await?;
-        // The join succeeded, so the room has a backend.
-        let user_id = self.backend()?.own_user_id();
-
-        self.with_state(&slot_id, |state| {
-            state.reactions.configure(reactions);
-            state.reactions.reset_own();
-            state.own = Some(OwnCall { user_id });
-        });
-
-        if let Some(notify) = &notify {
-            self.notify_session_started(notify, &rtc, &member_event_id)
-                .await;
-        }
-        Ok(member_event_id)
-    }
-
     /// Lowers our hand first, while the membership it annotates still stands.
     /// Best effort: peers drop the hand with the membership anyway.
     pub async fn leave(
@@ -247,6 +242,9 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
             );
         }
 
+        if let Some(Some(direct)) = self.with_state(slot_id, |state| state.direct.clone()) {
+            direct.finish_left();
+        }
         self.rtc.leave(slot_id, params).await?;
 
         self.with_state(slot_id, |state| {
@@ -256,46 +254,33 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         Ok(())
     }
 
-    /// Sends the MSC4075 notification that summons the room to this session;
-    /// see [`notify_session_started`] for when it is suppressed.
-    async fn notify_session_started(
-        &self,
-        notify: &NotifyConfig,
-        params: &JoinSessionParams,
-        member_event_id: &str,
-    ) {
-        let Ok(backend) = self.backend() else {
-            return;
-        };
-        let members = self
-            .rtc
-            .subscribe_membership_snapshots(&params.slot_id)
-            .map(|snapshots| snapshots.borrow().clone())
-            .unwrap_or_default();
-        notify_session_started(
-            backend.as_ref(),
-            self.rtc.room_id(),
-            notify,
-            params,
-            &members,
-            member_event_id,
-        )
-        .await;
-    }
-
     // ---- Reactions and raised hands (see `crate::reactions`) ----
     //
     // A reaction relates to a membership event and names no slot, so every
     // slot of the room is offered each event and keeps the ones that relate to
     // its own members.
 
-    /// Applies message-like room events — `io.element.call.reaction` and
-    /// `m.reaction` — to every slot. Other event types are ignored, so a host
-    /// may forward without filtering.
+    /// Applies message-like room events — `io.element.call.reaction`,
+    /// `m.reaction` and MSC4310 declines — to every slot. Other event types are
+    /// ignored, so a host may forward without filtering.
     pub fn on_timeline_events(&mut self, events: &[RawTimelineEvent]) {
         self.for_each_slot(|_, state| {
             for event in events {
                 state.reactions.ingest(event, &state.members, false);
+            }
+            if let Some(direct) = &state.direct {
+                direct.on_room_events(events);
+            }
+        });
+    }
+
+    /// Applies the room's sticky declines: matrix-js-sdk sends a decline as a
+    /// sticky event, where Element X sends it on the timeline. A decline that
+    /// arrives both ways ends the call once.
+    pub fn on_sticky_events(&mut self, events: &[RawTimelineEvent]) {
+        self.for_each_slot(|_, state| {
+            if let Some(direct) = &state.direct {
+                direct.on_room_events(events);
             }
         });
     }
@@ -593,6 +578,155 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
 /// `join` and `leave` are inherent, so they win over the core's;
 /// `join` takes [`CallJoinParams`], so code written against the core's does not
 /// compile rather than silently skipping the notification.
+/// Sending goes through the dialect wrapper, which sends the notification as
+/// a room event where the room's membership format has no sticky map.
+impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
+    /// The core join, then what the call's kind asks for: a group's
+    /// notification, or a DM call's lifecycle and the ring to send.
+    pub async fn join(&mut self, params: CallJoinParams) -> Result<CallJoined, JoinError> {
+        let reactions = params.reactions();
+        let CallJoinParams { rtc, kind, .. } = params;
+        let slot_id = rtc.slot_id.clone();
+
+        let member_event_id = self.rtc.join(rtc.clone()).await?;
+        // The join succeeded, so the room has a backend.
+        let user_id = self.backend()?.own_user_id();
+
+        self.with_state(&slot_id, |state| {
+            state.reactions.configure(reactions);
+            state.reactions.reset_own();
+            state.own = Some(OwnCall {
+                user_id: user_id.clone(),
+            });
+            state.direct = None;
+        });
+
+        let clock = self.shared.lock().unwrap().clock.clone();
+        let mut joined = CallJoined {
+            member_event_id,
+            direct: None,
+            ring: None,
+            status: CallStatusCell::new(clock, None),
+        };
+        match kind {
+            CallKind::Group { notify: None } => {}
+            CallKind::Group {
+                notify: Some(notify),
+            } => {
+                self.notify_session_started(&notify.into(), &rtc, &joined.member_event_id)
+                    .await;
+            }
+            CallKind::Direct { ring } => {
+                self.join_direct(&rtc, &user_id, ring, &mut joined).await;
+            }
+        }
+        Ok(joined)
+    }
+
+    /// A DM call (spec 030): who the callee is, and where the call starts.
+    async fn join_direct(
+        &mut self,
+        rtc: &JoinSessionParams,
+        user_id: &str,
+        ring: Option<crate::RingConfig>,
+        joined: &mut CallJoined,
+    ) {
+        let tag = format!("{}/{}", self.room_id(), rtc.slot_id);
+        let Some(callee) = callee_of(self.rtc.room_members(), user_id) else {
+            log::info!("[{tag}] DM is not one-to-one: no ring, no direct-call lifecycle");
+            if let Some(ring) = ring {
+                self.notify_session_started(&ring.demoted(), rtc, &joined.member_event_id)
+                    .await;
+            }
+            return;
+        };
+        let Ok(backend) = self.backend() else {
+            return;
+        };
+        let device_id = backend.own_device_id();
+        let members = self
+            .rtc
+            .subscribe_membership_snapshots(&rtc.slot_id)
+            .map(|snapshots| snapshots.borrow().clone())
+            .unwrap_or_default();
+        let clock = self.shared.lock().unwrap().clock.clone();
+        let anyone_else = members.iter().any(|member| member.sender != user_id);
+
+        let initial = match &ring {
+            // Somebody is already here — the callee, or another device of ours
+            // — so nobody is rung (R1).
+            Some(_)
+                if members
+                    .iter()
+                    .any(|member| !is_own_participation(member, user_id, &device_id)) =>
+            {
+                DirectCallState::InCall { since_ms: clock() }
+            }
+            Some(_) => DirectCallState::Sending,
+            None if anyone_else => DirectCallState::InCall { since_ms: clock() },
+            // The call we meant to answer or join is already over (R33).
+            None => DirectCallState::Ended {
+                reason: DirectCallEnd::Empty,
+            },
+        };
+        if let Some(ring) = &ring
+            && initial == DirectCallState::Sending
+        {
+            joined.ring = Some(RingJob {
+                tag: tag.clone(),
+                room_id: self.room_id(),
+                notify: ring.ring(),
+                application_type: rtc
+                    .application
+                    .application_type()
+                    .unwrap_or_default()
+                    .to_owned(),
+                member_event_id: joined.member_event_id.clone(),
+                clock: clock.clone(),
+            });
+        }
+        joined.status = CallStatusCell::new(clock.clone(), Some(initial.clone()));
+        let direct = DirectCall::new(
+            tag,
+            user_id.to_owned(),
+            callee,
+            clock,
+            &members,
+            initial,
+            joined.status.clone(),
+        );
+        self.with_state(&rtc.slot_id, |state| state.direct = Some(direct.clone()));
+        joined.direct = Some(direct);
+    }
+
+    /// Sends the MSC4075 notification that summons the room to this session;
+    /// see [`notify_session_started`] for when it is suppressed.
+    async fn notify_session_started(
+        &self,
+        notify: &NotifyConfig,
+        params: &JoinSessionParams,
+        member_event_id: &str,
+    ) {
+        let Ok(backend) = self.backend() else {
+            return;
+        };
+        let members = self
+            .rtc
+            .subscribe_membership_snapshots(&params.slot_id)
+            .map(|snapshots| snapshots.borrow().clone())
+            .unwrap_or_default();
+        notify_session_started(
+            backend.as_ref(),
+            self.rtc.room_id(),
+            notify,
+            params,
+            &members,
+            member_event_id,
+        )
+        .await;
+    }
+}
+
 impl<T: MatrixBackend> std::ops::Deref for CallRoomState<T> {
     type Target = BaseRtcRoom<T>;
 
@@ -613,14 +747,23 @@ impl<T: MatrixBackend + 'static> ApplicationIntake<T> for CallRoomState<T> {
     }
 
     fn timeline_event_types(&self) -> Vec<String> {
-        vec![
-            REACTION_EVENT_TYPE.to_owned(),
-            ANNOTATION_EVENT_TYPE.to_owned(),
-        ]
+        [REACTION_EVENT_TYPE, ANNOTATION_EVENT_TYPE]
+            .into_iter()
+            .chain(DECLINE_EVENT_TYPES)
+            .map(str::to_owned)
+            .collect()
     }
 
     fn on_timeline_events(&mut self, events: &[RawTimelineEvent]) {
         CallRoomState::on_timeline_events(self, events);
+    }
+
+    fn sticky_event_types(&self) -> Vec<String> {
+        DECLINE_EVENT_TYPES.into_iter().map(str::to_owned).collect()
+    }
+
+    fn on_sticky_events(&mut self, events: &[RawTimelineEvent]) {
+        CallRoomState::on_sticky_events(self, events);
     }
 
     fn on_event_redacted(&mut self, event_id: &str) {

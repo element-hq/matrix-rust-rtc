@@ -38,25 +38,28 @@ pub struct FfiEncryptionConfig {
     pub require_cross_signed_sender: Option<bool>,
 }
 
-/// What kind of notification an MSC4075 call notification asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
-pub enum FfiNotificationType {
-    /// Ring audibly, for `lifetime_ms`.
-    Ring,
-    /// Show a visual indication only.
-    Notification,
+/// What kind of call a join is. Only a DM call can ring, so a group call
+/// cannot express a ring and a DM call cannot take a group's notification.
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum FfiCallKind {
+    /// Not a DM. Never rings; `notify` tells the room with a visual
+    /// notification when we start the call.
+    Group { notify: Option<FfiGroupNotify> },
+    /// A DM call: the library rings, follows the call and ends it (see
+    /// `RtcCall::status`). With `ring`, the user chose to call;
+    /// without it, they are answering a ring or joining a call in progress.
+    Direct { ring: Option<FfiRingConfig> },
 }
 
-/// FFI-friendly MSC4075 notification request, for a join that *starts* a call.
+/// A group call's MSC4075 notification, for a join that starts the call.
+/// A visual indication, never a ring.
 #[derive(Clone, Debug, uniffi::Record)]
-pub struct FfiNotifyConfig {
-    /// Ring, or notify silently.
-    pub notification_type: FfiNotificationType,
+pub struct FfiGroupNotify {
     /// MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
     #[uniffi(default = None)]
     pub intent: Option<String>,
-    /// How long the ring stays valid, in milliseconds (default: 30000, capped
-    /// at 120000 because that is what receivers honour).
+    /// How long the notification stays valid, in milliseconds (default: 90000,
+    /// capped at 120000).
     #[uniffi(default = None)]
     pub lifetime_ms: Option<u64>,
     /// Users named individually in `m.mentions`. Usually empty.
@@ -68,20 +71,43 @@ pub struct FfiNotifyConfig {
     pub mention_room: bool,
 }
 
-impl From<FfiNotifyConfig> for matrix_rtc_call::NotifyConfig {
-    fn from(value: FfiNotifyConfig) -> Self {
-        matrix_rtc_call::NotifyConfig {
-            notification_type: match value.notification_type {
-                FfiNotificationType::Ring => matrix_rtc_call::NotificationType::Ring,
-                FfiNotificationType::Notification => {
-                    matrix_rtc_call::NotificationType::Notification
-                }
-            },
+impl From<FfiGroupNotify> for matrix_rtc_call::GroupNotify {
+    fn from(value: FfiGroupNotify) -> Self {
+        matrix_rtc_call::GroupNotify {
             intent: value.intent,
             lifetime_ms: value.lifetime_ms,
             mentions: matrix_rtc_call::Mentions {
                 user_ids: value.mention_user_ids,
                 room: value.mention_room,
+            },
+        }
+    }
+}
+
+/// The ring a DM call sends when the user chose to call. It always addresses
+/// the whole room.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiRingConfig {
+    /// How long the callee's phone rings, and how long the call waits for an
+    /// answer, in milliseconds (default: 90000, capped at 120000).
+    #[uniffi(default = None)]
+    pub lifetime_ms: Option<u64>,
+    /// MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
+    #[uniffi(default = None)]
+    pub intent: Option<String>,
+}
+
+impl From<FfiCallKind> for matrix_rtc_call::CallKind {
+    fn from(value: FfiCallKind) -> Self {
+        match value {
+            FfiCallKind::Group { notify } => matrix_rtc_call::CallKind::Group {
+                notify: notify.map(Into::into),
+            },
+            FfiCallKind::Direct { ring } => matrix_rtc_call::CallKind::Direct {
+                ring: ring.map(|ring| matrix_rtc_call::RingConfig {
+                    lifetime_ms: ring.lifetime_ms,
+                    intent: ring.intent,
+                }),
             },
         }
     }
@@ -97,6 +123,10 @@ pub struct FfiJoinSessionParams {
     /// What the join publishes on, if anything. Usually
     /// [`FfiJoinTransport::Advertised`].
     pub transport: FfiJoinTransport,
+    /// A group call or a DM call. Required: a default of a group call would
+    /// let a host that forgot to say DM place a quiet group call nobody
+    /// notices.
+    pub kind: FfiCallKind,
     /// Optional keep-alive timeout in milliseconds (default: 30000).
     ///
     /// Arms the delayed leave (the dead man's switch for a client that dies).
@@ -122,15 +152,6 @@ pub struct FfiJoinSessionParams {
     pub degraded_lifetime_ms: Option<u64>,
     /// Optional encryption configuration
     pub encryption_config: Option<FfiEncryptionConfig>,
-    /// Ask for an MSC4075 notification to be sent with this join, so other
-    /// devices in the room ring or show an incoming call.
-    ///
-    /// Unset — the default — joins quietly, which is what joining a call
-    /// someone else started does. Set it only when the user is *starting* the
-    /// call: the SDK still suppresses the notification if anybody is already in
-    /// the session, but the intent to summon anyone at all is yours to state.
-    #[uniffi(default = None)]
-    pub notify: Option<FfiNotifyConfig>,
     /// How this session handles Element Call reactions and the raised hand.
     /// Unset is enabled with Element Call's three-second window.
     #[uniffi(default = None)]
@@ -219,15 +240,20 @@ impl FfiJoinSessionParams {
             FfiJoinTransport::ReceiveOnly => "receive_only".to_owned(),
         };
 
+        let kind = match &self.kind {
+            FfiCallKind::Group { notify: None } => "group",
+            FfiCallKind::Group { notify: Some(_) } => "group+notify",
+            FfiCallKind::Direct { ring: None } => "direct",
+            FfiCallKind::Direct { ring: Some(_) } => "direct+ring",
+        };
         format!(
-            "[slot {}] transport={} keep_alive={:?}ms encryption={} notify={:?}",
+            "[slot {}] transport={} keep_alive={:?}ms encryption={} kind={kind}",
             self.application_slot_id
                 .as_deref()
                 .unwrap_or(matrix_rtc_core::ROOM_APPLICATION_SLOT_ID),
             transport,
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
-            self.notify.as_ref().map(|notify| notify.notification_type),
         )
     }
 
@@ -247,7 +273,7 @@ impl FfiJoinSessionParams {
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        options.notify = self.notify.map(Into::into);
+        options.kind = self.kind.into();
         options.reactions = self.reactions.map(Into::into);
         options
     }

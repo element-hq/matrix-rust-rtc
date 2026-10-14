@@ -104,8 +104,12 @@ What lets an application sit on the core without the core knowing it:
   applied them.
 - **`host/`**: `send_room_event`, `redact_event` and `RawTimelineEvent` exist for
   applications; the core uses none of them.
-- **`ApplicationIntake`**: how the feeder feeds an application timeline events
-  and relations without knowing which application it is.
+- **`ApplicationIntake`**: how the feeder feeds an application timeline events,
+  the sticky events of the types it names, and relations, without knowing
+  which application it is. Its sticky types are handed over before the set is
+  narrowed to member events.
+- **`BaseRtcRoom::room_members`**: the room's joined users, for an application
+  that needs the room's people rather than a slot's.
 - **`IngestDialect`**: which generation of MatrixRTC the feeder reads a room
   in; the core implements it for each `MembershipFormat`.
 
@@ -278,15 +282,19 @@ Membership is always applied as a complete set: a member whose event is absent f
 - The host-facing objects: `RtcClient` (one per backend, no I/O) opens an
   `RtcRoom` (one live object per room; a second is refused), whose `join`
   returns an `RtcSession` and `join_call` an `RtcCall` (a session plus
-  reactions, the raised hand and the ring). `close`/`leave` are the clean
+  reactions, the raised hand, a DM's ring and the call's status). `close`/`leave` are the clean
   paths; dropping sends no leave, and the delayed leave expires the
   membership.
 - Reactions and the raised hand (Element Call, unspecced) and MSC4075
-  notifications, in `CallRoomState` over the room's `BaseRtcRoom`: `join` rings
-  the room if we started, `leave` lowers our hand first, and the hand follows
+  notifications, in `CallRoomState` over the room's `BaseRtcRoom`: `join`
+  notifies a group call's room if we started, or rings a DM and follows its
+  lifecycle (`direct_call`), `leave` lowers our hand first, and the hand follows
   our membership event onto each refresh (the core's event-id watch).
-- The library does not detect incoming calls: MSC4075 is send-only here, and a
-  host learns of a ring through its own SDK or push path.
+- `status`: the call's one `CallStatus` — connecting, calling, connected,
+  ended and why — combining the participation, a DM's ring and pickup, and our
+  media, which the media layer reports through `MediaStatusReporter`.
+- The library does not detect incoming calls: a host learns of a ring through
+  its own SDK or push path.
 - Depends on the core alone; its timers are the core executor's; compiles for wasm32.
 - `RtcClient` opens each room through the core's `BaseRtcClient`, with
   `CallRoomState` as the room, in the host's `MembershipFormat`; its join
@@ -329,7 +337,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   order-sensitive wiring (identity mapper before key handler, key listeners
   before the replay of held keys, replay before the own-focus connect, our
   sender's key index after it) shared by the FFI and wasm media sessions and
-  `LiveKitCall`. Transports opt in with `OwnFocusTransport`, which hands the
+  `LiveKitCall`. It and the engine report our media to the call's status. Transports opt in with `OwnFocusTransport`, which hands the
   caller a typed own-focus connection.
 - Behind `livekit`: `attach_livekit` builds the MSC4195 key provider, bridge
   and `matrix-rtc-livekit` transport for a joined call (token endpoint and
@@ -482,6 +490,7 @@ Membership is always applied as a complete set: a member whose event is absent f
 - `MSC4143` (MatrixRTC): membership events represented by `m.rtc.member`.
 - `MSC4354` (Sticky events): membership updates are received as sticky events.
 - `MSC4075` (Notifications & ringing): `m.rtc.notification`, send side only.
+- `MSC4310` (Decline): received from a DM call's callee, never sent.
 
 The core uses the stable ids (`m.rtc.member`, `m.rtc.slot`) internally, but the
 deployed ecosystem still matches on the unstable `org.matrix.msc4143.*` ones, so
@@ -542,7 +551,7 @@ The outgoing key message declares `format: 0` as the spec requires.
 Membership says who is *in* a session, never who should be *summoned* to one, so
 a mobile client had nothing to raise an incoming call from. `matrix-rtc-call`'s
 `notification.rs` builds the `m.rtc.notification` that fills the gap;
-`RtcRoom::join_call` sends it when the host set `CallJoinOptions::notify`.
+`RtcRoom::join_call` sends it for a `CallJoinOptions::kind` that asks for one.
 Three decisions are worth knowing:
 
 - **The relation is what forced a breaking host change.** MSC4075 requires an
@@ -580,9 +589,32 @@ Three decisions are worth knowing:
   byte-exact legacy shape.
 
 Receiving is not implemented: the MSC's ring conditions, lifetime expiry against
-`origin_server_ts`, `m.call.ring.ack` acknowledgements and the sender-side
-"still ringing" indication are all absent, and on mobile the first signal is a
-push notification that never passes through this workspace anyway.
+`origin_server_ts` and `m.call.ring.ack` acknowledgements are absent, and on
+mobile the first signal is a push notification that never passes through this
+workspace anyway.
+
+### One-to-one calls (feature-hq spec 030)
+
+`CallKind::Direct` makes a join a DM call, whose lifecycle the library owns so
+both platforms behave alike:
+
+- **The callee is the room's other joined member.** A DM with any other number
+  is treated as a group call, and its ring becomes a plain notification.
+- **The ring goes out right after the membership, never waiting for media**,
+  from a task spawned once the room's lock is released. A failed send is
+  retried with a fresh `sender_ts`, until a 10 s deadline ends the call.
+- **The ring goes through the dialect wrapper by type**: `RingJob::run` and
+  `notify_session_started` take a `DialectBackend`, which sends it as a plain
+  room event in the pre-sticky format.
+- **Only the callee's decline of our ring counts**, read from the timeline and
+  from sticky events (matrix-js-sdk sends it sticky). A decline that arrives
+  before the ring's id is known is held until it is.
+- **The call ends itself** on a decline, no answer, no ring, everyone else
+  leaving (counted by user, not device), or an empty call joined without a
+  ring: the status publishes the reason, then the call leaves with it.
+- **`CallStatus` is what a host gates on.** Our media is up seconds before the
+  callee answers, so the timer and the system's "connected" come from
+  `Connected`, which needs both.
 
 ### Reactions and the raised hand (Element Call, unspecced)
 
@@ -740,8 +772,8 @@ Still outstanding:
    store.
 3. **A unified `CallEvent` stream on the `LiveKitCall` facade** — landed as
    `matrix_rtc_call_sdk::CallEvent` via `LiveKitCall::subscribe_call_events` (peer
-   joined/left, stream started/stopped, key imported, connection health,
-   ended-with-reason, including `EndedReason::SlotClosed`). Remaining: migrate
+   joined/left, stream started/stopped, key imported); connection health and the
+   end, with its reason, are `LiveKitCall::status`. Remaining: migrate
    the e2e test and examples off the raw `LiveKitCall::events`/`LiveKitCall::session`
    accessors and delete them.
 

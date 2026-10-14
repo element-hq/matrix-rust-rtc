@@ -38,7 +38,7 @@ pub mod tile;
 
 pub use attach::{AttachError, AttachOptions, MediaAttachment, attach_media};
 pub use engine::{CallEngine, EngineConfig, EngineHandle, StabilityConfig};
-pub use event::{CallEvent, EndedReason, FrameEncryptionDiagnostic};
+pub use event::{CallEvent, FrameEncryptionDiagnostic};
 #[cfg(feature = "livekit")]
 pub use livekit::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 #[cfg(feature = "matrix-sdk")]

@@ -90,6 +90,13 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         self.backend.is_some()
     }
 
+    /// The users joined to the room, as the host last supplied them; `None`
+    /// until it has. For applications that need the room's people rather than
+    /// a slot's participants, such as the one person a direct call rings.
+    pub fn room_members(&self) -> Option<&HashSet<String>> {
+        self.room_members.as_ref()
+    }
+
     /// Replays every existing slot's joined memberships to it first. Listeners
     /// cannot be removed.
     pub fn add_membership_listener(&mut self, listener: Arc<dyn MembershipListener>) {

@@ -44,7 +44,7 @@ use tokio::sync::{broadcast, watch};
 
 use crate::{CallEngine, CallEvent, MediaAttachment, Participant, StabilityConfig};
 use matrix_rtc_call::{
-    CallJoinOptions, JoinOptions, JoinTransport, NotifyConfig, RaisedHand, ReactionError,
+    CallJoinOptions, CallKind, CallStatus, JoinOptions, JoinTransport, RaisedHand, ReactionError,
     ReactionsConfig, RtcCall, RtcClient, RtcError, RtcRoom,
 };
 use matrix_rtc_core::RoomOptions;
@@ -180,14 +180,9 @@ pub struct LiveKitCallOptions {
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
     /// [`matrix_rtc_core::compat`], and delete all of it once Element Call catches up.
     pub format: MembershipFormat,
-    /// Ask for an MSC4075 notification to be sent with this join, so other
-    /// devices in the room ring or show an incoming call.
-    ///
-    /// `None` — the default — joins quietly, which is what joining a call
-    /// someone else started does. Set it only when *starting* the call: the
-    /// core still suppresses the notification if anybody is already in the
-    /// session, but the intent to summon anyone at all is the caller's.
-    pub notify: Option<NotifyConfig>,
+    /// A group call, with or without a notification, or a DM call, with or
+    /// without a ring. The default is a quiet group join.
+    pub kind: CallKind,
     /// How this call handles Element Call reactions and the raised hand.
     ///
     /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
@@ -216,7 +211,7 @@ impl Default for LiveKitCallOptions {
             http: None,
             auto_subscribe: true,
             format: MembershipFormat::default(),
-            notify: None,
+            kind: CallKind::default(),
             reactions: None,
             stability: StabilityConfig::default(),
         }
@@ -325,7 +320,7 @@ impl LiveKitCall {
         let call = Arc::new(
             room.join_call(CallJoinOptions {
                 join,
-                notify: options.notify.clone(),
+                kind: options.kind.clone(),
                 reactions: options.reactions.clone(),
             })
             .await?,
@@ -431,8 +426,18 @@ impl LiveKitCall {
         self.call.raised_hands().await
     }
 
+    /// Where the call is: connecting, calling, connected or ended, and why.
+    pub fn status(&self) -> CallStatus {
+        self.call.status()
+    }
+
+    /// The call's status as it changes, current value first.
+    pub fn subscribe_status(&self) -> watch::Receiver<CallStatus> {
+        self.call.subscribe_status()
+    }
+
     /// The unified call event stream: membership changes, media streams
-    /// starting/stopping, key imports, connection health, call end.
+    /// starting/stopping, key imports and the like.
     ///
     /// This is the transport-agnostic replacement for [`LiveKitCall::events`]. Any
     /// number of subscribers may exist; a subscriber that falls far behind
@@ -562,8 +567,8 @@ impl LiveKitCall {
     /// first error wins.
     ///
     /// A call whose slot closed has already left and ended itself
-    /// ([`CallEvent::Ended`] with `EndedReason::SlotClosed`); leaving it then
-    /// only releases what is left, and succeeds.
+    /// ([`CallStatus::Ended`] with `CallEnd::SlotClosed`); leaving it then only
+    /// releases what is left, and succeeds.
     pub async fn leave(self) -> Result<(), LiveKitCallError> {
         let LiveKitCall {
             call,
@@ -620,7 +625,7 @@ impl LiveKitCall {
 
 /// Close a MatrixRTC slot in a room by publishing an empty `m.rtc.slot` state
 /// event. Everyone in it — this client's own calls included — leaves, and
-/// their calls end with `EndedReason::SlotClosed`.
+/// their calls end with `CallEnd::SlotClosed`.
 ///
 /// Requires the power level for `m.rtc.slot` state, as [`open_slot`] does.
 pub async fn close_slot(

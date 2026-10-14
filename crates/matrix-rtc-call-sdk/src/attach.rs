@@ -157,6 +157,7 @@ where
             raised_hands,
             reactions,
             ended: Some(ended),
+            media_status: Some(call.media_status_reporter()),
             stability: options.stability,
         },
         memberships,
@@ -222,6 +223,8 @@ where
         None => None,
     };
 
+    // Our side is up: the own focus connected, or there is none to connect.
+    call.media_status_reporter().connected();
     log::info!("media: attached as member {member_id}, local identity {own_identity}");
     Ok(MediaAttachment {
         engine,

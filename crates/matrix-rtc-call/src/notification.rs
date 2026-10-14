@@ -14,15 +14,17 @@
 //! Only the sending half lives here: building the content, and
 //! [`notify_session_started`], which decides whether to send it (the first
 //! member to join, and only if the host asked for it via
-//! [`CallJoinOptions::notify`]); the receiving rules —
-//! push rules, lifetime expiry, ring acknowledgements — are not implemented.
+//! [`CallJoinOptions::kind`]). A DM call's ring is sent and timed by
+//! [`crate::direct_call`]. The receiving rules — push rules, lifetime expiry,
+//! ring acknowledgements — are not implemented.
 //!
 //! The MSC and the deployed ecosystem disagree about where the call fields go,
 //! so [`build_notification_content`] writes them in both places; its docs say
 //! why.
 //!
-//! [`CallJoinOptions::notify`]: crate::CallJoinOptions::notify
+//! [`CallJoinOptions::kind`]: crate::CallJoinOptions::kind
 
+use matrix_rtc_core::compat::DialectBackend;
 use matrix_rtc_core::{JoinSessionParams, JoinedMembership, MatrixBackend};
 use serde_json::{Map, Value, json};
 
@@ -32,8 +34,11 @@ use serde_json::{Map, Value, json};
 /// host-layer concern (see [`matrix_rtc_core::wire_event_type`]).
 pub const NOTIFICATION_EVENT_TYPE: &str = "m.rtc.notification";
 
-/// Default `lifetime` for a ring, in milliseconds. MSC4075's recommended value.
-pub const DEFAULT_RING_LIFETIME_MS: u64 = 30_000;
+/// Default `lifetime` for a ring, in milliseconds: Element Call web's, so a
+/// call rings for as long whichever client places it (spec 030 R6). MSC4075
+/// recommends 30 s, which made a native caller ring a third as long as a web
+/// one.
+pub const DEFAULT_RING_LIFETIME_MS: u64 = 90_000;
 
 /// The longest `lifetime` MSC4075 says a ring SHOULD carry (2 minutes).
 ///
@@ -82,12 +87,9 @@ impl Default for Mentions {
 
 /// What the host asks for when it joins.
 ///
-/// `None` on [`CallJoinOptions::notify`] means "join quietly" — which is what
-/// joining a call someone else started does. Element Call makes the same
-/// distinction by only passing a notification type when the app *starts* a
-/// call.
-///
-/// [`CallJoinOptions::notify`]: crate::CallJoinOptions::notify
+/// A host does not build one: it says what kind of call it joins
+/// ([`CallKind`](crate::CallKind)), and the call layer derives the
+/// notification from that.
 #[derive(Clone, Debug)]
 pub struct NotifyConfig {
     /// Ring, or notify silently.
@@ -236,7 +238,11 @@ pub fn build_notification_content(
 /// the core applies to drop a superseded participation of ours from the
 /// roster, which leaves such a candidate in rather than dropping a genuine
 /// peer.
-fn is_own_participation(member: &JoinedMembership, user_id: &str, own_device_id: &str) -> bool {
+pub(crate) fn is_own_participation(
+    member: &JoinedMembership,
+    user_id: &str,
+    own_device_id: &str,
+) -> bool {
     member.sender == user_id
         && member
             .origin
@@ -252,8 +258,8 @@ fn is_own_participation(member: &JoinedMembership, user_id: &str, own_device_id:
 /// [`crate::RtcRoom::join_call`] calls it; a host driving a bare core room calls
 /// it itself. Never fails the join: the user is in the call
 /// whether or not anyone else was told about it.
-pub async fn notify_session_started<T: MatrixBackend + ?Sized>(
-    backend: &T,
+pub async fn notify_session_started<B: MatrixBackend + 'static>(
+    backend: &DialectBackend<B>,
     room_id: &str,
     notify: &NotifyConfig,
     params: &JoinSessionParams,

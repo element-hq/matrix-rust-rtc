@@ -6,16 +6,22 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use matrix_rtc_core::compat::ingest::outbound_dialect;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::testing::MockBackend;
+use matrix_rtc_core::wire_event_type;
 use matrix_rtc_core::{
     ApplicationInfo, EventOrigin, JoinSessionParams, LeaveSessionParams, LiveKitTransport,
     MemberInfo, Membership, RawSlotEvent, RawStickyEvent, RawStickyEventContent, RawTimelineEvent,
     RtcTransport,
 };
-use serde_json::Value;
+use std::time::Duration;
+
+use serde_json::{Value, json};
 use tokio::sync::broadcast::error::TryRecvError;
 
 use super::*;
+use crate::direct_call::{GroupNotify, RingConfig};
 use crate::notification::{DEFAULT_RING_LIFETIME_MS, NOTIFICATION_EVENT_TYPE};
 use crate::reactions::ReactionSound;
 
@@ -80,7 +86,7 @@ fn join_params() -> JoinSessionParams {
     }))
 }
 
-type Call = CallRoomState<MockBackend>;
+type Call = CallRoomState<DialectBackend<MockBackend>>;
 
 /// The account these tests join as: the backend's, as every join's is.
 fn alice_backend() -> Arc<MockBackend> {
@@ -88,6 +94,11 @@ fn alice_backend() -> Arc<MockBackend> {
     backend.user_id = ALICE.to_owned();
     backend.device_id = "ALICEDEV".to_owned();
     Arc::new(backend)
+}
+
+/// What every host's sends go through; the mock records what comes out.
+fn dialect(sender: &Arc<MockBackend>) -> Arc<DialectBackend<MockBackend>> {
+    Arc::new(DialectBackend::new(sender.clone()))
 }
 
 async fn set_roster(call: &mut Call, events: Vec<RawStickyEvent>) {
@@ -101,7 +112,7 @@ async fn set_roster(call: &mut Call, events: Vec<RawStickyEvent>) {
 /// membership event `$bob-member-1`.
 async fn joined_call(mut params: CallJoinParams) -> (Call, Arc<MockBackend>, String) {
     let sender = alice_backend();
-    let mut call = CallRoomState::with_backend(ROOM, sender.clone());
+    let mut call = CallRoomState::with_backend(ROOM, dialect(&sender));
     let own_member_id = params.rtc.membership_id();
     params.rtc.membership_id = Some(own_member_id.clone());
     call.join(params).await.expect("join succeeds");
@@ -658,7 +669,7 @@ async fn disabled_reactions_neither_send_nor_receive() {
 #[tokio::test]
 async fn a_rooms_reactions_reach_the_session_holding_the_member() {
     let sender = alice_backend();
-    let mut call = CallRoomState::with_backend(ROOM, sender);
+    let mut call = CallRoomState::with_backend(ROOM, dialect(&sender));
     let other_slot = "m.call#OTHER";
 
     call.join(join_params().into()).await.expect("join slot A");
@@ -722,8 +733,15 @@ async fn the_host_intake_asks_for_annotations_of_membership_events() {
         call.timeline_event_types(),
         vec![
             REACTION_EVENT_TYPE.to_owned(),
-            ANNOTATION_EVENT_TYPE.to_owned()
+            ANNOTATION_EVENT_TYPE.to_owned(),
+            DECLINE_EVENT_TYPES[0].to_owned(),
+            DECLINE_EVENT_TYPES[1].to_owned(),
         ]
+    );
+    assert_eq!(
+        call.sticky_event_types(),
+        DECLINE_EVENT_TYPES.map(str::to_owned).to_vec(),
+        "matrix-js-sdk sends its declines sticky"
     );
     assert_eq!(
         call.pending_relations(),
@@ -753,7 +771,7 @@ fn open_slot(encryption: bool) -> RawSlotEvent {
 }
 
 async fn encrypted_call_manager(sender: Arc<MockBackend>) -> Call {
-    let mut call = CallRoomState::with_backend(ROOM, sender);
+    let mut call = CallRoomState::with_backend(ROOM, dialect(&sender));
     call.rtc_mut().on_encryption_received(true).await;
     call.rtc_mut()
         .on_slots_received(vec![open_slot(true)])
@@ -761,25 +779,26 @@ async fn encrypted_call_manager(sender: Arc<MockBackend>) -> Call {
     call
 }
 
-/// Joins as alice under `member_id`, asking for `notify`.
-async fn join_and_notify(call: &mut Call, member_id: &str, notify: Option<NotifyConfig>) {
+/// Joins a group call as alice under `member_id`, asking for `notify`.
+async fn join_and_notify(call: &mut Call, member_id: &str, notify: Option<GroupNotify>) {
     let mut rtc = join_params();
     rtc.membership_id = Some(member_id.to_owned());
     let params = CallJoinParams {
-        notify,
+        kind: CallKind::Group { notify },
         ..rtc.into()
     };
     call.join(params).await.expect("join should succeed");
 }
 
-/// Every sticky send of the notification type, as `(content, duration_ms)`.
+/// Every sticky send of the notification, under its wire type, as
+/// `(content, duration_ms)`.
 fn notifications_sent(sender: &MockBackend) -> Vec<(Value, u64)> {
     sender
         .sticky_events
         .lock()
         .unwrap()
         .iter()
-        .filter(|(_, event_type, _, _)| event_type == NOTIFICATION_EVENT_TYPE)
+        .filter(|(_, event_type, _, _)| event_type == wire_event_type(NOTIFICATION_EVENT_TYPE))
         .map(|(_, _, content, duration_ms)| (content.clone(), *duration_ms))
         .collect()
 }
@@ -792,8 +811,10 @@ async fn starting_a_call_notifies_the_room() {
     let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
 
-    let mut notify = NotifyConfig::ring();
-    notify.intent = Some("video".to_owned());
+    let notify = GroupNotify {
+        intent: Some("video".to_owned()),
+        ..GroupNotify::default()
+    };
     join_and_notify(&mut call, "alice-a", Some(notify)).await;
 
     let sent = notifications_sent(&sender);
@@ -805,7 +826,7 @@ async fn starting_a_call_notifies_the_room() {
         .lock()
         .unwrap()
         .iter()
-        .position(|(_, event_type, _, _)| event_type == "m.rtc.member")
+        .position(|(_, event_type, _, _)| event_type == wire_event_type("m.rtc.member"))
         .map(|index| format!("$sticky-{}", index + 1))
         .expect("the join sends a membership event");
     assert_eq!(
@@ -820,7 +841,8 @@ async fn starting_a_call_notifies_the_room() {
     assert_eq!(content.pointer("/application/type").unwrap(), "m.call");
     assert_eq!(
         content.pointer("/application/notification_type").unwrap(),
-        "ring"
+        "notification",
+        "a group call never rings"
     );
     assert_eq!(
         content.pointer("/application/m.call.intent").unwrap(),
@@ -855,7 +877,7 @@ async fn our_own_membership_does_not_count_as_somebody_else() {
         vec![member_event(ALICE, Some("ALICEDEV"), "alice-a", "$echo")],
     )
     .await;
-    join_and_notify(&mut call, "alice-a", Some(NotifyConfig::ring())).await;
+    join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
 
     assert_eq!(
         notifications_sent(&sender).len(),
@@ -875,7 +897,7 @@ async fn our_own_membership_does_not_count_as_somebody_else() {
 #[tokio::test]
 async fn a_stale_participation_of_ours_does_not_count_either() {
     let sender = alice_backend();
-    let mut call = CallRoomState::with_backend(ROOM, sender.clone());
+    let mut call = CallRoomState::with_backend(ROOM, dialect(&sender));
     call.rtc_mut()
         .on_slots_received(vec![open_slot(false)])
         .await;
@@ -888,7 +910,7 @@ async fn a_stale_participation_of_ours_does_not_count_either() {
     )
     .await;
 
-    join_and_notify(&mut call, "alice-new", Some(NotifyConfig::ring())).await;
+    join_and_notify(&mut call, "alice-new", Some(GroupNotify::default())).await;
 
     assert_eq!(
         notifications_sent(&sender).len(),
@@ -914,7 +936,7 @@ async fn another_device_of_ours_already_in_the_call_counts() {
         )],
     )
     .await;
-    join_and_notify(&mut call, "alice-a", Some(NotifyConfig::ring())).await;
+    join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
 
     assert!(
         notifications_sent(&sender).is_empty(),
@@ -934,7 +956,7 @@ async fn joining_an_occupied_session_notifies_nobody() {
         vec![member_event(BOB, Some("BOBDEV"), "bob-a", "$bob")],
     )
     .await;
-    join_and_notify(&mut call, "alice-a", Some(NotifyConfig::ring())).await;
+    join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
 
     assert!(
         notifications_sent(&sender).is_empty(),
@@ -955,7 +977,7 @@ async fn joining_quietly_notifies_nobody() {
 #[tokio::test]
 async fn a_call_layer_over_an_existing_manager_sees_its_rosters() {
     let sender = alice_backend();
-    let mut rtc = matrix_rtc_core::BaseRtcRoom::with_backend(ROOM, sender);
+    let mut rtc = matrix_rtc_core::BaseRtcRoom::with_backend(ROOM, dialect(&sender));
     rtc.set_current_sticky_state(vec![member_event(
         BOB,
         Some("BOBDEV"),
@@ -969,4 +991,386 @@ async fn a_call_layer_over_an_existing_manager_sees_its_rosters() {
     ingest(&mut call, bob_raises("$h1", "$bob-member-1", 5_000));
 
     assert_eq!(hands(&call), vec![("bob", "$h1".to_owned())]);
+}
+
+// ---- DM calls (spec 030) ----
+
+const CAROL: &str = "@carol:example.org";
+
+/// Paused tokio time as the call's clock, so the ring's stamps and its timers
+/// agree.
+fn paused_clock() -> Clock {
+    let base = tokio::time::Instant::now();
+    Arc::new(move || 1_000_000 + base.elapsed().as_millis() as u64)
+}
+
+/// A DM between alice and `others`, with `roster` already in the call,
+/// joined by alice as `alice-a` (membership `$sticky-1`).
+async fn dm(
+    others: &[&str],
+    roster: Vec<RawStickyEvent>,
+    ring: Option<RingConfig>,
+) -> (Call, Arc<MockBackend>, CallJoined) {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+    call.set_clock(paused_clock());
+    call.rtc_mut()
+        .on_members_received(
+            std::iter::once(ALICE)
+                .chain(others.iter().copied())
+                .map(str::to_owned),
+        )
+        .await;
+    set_roster(&mut call, roster).await;
+    let mut rtc = join_params();
+    rtc.membership_id = Some("alice-a".to_owned());
+    let joined = call
+        .join(CallJoinParams {
+            kind: CallKind::Direct { ring },
+            ..rtc.into()
+        })
+        .await
+        .expect("join succeeds");
+    (call, sender, joined)
+}
+
+fn ring() -> Option<RingConfig> {
+    Some(RingConfig::default())
+}
+
+/// Runs the ring as `join_call` does, once the room's lock is released.
+fn start_ring(call: &Call, joined: &mut CallJoined) -> tokio::task::JoinHandle<()> {
+    let job = joined.ring.take().expect("a ring to send");
+    let backend = call.rtc().backend().unwrap().clone();
+    tokio::spawn(job.run(backend, joined.direct.clone().unwrap()))
+}
+
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
+}
+
+fn state(joined: &CallJoined) -> DirectCallState {
+    joined.direct.as_ref().expect("a DM call").state()
+}
+
+fn ended(reason: DirectCallEnd) -> DirectCallState {
+    DirectCallState::Ended { reason }
+}
+
+fn decline(event_id: &str, sender: &str, ring_event_id: &str) -> RawTimelineEvent {
+    timeline_event(
+        event_id,
+        sender,
+        DECLINE_EVENT_TYPES[0],
+        0,
+        json!({ "m.relates_to": { "rel_type": "m.reference", "event_id": ring_event_id } }),
+    )
+}
+
+/// The ring is our second sticky send, after the membership.
+const RING: &str = "$sticky-2";
+
+#[tokio::test(start_paused = true)]
+async fn a_dm_call_rings_the_room_once_its_membership_is_sent() {
+    let (call, sender, mut joined) = dm(
+        &[BOB],
+        Vec::new(),
+        Some(RingConfig {
+            intent: Some("video".to_owned()),
+            ..RingConfig::default()
+        }),
+    )
+    .await;
+    assert_eq!(state(&joined), DirectCallState::Sending);
+
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    let sent = notifications_sent(&sender);
+    assert_eq!(sent.len(), 1, "one ring per call (R3)");
+    let (content, duration_ms) = &sent[0];
+    assert_eq!(content["notification_type"], "ring");
+    assert_eq!(content["m.call.intent"], "video");
+    assert_eq!(
+        content["m.mentions"],
+        json!({ "user_ids": [], "room": true }),
+        "the whole room, whatever the host would pick (R5)"
+    );
+    assert_eq!(
+        content["lifetime"], 90_000,
+        "Element Call web's default (R6)"
+    );
+    assert_eq!(
+        content.pointer("/m.relates_to/event_id").unwrap(),
+        "$sticky-1"
+    );
+    assert_eq!(*duration_ms, 180_000);
+    assert!(matches!(
+        state(&joined),
+        DirectCallState::Ringing {
+            lifetime_ms: 90_000,
+            ..
+        }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_ring_ends_the_call_when_its_lifetime_runs_out() {
+    let (call, _, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    tokio::time::sleep(Duration::from_millis(90_000 - 10)).await;
+    assert!(matches!(state(&joined), DirectCallState::Ringing { .. }));
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(state(&joined), ended(DirectCallEnd::Unanswered));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_callee_joining_from_any_device_picks_up() {
+    let (mut call, _, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    set_roster(
+        &mut call,
+        vec![member_event(
+            BOB,
+            Some("BOBTABLET"),
+            "bob-tablet",
+            "$bob-tablet",
+        )],
+    )
+    .await;
+    assert!(matches!(state(&joined), DirectCallState::InCall { .. }));
+
+    tokio::time::sleep(Duration::from_secs(100)).await;
+    assert!(
+        matches!(state(&joined), DirectCallState::InCall { .. }),
+        "a picked-up call is no longer timed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn another_device_of_ours_is_not_a_pickup_and_cannot_end_a_ringing_call() {
+    let (mut call, _, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    set_roster(
+        &mut call,
+        vec![member_event(
+            ALICE,
+            Some("ALICELAPTOP"),
+            "alice-laptop",
+            "$laptop",
+        )],
+    )
+    .await;
+    set_roster(&mut call, Vec::new()).await;
+    assert!(
+        matches!(state(&joined), DirectCallState::Ringing { .. }),
+        "nobody else has been here, so nobody can have left (R28)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn only_the_callees_decline_of_our_ring_ends_the_call() {
+    let (mut call, _, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    call.on_timeline_events(&[
+        decline("$from-carol", CAROL, RING),
+        decline("$from-our-laptop", ALICE, RING),
+        decline("$of-something-else", BOB, "$other"),
+        timeline_event(
+            "$an-annotation",
+            BOB,
+            DECLINE_EVENT_TYPES[0],
+            0,
+            json!({ "m.relates_to": { "rel_type": "m.annotation", "event_id": RING } }),
+        ),
+    ]);
+    assert!(matches!(state(&joined), DirectCallState::Ringing { .. }));
+
+    // matrix-js-sdk's sticky decline, under the stable spelling.
+    let mut sticky = decline("$from-bob", BOB, RING);
+    sticky.event_type = DECLINE_EVENT_TYPES[1].to_owned();
+    call.on_sticky_events(&[sticky.clone()]);
+    assert_eq!(state(&joined), ended(DirectCallEnd::Declined));
+    // Delivered again with the next sticky set, and on the timeline.
+    call.on_sticky_events(&[sticky.clone()]);
+    call.on_timeline_events(&[sticky]);
+    assert_eq!(state(&joined), ended(DirectCallEnd::Declined));
+}
+
+/// The pre-sticky generation has no sticky map: the ring is a room event
+/// there, and the decline that answers it arrives on the timeline.
+#[tokio::test(start_paused = true)]
+async fn a_dm_call_rings_with_a_room_event_in_the_room_state_format() {
+    let (mut call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    call.rtc().backend().unwrap().set_dialect(
+        ROOM,
+        outbound_dialect(MembershipFormat::RoomState, ALICE, "ALICEDEV", ROOM, SLOT),
+    );
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    assert!(notifications_sent(&sender).is_empty());
+    let sent = sender.room_events.lock().unwrap().clone();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].1, wire_event_type(NOTIFICATION_EVENT_TYPE));
+    assert!(matches!(state(&joined), DirectCallState::Ringing { .. }));
+
+    call.on_timeline_events(&[decline("$from-bob", BOB, "$room-1")]);
+    assert_eq!(state(&joined), ended(DirectCallEnd::Declined));
+}
+
+/// The sync carrying the decline can beat the response carrying the ring's id.
+#[tokio::test(start_paused = true)]
+async fn a_decline_that_arrives_before_the_rings_id_still_counts() {
+    let (mut call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    *sender.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
+    let _ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    call.on_timeline_events(&[decline("$from-bob", BOB, RING)]);
+    assert_eq!(state(&joined), DirectCallState::Sending);
+
+    *sender.sticky_event_error.lock().unwrap() = None;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(notifications_sent(&sender).len(), 1);
+    assert_eq!(state(&joined), ended(DirectCallEnd::Declined));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retried_ring_is_stamped_when_it_goes_out() {
+    let (call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    *sender.sticky_event_error.lock().unwrap() = Some("rate limited".to_owned());
+    let _ring = start_ring(&call, &mut joined);
+
+    // Attempts at 0 s, 1 s and 3 s fail; the one at 7 s goes through.
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    *sender.sticky_event_error.lock().unwrap() = None;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let sent = notifications_sent(&sender);
+    assert_eq!(sent.len(), 1);
+    let stamp = sent[0].0["sender_ts"].as_u64().unwrap();
+    assert!(
+        stamp >= 1_007_000,
+        "stamped at the attempt that landed, not the first ({stamp})"
+    );
+    assert!(matches!(state(&joined), DirectCallState::Ringing { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_ring_that_cannot_go_out_in_time_ends_the_call() {
+    let (call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    *sender.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
+    let _ring = start_ring(&call, &mut joined);
+
+    tokio::time::sleep(Duration::from_millis(9_900)).await;
+    assert_eq!(state(&joined), DirectCallState::Sending);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(state(&joined), ended(DirectCallEnd::RingNotSent));
+    assert!(notifications_sent(&sender).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn calling_someone_already_in_the_call_rings_nobody() {
+    let (_call, sender, joined) = dm(
+        &[BOB],
+        vec![member_event(
+            BOB,
+            Some("BOBDEV"),
+            BOB_MEMBER,
+            "$bob-member-1",
+        )],
+        ring(),
+    )
+    .await;
+
+    assert!(joined.ring.is_none());
+    assert!(matches!(state(&joined), DirectCallState::InCall { .. }));
+    assert!(notifications_sent(&sender).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn joining_a_dm_call_nobody_is_in_ends_it() {
+    let (_call, sender, joined) = dm(&[BOB], Vec::new(), None).await;
+    assert_eq!(state(&joined), ended(DirectCallEnd::Empty), "R33");
+    assert!(notifications_sent(&sender).is_empty());
+
+    let (_call, _, joined) = dm(
+        &[BOB],
+        vec![member_event(
+            BOB,
+            Some("BOBDEV"),
+            BOB_MEMBER,
+            "$bob-member-1",
+        )],
+        None,
+    )
+    .await;
+    assert!(matches!(state(&joined), DirectCallState::InCall { .. }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_call_ends_when_everyone_else_has_left() {
+    let (mut call, _, joined) = dm(
+        &[BOB],
+        vec![member_event(
+            BOB,
+            Some("BOBDEV"),
+            BOB_MEMBER,
+            "$bob-member-1",
+        )],
+        None,
+    )
+    .await;
+
+    // Our laptop staying does not keep the call alive (R26).
+    set_roster(
+        &mut call,
+        vec![member_event(
+            ALICE,
+            Some("ALICELAPTOP"),
+            "alice-laptop",
+            "$laptop",
+        )],
+    )
+    .await;
+    assert_eq!(state(&joined), ended(DirectCallEnd::OthersLeft));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dm_that_is_not_one_to_one_is_a_group_call() {
+    for others in [&[][..], &[BOB, CAROL][..]] {
+        let (_call, sender, joined) = dm(others, Vec::new(), ring()).await;
+
+        assert!(joined.direct.is_none(), "R37: no lifecycle");
+        assert!(joined.ring.is_none());
+        let sent = notifications_sent(&sender);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].0["notification_type"], "notification",
+            "the ring is demoted, as a group call's (R2)"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn leaving_while_it_rings_ends_the_lifecycle_and_its_timer() {
+    let (mut call, _, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    let ring = start_ring(&call, &mut joined);
+    settle().await;
+
+    call.leave(SLOT, LeaveSessionParams::new())
+        .await
+        .expect("leave succeeds");
+    assert_eq!(state(&joined), ended(DirectCallEnd::Left));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(ring.is_finished(), "the timer stopped with the ringing");
 }
