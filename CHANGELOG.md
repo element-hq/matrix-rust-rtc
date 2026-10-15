@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.5 - 2026-10-15
+
 ### Breaking
 
 - `CallJoinOptions::kind` (FFI `FfiJoinSessionParams::kind`, required) replaces `notify`: `Group { notify }` for a group call's notification, `Direct { ring }` for a DM call the library rings, follows and ends; web `joinCall` refuses `notification_type: "ring"`.
