@@ -905,6 +905,153 @@ public func FfiConverterTypeBackendSubscription_lower(_ value: BackendSubscripti
 
 
 /**
+ * A call's status, pulled with an async [`Self::next`] like the roster.
+ */
+public protocol CallStatusSubscriptionProtocol: AnyObject, Sendable {
+    
+    /**
+     * The current status on the first call, then each change. `None` once
+     * `Ended` has been handed out, since nothing follows it.
+     */
+    func next() async  -> FfiCallStatus?
+    
+}
+/**
+ * A call's status, pulled with an async [`Self::next`] like the roster.
+ */
+open class CallStatusSubscription: CallStatusSubscriptionProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_matrix_rtc_ffi_fn_clone_callstatussubscription(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_matrix_rtc_ffi_fn_free_callstatussubscription(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * The current status on the first call, then each change. `None` once
+     * `Ended` has been handed out, since nothing follows it.
+     */
+open func next()async  -> FfiCallStatus?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_callstatussubscription_next(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeFfiCallStatus.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCallStatusSubscription: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = CallStatusSubscription
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> CallStatusSubscription {
+        return CallStatusSubscription(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: CallStatusSubscription) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CallStatusSubscription {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: CallStatusSubscription, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCallStatusSubscription_lift(_ pointer: UnsafeMutableRawPointer) throws -> CallStatusSubscription {
+    return try FfiConverterTypeCallStatusSubscription.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCallStatusSubscription_lower(_ value: CallStatusSubscription) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeCallStatusSubscription.lower(value)
+}
+
+
+
+
+
+
+/**
  * A live local publication: push captured frames into it. Obtained from
  * [`MediaSession::publish`](super::MediaSession::publish).
  *
@@ -3298,10 +3445,21 @@ public protocol RtcCallProtocol: AnyObject, Sendable {
     func slotId()  -> String
     
     /**
+     * Where the call is now.
+     */
+    func status()  -> FfiCallStatus
+    
+    /**
      * The slot's joined roster as it changes; see
      * [`RtcRoom::subscribe_membership_snapshots`].
      */
     func subscribeMembershipSnapshots() async  -> MembershipSnapshotSubscription
+    
+    /**
+     * The status as it changes, current value first. In a DM, every `Ended`
+     * but `Left` is a leave the library makes itself: do not leave again.
+     */
+    func subscribeStatus()  -> CallStatusSubscription
     
     /**
      * Resolves once the call is over (left, slot closed, room closed), with
@@ -3549,6 +3707,16 @@ open func slotId() -> String  {
 }
     
     /**
+     * Where the call is now.
+     */
+open func status() -> FfiCallStatus  {
+    return try!  FfiConverterTypeFfiCallStatus_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_status(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * The slot's joined roster as it changes; see
      * [`RtcRoom::subscribe_membership_snapshots`].
      */
@@ -3568,6 +3736,17 @@ open func subscribeMembershipSnapshots()async  -> MembershipSnapshotSubscription
             errorHandler: nil
             
         )
+}
+    
+    /**
+     * The status as it changes, current value first. In a DM, every `Ended`
+     * but `Left` is a leave the library makes itself: do not leave again.
+     */
+open func subscribeStatus() -> CallStatusSubscription  {
+    return try!  FfiConverterTypeCallStatusSubscription_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_subscribe_status(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -5691,6 +5870,124 @@ public func FfiConverterTypeFfiEventIn_lower(_ value: FfiEventIn) -> RustBuffer 
 
 
 /**
+ * A group call's MSC4075 notification, for a join that starts the call.
+ * A visual indication, never a ring.
+ */
+public struct FfiGroupNotify {
+    /**
+     * MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
+     */
+    public var intent: String?
+    /**
+     * How long the notification stays valid, in milliseconds (default: 90000,
+     * capped at 120000).
+     */
+    public var lifetimeMs: UInt64?
+    /**
+     * Users named individually in `m.mentions`. Usually empty.
+     */
+    public var mentionUserIds: [String]
+    /**
+     * Whether the whole room is targeted (default: true, which is what a call
+     * in a room means). Note that the room's power levels may gate this.
+     */
+    public var mentionRoom: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
+         */intent: String? = nil, 
+        /**
+         * How long the notification stays valid, in milliseconds (default: 90000,
+         * capped at 120000).
+         */lifetimeMs: UInt64? = nil, 
+        /**
+         * Users named individually in `m.mentions`. Usually empty.
+         */mentionUserIds: [String] = [], 
+        /**
+         * Whether the whole room is targeted (default: true, which is what a call
+         * in a room means). Note that the room's power levels may gate this.
+         */mentionRoom: Bool = true) {
+        self.intent = intent
+        self.lifetimeMs = lifetimeMs
+        self.mentionUserIds = mentionUserIds
+        self.mentionRoom = mentionRoom
+    }
+}
+
+#if compiler(>=6)
+extension FfiGroupNotify: Sendable {}
+#endif
+
+
+extension FfiGroupNotify: Equatable, Hashable {
+    public static func ==(lhs: FfiGroupNotify, rhs: FfiGroupNotify) -> Bool {
+        if lhs.intent != rhs.intent {
+            return false
+        }
+        if lhs.lifetimeMs != rhs.lifetimeMs {
+            return false
+        }
+        if lhs.mentionUserIds != rhs.mentionUserIds {
+            return false
+        }
+        if lhs.mentionRoom != rhs.mentionRoom {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(intent)
+        hasher.combine(lifetimeMs)
+        hasher.combine(mentionUserIds)
+        hasher.combine(mentionRoom)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiGroupNotify: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiGroupNotify {
+        return
+            try FfiGroupNotify(
+                intent: FfiConverterOptionString.read(from: &buf), 
+                lifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
+                mentionUserIds: FfiConverterSequenceString.read(from: &buf), 
+                mentionRoom: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiGroupNotify, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.intent, into: &buf)
+        FfiConverterOptionUInt64.write(value.lifetimeMs, into: &buf)
+        FfiConverterSequenceString.write(value.mentionUserIds, into: &buf)
+        FfiConverterBool.write(value.mentionRoom, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGroupNotify_lift(_ buf: RustBuffer) throws -> FfiGroupNotify {
+    return try FfiConverterTypeFfiGroupNotify.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiGroupNotify_lower(_ value: FfiGroupNotify) -> RustBuffer {
+    return FfiConverterTypeFfiGroupNotify.lower(value)
+}
+
+
+/**
  * FFI-friendly join session parameters.
  */
 public struct FfiJoinSessionParams {
@@ -5704,6 +6001,12 @@ public struct FfiJoinSessionParams {
      * [`FfiJoinTransport::Advertised`].
      */
     public var transport: FfiJoinTransport
+    /**
+     * A group call or a DM call. Required: a default of a group call would
+     * let a host that forgot to say DM place a quiet group call nobody
+     * notices.
+     */
+    public var kind: FfiCallKind
     /**
      * Optional keep-alive timeout in milliseconds (default: 30000).
      *
@@ -5737,16 +6040,6 @@ public struct FfiJoinSessionParams {
      */
     public var encryptionConfig: FfiEncryptionConfig?
     /**
-     * Ask for an MSC4075 notification to be sent with this join, so other
-     * devices in the room ring or show an incoming call.
-     *
-     * Unset — the default — joins quietly, which is what joining a call
-     * someone else started does. Set it only when the user is *starting* the
-     * call: the SDK still suppresses the notification if anybody is already in
-     * the session, but the intent to summon anyone at all is yours to state.
-     */
-    public var notify: FfiNotifyConfig?
-    /**
      * How this session handles Element Call reactions and the raised hand.
      * Unset is enabled with Element Call's three-second window.
      */
@@ -5763,6 +6056,11 @@ public struct FfiJoinSessionParams {
          * What the join publishes on, if anything. Usually
          * [`FfiJoinTransport::Advertised`].
          */transport: FfiJoinTransport, 
+        /**
+         * A group call or a DM call. Required: a default of a group call would
+         * let a host that forgot to say DM place a quiet group call nobody
+         * notices.
+         */kind: FfiCallKind, 
         /**
          * Optional keep-alive timeout in milliseconds (default: 30000).
          *
@@ -5792,25 +6090,16 @@ public struct FfiJoinSessionParams {
          * Optional encryption configuration
          */encryptionConfig: FfiEncryptionConfig?, 
         /**
-         * Ask for an MSC4075 notification to be sent with this join, so other
-         * devices in the room ring or show an incoming call.
-         *
-         * Unset — the default — joins quietly, which is what joining a call
-         * someone else started does. Set it only when the user is *starting* the
-         * call: the SDK still suppresses the notification if anybody is already in
-         * the session, but the intent to summon anyone at all is yours to state.
-         */notify: FfiNotifyConfig? = nil, 
-        /**
          * How this session handles Element Call reactions and the raised hand.
          * Unset is enabled with Element Call's three-second window.
          */reactions: FfiReactionsConfig? = nil) {
         self.applicationSlotId = applicationSlotId
         self.transport = transport
+        self.kind = kind
         self.keepAliveTimeoutMs = keepAliveTimeoutMs
         self.stickyDurationMs = stickyDurationMs
         self.degradedLifetimeMs = degradedLifetimeMs
         self.encryptionConfig = encryptionConfig
-        self.notify = notify
         self.reactions = reactions
     }
 }
@@ -5828,6 +6117,9 @@ extension FfiJoinSessionParams: Equatable, Hashable {
         if lhs.transport != rhs.transport {
             return false
         }
+        if lhs.kind != rhs.kind {
+            return false
+        }
         if lhs.keepAliveTimeoutMs != rhs.keepAliveTimeoutMs {
             return false
         }
@@ -5840,9 +6132,6 @@ extension FfiJoinSessionParams: Equatable, Hashable {
         if lhs.encryptionConfig != rhs.encryptionConfig {
             return false
         }
-        if lhs.notify != rhs.notify {
-            return false
-        }
         if lhs.reactions != rhs.reactions {
             return false
         }
@@ -5852,11 +6141,11 @@ extension FfiJoinSessionParams: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(applicationSlotId)
         hasher.combine(transport)
+        hasher.combine(kind)
         hasher.combine(keepAliveTimeoutMs)
         hasher.combine(stickyDurationMs)
         hasher.combine(degradedLifetimeMs)
         hasher.combine(encryptionConfig)
-        hasher.combine(notify)
         hasher.combine(reactions)
     }
 }
@@ -5872,11 +6161,11 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
             try FfiJoinSessionParams(
                 applicationSlotId: FfiConverterOptionString.read(from: &buf), 
                 transport: FfiConverterTypeFfiJoinTransport.read(from: &buf), 
+                kind: FfiConverterTypeFfiCallKind.read(from: &buf), 
                 keepAliveTimeoutMs: FfiConverterOptionUInt64.read(from: &buf), 
                 stickyDurationMs: FfiConverterOptionUInt64.read(from: &buf), 
                 degradedLifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
                 encryptionConfig: FfiConverterOptionTypeFfiEncryptionConfig.read(from: &buf), 
-                notify: FfiConverterOptionTypeFfiNotifyConfig.read(from: &buf), 
                 reactions: FfiConverterOptionTypeFfiReactionsConfig.read(from: &buf)
         )
     }
@@ -5884,11 +6173,11 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
     public static func write(_ value: FfiJoinSessionParams, into buf: inout [UInt8]) {
         FfiConverterOptionString.write(value.applicationSlotId, into: &buf)
         FfiConverterTypeFfiJoinTransport.write(value.transport, into: &buf)
+        FfiConverterTypeFfiCallKind.write(value.kind, into: &buf)
         FfiConverterOptionUInt64.write(value.keepAliveTimeoutMs, into: &buf)
         FfiConverterOptionUInt64.write(value.stickyDurationMs, into: &buf)
         FfiConverterOptionUInt64.write(value.degradedLifetimeMs, into: &buf)
         FfiConverterOptionTypeFfiEncryptionConfig.write(value.encryptionConfig, into: &buf)
-        FfiConverterOptionTypeFfiNotifyConfig.write(value.notify, into: &buf)
         FfiConverterOptionTypeFfiReactionsConfig.write(value.reactions, into: &buf)
     }
 }
@@ -6236,137 +6525,6 @@ public func FfiConverterTypeFfiMediaConstraints_lift(_ buf: RustBuffer) throws -
 #endif
 public func FfiConverterTypeFfiMediaConstraints_lower(_ value: FfiMediaConstraints) -> RustBuffer {
     return FfiConverterTypeFfiMediaConstraints.lower(value)
-}
-
-
-/**
- * FFI-friendly MSC4075 notification request, for a join that *starts* a call.
- */
-public struct FfiNotifyConfig {
-    /**
-     * Ring, or notify silently.
-     */
-    public var notificationType: FfiNotificationType
-    /**
-     * MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
-     */
-    public var intent: String?
-    /**
-     * How long the ring stays valid, in milliseconds (default: 30000, capped
-     * at 120000 because that is what receivers honour).
-     */
-    public var lifetimeMs: UInt64?
-    /**
-     * Users named individually in `m.mentions`. Usually empty.
-     */
-    public var mentionUserIds: [String]
-    /**
-     * Whether the whole room is targeted (default: true, which is what a call
-     * in a room means). Note that the room's power levels may gate this.
-     */
-    public var mentionRoom: Bool
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Ring, or notify silently.
-         */notificationType: FfiNotificationType, 
-        /**
-         * MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
-         */intent: String? = nil, 
-        /**
-         * How long the ring stays valid, in milliseconds (default: 30000, capped
-         * at 120000 because that is what receivers honour).
-         */lifetimeMs: UInt64? = nil, 
-        /**
-         * Users named individually in `m.mentions`. Usually empty.
-         */mentionUserIds: [String] = [], 
-        /**
-         * Whether the whole room is targeted (default: true, which is what a call
-         * in a room means). Note that the room's power levels may gate this.
-         */mentionRoom: Bool = true) {
-        self.notificationType = notificationType
-        self.intent = intent
-        self.lifetimeMs = lifetimeMs
-        self.mentionUserIds = mentionUserIds
-        self.mentionRoom = mentionRoom
-    }
-}
-
-#if compiler(>=6)
-extension FfiNotifyConfig: Sendable {}
-#endif
-
-
-extension FfiNotifyConfig: Equatable, Hashable {
-    public static func ==(lhs: FfiNotifyConfig, rhs: FfiNotifyConfig) -> Bool {
-        if lhs.notificationType != rhs.notificationType {
-            return false
-        }
-        if lhs.intent != rhs.intent {
-            return false
-        }
-        if lhs.lifetimeMs != rhs.lifetimeMs {
-            return false
-        }
-        if lhs.mentionUserIds != rhs.mentionUserIds {
-            return false
-        }
-        if lhs.mentionRoom != rhs.mentionRoom {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(notificationType)
-        hasher.combine(intent)
-        hasher.combine(lifetimeMs)
-        hasher.combine(mentionUserIds)
-        hasher.combine(mentionRoom)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFfiNotifyConfig: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNotifyConfig {
-        return
-            try FfiNotifyConfig(
-                notificationType: FfiConverterTypeFfiNotificationType.read(from: &buf), 
-                intent: FfiConverterOptionString.read(from: &buf), 
-                lifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
-                mentionUserIds: FfiConverterSequenceString.read(from: &buf), 
-                mentionRoom: FfiConverterBool.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: FfiNotifyConfig, into buf: inout [UInt8]) {
-        FfiConverterTypeFfiNotificationType.write(value.notificationType, into: &buf)
-        FfiConverterOptionString.write(value.intent, into: &buf)
-        FfiConverterOptionUInt64.write(value.lifetimeMs, into: &buf)
-        FfiConverterSequenceString.write(value.mentionUserIds, into: &buf)
-        FfiConverterBool.write(value.mentionRoom, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiNotifyConfig_lift(_ buf: RustBuffer) throws -> FfiNotifyConfig {
-    return try FfiConverterTypeFfiNotifyConfig.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiNotifyConfig_lower(_ value: FfiNotifyConfig) -> RustBuffer {
-    return FfiConverterTypeFfiNotifyConfig.lower(value)
 }
 
 
@@ -7298,6 +7456,94 @@ public func FfiConverterTypeFfiReceiveStats_lift(_ buf: RustBuffer) throws -> Ff
 #endif
 public func FfiConverterTypeFfiReceiveStats_lower(_ value: FfiReceiveStats) -> RustBuffer {
     return FfiConverterTypeFfiReceiveStats.lower(value)
+}
+
+
+/**
+ * The ring a DM call sends when the user chose to call. It always addresses
+ * the whole room.
+ */
+public struct FfiRingConfig {
+    /**
+     * How long the callee's phone rings, and how long the call waits for an
+     * answer, in milliseconds (default: 90000, capped at 120000).
+     */
+    public var lifetimeMs: UInt64?
+    /**
+     * MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
+     */
+    public var intent: String?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * How long the callee's phone rings, and how long the call waits for an
+         * answer, in milliseconds (default: 90000, capped at 120000).
+         */lifetimeMs: UInt64? = nil, 
+        /**
+         * MSC4196 `m.call.intent`, e.g. "audio" or "video". Omitted when unset.
+         */intent: String? = nil) {
+        self.lifetimeMs = lifetimeMs
+        self.intent = intent
+    }
+}
+
+#if compiler(>=6)
+extension FfiRingConfig: Sendable {}
+#endif
+
+
+extension FfiRingConfig: Equatable, Hashable {
+    public static func ==(lhs: FfiRingConfig, rhs: FfiRingConfig) -> Bool {
+        if lhs.lifetimeMs != rhs.lifetimeMs {
+            return false
+        }
+        if lhs.intent != rhs.intent {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(lifetimeMs)
+        hasher.combine(intent)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiRingConfig: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRingConfig {
+        return
+            try FfiRingConfig(
+                lifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
+                intent: FfiConverterOptionString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiRingConfig, into buf: inout [UInt8]) {
+        FfiConverterOptionUInt64.write(value.lifetimeMs, into: &buf)
+        FfiConverterOptionString.write(value.intent, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRingConfig_lift(_ buf: RustBuffer) throws -> FfiRingConfig {
+    return try FfiConverterTypeFfiRingConfig.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRingConfig_lower(_ value: FfiRingConfig) -> RustBuffer {
+    return FfiConverterTypeFfiRingConfig.lower(value)
 }
 
 
@@ -9270,6 +9516,148 @@ extension FfiBackendError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Why a call ended.
+ */
+
+public enum FfiCallEnd {
+    
+    /**
+     * We left, or the room was closed.
+     */
+    case left
+    /**
+     * The callee declined our ring.
+     */
+    case declined
+    /**
+     * Nobody answered before the ring ran out.
+     */
+    case unanswered
+    /**
+     * The ring could not be sent in time.
+     */
+    case ringNotSent
+    /**
+     * Everyone else left a DM call.
+     */
+    case othersLeft
+    /**
+     * A DM call joined without a ring had nobody in it.
+     */
+    case empty
+    /**
+     * The slot was closed, which ended our participation without us asking.
+     */
+    case slotClosed
+    /**
+     * The connection to our own focus closed and will not come back.
+     */
+    case connectionClosed(message: String
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiCallEnd: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCallEnd: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCallEnd
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCallEnd {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .left
+        
+        case 2: return .declined
+        
+        case 3: return .unanswered
+        
+        case 4: return .ringNotSent
+        
+        case 5: return .othersLeft
+        
+        case 6: return .empty
+        
+        case 7: return .slotClosed
+        
+        case 8: return .connectionClosed(message: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCallEnd, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .left:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .declined:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .unanswered:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .ringNotSent:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .othersLeft:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .empty:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .slotClosed:
+            writeInt(&buf, Int32(7))
+        
+        
+        case let .connectionClosed(message):
+            writeInt(&buf, Int32(8))
+            FfiConverterString.write(message, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallEnd_lift(_ buf: RustBuffer) throws -> FfiCallEnd {
+    return try FfiConverterTypeFfiCallEnd.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallEnd_lower(_ value: FfiCallEnd) -> RustBuffer {
+    return FfiConverterTypeFfiCallEnd.lower(value)
+}
+
+
+extension FfiCallEnd: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * An event on the unified call stream (mirrors
  * `matrix_rtc_call_sdk::CallEvent`). Consume via
  * [`MediaSession::next_event`](super::MediaSession::next_event).
@@ -9366,16 +9754,6 @@ public enum FfiCallEvent {
      */
     case unknownParticipant(identity: String
     )
-    /**
-     * Media health: `degraded` while any transport connection reconnects.
-     */
-    case mediaConnectionState(degraded: Bool
-    )
-    /**
-     * The call is over; no further events follow.
-     */
-    case ended(reason: FfiEndedReason
-    )
 }
 
 
@@ -9430,12 +9808,6 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
         )
         
         case 13: return .unknownParticipant(identity: try FfiConverterString.read(from: &buf)
-        )
-        
-        case 14: return .mediaConnectionState(degraded: try FfiConverterBool.read(from: &buf)
-        )
-        
-        case 15: return .ended(reason: try FfiConverterTypeFfiEndedReason.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9528,16 +9900,6 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
             writeInt(&buf, Int32(13))
             FfiConverterString.write(identity, into: &buf)
             
-        
-        case let .mediaConnectionState(degraded):
-            writeInt(&buf, Int32(14))
-            FfiConverterBool.write(degraded, into: &buf)
-            
-        
-        case let .ended(reason):
-            writeInt(&buf, Int32(15))
-            FfiConverterTypeFfiEndedReason.write(reason, into: &buf)
-            
         }
     }
 }
@@ -9568,68 +9930,64 @@ extension FfiCallEvent: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * Why the call ended.
+ * What kind of call a join is. Only a DM call can ring, so a group call
+ * cannot express a ring and a DM call cannot take a group's notification.
  */
 
-public enum FfiEndedReason {
+public enum FfiCallKind {
     
     /**
-     * We left deliberately.
+     * Not a DM. Never rings; `notify` tells the room with a visual
+     * notification when we start the call.
      */
-    case left
+    case group(notify: FfiGroupNotify?
+    )
     /**
-     * The slot was closed, which ended the call without us asking.
+     * A DM call: the library rings, follows the call and ends it (see
+     * `RtcCall::status`). With `ring`, the user chose to call;
+     * without it, they are answering a ring or joining a call in progress.
      */
-    case slotClosed
-    /**
-     * The connection to our own focus closed and will not be
-     * re-established.
-     */
-    case connectionClosed(message: String
+    case direct(ring: FfiRingConfig?
     )
 }
 
 
 #if compiler(>=6)
-extension FfiEndedReason: Sendable {}
+extension FfiCallKind: Sendable {}
 #endif
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public struct FfiConverterTypeFfiEndedReason: FfiConverterRustBuffer {
-    typealias SwiftType = FfiEndedReason
+public struct FfiConverterTypeFfiCallKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCallKind
 
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiEndedReason {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCallKind {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .left
+        case 1: return .group(notify: try FfiConverterOptionTypeFfiGroupNotify.read(from: &buf)
+        )
         
-        case 2: return .slotClosed
-        
-        case 3: return .connectionClosed(message: try FfiConverterString.read(from: &buf)
+        case 2: return .direct(ring: try FfiConverterOptionTypeFfiRingConfig.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
 
-    public static func write(_ value: FfiEndedReason, into buf: inout [UInt8]) {
+    public static func write(_ value: FfiCallKind, into buf: inout [UInt8]) {
         switch value {
         
         
-        case .left:
+        case let .group(notify):
             writeInt(&buf, Int32(1))
+            FfiConverterOptionTypeFfiGroupNotify.write(notify, into: &buf)
+            
         
-        
-        case .slotClosed:
+        case let .direct(ring):
             writeInt(&buf, Int32(2))
-        
-        
-        case let .connectionClosed(message):
-            writeInt(&buf, Int32(3))
-            FfiConverterString.write(message, into: &buf)
+            FfiConverterOptionTypeFfiRingConfig.write(ring, into: &buf)
             
         }
     }
@@ -9639,19 +9997,136 @@ public struct FfiConverterTypeFfiEndedReason: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFfiEndedReason_lift(_ buf: RustBuffer) throws -> FfiEndedReason {
-    return try FfiConverterTypeFfiEndedReason.lift(buf)
+public func FfiConverterTypeFfiCallKind_lift(_ buf: RustBuffer) throws -> FfiCallKind {
+    return try FfiConverterTypeFfiCallKind.lift(buf)
 }
 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-public func FfiConverterTypeFfiEndedReason_lower(_ value: FfiEndedReason) -> RustBuffer {
-    return FfiConverterTypeFfiEndedReason.lower(value)
+public func FfiConverterTypeFfiCallKind_lower(_ value: FfiCallKind) -> RustBuffer {
+    return FfiConverterTypeFfiCallKind.lower(value)
 }
 
 
-extension FfiEndedReason: Equatable, Hashable {}
+extension FfiCallKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Where a joined call is. There is none before the join returns: the host
+ * shows its own joining state until then, and in a DM it already shows that
+ * it is calling.
+ */
+
+public enum FfiCallStatus {
+    
+    /**
+     * Our media is not up yet, and there is somebody to talk to: a group
+     * call, or a DM whose callee is already here.
+     */
+    case connecting
+    /**
+     * A DM call waiting for `callee`, the user ID it rings: show that we
+     * are calling them. `media` is how far our own side has got meanwhile.
+     */
+    case calling(callee: String, ring: FfiRingPhase, media: FfiMediaPhase
+    )
+    /**
+     * Media up and somebody to talk to. `since_ms` is the zero of the call's
+     * duration and the moment to report the system call connected; it holds
+     * through `degraded`.
+     */
+    case connected(sinceMs: UInt64, degraded: Bool
+    )
+    /**
+     * Final.
+     */
+    case ended(reason: FfiCallEnd
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiCallStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCallStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCallStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCallStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .connecting
+        
+        case 2: return .calling(callee: try FfiConverterString.read(from: &buf), ring: try FfiConverterTypeFfiRingPhase.read(from: &buf), media: try FfiConverterTypeFfiMediaPhase.read(from: &buf)
+        )
+        
+        case 3: return .connected(sinceMs: try FfiConverterUInt64.read(from: &buf), degraded: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 4: return .ended(reason: try FfiConverterTypeFfiCallEnd.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCallStatus, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .connecting:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .calling(callee,ring,media):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(callee, into: &buf)
+            FfiConverterTypeFfiRingPhase.write(ring, into: &buf)
+            FfiConverterTypeFfiMediaPhase.write(media, into: &buf)
+            
+        
+        case let .connected(sinceMs,degraded):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt64.write(sinceMs, into: &buf)
+            FfiConverterBool.write(degraded, into: &buf)
+            
+        
+        case let .ended(reason):
+            writeInt(&buf, Int32(4))
+            FfiConverterTypeFfiCallEnd.write(reason, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallStatus_lift(_ buf: RustBuffer) throws -> FfiCallStatus {
+    return try FfiConverterTypeFfiCallStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallStatus_lower(_ value: FfiCallStatus) -> RustBuffer {
+    return FfiConverterTypeFfiCallStatus.lower(value)
+}
+
+
+extension FfiCallStatus: Equatable, Hashable {}
 
 
 
@@ -10110,6 +10585,85 @@ extension FfiKeyRejection: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * How far our own media has got.
+ */
+
+public enum FfiMediaPhase {
+    
+    case connecting
+    /**
+     * `degraded` while a transport reconnects.
+     */
+    case connected(degraded: Bool
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiMediaPhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMediaPhase: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMediaPhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMediaPhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .connecting
+        
+        case 2: return .connected(degraded: try FfiConverterBool.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiMediaPhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .connecting:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .connected(degraded):
+            writeInt(&buf, Int32(2))
+            FfiConverterBool.write(degraded, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMediaPhase_lift(_ buf: RustBuffer) throws -> FfiMediaPhase {
+    return try FfiConverterTypeFfiMediaPhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMediaPhase_lower(_ value: FfiMediaPhase) -> RustBuffer {
+    return FfiConverterTypeFfiMediaPhase.lower(value)
+}
+
+
+extension FfiMediaPhase: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Which MatrixRTC generation a session speaks, for interoperating with Element
  * Call builds that predate the 2026 MSC4143 rewrite.
  *
@@ -10213,85 +10767,6 @@ public func FfiConverterTypeFfiMembershipFormat_lower(_ value: FfiMembershipForm
 
 
 extension FfiMembershipFormat: Equatable, Hashable {}
-
-
-
-
-
-
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * What kind of notification an MSC4075 call notification asks for.
- */
-
-public enum FfiNotificationType {
-    
-    /**
-     * Ring audibly, for `lifetime_ms`.
-     */
-    case ring
-    /**
-     * Show a visual indication only.
-     */
-    case notification
-}
-
-
-#if compiler(>=6)
-extension FfiNotificationType: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFfiNotificationType: FfiConverterRustBuffer {
-    typealias SwiftType = FfiNotificationType
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiNotificationType {
-        let variant: Int32 = try readInt(&buf)
-        switch variant {
-        
-        case 1: return .ring
-        
-        case 2: return .notification
-        
-        default: throw UniffiInternalError.unexpectedEnumCase
-        }
-    }
-
-    public static func write(_ value: FfiNotificationType, into buf: inout [UInt8]) {
-        switch value {
-        
-        
-        case .ring:
-            writeInt(&buf, Int32(1))
-        
-        
-        case .notification:
-            writeInt(&buf, Int32(2))
-        
-        }
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiNotificationType_lift(_ buf: RustBuffer) throws -> FfiNotificationType {
-    return try FfiConverterTypeFfiNotificationType.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFfiNotificationType_lower(_ value: FfiNotificationType) -> RustBuffer {
-    return FfiConverterTypeFfiNotificationType.lower(value)
-}
-
-
-extension FfiNotificationType: Equatable, Hashable {}
 
 
 
@@ -10466,6 +10941,90 @@ public func FfiConverterTypeFfiQualityLimitation_lower(_ value: FfiQualityLimita
 
 
 extension FfiQualityLimitation: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How far a DM call's ring has got.
+ */
+
+public enum FfiRingPhase {
+    
+    /**
+     * The ring is being sent: show that we are calling, without a ringback.
+     */
+    case sending
+    /**
+     * The ring went out at `sent_at_ms` and lasts `lifetime_ms`: play the
+     * ringback.
+     */
+    case ringing(sentAtMs: UInt64, lifetimeMs: UInt64
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiRingPhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiRingPhase: FfiConverterRustBuffer {
+    typealias SwiftType = FfiRingPhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiRingPhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sending
+        
+        case 2: return .ringing(sentAtMs: try FfiConverterUInt64.read(from: &buf), lifetimeMs: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiRingPhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sending:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .ringing(sentAtMs,lifetimeMs):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(sentAtMs, into: &buf)
+            FfiConverterUInt64.write(lifetimeMs, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRingPhase_lift(_ buf: RustBuffer) throws -> FfiRingPhase {
+    return try FfiConverterTypeFfiRingPhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiRingPhase_lower(_ value: FfiRingPhase) -> RustBuffer {
+    return FfiConverterTypeFfiRingPhase.lower(value)
+}
+
+
+extension FfiRingPhase: Equatable, Hashable {}
 
 
 
@@ -11757,6 +12316,30 @@ fileprivate struct FfiConverterOptionTypeFfiEncryptionConfig: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiGroupNotify: FfiConverterRustBuffer {
+    typealias SwiftType = FfiGroupNotify?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiGroupNotify.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiGroupNotify.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiLeaveReason: FfiConverterRustBuffer {
     typealias SwiftType = FfiLeaveReason?
 
@@ -11805,30 +12388,6 @@ fileprivate struct FfiConverterOptionTypeFfiLocalState: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeFfiNotifyConfig: FfiConverterRustBuffer {
-    typealias SwiftType = FfiNotifyConfig?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeFfiNotifyConfig.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeFfiNotifyConfig.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeFfiReactionsConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiReactionsConfig?
 
@@ -11869,6 +12428,30 @@ fileprivate struct FfiConverterOptionTypeFfiReceiveStats: FfiConverterRustBuffer
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiReceiveStats.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiRingConfig: FfiConverterRustBuffer {
+    typealias SwiftType = FfiRingConfig?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiRingConfig.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiRingConfig.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -11989,6 +12572,30 @@ fileprivate struct FfiConverterOptionTypeFfiCallEvent: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiCallEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiCallStatus: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCallStatus?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiCallStatus.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiCallStatus.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -12760,6 +13367,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_backendsubscription_cancel() != 3185) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_callstatussubscription_next() != 14229) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_ffilocaltrack_capture_audio() != 46976) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12925,7 +13535,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_slot_id() != 64029) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_status() != 1179) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_subscribe_membership_snapshots() != 50684) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_subscribe_status() != 19759) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_wait_for_end() != 2943) {
