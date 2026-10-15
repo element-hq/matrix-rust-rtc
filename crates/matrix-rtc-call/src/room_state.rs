@@ -606,7 +606,7 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             member_event_id,
             direct: None,
             ring: None,
-            status: CallStatusCell::new(clock, None),
+            status: CallStatusCell::new(clock),
         };
         match kind {
             CallKind::Group { notify: None } => {}
@@ -685,7 +685,7 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
                 clock: clock.clone(),
             });
         }
-        joined.status = CallStatusCell::new(clock.clone(), Some(initial.clone()));
+        joined.status = CallStatusCell::new_direct(clock.clone(), callee.clone(), initial.clone());
         let direct = DirectCall::new(
             tag,
             user_id.to_owned(),

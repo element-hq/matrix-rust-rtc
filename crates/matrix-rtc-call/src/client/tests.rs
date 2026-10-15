@@ -789,9 +789,10 @@ async fn a_sticky_decline_reaches_the_call_through_the_feeder() {
         matches!(
             status,
             CallStatus::Calling {
+                callee,
                 ring: RingPhase::Ringing { .. },
                 ..
-            }
+            } if callee == BOB
         )
     })
     .await;

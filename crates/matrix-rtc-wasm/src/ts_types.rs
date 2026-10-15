@@ -156,8 +156,9 @@ export type RtcMediaPhase =
 export type RtcCallStatus =
     /** Our media is not up yet, and there is somebody to talk to. */
     | { type: "connecting" }
-    /** A DM call waiting for the callee; `media` is how far our side has got. */
+    /** A DM call waiting for `callee`, the user ID it rings; `media` is how far our side has got. */
     | { type: "calling";
+        callee: string;
         ring: { type: "sending" } | { type: "ringing"; sent_at_ms: number; lifetime_ms: number };
         media: RtcMediaPhase }
     /** Media up and somebody to talk to; `since_ms` holds through `degraded`. */

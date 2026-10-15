@@ -15,6 +15,7 @@ use serde::Serialize;
 pub(crate) enum WasmCallStatus {
     Connecting,
     Calling {
+        callee: String,
         ring: WasmRingPhase,
         media: WasmMediaPhase,
     },
@@ -47,7 +48,12 @@ impl From<CallStatus> for WasmCallStatus {
     fn from(value: CallStatus) -> Self {
         match value {
             CallStatus::Connecting => Self::Connecting,
-            CallStatus::Calling { ring, media } => Self::Calling {
+            CallStatus::Calling {
+                callee,
+                ring,
+                media,
+            } => Self::Calling {
+                callee,
                 ring: match ring {
                     RingPhase::Sending => WasmRingPhase::Sending,
                     RingPhase::Ringing {

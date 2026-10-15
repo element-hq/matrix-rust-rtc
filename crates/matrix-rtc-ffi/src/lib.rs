@@ -765,9 +765,10 @@ pub enum FfiCallStatus {
     /// Our media is not up yet, and there is somebody to talk to: a group
     /// call, or a DM whose callee is already here.
     Connecting,
-    /// A DM call waiting for the callee: show that we are calling. `media` is
-    /// how far our own side has got meanwhile.
+    /// A DM call waiting for `callee`, the user ID it rings: show that we
+    /// are calling them. `media` is how far our own side has got meanwhile.
     Calling {
+        callee: String,
         ring: FfiRingPhase,
         media: FfiMediaPhase,
     },
@@ -783,7 +784,12 @@ impl From<call::CallStatus> for FfiCallStatus {
     fn from(value: call::CallStatus) -> Self {
         match value {
             call::CallStatus::Connecting => Self::Connecting,
-            call::CallStatus::Calling { ring, media } => Self::Calling {
+            call::CallStatus::Calling {
+                callee,
+                ring,
+                media,
+            } => Self::Calling {
+                callee,
                 ring: ring.into(),
                 media: media.into(),
             },

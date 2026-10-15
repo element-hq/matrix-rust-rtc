@@ -17,7 +17,7 @@ log only.
 
 ### Added
 
-- `RtcCall::status`/`subscribe_status` (FFI `status`/`subscribe_status`, web `status` and `onStatus`, `LiveKitCall::status`) report the call as connecting, calling (a DM's ring, with our media's progress), connected since the pickup or our media, or ended with a reason, including a DM's decline, no answer and everyone else leaving.
+- `RtcCall::status`/`subscribe_status` (FFI `status`/`subscribe_status`, web `status` and `onStatus`, `LiveKitCall::status`) report the call as connecting, calling (a DM's ring, with the callee's user ID and our media's progress), connected since the pickup or our media, or ended with a reason, including a DM's decline, no answer and everyone else leaving.
 - `ApplicationIntake::sticky_event_types`/`on_sticky_events` hand an application the sticky events of its types, and `BaseRtcRoom::room_members` the room's joined users.
 
 ## v0.5.0-rc.4 - 2026-10-13

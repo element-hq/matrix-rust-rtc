@@ -28,9 +28,11 @@ pub enum CallStatus {
     /// Our media is not up yet, and there is somebody to talk to: a group
     /// call, or a DM whose callee is already here.
     Connecting,
-    /// A DM call waiting for the callee. `media` is how far our own side has
-    /// got meanwhile: the ring goes out before our media is up.
+    /// A DM call waiting for `callee`, the user ID it rings. `media` is how
+    /// far our own side has got meanwhile: the ring goes out before our media
+    /// is up.
     Calling {
+        callee: String,
         ring: RingPhase,
         media: MediaPhase,
     },
@@ -109,32 +111,55 @@ struct Inputs {
     clock: Clock,
     media: MediaPhase,
     /// `None` in a group call, which waits for nobody.
-    direct: Option<DirectCallState>,
+    direct: Option<Direct>,
     connected_since_ms: Option<u64>,
     /// The first end reported, by whichever source.
     ended: Option<CallEnd>,
 }
 
+/// A DM call's part of the inputs: whom it rings, and how far it has got.
+struct Direct {
+    callee: String,
+    state: DirectCallState,
+}
+
 impl Inputs {
+    fn new(clock: Clock, direct: Option<Direct>) -> Self {
+        Self {
+            clock,
+            media: MediaPhase::Connecting,
+            direct,
+            connected_since_ms: None,
+            ended: None,
+        }
+    }
+
     fn status(&mut self) -> CallStatus {
         if let Some(reason) = &self.ended {
             return CallStatus::Ended {
                 reason: reason.clone(),
             };
         }
-        let ring = match &self.direct {
-            Some(DirectCallState::Sending) => Some(RingPhase::Sending),
-            Some(DirectCallState::Ringing {
-                sent_at_ms,
-                lifetime_ms,
-            }) => Some(RingPhase::Ringing {
-                sent_at_ms: *sent_at_ms,
-                lifetime_ms: *lifetime_ms,
-            }),
-            Some(DirectCallState::InCall { .. } | DirectCallState::Ended { .. }) | None => None,
-        };
+        let ring = self.direct.as_ref().and_then(|direct| {
+            let ring = match direct.state {
+                DirectCallState::Sending => RingPhase::Sending,
+                DirectCallState::Ringing {
+                    sent_at_ms,
+                    lifetime_ms,
+                } => RingPhase::Ringing {
+                    sent_at_ms,
+                    lifetime_ms,
+                },
+                DirectCallState::InCall { .. } | DirectCallState::Ended { .. } => return None,
+            };
+            Some((direct.callee.clone(), ring))
+        });
         match (ring, self.media) {
-            (Some(ring), media) => CallStatus::Calling { ring, media },
+            (Some((callee, ring)), media) => CallStatus::Calling {
+                callee,
+                ring,
+                media,
+            },
             (None, MediaPhase::Connecting) => CallStatus::Connecting,
             (None, MediaPhase::Connected { degraded }) => CallStatus::Connected {
                 since_ms: *self
@@ -145,11 +170,14 @@ impl Inputs {
         }
     }
 
+    /// Only a DM call has a direct part to update.
     fn set_direct(&mut self, state: DirectCallState) {
         if let DirectCallState::Ended { reason } = &state {
             self.end((*reason).into());
         }
-        self.direct = Some(state);
+        if let Some(direct) = &mut self.direct {
+            direct.state = state;
+        }
     }
 
     fn end(&mut self, reason: CallEnd) {
@@ -158,17 +186,24 @@ impl Inputs {
 }
 
 impl CallStatusCell {
-    pub(crate) fn new(clock: Clock, direct: Option<DirectCallState>) -> Arc<Self> {
-        let mut inputs = Inputs {
-            clock,
-            media: MediaPhase::Connecting,
-            direct: None,
-            connected_since_ms: None,
-            ended: None,
+    /// A group call's, which waits for nobody.
+    pub(crate) fn new(clock: Clock) -> Arc<Self> {
+        Self::from_inputs(Inputs::new(clock, None))
+    }
+
+    /// A DM call's, ringing `callee` or not as `initial` says.
+    pub(crate) fn new_direct(clock: Clock, callee: String, initial: DirectCallState) -> Arc<Self> {
+        let direct = Direct {
+            callee,
+            state: initial.clone(),
         };
-        if let Some(direct) = direct {
-            inputs.set_direct(direct);
-        }
+        let mut inputs = Inputs::new(clock, Some(direct));
+        // Records the end of a call that is over before it starts (R33).
+        inputs.set_direct(initial);
+        Self::from_inputs(inputs)
+    }
+
+    fn from_inputs(mut inputs: Inputs) -> Arc<Self> {
         let status = inputs.status();
         Arc::new(Self {
             inputs: Mutex::new(inputs),
@@ -228,7 +263,7 @@ impl MediaStatusReporter {
     /// drives.
     #[cfg(feature = "testing")]
     pub fn standalone() -> (Self, watch::Receiver<CallStatus>) {
-        let cell = CallStatusCell::new(Arc::new(crate::now_ms), None);
+        let cell = CallStatusCell::new(Arc::new(crate::now_ms));
         let status = cell.subscribe();
         (Self::new(cell), status)
     }
@@ -271,9 +306,14 @@ impl MediaStatusReporter {
 mod tests {
     use super::*;
 
+    const BOB: &str = "@bob:example.org";
+
     fn cell(direct: Option<DirectCallState>) -> (Arc<CallStatusCell>, MediaStatusReporter) {
         let clock: Clock = Arc::new(|| 1_000);
-        let cell = CallStatusCell::new(clock, direct);
+        let cell = match direct {
+            Some(initial) => CallStatusCell::new_direct(clock, BOB.to_owned(), initial),
+            None => CallStatusCell::new(clock),
+        };
         (cell.clone(), MediaStatusReporter::new(cell))
     }
 
@@ -299,6 +339,7 @@ mod tests {
         assert_eq!(
             cell.status(),
             CallStatus::Calling {
+                callee: BOB.to_owned(),
                 ring: RingPhase::Sending,
                 media: MediaPhase::Connecting
             }
@@ -311,6 +352,7 @@ mod tests {
         assert_eq!(
             cell.status(),
             CallStatus::Calling {
+                callee: BOB.to_owned(),
                 ring: RingPhase::Ringing {
                     sent_at_ms: 10,
                     lifetime_ms: 90_000
