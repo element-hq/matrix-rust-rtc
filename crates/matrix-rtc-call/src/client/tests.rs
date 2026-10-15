@@ -15,6 +15,7 @@ use matrix_rtc_core::{
 use serde_json::json;
 
 use super::*;
+use crate::{CallEnd, RingPhase};
 
 const ROOM: &str = "!room:example.org";
 const OTHER_ROOM: &str = "!other:example.org";
@@ -711,5 +712,139 @@ async fn closing_the_room_publishes_why_its_sessions_ended() {
     assert_eq!(
         ended.borrow().clone().map(|reason| reason.code),
         Some(LeaveCode::Leave)
+    );
+}
+
+// ---- DM calls ----
+
+/// The call's status once it satisfies `done`, or a panic after two seconds.
+async fn status_once(
+    call: &RtcCall<MockBackend>,
+    done: impl Fn(&CallStatus) -> bool,
+) -> CallStatus {
+    let mut states = call.subscribe_status();
+    tokio::time::timeout(Duration::from_secs(2), states.wait_for(|state| done(state)))
+        .await
+        .expect("the state arrives in time")
+        .expect("the call is alive")
+        .clone()
+}
+
+/// The lifecycle ends the call itself: nobody has to leave for it.
+#[tokio::test]
+async fn a_dm_call_leaves_by_itself_when_the_other_person_leaves() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room
+        .join_call(CallJoinOptions::new().kind(CallKind::Direct { ring: None }))
+        .await
+        .expect("the join succeeds");
+    // Bob is here, and our media is not: nobody to wait for.
+    assert_eq!(call.status(), CallStatus::Connecting);
+    call.media_status_reporter().connected();
+    assert!(matches!(call.status(), CallStatus::Connected { .. }));
+
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    sink.on_sticky_events(Vec::new());
+
+    let status = status_once(&call, |status| matches!(status, CallStatus::Ended { .. })).await;
+    assert_eq!(
+        status,
+        CallStatus::Ended {
+            reason: CallEnd::OthersLeft
+        }
+    );
+    let mut ended = call.subscribe_ended();
+    let reason = tokio::time::timeout(Duration::from_secs(2), ended.wait_for(Option::is_some))
+        .await
+        .expect("the call ends in time")
+        .unwrap()
+        .clone()
+        .unwrap();
+    assert_eq!(reason.code, LeaveCode::Leave);
+    assert_eq!(reason.reason.as_deref(), Some("others_left"));
+    assert!(!call.is_live());
+}
+
+/// matrix-js-sdk sends a decline as a sticky event, which the feeder hands the
+/// call before narrowing the set to memberships.
+#[tokio::test]
+async fn a_sticky_decline_reaches_the_call_through_the_feeder() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    // Bob is in the room, not in the call: there is somebody to ring.
+    sink.on_sticky_events(Vec::new());
+    settle().await;
+
+    let call = room
+        .join_call(CallJoinOptions::new().kind(CallKind::Direct {
+            ring: Some(crate::RingConfig::default()),
+        }))
+        .await
+        .expect("the join succeeds");
+    status_once(&call, |status| {
+        matches!(
+            status,
+            CallStatus::Calling {
+                callee,
+                ring: RingPhase::Ringing { .. },
+                ..
+            } if callee == BOB
+        )
+    })
+    .await;
+    let ring = mock
+        .sticky_events
+        .lock()
+        .unwrap()
+        .iter()
+        .position(|(_, event_type, _, _)| event_type.ends_with("rtc.notification"))
+        .map(|index| format!("$sticky-{}", index + 1))
+        .expect("the ring went out");
+
+    sink.on_sticky_events(vec![EventIn {
+        event_id: "$decline".to_owned(),
+        sender: BOB.to_owned(),
+        event_type: "org.matrix.msc4310.rtc.decline".to_owned(),
+        state_key: None,
+        origin_server_ts: 3,
+        content: json!({
+            "m.relates_to": { "rel_type": "m.reference", "event_id": ring },
+            "msc4354_sticky_key": ring,
+        }),
+        encryption: EventEncryption::Cleartext,
+    }]);
+
+    let status = status_once(&call, |status| matches!(status, CallStatus::Ended { .. })).await;
+    assert_eq!(
+        status,
+        CallStatus::Ended {
+            reason: CallEnd::Declined
+        }
+    );
+}
+
+/// A group call waits for nobody: it connects with our media, and ends when
+/// we leave.
+#[tokio::test]
+async fn a_group_call_is_connected_by_its_media_and_ended_by_the_leave() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    assert_eq!(call.status(), CallStatus::Connecting);
+
+    call.media_status_reporter().connected();
+    assert!(matches!(call.status(), CallStatus::Connected { .. }));
+
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+    assert_eq!(
+        call.status(),
+        CallStatus::Ended {
+            reason: CallEnd::Left
+        }
     );
 }

@@ -86,6 +86,8 @@ required-features = ["matrix-sdk", "testing"]
 [dev-dependencies]
 # `MockBackend`, to join a real call in the `attach` tests.
 matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
+# `MediaStatusReporter::standalone`, to watch what the engine reports.
+matrix-rtc-call = { path = "../matrix-rtc-call", features = ["testing"] }
 serde = { workspace = true }
 serde_json.workspace = true
 # `signal` for the join_and_record example's Ctrl-C hang-up; `io-std` for the

@@ -453,3 +453,80 @@ async fn a_stalled_seeding_names_the_deliveries_it_waits_on() {
         ["on_joined_members (including our own user)"]
     );
 }
+
+/// An application that asks for one sticky type and records what it is given.
+struct StickyApp {
+    rtc: BaseRtcRoom<MockBackend>,
+    received: Vec<RawTimelineEvent>,
+}
+
+impl ApplicationIntake<MockBackend> for StickyApp {
+    fn rtc(&mut self) -> &mut BaseRtcRoom<MockBackend> {
+        &mut self.rtc
+    }
+
+    fn sticky_event_types(&self) -> Vec<String> {
+        vec!["org.example.call.decline".to_owned()]
+    }
+
+    fn on_sticky_events(&mut self, events: &[RawTimelineEvent]) {
+        self.received.extend_from_slice(events);
+    }
+}
+
+/// The application gets its own sticky types out of the set, and the member
+/// events in the same set still reach the roster.
+#[tokio::test]
+async fn an_application_gets_its_sticky_types_before_the_set_is_narrowed() {
+    let mock = Arc::new(MockBackend::new());
+    let app = Arc::new(Mutex::new(StickyApp {
+        rtc: BaseRtcRoom::with_backend(ROOM, mock.clone()),
+        received: Vec::new(),
+    }));
+    let (attachment, run) = RoomFeeder::attach(
+        mock.clone(),
+        app.clone(),
+        Arc::new(MembershipFormat::Current),
+    )
+    .await
+    .expect("attach");
+    tokio::spawn(run.run());
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    sink.on_encryption(false);
+    sink.on_state_events(SLOT_EVENT_TYPE.to_owned(), vec![open_slot()]);
+    sink.on_joined_members(vec![ME.to_owned(), BOB.to_owned()]);
+
+    let decline = EventIn {
+        event_id: "$decline".to_owned(),
+        sender: BOB.to_owned(),
+        event_type: "org.example.call.decline".to_owned(),
+        state_key: None,
+        origin_server_ts: 3,
+        content: json!({ "msc4354_sticky_key": "d" }),
+        encryption: EventEncryption::Cleartext,
+    };
+    let unrelated = EventIn {
+        event_id: "$other".to_owned(),
+        event_type: "org.example.other".to_owned(),
+        ..decline.clone()
+    };
+    sink.on_sticky_events(vec![member_event(BOB, "bob-1", "$m1"), decline, unrelated]);
+    attachment.seeded().await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while app.lock().await.rtc.member_count(SLOT) != Some(1) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the member never landed"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let received = app.lock().await.received.clone();
+    assert_eq!(
+        received
+            .iter()
+            .map(|event| event.event_id.as_str())
+            .collect::<Vec<_>>(),
+        ["$decline"]
+    );
+}

@@ -39,8 +39,8 @@ pub use logging::{
     setup_logging,
 };
 pub use params::{
-    FfiEncryptionConfig, FfiJoinSessionParams, FfiJoinTransport, FfiLeaveSessionParams,
-    FfiNotificationType, FfiNotifyConfig, FfiReactionsConfig,
+    FfiCallKind, FfiEncryptionConfig, FfiGroupNotify, FfiJoinSessionParams, FfiJoinTransport,
+    FfiLeaveSessionParams, FfiReactionsConfig, FfiRingConfig,
 };
 
 /// Participants with observable frame streams, publishing, and constraints —
@@ -643,6 +643,22 @@ impl RtcCall {
             .collect()
     }
 
+    // ---- Where the call is ----
+    //
+    // The library combines our media, a DM's ring and pickup, and the end into
+    // one status. The host draws it; it never works one out itself.
+
+    /// Where the call is now.
+    pub fn status(&self) -> FfiCallStatus {
+        self.call.status().into()
+    }
+
+    /// The status as it changes, current value first. In a DM, every `Ended`
+    /// but `Left` is a leave the library makes itself: do not leave again.
+    pub fn subscribe_status(&self) -> Arc<CallStatusSubscription> {
+        CallStatusSubscription::new(self.call.subscribe_status())
+    }
+
     /// Leaves the slot; the call is over and its media stopped at once, even
     /// when the send fails — the delayed leave then removes the membership.
     pub async fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
@@ -658,6 +674,164 @@ impl RtcCall {
             .inspect_err(|error| log::warn!("call: leave failed: {error}"))?;
         log::info!("call: leave succeeded");
         Ok(())
+    }
+}
+
+/// Why a call ended.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCallEnd {
+    /// We left, or the room was closed.
+    Left,
+    /// The callee declined our ring.
+    Declined,
+    /// Nobody answered before the ring ran out.
+    Unanswered,
+    /// The ring could not be sent in time.
+    RingNotSent,
+    /// Everyone else left a DM call.
+    OthersLeft,
+    /// A DM call joined without a ring had nobody in it.
+    Empty,
+    /// The slot was closed, which ended our participation without us asking.
+    SlotClosed,
+    /// The connection to our own focus closed and will not come back.
+    ConnectionClosed { message: String },
+}
+
+impl From<call::CallEnd> for FfiCallEnd {
+    fn from(value: call::CallEnd) -> Self {
+        match value {
+            call::CallEnd::Left => Self::Left,
+            call::CallEnd::Declined => Self::Declined,
+            call::CallEnd::Unanswered => Self::Unanswered,
+            call::CallEnd::RingNotSent => Self::RingNotSent,
+            call::CallEnd::OthersLeft => Self::OthersLeft,
+            call::CallEnd::Empty => Self::Empty,
+            call::CallEnd::SlotClosed => Self::SlotClosed,
+            call::CallEnd::ConnectionClosed { message } => Self::ConnectionClosed { message },
+        }
+    }
+}
+
+/// How far a DM call's ring has got.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiRingPhase {
+    /// The ring is being sent: show that we are calling, without a ringback.
+    Sending,
+    /// The ring went out at `sent_at_ms` and lasts `lifetime_ms`: play the
+    /// ringback.
+    Ringing { sent_at_ms: u64, lifetime_ms: u64 },
+}
+
+impl From<call::RingPhase> for FfiRingPhase {
+    fn from(value: call::RingPhase) -> Self {
+        match value {
+            call::RingPhase::Sending => Self::Sending,
+            call::RingPhase::Ringing {
+                sent_at_ms,
+                lifetime_ms,
+            } => Self::Ringing {
+                sent_at_ms,
+                lifetime_ms,
+            },
+        }
+    }
+}
+
+/// How far our own media has got.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMediaPhase {
+    Connecting,
+    /// `degraded` while a transport reconnects.
+    Connected {
+        degraded: bool,
+    },
+}
+
+impl From<call::MediaPhase> for FfiMediaPhase {
+    fn from(value: call::MediaPhase) -> Self {
+        match value {
+            call::MediaPhase::Connecting => Self::Connecting,
+            call::MediaPhase::Connected { degraded } => Self::Connected { degraded },
+        }
+    }
+}
+
+/// Where a joined call is. There is none before the join returns: the host
+/// shows its own joining state until then, and in a DM it already shows that
+/// it is calling.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCallStatus {
+    /// Our media is not up yet, and there is somebody to talk to: a group
+    /// call, or a DM whose callee is already here.
+    Connecting,
+    /// A DM call waiting for `callee`, the user ID it rings: show that we
+    /// are calling them. `media` is how far our own side has got meanwhile.
+    Calling {
+        callee: String,
+        ring: FfiRingPhase,
+        media: FfiMediaPhase,
+    },
+    /// Media up and somebody to talk to. `since_ms` is the zero of the call's
+    /// duration and the moment to report the system call connected; it holds
+    /// through `degraded`.
+    Connected { since_ms: u64, degraded: bool },
+    /// Final.
+    Ended { reason: FfiCallEnd },
+}
+
+impl From<call::CallStatus> for FfiCallStatus {
+    fn from(value: call::CallStatus) -> Self {
+        match value {
+            call::CallStatus::Connecting => Self::Connecting,
+            call::CallStatus::Calling {
+                callee,
+                ring,
+                media,
+            } => Self::Calling {
+                callee,
+                ring: ring.into(),
+                media: media.into(),
+            },
+            call::CallStatus::Connected { since_ms, degraded } => {
+                Self::Connected { since_ms, degraded }
+            }
+            call::CallStatus::Ended { reason } => Self::Ended {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+/// A call's status, pulled with an async [`Self::next`] like the roster.
+#[derive(uniffi::Object)]
+pub struct CallStatusSubscription {
+    receiver: tokio::sync::Mutex<watch::Receiver<call::CallStatus>>,
+}
+
+impl CallStatusSubscription {
+    fn new(mut receiver: watch::Receiver<call::CallStatus>) -> Arc<Self> {
+        // The first `next` yields the status as it is now.
+        receiver.mark_changed();
+        Arc::new(Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl CallStatusSubscription {
+    /// The current status on the first call, then each change. `None` once
+    /// `Ended` has been handed out, since nothing follows it.
+    pub async fn next(&self) -> Option<FfiCallStatus> {
+        let mut receiver = self.receiver.lock().await;
+        let unseen = receiver.has_changed().unwrap_or(false);
+        if !unseen && matches!(*receiver.borrow(), call::CallStatus::Ended { .. }) {
+            return None;
+        }
+        receiver.changed().await.ok()?;
+        let status = receiver.borrow_and_update().clone();
+        Some(status.into())
     }
 }
 
@@ -836,7 +1010,7 @@ mod tests {
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             encryption_config: None,
-            notify: None,
+            kind: FfiCallKind::Group { notify: None },
             reactions: None,
         }
     }
@@ -1125,6 +1299,33 @@ mod tests {
             first.member_id(),
             second.member_id(),
             "a rejoin must not reuse the member id"
+        );
+    }
+
+    /// The first `next` is the status now, and nothing follows `Ended`, so a
+    /// host's loop over the subscription ends with the call.
+    #[tokio::test]
+    async fn the_status_subscription_ends_after_the_call_does() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        let call = room.clone().join_call(join_params()).await.expect("join");
+        let subscription = call.subscribe_status();
+        assert_eq!(subscription.next().await, Some(FfiCallStatus::Connecting));
+
+        call.leave(no_reason()).await.expect("leave");
+        assert_eq!(
+            subscription.next().await,
+            Some(FfiCallStatus::Ended {
+                reason: FfiCallEnd::Left
+            })
+        );
+        assert_eq!(subscription.next().await, None);
+        assert_eq!(
+            call.status(),
+            FfiCallStatus::Ended {
+                reason: FfiCallEnd::Left
+            }
         );
     }
 

@@ -14,8 +14,9 @@
 //! background work on the core's [`executor`](matrix_rtc_core::executor): a
 //! room's feeds while the room object lives; the core's upkeep (keep-alive,
 //! key rotations) and, for a call, the raised hand following our membership
-//! event while the session does. Off wasm32 that is the current tokio runtime,
-//! so a native host opens rooms and joins from within one.
+//! event and a DM call's ring and lifecycle while the session does. Off wasm32
+//! that is the current tokio runtime, so a native host opens rooms and joins
+//! from within one.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -32,9 +33,10 @@ use matrix_rtc_core::{
 };
 use tokio::sync::{Mutex, broadcast, watch};
 
-use crate::notification::NotifyConfig;
+use crate::direct_call::{CallKind, DirectCall, DirectCallEnd, DirectCallState};
 use crate::reactions::{RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction};
 use crate::room_state::{CallJoinParams, CallRoomState};
+use crate::status::{CallStatus, CallStatusCell, MediaStatusReporter};
 use crate::transports::{self, JoinTransport};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
@@ -160,9 +162,10 @@ fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> Strin
 #[derive(Clone, Debug)]
 pub struct CallJoinOptions {
     pub join: JoinOptions,
-    /// Ring the room (MSC4075). Suppressed when somebody else is already in
-    /// the slot, so it is the intent to summon, not a guarantee of a ring.
-    pub notify: Option<NotifyConfig>,
+    /// A group call, or a DM call; only a DM call can ring. A notification or
+    /// a ring is suppressed when somebody else is already in the slot, so it
+    /// is the intent to summon, not a guarantee of one.
+    pub kind: CallKind,
     /// `None` is [`ReactionsConfig::default`].
     pub reactions: Option<ReactionsConfig>,
 }
@@ -173,7 +176,7 @@ impl CallJoinOptions {
     pub fn new() -> Self {
         Self {
             join: JoinOptions::application(CALL_APPLICATION),
-            notify: None,
+            kind: CallKind::default(),
             reactions: None,
         }
     }
@@ -190,9 +193,9 @@ impl CallJoinOptions {
         self
     }
 
-    /// Rings the room when we start the call.
-    pub fn notify(mut self, notify: NotifyConfig) -> Self {
-        self.notify = Some(notify);
+    /// What kind of call this is: see [`CallKind`].
+    pub fn kind(mut self, kind: CallKind) -> Self {
+        self.kind = kind;
         self
     }
 
@@ -367,11 +370,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     }
 
     /// Joins a call slot: the generic join, then the call layer — reactions
-    /// for this participation, and the ring if asked for.
+    /// for this participation, a group's notification, or a DM call's ring and
+    /// lifecycle.
     pub async fn join_call(&self, options: CallJoinOptions) -> Result<RtcCall<B>, RtcError> {
         let CallJoinOptions {
             join,
-            notify,
+            kind,
             reactions,
         } = options;
         let slot_id = join.slot_id.clone();
@@ -381,10 +385,10 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             .prepare_join(&mut state, join, transport.clone())
             .await?;
         let member_id = rtc.membership_id();
-        state
+        let joined = state
             .join(CallJoinParams {
                 rtc,
-                notify,
+                kind,
                 reactions,
             })
             .await?;
@@ -392,9 +396,26 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
         let event_moves = state.rtc().subscribe_own_membership_event_id(&slot_id);
         drop(state);
+        let session = self.session(slot_id.clone(), member_id, transport, upkeep, auto_leaves);
+        session.end.report_to(joined.status.clone());
+        // After the lock is released: the ring may be retried for seconds, and
+        // a pickup or a decline must be able to arrive meanwhile.
+        let ring = joined
+            .direct
+            .as_ref()
+            .zip(joined.ring)
+            .map(|(direct, job)| {
+                executor::spawn(job.run(self.backend.clone(), direct.clone())).abort_on_drop()
+            });
+        let follow_direct = joined.direct.as_ref().map(|direct| {
+            self.follow_direct_call(slot_id.clone(), direct.clone(), session.end.clone())
+        });
         Ok(RtcCall {
-            _hand: event_moves.map(|moves| self.follow_hand(slot_id.clone(), moves)),
-            session: self.session(slot_id, member_id, transport, upkeep, auto_leaves),
+            _hand: event_moves.map(|moves| self.follow_hand(slot_id, moves)),
+            status: joined.status,
+            _ring: ring,
+            _follow_direct: follow_direct,
+            session,
         })
     }
 
@@ -552,6 +573,51 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         .abort_on_drop()
     }
 
+    /// Leaves when a DM call's lifecycle ends it — a decline, no answer, no
+    /// ring, nobody left, nobody there — and ends the lifecycle as
+    /// [`DirectCallEnd::Left`] when the participation ends any other way.
+    fn follow_direct_call(
+        &self,
+        slot_id: String,
+        direct: Arc<DirectCall>,
+        end: Arc<SessionEnd>,
+    ) -> AbortOnDrop<()> {
+        let state = self.state.clone();
+        let room_id = self.room_id.clone();
+        executor::spawn(async move {
+            let mut states = direct.subscribe();
+            let mut ended = end.ended.subscribe();
+            let reason = tokio::select! {
+                result = states.wait_for(|state| matches!(state, DirectCallState::Ended { .. })) => {
+                    match result.map(|state| state.clone()) {
+                        Ok(DirectCallState::Ended { reason }) => reason,
+                        _ => return,
+                    }
+                }
+                _ = ended.wait_for(Option::is_some) => {
+                    direct.finish_left();
+                    return;
+                }
+            };
+            if reason == DirectCallEnd::Left {
+                return;
+            }
+            // Ended before the send, as a host leave is, so media stops at once.
+            let leave_reason = LeaveReason::with_reason(LeaveCode::Leave, reason.as_str());
+            if !end.end(leave_reason.clone()) {
+                return;
+            }
+            log::info!("[{room_id}/{slot_id}] leaving: {}", reason.as_str());
+            let params = LeaveSessionParams {
+                leave_reason: Some(leave_reason),
+            };
+            if let Err(error) = state.lock().await.leave(&slot_id, params).await {
+                log::warn!("[{room_id}/{slot_id}] leave failed ({error}); the delayed leave follows");
+            }
+        })
+        .abort_on_drop()
+    }
+
     fn end_sessions(&self, reason: LeaveReason) {
         for (_, end) in self.sessions().drain() {
             end.end(reason.clone());
@@ -563,6 +629,8 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 struct SessionEnd {
     live: AtomicBool,
     ended: watch::Sender<Option<LeaveReason>>,
+    /// A call's status, told the end as it happens.
+    status: StdMutex<Option<Arc<CallStatusCell>>>,
 }
 
 impl SessionEnd {
@@ -570,7 +638,20 @@ impl SessionEnd {
         Self {
             live: AtomicBool::new(true),
             ended: watch::channel(None).0,
+            status: StdMutex::new(None),
         }
+    }
+
+    /// An end that already happened is reported at once.
+    fn report_to(&self, status: Arc<CallStatusCell>) {
+        let mut slot = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reason) = &*self.ended.borrow() {
+            status.on_session_ended(reason);
+        }
+        *slot = Some(status);
     }
 
     fn is_live(&self) -> bool {
@@ -579,8 +660,15 @@ impl SessionEnd {
 
     /// `false` if it was already over.
     fn end(&self, reason: LeaveReason) -> bool {
+        let status = self
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let live = self.live.swap(false, Ordering::SeqCst);
         if live {
+            if let Some(status) = &*status {
+                status.on_session_ended(&reason);
+            }
             self.ended.send_replace(Some(reason));
         }
         live
@@ -767,11 +855,17 @@ impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
 }
 
 /// Our participation in a call slot: an [`RtcSession`] (reached through
-/// `Deref`) plus reactions and the raised hand.
+/// `Deref`) plus reactions, the raised hand, its status and, in a DM, the ring
+/// and the lifecycle.
 pub struct RtcCall<B: MatrixBackend + 'static> {
     session: RtcSession<B>,
     /// Keeps our raised hand on our current membership event.
     _hand: Option<AbortOnDrop<()>>,
+    status: Arc<CallStatusCell>,
+    /// Sends the ring and times it.
+    _ring: Option<AbortOnDrop<()>>,
+    /// Leaves when the lifecycle ends the call.
+    _follow_direct: Option<AbortOnDrop<()>>,
 }
 
 impl<B: MatrixBackend + 'static> RtcCall<B> {
@@ -824,6 +918,23 @@ impl<B: MatrixBackend + 'static> RtcCall<B> {
 
     pub async fn reactions_config(&self) -> Option<ReactionsConfig> {
         self.state.lock().await.reactions_config(&self.slot_id)
+    }
+
+    /// Where the call is: what a host gates its timer, its "Calling…" and
+    /// its system call report on.
+    pub fn status(&self) -> CallStatus {
+        self.status.status()
+    }
+
+    /// The status as it changes, current value first. In a DM, every `Ended`
+    /// but [`crate::CallEnd::Left`] is a leave the call makes itself.
+    pub fn subscribe_status(&self) -> watch::Receiver<CallStatus> {
+        self.status.subscribe()
+    }
+
+    /// For the media layer, which alone knows when our own connection is up.
+    pub fn media_status_reporter(&self) -> MediaStatusReporter {
+        MediaStatusReporter::new(self.status.clone())
     }
 }
 

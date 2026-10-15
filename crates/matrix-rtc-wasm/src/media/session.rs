@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_call_sdk::{
-    AttachOptions, CallEngine, CallEvent, EndedReason, FrameEncryptionDiagnostic, MediaAttachment,
-    Participant, StabilityConfig, attach_media,
+    AttachOptions, CallEngine, CallEvent, FrameEncryptionDiagnostic, MediaAttachment, Participant,
+    StabilityConfig, attach_media,
 };
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_transport::keys::MediaKeyHandler;
@@ -30,6 +30,8 @@ use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
 use crate::WasmRtcCall;
+use crate::status::WasmCallStatus;
+use matrix_rtc_call::CallStatus;
 
 /// livekit-js's `ExternalE2EEKeyProvider` default `keyringSize`.
 const LIVEKIT_JS_DEFAULT_KEY_RING_SIZE: u16 = 16;
@@ -107,9 +109,10 @@ impl WasmRtcCall {
     /// receive-only call;
     /// `delegate` is the object driving livekit-js (see the module docs of
     /// the transport for its required methods). The delegate may additionally
-    /// implement `onParticipants(roster)` and `onEvent(event)` — the push
-    /// half of the session, invoked from spawned pumps for the life of the
-    /// call.
+    /// implement `onParticipants(roster)`, `onEvent(event)` and
+    /// `onStatus(status)` — the push half of the session, invoked from spawned
+    /// pumps for the life of the call. `onStatus` is called with the status
+    /// as it is first, and last with the call's end.
     #[wasm_bindgen(js_name = connectMedia)]
     pub async fn connect_media(
         &self,
@@ -246,6 +249,26 @@ impl WasmRtcCall {
             });
         }
 
+        if let Some(on_status) = delegate_callback(&delegate, "onStatus") {
+            let mut status = self.inner().subscribe_status();
+            status.mark_changed();
+            wasm_bindgen_futures::spawn_local(async move {
+                while status.changed().await.is_ok() {
+                    let current = status.borrow_and_update().clone();
+                    let ended = matches!(current, CallStatus::Ended { .. });
+                    match serde_wasm_bindgen::to_value(&WasmCallStatus::from(current)) {
+                        Ok(value) => {
+                            let _ = on_status.call1(&JsValue::NULL, &value);
+                        }
+                        Err(error) => log::warn!("media: status did not serialize: {error}"),
+                    }
+                    if ended {
+                        break;
+                    }
+                }
+            });
+        }
+
         Ok(WasmMediaSession {
             engine,
             own_connection,
@@ -269,8 +292,8 @@ fn delegate_callback(delegate: &JsValue, name: &str) -> Option<Function> {
 /// rendering — stays in livekit-js; join roster entries to
 /// `room.getParticipantByIdentity(rtc_identity)`.
 ///
-/// Roster changes and call events arrive through the delegate's
-/// `onParticipants` / `onEvent` callbacks, registered at
+/// Roster changes, call events and the call's status arrive through the
+/// delegate's `onParticipants` / `onEvent` / `onStatus` callbacks, registered at
 /// [`WasmRtcCall::connect_media`] time.
 ///
 /// Ends with the call; [`WasmMediaSession::disconnect`] ends it while staying
@@ -460,13 +483,6 @@ enum WasmCallEvent {
     UnknownParticipant {
         identity: String,
     },
-    MediaConnectionState {
-        degraded: bool,
-    },
-    Ended {
-        /// `left`, or the transport's disconnect description.
-        reason: String,
-    },
 }
 
 #[derive(Serialize)]
@@ -597,14 +613,6 @@ impl From<CallEvent> for WasmCallEvent {
                 sound,
             },
             CallEvent::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
-            CallEvent::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },
-            CallEvent::Ended { reason } => Self::Ended {
-                reason: match reason {
-                    EndedReason::Left => "left".to_owned(),
-                    EndedReason::SlotClosed => "slot_closed".to_owned(),
-                    EndedReason::ConnectionClosed { message } => message,
-                },
-            },
         }
     }
 }

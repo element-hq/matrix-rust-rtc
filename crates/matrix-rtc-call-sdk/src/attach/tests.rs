@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use matrix_rtc_call::{CallJoinOptions, JoinTransport, RtcClient, RtcRoom};
+use matrix_rtc_call::{CallEnd, CallJoinOptions, CallStatus, JoinTransport, RtcClient, RtcRoom};
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     EventEncryption, EventIn, JoinedMembership, KEY_MESSAGE_TYPE, LeaveSessionParams, RoomOptions,
@@ -76,6 +76,8 @@ impl TransportConnection for FakeConnection {
 struct FakeTransport {
     own_connects: Mutex<Vec<String>>,
     refuse: bool,
+    /// The own connection's events, for a test to play the SFU.
+    own_events: Mutex<Option<mpsc::UnboundedSender<ConnectionEvent>>>,
 }
 
 #[async_trait]
@@ -129,6 +131,7 @@ impl OwnFocusTransport for FakeTransport {
             return Err(TransportError::Connect("refused".into()));
         }
         let (tx, rx) = mpsc::unbounded_channel();
+        *self.own_events.lock().unwrap() = Some(tx.clone());
         Ok((
             FakeConnection {
                 _events: Some(tx),
@@ -353,4 +356,79 @@ async fn a_refusing_own_focus_fails_the_attach() {
     )
     .await;
     assert!(matches!(result, Err(AttachError::Transport(_))));
+}
+
+/// The status follows our own focus: up once attached, degraded while it
+/// reconnects, over when it closes for good.
+#[tokio::test]
+async fn our_own_focus_drives_the_call_status() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let transport = Arc::new(FakeTransport::default());
+    assert_eq!(call.status(), CallStatus::Connecting);
+
+    let _attached = attach_media(
+        &call,
+        transport.clone(),
+        Arc::new(MediaKeyHandler::new()),
+        options(&mock),
+    )
+    .await
+    .expect("attaches");
+    let CallStatus::Connected {
+        since_ms,
+        degraded: false,
+    } = call.status()
+    else {
+        panic!("connected once attached, not {:?}", call.status());
+    };
+
+    let events = transport.own_events.lock().unwrap().clone().unwrap();
+    events.send(ConnectionEvent::Reconnecting).unwrap();
+    settle().await;
+    assert_eq!(
+        call.status(),
+        CallStatus::Connected {
+            since_ms,
+            degraded: true
+        }
+    );
+
+    events
+        .send(ConnectionEvent::Closed {
+            message: "gone".to_owned(),
+        })
+        .unwrap();
+    settle().await;
+    assert_eq!(
+        call.status(),
+        CallStatus::Ended {
+            reason: CallEnd::ConnectionClosed {
+                message: "gone".to_owned()
+            }
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_refused_own_focus_leaves_the_call_connecting() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let transport = Arc::new(FakeTransport {
+        refuse: true,
+        ..FakeTransport::default()
+    });
+
+    let _ = attach_media(
+        &call,
+        transport,
+        Arc::new(MediaKeyHandler::new()),
+        options(&mock),
+    )
+    .await;
+    assert_eq!(call.status(), CallStatus::Connecting);
 }

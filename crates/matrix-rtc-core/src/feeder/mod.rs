@@ -326,9 +326,13 @@ impl RoomFeeder {
         B: MatrixBackend + 'static,
         M: ApplicationIntake<B>,
     {
-        let (room_id, timeline_event_types) = {
+        let (room_id, timeline_event_types, sticky_event_types) = {
             let mut room = room.lock().await;
-            (room.rtc().room_id().to_owned(), room.timeline_event_types())
+            (
+                room.rtc().room_id().to_owned(),
+                room.timeline_event_types(),
+                room.sticky_event_types(),
+            )
         };
         let subjects = subjects_for(dialect.as_ref(), timeline_event_types);
         log::info!("[{room_id}] attaching: {subjects:?}");
@@ -351,6 +355,7 @@ impl RoomFeeder {
             room,
             room_id,
             dialect,
+            sticky_event_types,
             rx,
             seeded: seeded_tx,
             state: FeedState::default(),
@@ -381,6 +386,9 @@ pub struct RoomFeederRun<B, M> {
     room: Arc<Mutex<M>>,
     room_id: String,
     dialect: Arc<dyn IngestDialect>,
+    /// The application's sticky types, read once at attach like its timeline
+    /// types.
+    sticky_event_types: Vec<String>,
     rx: mpsc::UnboundedReceiver<RoomInput>,
     seeded: watch::Sender<bool>,
     state: FeedState,
@@ -424,6 +432,7 @@ where
                 RoomInput::State(event_type, events) => self.on_state(event_type, events).await,
                 RoomInput::Members(user_ids) => self.on_members(user_ids).await,
                 RoomInput::Sticky(events) => {
+                    self.on_application_sticky(&events).await;
                     self.state.sticky = Some(
                         events
                             .into_iter()
@@ -449,6 +458,19 @@ where
             }
         }
         log::info!("[{}] feeder stopped", self.room_id);
+    }
+
+    /// Hands the application its sticky types before the set is narrowed to
+    /// member events, which is all the membership dialect reads.
+    async fn on_application_sticky(&self, events: &[EventIn]) {
+        let events: Vec<RawTimelineEvent> = events
+            .iter()
+            .filter(|event| self.sticky_event_types.contains(&event.event_type))
+            .map(|event| to_timeline_event(&self.room_id, event.clone()))
+            .collect();
+        if !events.is_empty() {
+            self.room.lock().await.on_sticky_events(&events);
+        }
     }
 
     async fn on_state(&mut self, event_type: String, events: Vec<EventIn>) {

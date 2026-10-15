@@ -26,8 +26,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_call::{RaisedHand, ReceivedReaction};
-use matrix_rtc_core::{DiscardedKey, JoinedMembership, LeaveCode, LeaveReason};
+use matrix_rtc_call::{MediaStatusReporter, RaisedHand, ReceivedReaction};
+use matrix_rtc_core::{DiscardedKey, JoinedMembership, LeaveReason};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use matrix_rtc_core::executor as rt;
@@ -38,7 +38,7 @@ use matrix_rtc_transport::{
     TransportConnection, TransportError,
 };
 
-use crate::event::{CallEvent, EndedReason, FrameEncryptionDiagnostic, SpeakingMember};
+use crate::event::{CallEvent, FrameEncryptionDiagnostic, SpeakingMember};
 use crate::participant::{Participant, StreamState};
 use crate::tile::{
     CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
@@ -107,6 +107,9 @@ pub struct EngineConfig {
     /// `RtcSession::subscribe_ended`: once `Some`, the engine ends the call
     /// and closes every connection, the own-focus one included.
     pub ended: Option<watch::Receiver<Option<LeaveReason>>>,
+    /// The call's status (`RtcCall::media_status_reporter`), told when our
+    /// media degrades, is lost or is shut down. `None` reports nothing.
+    pub media_status: Option<MediaStatusReporter>,
     /// Damping of the tile order; see [`StabilityConfig`].
     pub stability: StabilityConfig,
 }
@@ -253,6 +256,7 @@ impl CallEngine {
 
         let actor = Actor {
             pool,
+            media_status: config.media_status,
             own_member_id: config.own_member_id,
             events_tx: events_tx.clone(),
             participants_tx,
@@ -550,8 +554,8 @@ impl CallEngine {
         .await
     }
 
-    /// Emit [`CallEvent::Ended`] and close every pooled peer-focus connection.
-    /// The adopted own-focus connection is not closed here — its owner (the
+    /// Close every pooled peer-focus connection, and report media detached to
+    /// the call's status. The adopted own-focus connection is not closed here — its owner (the
     /// caller of [`CallEngine::adopt_own_connection`]) closes it and gets the
     /// result. Resolves once the engine has processed the shutdown.
     pub async fn shutdown(&self) {
@@ -565,6 +569,7 @@ impl CallEngine {
 struct Actor {
     /// The call's media connections, and the identity mapping over them.
     pool: MediaPool,
+    media_status: Option<MediaStatusReporter>,
     own_member_id: String,
     events_tx: broadcast::Sender<CallEvent>,
     participants_tx: watch::Sender<Vec<Participant>>,
@@ -733,7 +738,10 @@ impl Actor {
                 }
                 message = messages.recv() => match message {
                     Some(ActorMessage::Shutdown { ack }) => {
-                        self.end(EndedReason::Left);
+                        if let Some(status) = &self.media_status {
+                            status.detached();
+                        }
+                        self.end();
                         let _ = ack.send(());
                         break;
                     }
@@ -1021,10 +1029,15 @@ impl Actor {
                     self.emit(CallEvent::UnknownParticipant { identity });
                 }
                 PoolEvent::Degraded(degraded) => {
-                    self.emit(CallEvent::MediaConnectionState { degraded });
+                    if let Some(status) = &self.media_status {
+                        status.degraded(degraded);
+                    }
                 }
                 PoolEvent::OwnConnectionLost { message } => {
-                    self.end(EndedReason::ConnectionClosed { message });
+                    if let Some(status) = &self.media_status {
+                        status.lost(message);
+                    }
+                    self.end();
                 }
             }
         }
@@ -1388,15 +1401,15 @@ impl Actor {
 
     // ---- end ---------------------------------------------------------------
 
-    /// Emit [`CallEvent::Ended`] once and close all pooled peer-focus
-    /// connections. The adopted own-focus connection is never closed by the
-    /// engine (its owner closes it; at this point it is usually already gone).
-    fn end(&mut self, reason: EndedReason) {
+    /// Close all pooled peer-focus connections, once. The adopted own-focus
+    /// connection is never closed by the engine (its owner closes it; at this
+    /// point it is usually already gone). Why the call ended is the call's
+    /// status to say.
+    fn end(&mut self) {
         if self.ended {
             return;
         }
         self.ended = true;
-        self.emit(CallEvent::Ended { reason });
         self.pool.close();
     }
 
@@ -1408,10 +1421,7 @@ impl Actor {
         }
         log::info!("call: the session ended ({:?}); ending media", reason.code);
         let own = self.pool.own_connection();
-        self.end(match reason.code {
-            LeaveCode::SlotClosed => EndedReason::SlotClosed,
-            _ => EndedReason::Left,
-        });
+        self.end();
         if let Some(own) = own
             && let Err(error) = own.close().await
         {
@@ -1603,7 +1613,8 @@ mod tests {
 
     use futures_core::stream::BoxStream;
     use futures_util::StreamExt;
-    use matrix_rtc_core::{EventOrigin, LiveKitTransport, RtcTransport};
+    use matrix_rtc_call::{CallEnd, CallStatus};
+    use matrix_rtc_core::{EventOrigin, LeaveCode, LiveKitTransport, RtcTransport};
 
     use crate::event::FrameEncryptionDiagnostic;
     use matrix_rtc_core::KeyRejection;
@@ -1872,6 +1883,8 @@ mod tests {
         raised_hands: watch::Sender<Vec<RaisedHand>>,
         reactions: broadcast::Sender<ReceivedReaction>,
         ended: watch::Sender<Option<LeaveReason>>,
+        /// The status a call would show, our media already connected.
+        status: watch::Receiver<CallStatus>,
         state: Arc<TransportState>,
     }
 
@@ -1893,6 +1906,8 @@ mod tests {
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
         let (reactions, reactions_rx) = broadcast::channel(8);
         let (ended, ended_rx) = watch::channel(None);
+        let (media_status, status) = MediaStatusReporter::standalone();
+        media_status.connected();
         let engine = CallEngine::new(
             EngineConfig {
                 transports: vec![Arc::new(FakeTransport {
@@ -1912,6 +1927,7 @@ mod tests {
                 raised_hands: Some(raised_hands_rx),
                 reactions: Some(reactions_rx),
                 ended: Some(ended_rx),
+                media_status: Some(media_status),
                 stability,
             },
             memberships_rx,
@@ -1923,7 +1939,15 @@ mod tests {
             raised_hands,
             reactions,
             ended,
+            status,
             state,
+        }
+    }
+
+    fn degraded(fx: &Fixture) -> Option<bool> {
+        match *fx.status.borrow() {
+            CallStatus::Connected { degraded, .. } => Some(degraded),
+            _ => None,
         }
     }
 
@@ -2392,12 +2416,7 @@ mod tests {
 
         fx.ended
             .send_replace(Some(LeaveReason::new(LeaveCode::SlotClosed)));
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::Ended {
-                reason: EndedReason::SlotClosed,
-            }
-        );
+        settle(&fx.engine).await;
 
         fx.raised_hands.send(vec![hand("bob", 5)]).unwrap();
         wait_until(|| participant(&fx, "bob").hand_raised_at_ms == Some(5)).await;
@@ -3107,7 +3126,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_own_connection_ends_the_call() {
-        let mut fx = fixture();
+        let fx = fixture();
         let connection = adopt(&fx);
         connection
             .send(ConnectionEvent::Closed {
@@ -3115,32 +3134,26 @@ mod tests {
             })
             .unwrap();
 
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::Ended {
-                reason: EndedReason::ConnectionClosed {
-                    message: "server shutting down".to_owned(),
-                },
-            }
-        );
+        wait_until(|| {
+            *fx.status.borrow()
+                == CallStatus::Ended {
+                    reason: CallEnd::ConnectionClosed {
+                        message: "server shutting down".to_owned(),
+                    },
+                }
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn reconnect_cycle_reports_degraded_media() {
-        let mut fx = fixture();
+        let fx = fixture();
         let connection = adopt(&fx);
         connection.send(ConnectionEvent::Reconnecting).unwrap();
+        wait_until(|| degraded(&fx) == Some(true)).await;
         connection.send(ConnectionEvent::Reconnecting).unwrap(); // deduplicated
         connection.send(ConnectionEvent::Reconnected).unwrap();
-
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::MediaConnectionState { degraded: true }
-        );
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::MediaConnectionState { degraded: false }
-        );
+        wait_until(|| degraded(&fx) == Some(false)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3228,15 +3241,9 @@ mod tests {
                 kind: MediaStreamKind::Microphone,
             }
         );
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::MediaConnectionState { degraded: true }
-        );
+        wait_until(|| degraded(&fx) == Some(true)).await;
         wait_until(|| connect_count(&fx, PEER_FOCUS) >= 2).await;
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::MediaConnectionState { degraded: false }
-        );
+        wait_until(|| degraded(&fx) == Some(false)).await;
         assert!(
             fx.engine
                 .participants()
@@ -3955,8 +3962,8 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shutdown_emits_left_and_closes_peer_connections() {
-        let mut fx = fixture();
+    async fn shutdown_detaches_media_and_closes_peer_connections() {
+        let fx = fixture();
         fx.memberships
             .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
             .unwrap();
@@ -3965,12 +3972,7 @@ mod tests {
         let own = adopt(&fx);
 
         fx.engine.shutdown().await;
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::Ended {
-                reason: EndedReason::Left,
-            }
-        );
+        assert_eq!(*fx.status.borrow(), CallStatus::Connecting);
         wait_until(|| closed(&fx, PEER_FOCUS)).await;
         // The adopted own connection is left to its owner.
         assert!(!closed(&fx, OWN_FOCUS));
@@ -3979,19 +3981,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_closed_slot_ends_the_call_and_closes_the_own_connection() {
-        let mut fx = fixture();
+        let fx = fixture();
         let _own = adopt(&fx);
         settle(&fx.engine).await;
 
         fx.ended
             .send_replace(Some(LeaveReason::new(LeaveCode::SlotClosed)));
 
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::Ended {
-                reason: EndedReason::SlotClosed,
-            }
-        );
         wait_until(|| closed(&fx, OWN_FOCUS)).await;
         // The host's own teardown afterwards is harmless.
         fx.engine.shutdown().await;
@@ -3999,19 +3995,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_host_leave_ends_the_call_and_closes_the_own_connection() {
-        let mut fx = fixture();
+        let fx = fixture();
         let _own = adopt(&fx);
         settle(&fx.engine).await;
 
         fx.ended
             .send_replace(Some(LeaveReason::new(LeaveCode::Leave)));
 
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::Ended {
-                reason: EndedReason::Left,
-            }
-        );
         wait_until(|| closed(&fx, OWN_FOCUS)).await;
     }
 

@@ -8,6 +8,18 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- `CallJoinOptions::kind` (FFI `FfiJoinSessionParams::kind`, required) replaces `notify`: `Group { notify }` for a group call's notification, `Direct { ring }` for a DM call the library rings, follows and ends; web `joinCall` refuses `notification_type: "ring"`.
+- An MSC4075 ring now lasts 90 s by default, as Element Call's does.
+- `notify_session_started` takes the `DialectBackend`, so a notification always goes out in the room's membership format.
+- `CallEvent::Ended`, `CallEvent::MediaConnectionState` and `EndedReason` (FFI `FfiEndedReason`, web `ended` and `media_connection_state`) are removed: the call's status says both.
+
+### Added
+
+- `RtcCall::status`/`subscribe_status` (FFI `status`/`subscribe_status`, web `status` and `onStatus`, `LiveKitCall::status`) report the call as connecting, calling (a DM's ring, with the callee's user ID and our media's progress), connected since the pickup or our media, or ended with a reason, including a DM's decline, no answer and everyone else leaving.
+- `ApplicationIntake::sticky_event_types`/`on_sticky_events` hand an application the sticky events of its types, and `BaseRtcRoom::room_members` the room's joined users.
+
 ## v0.5.0-rc.4 - 2026-10-13
 
 ### Breaking

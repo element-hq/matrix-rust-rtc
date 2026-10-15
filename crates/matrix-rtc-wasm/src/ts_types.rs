@@ -144,10 +144,29 @@ export type RtcCallEvent =
     /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`null` = silent).
      *  Only while we are in the call, and only for a recent reaction (`reactions.max_age_ms`). */
     | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string | null }
-    | { type: "unknown_participant"; identity: string }
-    | { type: "media_connection_state"; degraded: boolean }
-    /** `reason` is `"left"`, `"slot_closed"`, or the transport's message when the own focus closed. */
-    | { type: "ended"; reason: string };
+    | { type: "unknown_participant"; identity: string };
+
+/** How far our own media has got. */
+export type RtcMediaPhase =
+    | { type: "connecting" }
+    /** `degraded` while a transport reconnects. */
+    | { type: "connected"; degraded: boolean };
+
+/** Where a joined call is (`WasmRtcCall.status`, `onStatus`). Only `ended` is final. */
+export type RtcCallStatus =
+    /** Our media is not up yet, and there is somebody to talk to. */
+    | { type: "connecting" }
+    /** A DM call waiting for `callee`, the user ID it rings; `media` is how far our side has got. */
+    | { type: "calling";
+        callee: string;
+        ring: { type: "sending" } | { type: "ringing"; sent_at_ms: number; lifetime_ms: number };
+        media: RtcMediaPhase }
+    /** Media up and somebody to talk to; `since_ms` holds through `degraded`. */
+    | { type: "connected"; since_ms: number; degraded: boolean }
+    /** `message` is the transport's, for `connection_closed` only. */
+    | { type: "ended";
+        reason: "left" | "declined" | "unanswered" | "ring_not_sent" | "others_left" | "empty" | "slot_closed" | "connection_closed";
+        message: string | null };
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
 export interface MediaSessionConfigIn {
@@ -187,6 +206,8 @@ export interface MediaDelegate {
     onParticipants?(roster: RtcParticipant[]): void;
     /** The push half: the unified call event stream. */
     onEvent?(event: RtcCallEvent): void;
+    /** The call's status: as it is first, then each change, last the end. */
+    onStatus?(status: RtcCallStatus): void;
 }
 
 /** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */

@@ -17,8 +17,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # Sync primitives only: tasks and timers go through `matrix_rtc_core::executor`,
-# never `tokio::time`, which panics on wasm32-unknown-unknown.
-tokio = { workspace = true }
+# never `tokio::time`, which panics on wasm32-unknown-unknown. `select!` is a
+# macro over those, and wasm-safe.
+tokio = { workspace = true, features = ["macros"] }
 log.workspace = true
 # `DialectBackend` wraps the host's `MatrixBackend`, an async trait.
 async-trait.workspace = true
@@ -31,6 +32,10 @@ unicode-segmentation = "1"
 # clock there); web-time is the drop-in that reads `Date.now()` instead.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 web-time = "1"
+
+[features]
+# `MediaStatusReporter::standalone`, for the media layer's tests.
+testing = []
 
 [dev-dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }

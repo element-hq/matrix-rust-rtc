@@ -65,7 +65,8 @@ use matrix_sdk::ruma::{OwnedRoomId, RoomId, UserId};
 use matrix_sdk::{Client, RoomMemberships};
 use matrix_sdk_ui::sync_service::SyncService;
 
-use matrix_rtc_call_sdk::{CallEvent, EndedReason, Participant as MediaParticipant};
+use matrix_rtc_call::{CallEnd, CallStatus};
+use matrix_rtc_call_sdk::{CallEvent, Participant as MediaParticipant};
 use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, close_slot, open_slot};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
@@ -156,7 +157,7 @@ enum Scenario {
     /// Single focus, then alice closes the slot mid-call. MSC4143 counts nobody
     /// as joined to a closed slot, so both rosters must empty out — each peer's
     /// own entry included — and both calls end themselves
-    /// (`EndedReason::SlotClosed`), after which `LiveKitCall::leave` still
+    /// (`CallEnd::SlotClosed`), after which `LiveKitCall::leave` still
     /// succeeds. Not run in `RoomState`, which has no slots.
     SlotClosed,
 }
@@ -401,26 +402,24 @@ async fn wait_for_member_count(call: &LiveKitCall, target: usize, label: &str) -
     false
 }
 
-/// Wait for the call to end itself with `EndedReason::SlotClosed`.
+/// Wait for the call to end itself with `CallEnd::SlotClosed`.
 async fn wait_for_slot_closed_end(
-    events: &mut tokio::sync::broadcast::Receiver<CallEvent>,
+    status: &mut tokio::sync::watch::Receiver<CallStatus>,
     label: &str,
 ) -> bool {
-    use tokio::sync::broadcast::error::RecvError;
-    let ended = tokio::time::timeout(Duration::from_secs(30), async {
-        loop {
-            match events.recv().await {
-                Ok(CallEvent::Ended { reason }) => return Some(reason),
-                Ok(_) | Err(RecvError::Lagged(_)) => {}
-                Err(RecvError::Closed) => return None,
-            }
-        }
-    })
+    let ended = tokio::time::timeout(
+        Duration::from_secs(30),
+        status.wait_for(|status| matches!(status, CallStatus::Ended { .. })),
+    )
     .await
     .ok()
-    .flatten();
+    .and_then(Result::ok)
+    .map(|status| status.clone());
     println!("[{label}] call ended: {ended:?}");
-    ended == Some(EndedReason::SlotClosed)
+    ended
+        == Some(CallStatus::Ended {
+            reason: CallEnd::SlotClosed,
+        })
 }
 
 /// Poll until a peer's media key has been imported, or time out.
@@ -682,15 +681,15 @@ async fn run(
     // happens in the room afterwards, so this also shows the close is noticed
     // without other membership traffic to prompt a re-read.
     let slot_closed_ok = if scenario == Scenario::SlotClosed {
-        let mut alice_events = alice.call.subscribe_call_events();
-        let mut bob_events = bob.call.subscribe_call_events();
+        let mut alice_status = alice.call.subscribe_status();
+        let mut bob_status = bob.call.subscribe_status();
         println!("[alice] closing slot {}", cfg.slot_id);
         close_slot(&alice_client, room_id.as_str(), &cfg.slot_id).await?;
         let alice_empty = wait_for_member_count(&alice.call, 0, "alice").await;
         let bob_empty = wait_for_member_count(&bob.call, 0, "bob").await;
         // Both calls end themselves; the closer is not exempt.
-        let alice_ended = wait_for_slot_closed_end(&mut alice_events, "alice").await;
-        let bob_ended = wait_for_slot_closed_end(&mut bob_events, "bob").await;
+        let alice_ended = wait_for_slot_closed_end(&mut alice_status, "alice").await;
+        let bob_ended = wait_for_slot_closed_end(&mut bob_status, "bob").await;
         alice_empty && bob_empty && alice_ended && bob_ended
     } else {
         true

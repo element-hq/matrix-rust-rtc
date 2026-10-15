@@ -22,6 +22,18 @@ pub trait ApplicationIntake<T: MatrixBackend> {
 
     fn on_timeline_events(&mut self, _events: &[RawTimelineEvent]) {}
 
+    /// The sticky (MSC4354) event types to forward to
+    /// [`Self::on_sticky_events`]. The core's own member events are never
+    /// among them: those go to the membership dialect.
+    fn sticky_event_types(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The room's current sticky events of [`Self::sticky_event_types`]. A host
+    /// hands over the whole sticky set each time, so the same event arrives
+    /// again on every delivery; an application handles it idempotently.
+    fn on_sticky_events(&mut self, _events: &[RawTimelineEvent]) {}
+
     fn on_event_redacted(&mut self, _event_id: &str) {}
 
     fn pending_relations(&self) -> Vec<RelationsRequest> {

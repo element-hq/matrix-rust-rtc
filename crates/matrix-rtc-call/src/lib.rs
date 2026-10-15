@@ -4,8 +4,9 @@
 // Please see LICENSE in the repository root for full details.
 
 //! The call application over `matrix-rtc-core`, which is application-agnostic:
-//! Element Call's reactions and raised hand ([`reactions`]), MSC4075 ringing
-//! ([`notification`]), and the host-facing [`RtcClient`] → [`RtcRoom`] →
+//! Element Call's reactions and raised hand ([`reactions`]), MSC4075
+//! notifications ([`notification`]), a DM call's ringing and lifecycle
+//! ([`direct_call`]), and the host-facing [`RtcClient`] → [`RtcRoom`] →
 //! [`RtcSession`] / [`RtcCall`].
 //!
 //! It also holds [`transports`], which transport a join publishes on: the
@@ -14,14 +15,18 @@
 //! (`matrix_rtc_core::compat`) are the core's.
 
 mod client;
+pub mod direct_call;
 #[cfg(test)]
 mod feeder_tests;
 pub mod notification;
 pub mod reactions;
+mod status;
+pub use status::{CallEnd, CallStatus, MediaPhase, MediaStatusReporter, RingPhase};
 mod room_state;
 pub mod transports;
 
 pub use client::{CallJoinOptions, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession};
+pub use direct_call::{CallKind, DECLINE_EVENT_TYPES, GroupNotify, RING_SEND_DEADLINE, RingConfig};
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,

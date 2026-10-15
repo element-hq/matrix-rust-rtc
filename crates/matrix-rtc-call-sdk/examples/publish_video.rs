@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use matrix_rtc_call::{CallJoinOptions, RtcClient};
+use matrix_rtc_call::{CallJoinOptions, CallStatus, RtcClient};
 use matrix_rtc_call_sdk::{CallEvent, LiveKitAttachOptions, SdkMatrixBackend, attach_livekit};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_transport::{
@@ -92,10 +92,11 @@ async fn run_call(
     });
 
     // Receive: one task per remote camera, logging what arrives. Ctrl-C
-    // leaves; the loop ends on `Ended`, which a leave, the slot or the room
-    // closing all produce.
+    // leaves; the loop ends when the call's status says it ended, which a leave,
+    // the slot or the room closing all produce.
     let engine = media.engine;
     let mut events = engine.subscribe_events();
+    let mut status = call.subscribe_status();
     let hang_up = tokio::signal::ctrl_c();
     tokio::pin!(hang_up);
     let mut left = false;
@@ -105,6 +106,10 @@ async fn run_call(
                 left = true;
                 call.leave(Default::default()).await?;
                 continue;
+            }
+            ended = status.wait_for(|status| matches!(status, CallStatus::Ended { .. })) => {
+                println!("call ended: {:?}", ended.map(|status| status.clone()));
+                break;
             }
             event = events.recv() => event,
         };
@@ -145,10 +150,6 @@ async fn run_call(
                         }
                     }
                 });
-            }
-            Ok(CallEvent::Ended { reason }) => {
-                println!("call ended: {reason:?}");
-                break;
             }
             Ok(_) | Err(RecvError::Lagged(_)) => {}
             Err(RecvError::Closed) => break,
