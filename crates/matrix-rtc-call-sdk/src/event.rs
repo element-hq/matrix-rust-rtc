@@ -145,7 +145,7 @@ pub enum CallEvent {
         sender_user_id: Option<String>,
         sender_device_id: Option<String>,
         /// Why it was refused. Typed rather than a message, so a host can act on
-        /// it — `NotCrossSigned` is a "verify this device" prompt, not just a log
+        /// it — `SenderNotConfirmed` is a "verify this device" prompt, not just a log
         /// line.
         reason: KeyRejection,
     },

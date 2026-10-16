@@ -583,7 +583,7 @@ async fn an_expired_key_is_rotated_at_its_deadline_with_nobody_ticking() {
         delay_before_use_ms: 0,
         key_rotation_grace_period_ms: 50,
         max_key_lifetime_ms: 100,
-        require_cross_signed_sender: false,
+        require_confirmed_sender: false,
         ..EncryptionConfig::default()
     });
     let _call = room.join_call(options).await.expect("join");

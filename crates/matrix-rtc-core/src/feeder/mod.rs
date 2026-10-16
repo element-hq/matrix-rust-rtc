@@ -152,18 +152,18 @@ pub fn event_origin(encryption: &EventEncryption) -> EventOrigin {
     }
 }
 
-/// The `KeyOrigin` of a to-device message. A cross-signing status the client
-/// did not report counts as not cross-signed.
+/// The `KeyOrigin` of a to-device message. A confirmation the client did not
+/// report counts as unconfirmed.
 pub fn key_origin(encryption: &EventEncryption, sender: &str) -> KeyOrigin {
     match encryption {
         EventEncryption::Cleartext => KeyOrigin::Cleartext,
         EventEncryption::Encrypted {
             sender_device_id,
-            sender_cross_signed,
+            sender_confirmed,
         } => KeyOrigin::Encrypted {
             sender_user_id: sender.to_owned(),
             sender_device_id: sender_device_id.clone(),
-            sender_is_cross_signed: sender_cross_signed.unwrap_or(false),
+            sender_is_confirmed: sender_confirmed.unwrap_or(false),
         },
     }
 }

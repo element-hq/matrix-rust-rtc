@@ -335,14 +335,14 @@ impl From<matrix_rtc_call_sdk::FrameEncryptionDiagnostic> for FfiFrameEncryption
 
 /// Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
 ///
-/// Typed rather than a message so a host can act on it: `NotCrossSigned` is a
+/// Typed rather than a message so a host can act on it: `SenderNotConfirmed` is a
 /// "verify this device" prompt, not just something to log.
 #[derive(Clone, Debug, uniffi::Enum)]
 pub enum FfiKeyRejection {
     /// Sent in cleartext, so the sender cannot be authenticated (MSC4143).
     Cleartext,
-    /// The sending device is not cross-signed (MSC4153).
-    NotCrossSigned,
+    /// The client does not confirm the sender (MSC4153).
+    SenderNotConfirmed,
     /// The message named a different room than this session's.
     RoomMismatch { claimed: String },
     /// The sender does not match the one on the member event it claims.
@@ -362,7 +362,7 @@ impl From<matrix_rtc_core::KeyRejection> for FfiKeyRejection {
         use matrix_rtc_core::KeyRejection as Rejection;
         match reason {
             Rejection::Cleartext => Self::Cleartext,
-            Rejection::NotCrossSigned => Self::NotCrossSigned,
+            Rejection::SenderNotConfirmed => Self::SenderNotConfirmed,
             Rejection::RoomMismatch { claimed } => Self::RoomMismatch { claimed },
             Rejection::SenderMismatch { expected, actual } => {
                 Self::SenderMismatch { expected, actual }

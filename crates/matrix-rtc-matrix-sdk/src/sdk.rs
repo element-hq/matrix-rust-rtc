@@ -165,7 +165,7 @@ fn event_encryption(info: Option<&EncryptionInfo>) -> EventEncryption {
     );
     EventEncryption::Encrypted {
         sender_device_id: info.sender_device.as_ref().map(|d| d.to_string()),
-        sender_cross_signed: Some(cross_signed),
+        sender_confirmed: Some(cross_signed),
     }
 }
 
@@ -193,7 +193,7 @@ async fn sender_trust_pending(client: &Client, info: &EncryptionInfo) -> bool {
 fn device_encryption(device: &Device) -> EventEncryption {
     EventEncryption::Encrypted {
         sender_device_id: Some(device.device_id().to_string()),
-        sender_cross_signed: Some(device.is_verified() || device.is_cross_signed_by_owner()),
+        sender_confirmed: Some(device.is_verified() || device.is_cross_signed_by_owner()),
     }
 }
 

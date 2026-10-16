@@ -896,7 +896,7 @@ mod tests {
         FfiEventEncryption {
             encrypted: false,
             sender_device_id: None,
-            sender_cross_signed: None,
+            sender_confirmed: None,
         }
     }
 
@@ -904,7 +904,7 @@ mod tests {
         FfiEventEncryption {
             encrypted: true,
             sender_device_id: Some(device.to_owned()),
-            sender_cross_signed: Some(true),
+            sender_confirmed: Some(true),
         }
     }
 

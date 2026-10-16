@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- `EventEncryption`'s `sender_cross_signed` is `sender_confirmed` (FFI `senderConfirmed`), the client's verdict on the sender under its own trust settings; `require_cross_signed_sender` is `require_confirmed_sender` and `KeyRejection::NotCrossSigned` is `SenderNotConfirmed` (web `sender_not_confirmed`).
+
 ## v0.5.0-rc.5 - 2026-10-15
 
 ### Breaking

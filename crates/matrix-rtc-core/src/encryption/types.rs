@@ -74,8 +74,8 @@ pub enum KeyOrigin {
         /// Device the message was decrypted as coming from, when the host
         /// could determine it.
         sender_device_id: Option<String>,
-        /// Whether that device is cross-signed (MSC4153).
-        sender_is_cross_signed: bool,
+        /// Whether the client confirms the sender (MSC4153).
+        sender_is_confirmed: bool,
     },
     /// The message arrived in the clear, so it has no authenticated sender.
     Cleartext,
@@ -86,8 +86,8 @@ pub enum KeyOrigin {
 pub enum KeyRejection {
     /// Sent in cleartext, so the sender cannot be authenticated (MSC4143).
     Cleartext,
-    /// The sending device is not cross-signed (MSC4153).
-    NotCrossSigned,
+    /// The client does not confirm the sender (MSC4153).
+    SenderNotConfirmed,
     /// The message names a different room than this session's.
     RoomMismatch {
         /// The `room_id` carried in the message.
@@ -117,7 +117,7 @@ impl std::fmt::Display for KeyRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cleartext => write!(f, "sent in cleartext"),
-            Self::NotCrossSigned => write!(f, "sending device is not cross-signed"),
+            Self::SenderNotConfirmed => write!(f, "the client does not confirm the sender"),
             Self::UnverifiableDevice => write!(
                 f,
                 "the member event names no sending device to check this against"
@@ -277,7 +277,7 @@ pub struct EncryptionConfig {
     /// sessions that don't require encryption.
     pub manage_media_keys: bool,
 
-    /// Whether to discard keys from devices that are not cross-signed
+    /// Whether to discard keys from senders the client does not confirm
     /// (default: true).
     ///
     /// MSC4143 defers to [MSC4153] here: clients that exclude insecure devices
@@ -285,7 +285,7 @@ pub struct EncryptionConfig {
     /// where unverified devices are expected, such as throwaway test logins.
     ///
     /// [MSC4153]: https://github.com/matrix-org/matrix-spec-proposals/pull/4153
-    pub require_cross_signed_sender: bool,
+    pub require_confirmed_sender: bool,
 }
 
 impl Default for EncryptionConfig {
@@ -295,7 +295,7 @@ impl Default for EncryptionConfig {
             key_rotation_grace_period_ms: 10_000, // MSC4143 default
             max_key_lifetime_ms: 90 * 60 * 1000,  // 1h30
             manage_media_keys: true,
-            require_cross_signed_sender: true,
+            require_confirmed_sender: true,
         }
     }
 }

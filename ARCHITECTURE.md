@@ -537,8 +537,9 @@ stored and signalled once it has been matched against the sender's member event:
   keys), so that half is a backstop rather than an expected path. The exception
   is `EventOrigin::Unknown`, where the host reported nothing at all and the rule
   is skipped like every other unreported fact.
-- Keys from devices that are not cross-signed are discarded unless
-  `EncryptionConfig::require_cross_signed_sender` is turned off (MSC4153).
+- Keys from senders the client does not confirm (under MSC4153, a device that
+  is not cross-signed) are discarded unless
+  `EncryptionConfig::require_confirmed_sender` is turned off.
 - A key that arrives before its member event is buffered *with its origin* and
   checked when the membership shows up — verification is deferred, never
   skipped. Rejected keys never reach the outdated-key filter, so a bogus key
@@ -735,7 +736,7 @@ type makes that unrepresentable. `EventOrigin::Unknown` is distinct from
 `Cleartext`: it means the host did not report, so the rule is skipped rather
 than failed. A host never builds an `EventOrigin`: it reports what its client
 can honestly say — `EventEncryption::{Cleartext, Encrypted { sender_device_id,
-sender_cross_signed }}` on each `EventIn` — and the feeder derives the origin
+sender_confirmed }}` on each `EventIn` — and the feeder derives the origin
 (and, for keys, `KeyOrigin`) from it.
 
 ### Transports and who chooses them

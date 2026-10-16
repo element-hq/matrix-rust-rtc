@@ -473,7 +473,7 @@ enum WasmCallEvent {
         key_index: Option<u8>,
         sender_user_id: Option<String>,
         sender_device_id: Option<String>,
-        /// Machine-readable rejection: `cleartext | not_cross_signed |
+        /// Machine-readable rejection: `cleartext | sender_not_confirmed |
         /// room_mismatch | sender_mismatch | unverifiable_device |
         /// device_mismatch`.
         reason_code: &'static str,
@@ -505,7 +505,7 @@ fn rejection_code(rejection: &matrix_rtc_core::KeyRejection) -> &'static str {
     use matrix_rtc_core::KeyRejection;
     match rejection {
         KeyRejection::Cleartext => "cleartext",
-        KeyRejection::NotCrossSigned => "not_cross_signed",
+        KeyRejection::SenderNotConfirmed => "sender_not_confirmed",
         KeyRejection::RoomMismatch { .. } => "room_mismatch",
         KeyRejection::SenderMismatch { .. } => "sender_mismatch",
         KeyRejection::UnverifiableDevice => "unverifiable_device",

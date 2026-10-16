@@ -69,7 +69,7 @@ export function host(client: {
         sender: '@a:hs',
         event_type: 'm.rtc.encryption_key',
         content: {},
-        encryption: { kind: 'encrypted', sender_device_id: 'DEV', sender_cross_signed: true },
+        encryption: { kind: 'encrypted', sender_device_id: 'DEV', sender_confirmed: true },
       });
       return { cancel: () => {} };
     },

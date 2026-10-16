@@ -65,7 +65,7 @@ fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoo
                     encryption: FfiEventEncryption {
                         encrypted: false,
                         sender_device_id: None,
-                        sender_cross_signed: None,
+                        sender_confirmed: None,
                     },
                 }],
             );
