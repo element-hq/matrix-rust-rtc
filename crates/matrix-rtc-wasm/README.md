@@ -149,7 +149,7 @@ Each event is an `EventIn`:
 `{ event_id, sender, event_type, state_key?, origin_server_ts, content, encryption }`
 with `content` verbatim (decrypt first) and `encryption` what your client can
 honestly report — `{ kind: 'cleartext' }` or
-`{ kind: 'encrypted', sender_device_id?, sender_cross_signed? }`, the device
+`{ kind: 'encrypted', sender_device_id?, sender_confirmed? }`, the device
 attributed from the decryption metadata (the js-sdk host matches the megolm
 sender key against the device list). Rust derives the MSC4143 origin rules and
 the MSC4153 key acceptance from that; you never say who is joined. To-device

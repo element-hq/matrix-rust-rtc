@@ -42,7 +42,7 @@ export function memberEventIn({ sender, deviceId, memberId, slotId, focus, event
         can_subscribe: ['livekit'],
       },
     },
-    encryption: { kind: 'encrypted', sender_device_id: deviceId, sender_cross_signed: true },
+    encryption: { kind: 'encrypted', sender_device_id: deviceId, sender_confirmed: true },
   };
 }
 

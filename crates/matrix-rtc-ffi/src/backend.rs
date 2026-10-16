@@ -75,14 +75,15 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for FfiBackendError {
 
 /// What the client reports about how an event arrived. `encrypted: false`
 /// means cleartext; the other two fields then mean nothing. Report only what
-/// the client says — a cross-signing status it cannot give stays `null`.
+/// the client says — a confirmation it cannot give stays `null`.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FfiEventEncryption {
     pub encrypted: bool,
     #[uniffi(default = None)]
     pub sender_device_id: Option<String>,
     #[uniffi(default = None)]
-    pub sender_cross_signed: Option<bool>,
+    /// Whether the client confirms the sender under its own trust settings.
+    pub sender_confirmed: Option<bool>,
 }
 
 impl From<FfiEventEncryption> for EventEncryption {
@@ -90,7 +91,7 @@ impl From<FfiEventEncryption> for EventEncryption {
         if value.encrypted {
             EventEncryption::Encrypted {
                 sender_device_id: value.sender_device_id,
-                sender_cross_signed: value.sender_cross_signed,
+                sender_confirmed: value.sender_confirmed,
             }
         } else {
             EventEncryption::Cleartext

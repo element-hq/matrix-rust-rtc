@@ -443,17 +443,17 @@ export class MatrixHost {
   /** Olm metadata plus MSC4153: the key is only accepted from a cross-signed device. */
   async toDeviceEncryption(encryptionInfo) {
     if (!encryptionInfo) return { kind: 'cleartext' };
-    let senderCrossSigned;
+    let senderConfirmed;
     if (encryptionInfo.sender && encryptionInfo.senderDevice) {
       const status = await this.client
         .getCrypto()
         .getDeviceVerificationStatus(encryptionInfo.sender, encryptionInfo.senderDevice);
-      senderCrossSigned = status?.signedByOwner ?? false;
+      senderConfirmed = status?.signedByOwner ?? false;
     }
     return {
       kind: 'encrypted',
       sender_device_id: encryptionInfo.senderDevice,
-      sender_cross_signed: senderCrossSigned,
+      sender_confirmed: senderConfirmed,
     };
   }
 

@@ -26,8 +26,8 @@ const TS_TYPES: &'static str = r#"
 /** What the client reports about how an event or to-device message arrived. */
 export type EventEncryptionIn =
     | { kind: "cleartext" }
-    /** `sender_cross_signed` stays absent when the client cannot say; never infer it. */
-    | { kind: "encrypted"; sender_device_id?: string; sender_cross_signed?: boolean };
+    /** `sender_confirmed`: whether the client confirms the sender under its own trust settings; absent when it cannot say, never inferred. */
+    | { kind: "encrypted"; sender_device_id?: string; sender_confirmed?: boolean };
 
 /** A room event as the client handed it over, content verbatim; the library parses it. */
 export interface EventIn {
@@ -136,7 +136,7 @@ export type RtcCallEvent =
         installed_key_indices: number[] | null }
     | { type: "key_discarded"; member_id: string; key_index: number | null;
         sender_user_id: string | null; sender_device_id: string | null;
-        reason_code: "cleartext" | "not_cross_signed" | "room_mismatch" | "sender_mismatch" | "unverifiable_device" | "device_mismatch";
+        reason_code: "cleartext" | "sender_not_confirmed" | "room_mismatch" | "sender_mismatch" | "unverifiable_device" | "device_mismatch";
         reason: string }
     /** Only for a hand raised while we are in the call; the state is `hand_raised_at_ms` / `hand_raised_position`. */
     | { type: "hand_raised"; member_id: string; raised_at_ms: number }
@@ -230,7 +230,7 @@ export interface JoinParamsIn {
         key_rotation_grace_period_ms?: number;
         max_key_lifetime_ms?: number;
         manage_media_keys?: boolean;
-        require_cross_signed_sender?: boolean;
+        require_confirmed_sender?: boolean;
     };
     notify?: { notification_type?: string; mentions?: Record<string, unknown>; lifetime_ms?: number };
     /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */

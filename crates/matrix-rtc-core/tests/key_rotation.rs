@@ -648,7 +648,7 @@ impl Call {
                 origin: KeyOrigin::Encrypted {
                     sender_user_id: sender.user_id.clone(),
                     sender_device_id: Some(sender.device_id.clone()),
-                    sender_is_cross_signed: true,
+                    sender_is_confirmed: true,
                 },
                 room_id: ROOM_ID.to_owned(),
                 member_id: message.from_member_id.clone(),

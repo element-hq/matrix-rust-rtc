@@ -195,7 +195,7 @@
 //!     origin: KeyOrigin::Encrypted {
 //!         sender_user_id: "@bob:example.org".to_string(),
 //!         sender_device_id: Some("device456".to_string()),
-//!         sender_is_cross_signed: true,
+//!         sender_is_confirmed: true,
 //!     },
 //!     room_id: "!room:example.org".to_string(),
 //!     member_id: "bob-member-id".to_string(),
@@ -1679,10 +1679,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         match &key.origin {
             KeyOrigin::Cleartext => Err(KeyRejection::Cleartext),
             KeyOrigin::Encrypted {
-                sender_is_cross_signed,
+                sender_is_confirmed,
                 ..
-            } if self.config.require_cross_signed_sender && !sender_is_cross_signed => {
-                Err(KeyRejection::NotCrossSigned)
+            } if self.config.require_confirmed_sender && !sender_is_confirmed => {
+                Err(KeyRejection::SenderNotConfirmed)
             }
             KeyOrigin::Encrypted { .. } => Ok(()),
         }
@@ -1704,10 +1704,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             KeyOrigin::Encrypted {
                 sender_user_id,
                 sender_device_id,
-                sender_is_cross_signed,
+                sender_is_confirmed,
             } => log::debug!(
                 "[{}/{}] key index {} for member {} from {sender_user_id}/{} \
-                 cross_signed={sender_is_cross_signed}",
+                 confirmed={sender_is_confirmed}",
                 self.room_id,
                 self.slot_id,
                 received.key_index,
@@ -2057,7 +2057,7 @@ mod tests {
             origin: KeyOrigin::Encrypted {
                 sender_user_id: "@bob:example.org".to_string(),
                 sender_device_id: Some("device456".to_string()),
-                sender_is_cross_signed: true,
+                sender_is_confirmed: true,
             },
             room_id: ROOM_ID.to_string(),
             member_id: "bob-device456-uuid".to_string(),
@@ -3118,7 +3118,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
         };
         manager
             .receive_key(key)
@@ -3133,7 +3133,7 @@ mod tests {
                 key_index: Some(3),
                 sender_user_id: Some("@bob:example.org".to_string()),
                 sender_device_id: Some("device456".to_string()),
-                reason: KeyRejection::NotCrossSigned,
+                reason: KeyRejection::SenderNotConfirmed,
             }],
         );
         assert!(
@@ -3163,7 +3163,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("SOMEOTHERDEV".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         manager
             .receive_key(key)
@@ -3207,7 +3207,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@mallory:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         assert_discarded(&manager, key).await;
     }
@@ -3221,7 +3221,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("someOtherDevice".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         assert_discarded(&manager, key).await;
     }
@@ -3332,23 +3332,23 @@ mod tests {
     /// MSC4153: keys from devices that are not cross-signed are discarded when
     /// the client is configured to exclude insecure devices.
     #[tokio::test]
-    async fn key_from_non_cross_signed_device_is_discarded_when_required() {
+    async fn key_from_unconfirmed_sender_is_discarded_when_required() {
         let manager = manager_with_bob();
         let mut key = bob_key(vec![1u8; 32], 0);
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
         };
         assert_discarded(&manager, key).await;
     }
 
     /// ...and accepted when the deployment has opted out of that requirement.
     #[tokio::test]
-    async fn key_from_non_cross_signed_device_is_accepted_when_not_required() {
+    async fn key_from_unconfirmed_sender_is_accepted_when_not_required() {
         let mut manager = manager_with_bob();
         manager.set_config(EncryptionConfig {
-            require_cross_signed_sender: false,
+            require_confirmed_sender: false,
             ..EncryptionConfig::default()
         });
 
@@ -3356,7 +3356,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
         };
         manager.receive_key(key).await.expect("should succeed");
 
@@ -3397,7 +3397,7 @@ mod tests {
         impostor.origin = KeyOrigin::Encrypted {
             sender_user_id: "@mallory:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         manager.receive_key(impostor).await.unwrap();
         manager
@@ -3425,7 +3425,7 @@ mod tests {
         impostor.origin = KeyOrigin::Encrypted {
             sender_user_id: "@mallory:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         manager.receive_key(impostor).await.unwrap();
 

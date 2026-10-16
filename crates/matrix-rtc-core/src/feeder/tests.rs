@@ -395,12 +395,12 @@ async fn the_to_device_feeder_subscribes_to_the_spec_and_extra_key_types() {
 }
 
 #[test]
-fn key_origin_treats_an_unreported_cross_signing_as_not_cross_signed() {
+fn key_origin_treats_an_unreported_confirmation_as_unconfirmed() {
     let origin = key_origin(&EventEncryption::encrypted(Some("D".to_owned()), None), BOB);
     assert!(matches!(
         origin,
         KeyOrigin::Encrypted {
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
             ..
         }
     ));

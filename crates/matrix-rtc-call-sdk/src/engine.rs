@@ -2745,7 +2745,7 @@ mod tests {
             key_index: Some(2),
             sender_user_id: Some("@bob:example.org".to_owned()),
             sender_device_id: Some("BOBDEV".to_owned()),
-            reason: KeyRejection::NotCrossSigned,
+            reason: KeyRejection::SenderNotConfirmed,
         });
 
         assert_eq!(
@@ -2755,7 +2755,7 @@ mod tests {
                 key_index: Some(2),
                 sender_user_id: Some("@bob:example.org".to_owned()),
                 sender_device_id: Some("BOBDEV".to_owned()),
-                reason: KeyRejection::NotCrossSigned,
+                reason: KeyRejection::SenderNotConfirmed,
             }
         );
     }

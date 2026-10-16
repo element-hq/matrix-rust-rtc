@@ -128,8 +128,7 @@ pub struct OpenIdToken {
 /// What the client reports about how an event or to-device message arrived.
 ///
 /// Only what a client can honestly say: whether it decrypted the event, which
-/// device it attributed it to, and whether it knows that device to be
-/// cross-signed. The library derives [`EventOrigin`](crate::EventOrigin) and
+/// device it attributed it to, and whether it confirms the sender. The library derives [`EventOrigin`](crate::EventOrigin) and
 /// [`KeyOrigin`](crate::KeyOrigin) from it; a host never builds those.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -140,17 +139,17 @@ pub enum EventEncryption {
     Encrypted {
         /// The sending device, as decryption attributed it.
         sender_device_id: Option<String>,
-        /// Whether that device is cross-signed (MSC4153); `None` when the
-        /// client did not say.
-        sender_cross_signed: Option<bool>,
+        /// Whether the client confirms the sender under its own trust settings,
+        /// such as a cross-signed device (MSC4153); `None` when it did not say.
+        sender_confirmed: Option<bool>,
     },
 }
 
 impl EventEncryption {
-    pub fn encrypted(sender_device_id: Option<String>, sender_cross_signed: Option<bool>) -> Self {
+    pub fn encrypted(sender_device_id: Option<String>, sender_confirmed: Option<bool>) -> Self {
         Self::Encrypted {
             sender_device_id,
-            sender_cross_signed,
+            sender_confirmed,
         }
     }
 

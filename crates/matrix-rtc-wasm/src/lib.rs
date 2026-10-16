@@ -586,11 +586,11 @@ pub struct WasmEncryptionConfig {
     pub max_key_lifetime_ms: Option<u64>,
     #[serde(default)]
     pub manage_media_keys: Option<bool>,
-    /// Whether to discard keys from devices that are not cross-signed
+    /// Whether to discard keys from senders the client does not confirm
     /// (default: true, per MSC4153). Turn it off only where the client cannot
     /// report cross-signing at all.
     #[serde(default)]
-    pub require_cross_signed_sender: Option<bool>,
+    pub require_confirmed_sender: Option<bool>,
 }
 
 impl From<WasmEncryptionConfig> for EncryptionConfig {
@@ -600,7 +600,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             max_key_lifetime_ms: value.max_key_lifetime_ms.unwrap_or(90 * 60 * 1000),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
-            require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
+            require_confirmed_sender: value.require_confirmed_sender.unwrap_or(true),
         }
     }
 }
