@@ -114,13 +114,20 @@ where
     M: ApplicationIntake<DialectBackend<B>> + MaybeSend + 'static,
 {
     pub fn new(backend: Arc<B>) -> Self {
+        Self::with_outbox(backend, Outbox::new())
+    }
+
+    /// [`Self::new`] with the retry layer given: its clock is the one every
+    /// deadline of the client's joins is read from, which is how a test runs
+    /// a call on paused time.
+    pub fn with_outbox(backend: Arc<B>, outbox: Outbox) -> Self {
         Self {
             shared: Arc::new(ClientShared {
                 backend: Arc::new(DialectBackend::new(backend)),
                 registry: RoomRegistry::default(),
                 to_device: StdMutex::new(None),
                 opening: Mutex::new(()),
-                outbox: Outbox::new(),
+                outbox,
             }),
         }
     }

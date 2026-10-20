@@ -34,6 +34,10 @@ set -e
 #            download on first build) and bundles libwebrtc.jar into the AAR.
 #            Expect the .so to grow by roughly 8-15 MB per ABI — see
 #            mobile/PACKAGING.md.
+#            The debug variant (`--profile dev`) also carries the `testing`
+#            feature: `ScriptedMatrixBackend`, `ScriptedMediaTransport` and
+#            `connect_scripted_media_session` for the host's own tests (034
+#            contract C16). Release profiles never do.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -98,6 +102,10 @@ FEATURE_ARGS=()
 if [ "${MEDIA:-0}" = "1" ]; then
     FEATURE_ARGS=(--features media)
     echo "Building Android AAR (MEDIA variant: frame streams + publishing)..."
+    if [ "$PROFILE" = "dev" ]; then
+        FEATURE_ARGS=(--features media,testing)
+        echo "Debug build: with the scripted test fakes (testing feature)."
+    fi
 else
     echo "Building Android AAR (slim signalling-only variant; MEDIA=1 for media)..."
 fi

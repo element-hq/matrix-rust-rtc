@@ -42,6 +42,8 @@ enum Reconnect {
     Fail,
     TokenRejected,
     Refused,
+    /// Never answers.
+    Hang,
 }
 
 struct FakeTransport(Arc<TransportState>);
@@ -138,6 +140,7 @@ impl TransportConnection for FakeConnection {
             Reconnect::Fail => Err(TransportError::Connect("unreachable".into())),
             Reconnect::TokenRejected => Err(TransportError::TokenRejected("401".into())),
             Reconnect::Refused => Err(TransportError::Refused("403".into())),
+            Reconnect::Hang => std::future::pending().await,
         }
     }
 
@@ -536,6 +539,66 @@ async fn the_own_focus_is_reconnected_after_the_transport_gives_up() {
     fx.pool.close();
     fx.drain().await;
     assert!(fx.state.closes.lock().unwrap().is_empty());
+}
+
+/// 034 R24 as sharpened: from a loss the transport gave up on, attempts at
+/// most 10 s apart and one at the budget's end, so an SFU back at 35 s is
+/// reconnected, and one back at 60 s still counts.
+#[tokio::test(start_paused = true)]
+async fn the_own_focus_is_tried_every_ten_seconds_and_at_the_budget_end() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend([Reconnect::Fail; 9]);
+    let start = tokio::time::Instant::now();
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..70 {
+        events.extend(fx.drain().await);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let attempts: Vec<u64> = fx
+        .state
+        .reconnects
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(at, _)| (*at - start).as_secs())
+        .collect();
+    assert_eq!(attempts, [0, 1, 3, 7, 15, 25, 35, 45, 55, 60]);
+    assert_eq!(lost(&events), None, "the attempt at 60 s landed");
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+}
+
+/// The last attempt gets ten seconds to answer before the focus is given up.
+#[tokio::test(start_paused = true)]
+async fn a_last_attempt_that_never_answers_ends_ten_seconds_later() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend([Reconnect::Fail; 9].into_iter().chain([Reconnect::Hang]));
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    let mut lost_at = None;
+    let start = tokio::time::Instant::now();
+    for _ in 0..80 {
+        if lost(&fx.drain().await).is_some() && lost_at.is_none() {
+            lost_at = Some((tokio::time::Instant::now() - start).as_secs());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(lost_at, Some(70));
 }
 
 fn lost(events: &[PoolEvent]) -> Option<OwnConnectionLoss> {

@@ -49,6 +49,8 @@ pub use frames::{
     AudioFrameStream, FfiAudioFrame, FfiLocalTrack, FfiVideoFrameData, FfiVideoPlane,
     FfiVideoRotation, VideoFrameRef, VideoFrameStream,
 };
+#[cfg(feature = "testing")]
+pub(crate) use session::attach_error as session_attach_error;
 pub use session::{MediaSession, MediaSessionConfig, connect_media_session};
 pub use types::{
     FfiAudioSourceConfig, FfiCallEvent, FfiConnectionState, FfiFrameEncryptionDiagnostic,

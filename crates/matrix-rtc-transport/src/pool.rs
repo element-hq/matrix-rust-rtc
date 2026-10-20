@@ -74,6 +74,14 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// connect request, before the call ends (034 R24).
 pub const OWN_RECONNECT_BUDGET: Duration = Duration::from_secs(60);
 
+/// Our own focus's reconnect backoff ceiling: lower than a peer focus's, so
+/// an SFU back late in the budget is tried before it runs out (034 R24).
+const OWN_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
+/// How long the attempt made at the budget's end may take before our own
+/// focus is given up regardless (034 R24).
+const OWN_FINAL_ATTEMPT_GRACE: Duration = Duration::from_secs(10);
+
 /// How long our own focus is down before our media may move to a peer's
 /// focus, when the host allows it (034 R25). A first value: the core logs
 /// each loss's time to recovery so real outages can tune it.
@@ -263,6 +271,9 @@ enum Message {
     OwnRetry { attempt: u32 },
     /// The reconnect budget of the loss numbered `epoch` ran out.
     OwnBudget { epoch: u64 },
+    /// The attempt made at the end of the loss numbered `epoch`'s budget did
+    /// not answer in time.
+    OwnFinalAttemptExpired { epoch: u64 },
     /// The loss numbered `epoch` has lasted [`FALLBACK_GRACE`].
     OwnFallback { epoch: u64 },
 }
@@ -283,6 +294,9 @@ struct OwnRecovery {
     refetch_next: bool,
     /// The connection has been up at least once.
     ever_up: bool,
+    /// The budget ran out: the attempt in flight, or the one made then, is
+    /// the last.
+    budget_spent: bool,
 }
 
 /// Read access to the subscribed remote tracks, from outside the owner's
@@ -554,6 +568,7 @@ impl MediaPool {
             token_refetched: false,
             refetch_next: false,
             ever_up: true,
+            budget_spent: false,
         });
         self.pool.insert(
             key.clone(),
@@ -583,6 +598,7 @@ impl MediaPool {
             token_refetched: false,
             refetch_next: false,
             ever_up: false,
+            budget_spent: false,
         });
         self.pool.insert(
             key,
@@ -742,6 +758,13 @@ impl MediaPool {
             }
             Message::OwnRetry { attempt } => self.own_retry(attempt),
             Message::OwnBudget { epoch } => self.own_budget(epoch),
+            Message::OwnFinalAttemptExpired { epoch } => {
+                if self.own.as_ref().is_some_and(|own| {
+                    own.epoch == epoch && own.budget_spent && own.lost_since.is_some()
+                }) {
+                    self.give_up_own_budget();
+                }
+            }
             Message::OwnFallback { epoch } => {
                 if self.own.as_ref().is_some_and(|own| own.epoch == epoch) {
                     self.try_fallback();
@@ -1359,6 +1382,7 @@ impl MediaPool {
             own.epoch += 1;
             own.token_refetched = false;
             own.refetch_next = false;
+            own.budget_spent = false;
             log::info!(
                 "own focus {} back after {} ms",
                 if own.ever_up {
@@ -1431,6 +1455,16 @@ impl MediaPool {
                 self.clear_degraded(&key);
                 self.reapply_connection_constraints(&key);
             }
+            Err(error) if own.budget_spent => {
+                log::warn!("the last attempt at our own focus failed: {error}");
+                if let TransportError::TokenRejected(message) | TransportError::Refused(message) =
+                    error
+                {
+                    self.give_up_own(OwnConnectionLoss::Refused, message);
+                } else {
+                    self.give_up_own_budget();
+                }
+            }
             Err(TransportError::TokenRejected(message)) if !own.token_refetched => {
                 log::warn!("our own focus rejected the token ({message}); fetching a fresh one");
                 own.token_refetched = true;
@@ -1455,7 +1489,14 @@ impl MediaPool {
         if let Some(entry) = self.pool.get_mut(&key) {
             entry.state = ConnState::Backoff { attempt };
         }
-        let delay = backoff_delay(attempt);
+        // Never past the budget's end, where the last attempt is made.
+        let left = self
+            .own
+            .as_ref()
+            .and_then(|own| own.lost_since)
+            .map(|since| self.own_reconnect_budget.saturating_sub(since.elapsed()));
+        let delay = backoff_delay(attempt).min(OWN_BACKOFF_MAX);
+        let delay = left.map_or(delay, |left| delay.min(left));
         let messages = self.messages_tx.clone();
         rt::spawn(async move {
             rt::sleep(delay).await;
@@ -1477,13 +1518,38 @@ impl MediaPool {
         }
     }
 
+    /// The budget ran out: one last attempt, at once unless one is in flight,
+    /// decides; it is given [`OWN_FINAL_ATTEMPT_GRACE`] to answer (034 R24).
     fn own_budget(&mut self, epoch: u64) {
-        let Some(own) = &self.own else {
+        let Some(own) = self.own.as_mut() else {
             return;
         };
         if own.epoch != epoch || own.lost_since.is_none() {
             return;
         }
+        own.budget_spent = true;
+        let backoff = self.own_connection_key.as_ref().and_then(|key| {
+            self.pool.get(key).and_then(|entry| match entry.state {
+                ConnState::Backoff { attempt } => Some(attempt),
+                _ => None,
+            })
+        });
+        if let Some(attempt) = backoff {
+            log::info!("our own focus's budget ran out; one last attempt");
+            self.spawn_own_attempt(attempt);
+        }
+        let messages = self.messages_tx.clone();
+        rt::spawn(async move {
+            rt::sleep(OWN_FINAL_ATTEMPT_GRACE).await;
+            let _ = messages.send(PoolMessage(Message::OwnFinalAttemptExpired { epoch }));
+        });
+    }
+
+    /// Our own focus not back within the budget.
+    fn give_up_own_budget(&mut self) {
+        let Some(own) = &self.own else {
+            return;
+        };
         let reason = if own.ever_up {
             OwnConnectionLoss::Budget
         } else {

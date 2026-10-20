@@ -146,7 +146,7 @@ pub struct FfiToDeviceMessageIn {
     pub encryption: FfiEventEncryption,
 }
 
-fn parse_content(event_type: &str, sender: &str, content_json: &str) -> Option<Value> {
+pub(crate) fn parse_content(event_type: &str, sender: &str, content_json: &str) -> Option<Value> {
     serde_json::from_str(content_json)
         .inspect_err(|error| {
             log::warn!("ignoring a {event_type} from {sender} whose content is not JSON: {error}");
@@ -154,7 +154,7 @@ fn parse_content(event_type: &str, sender: &str, content_json: &str) -> Option<V
         .ok()
 }
 
-fn events_into_core(events: Vec<FfiEventIn>) -> Vec<EventIn> {
+pub(crate) fn events_into_core(events: Vec<FfiEventIn>) -> Vec<EventIn> {
     events
         .into_iter()
         .filter_map(FfiEventIn::into_core)
@@ -213,7 +213,7 @@ pub struct FfiOpenIdToken {
 /// current set at subscription time. An empty set means none.
 #[derive(uniffi::Object)]
 pub struct RoomSink {
-    inner: Arc<dyn CoreRoomSink>,
+    pub(crate) inner: Arc<dyn CoreRoomSink>,
 }
 
 #[uniffi::export]
@@ -247,7 +247,7 @@ impl RoomSink {
 /// Where the host delivers to-device messages of the subscribed types.
 #[derive(uniffi::Object)]
 pub struct ToDeviceSink {
-    inner: Arc<dyn CoreToDeviceSink>,
+    pub(crate) inner: Arc<dyn CoreToDeviceSink>,
 }
 
 #[uniffi::export]

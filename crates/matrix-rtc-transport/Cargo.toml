@@ -32,6 +32,11 @@ serde_json = { workspace = true }
 sha2 = "0.10"
 base64 = "0.22"
 
+[features]
+# `testing::ScriptedTransport`: a transport whose connections a test scripts,
+# for the call SDK's scenario tests and the FFI's debug artifacts (034 C16).
+testing = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time", "sync", "test-util"] }
 proptest = "1"

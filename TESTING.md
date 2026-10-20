@@ -19,6 +19,20 @@ Tests drive the core through fakes rather than mocks of internals:
 time; transport tests use small fake `MediaTransport`s that record connects
 and let the test play the SFU's events.
 
+## Scripted outages
+
+`crates/matrix-rtc-call-sdk/tests/resilience/` runs whole calls the way a host
+makes one — `RtcClient` → `RtcRoom` → `join_call` → `attach_media` — over
+`MockBackend` (the homeserver, which `set_outage` takes away) and the transport
+crate's `ScriptedTransport` (the SFUs, behind its `testing` feature), on paused
+time: the homeserver away for minutes and back, a delayed-leave flap, our own
+SFU lost with and without a fallback, joining with the SFU down. The per-rule
+tests live with their modules; these check that the rules compose. The same
+two fakes reach hosts' tests through the FFI's `testing` feature
+(`ScriptedMatrixBackend`, `ScriptedMediaTransport`), and what only a real
+stack shows is in the `e2e_resilience_*` scenarios
+(`crates/matrix-rtc-call-sdk/tests/E2E_CALL.md`).
+
 ## Property tests (proptest)
 
 A scenario test checks one sequence someone thought of. A property test states

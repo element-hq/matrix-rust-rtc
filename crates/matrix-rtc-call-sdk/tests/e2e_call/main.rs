@@ -46,6 +46,7 @@
 //! ```
 
 mod provision;
+mod resilience;
 mod simulcast;
 
 use std::env;

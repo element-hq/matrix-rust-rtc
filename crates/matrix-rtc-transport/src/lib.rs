@@ -35,6 +35,8 @@ pub mod local;
 pub mod pool;
 pub mod stats;
 pub mod stream;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use connection::{
     ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, FrameStream,

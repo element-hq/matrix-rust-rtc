@@ -724,6 +724,9 @@ pub struct MockBackend {
     /// `(user_id, device_id)` recipients a to-device send answers as not
     /// delivered; the rest of the batch is delivered.
     pub undeliverable: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    /// While set, every send answers this, before any scripted outcome: an
+    /// outage of the homeserver ([`Self::set_outage`]).
+    pub outage: std::sync::Mutex<Option<MockOutcome>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -752,6 +755,7 @@ impl Default for MockBackend {
             call_log: Default::default(),
             created_at: crate::executor::Instant::now(),
             undeliverable: Default::default(),
+            outage: Default::default(),
         }
     }
 }
@@ -807,6 +811,12 @@ impl MockBackend {
             .extend(outcomes);
     }
 
+    /// Every send answers `outcome` from now until `None` ends the outage;
+    /// the scripted queues are left for after it. `rtc_transports` included.
+    pub fn set_outage(&self, outcome: Option<MockOutcome>) {
+        *self.outage.lock().unwrap() = outcome;
+    }
+
     /// Every call received so far, in order.
     pub fn calls(&self) -> Vec<MockCall> {
         self.call_log.lock().unwrap().clone()
@@ -828,13 +838,15 @@ impl MockBackend {
             method,
             at: self.created_at.elapsed(),
         });
-        let mut outcome = self
-            .scripted
-            .lock()
-            .unwrap()
-            .get_mut(&method)
-            .and_then(|queue| queue.pop_front())
-            .unwrap_or(MockOutcome::Ok);
+        let outage = self.outage.lock().unwrap().clone();
+        let mut outcome = outage.unwrap_or_else(|| {
+            self.scripted
+                .lock()
+                .unwrap()
+                .get_mut(&method)
+                .and_then(|queue| queue.pop_front())
+                .unwrap_or(MockOutcome::Ok)
+        });
         loop {
             match outcome {
                 MockOutcome::Ok => return Ok(()),

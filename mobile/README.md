@@ -86,13 +86,53 @@ room.shutdown()                                    // leaves what is still joine
 ## When the call ends
 
 Every ending takes one path: `call.leave()`, the slot closing mid-call (the
-library sends your leave with `leave_reason.code = "slot_closed"` on its own) or
-`room.close()`. The call is over (`isLive()` is false) as soon as `leave()` is
-called, even if the leave then fails to send, and a `MediaSession`
-ends itself — `Ended(Left)` or `Ended(SlotClosed)`, every SFU connection closed —
-so there is no separate `disconnect()` to call. Stop camera and microphone
-capture on that `Ended`. A host running its own media waits on
+library sends your leave with `leave_reason.code = "slot_closed"` on its own),
+our own SFU given up (below), or `room.close()`. `leave()` returns at once: the
+call is over (`isLive()` is false) and media has stopped when it returns, and
+the leave is then sent in the background, once — it fails only with
+`CallOver`, never on a failed send. A `MediaSession` ends itself — `Ended(Left)`,
+`Ended(SlotClosed)` or `Ended(ConnectionClosed { reason })`, every SFU
+connection closed — so there is no separate `disconnect()` to call. Stop camera
+and microphone capture on that `Ended`. A host running its own media waits on
 `call.waitForEnd()` and tears it down there.
+
+## When the network is not there
+
+Calls survive the homeserver going away and SFUs dropping; what the host does
+is small, and specified in feature-hq's
+`plans/034.rust_rtc_transient_resilience/contract.md` (the source of truth;
+this is the summary).
+
+- **One attempt, an answer within 30 s.** Every `MatrixBackend` send is one
+  attempt whose outcome you report within 30 s; the library retries. With
+  matrix-sdk, configure the request as two attempts of 10 s
+  (`RequestConfig(timeout = 10 s, retryLimit = 2)`): the SDK's own retry reuses
+  the transaction id, so it cannot duplicate an event. Report the Matrix
+  `errcode`, status and `retry_after_ms` on `FfiBackendError`; set `permanent`
+  only for a failure your client knows is final.
+- **`client.reportConnectivity(online)`** is optional and makes recovery
+  immediate: `false` when your client goes offline, `true` only once a request
+  has succeeded after that — never merely because sync started.
+- **What to show.** `client.signallingHealth()` (live before any call exists)
+  is the server indicator; `media.interruptions()` / `nextInterruptions()` is
+  every cause interrupting the call, one field each. Tiles carry `connection`
+  (`Connected`, `Reconnecting`, `Unreachable`) and `decryptable`.
+- **Our own SFU** is reconnected for 60 s (`ownReconnectBudgetMs`) before the
+  call ends with `ConnectionClosed { Budget | Refused | NeverConnected }`,
+  after its leave; `connectMediaSession` returns without waiting for it. With
+  `sfuFallback` (off by default; only where the other member's SFU accepts
+  your homeserver's accounts) your media moves to another member's SFU after
+  10 s, same member id.
+- **Keep the objects alive** across background, minimise and rotation:
+  dropping the client, room, call or media session is leaving without a leave.
+
+**Testing.** Debug builds of the media artifact (`--profile dev` with
+`MEDIA=1`) carry `ScriptedMatrixBackend`, `ScriptedMediaTransport` and
+`connectScriptedMediaSession`: hand the backend to `RtcClient` and connect
+media through the transport, then take either side away by hand
+(`setOutage`, `script`, `interrupt`, `close`, `restore`, `refuse`,
+`rejectToken`) or by fixture key (`play("outage.homeserver.30s")`,
+`play("outage.own_sfu.fallback")`, …).
 
 ## Turn on logging first
 

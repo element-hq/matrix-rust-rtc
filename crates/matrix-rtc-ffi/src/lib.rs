@@ -47,6 +47,8 @@ pub use params::{
 /// see the module docs. Pulls the LiveKit client (libwebrtc): default off.
 #[cfg(feature = "media")]
 pub mod media;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MatrixRtcFfiError {

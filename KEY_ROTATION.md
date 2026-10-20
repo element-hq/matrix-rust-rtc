@@ -302,6 +302,19 @@ This is load-bearing. If nothing ever collected an owed rotation, a member who
 left while a key was fresh would keep a working key for as long as the roster
 stayed still — strictly worse than rotating per departure.
 
+## A key a member did not get
+
+A rotation's key goes to every member's device in one to-device batch, and a
+batch can deliver to some devices and not others. The member whose device did
+not get it holds an old key, so everything we send from the rotation on is
+undecryptable for them (feature 034, R32). The core keeps who was not reached
+(`EncryptionManager::undelivered_key_members`) and the session's upkeep retries
+the *current* key to each of them on its own backoff, one attempt at a time,
+until it lands. A newer rotation supersedes the retry (its own batch goes to
+everyone), and a member's departure drops theirs. Nothing about the expiry
+model above changes: a retry re-sends the key a member should already hold, it
+never mints one.
+
 ## Related
 
 - MSC4143 for `delayBeforeUse`, `keyRotationGracePeriod`, and to-device key

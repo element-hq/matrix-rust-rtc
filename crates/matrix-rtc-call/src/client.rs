@@ -234,6 +234,15 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         }
     }
 
+    /// [`Self::new`] with the retry layer given, whose clock every deadline
+    /// of the client's calls is read from: how a test runs a call on paused
+    /// time.
+    pub fn with_outbox(backend: Arc<B>, outbox: Outbox) -> Self {
+        Self {
+            base: BaseRtcClient::with_outbox(backend, outbox),
+        }
+    }
+
     /// The host's backend behind the dialect wrapper, for what sends outside
     /// the rooms (a media layer's token exchange).
     pub fn backend(&self) -> &Arc<DialectBackend<B>> {

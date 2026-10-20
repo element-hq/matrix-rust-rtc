@@ -196,6 +196,11 @@ pub struct LiveKitCallOptions {
     /// window reorders are coalesced into. A product decision rather than a
     /// protocol one; see [`StabilityConfig`].
     pub stability: StabilityConfig,
+    /// Whether our media may move to another member's SFU while ours is
+    /// down (034 R25); see
+    /// [`AttachOptions::sfu_fallback`](crate::AttachOptions::sfu_fallback).
+    /// Off by default.
+    pub sfu_fallback: bool,
 }
 
 impl Default for LiveKitCallOptions {
@@ -214,6 +219,7 @@ impl Default for LiveKitCallOptions {
             kind: CallKind::default(),
             reactions: None,
             stability: StabilityConfig::default(),
+            sfu_fallback: false,
         }
     }
 }
@@ -343,7 +349,7 @@ impl LiveKitCall {
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),
                 own_reconnect_budget: None,
-                sfu_fallback: false,
+                sfu_fallback: options.sfu_fallback,
             },
         )
         .await;

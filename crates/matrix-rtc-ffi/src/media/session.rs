@@ -16,8 +16,7 @@ use tokio::sync::watch;
 use matrix_rtc_call_sdk::{AttachError, CallEngine, CallEvent, MediaAttachment};
 use matrix_rtc_call_sdk::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_livekit::{LiveKitTransportConnection, MediaKeyBridge};
-use matrix_rtc_transport::{MediaStreamKind, TransportConnection as _};
+use matrix_rtc_transport::{MediaKeyHandler, MediaStreamKind, TransportConnection};
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
@@ -85,16 +84,7 @@ async fn build_media_session(
             call.slot_id(),
         );
     }
-    let LiveKitAttachment {
-        media:
-            MediaAttachment {
-                engine,
-                own_connection,
-                own_identity,
-                events,
-            },
-        key_bridge,
-    } = attach_livekit(
+    let LiveKitAttachment { media, key_bridge } = attach_livekit(
         call.inner(),
         call.backend(),
         LiveKitAttachOptions {
@@ -109,24 +99,15 @@ async fn build_media_session(
         },
     )
     .await
-    .map_err(|error| match error {
+    .map_err(attach_error)?;
+    Ok(MediaSession::new(media, key_bridge))
+}
+
+pub(crate) fn attach_error(error: AttachError) -> MediaFfiError {
+    match error {
         AttachError::NotJoined(message) => MediaFfiError::NotJoined(message),
         error => MediaFfiError::Transport(error.to_string()),
-    })?;
-
-    let tiles = engine.subscribe_tiles();
-    let local = engine.subscribe_local_state();
-    let interruptions = engine.subscribe_interruptions();
-    Ok(Arc::new(MediaSession {
-        engine,
-        connection: own_connection,
-        _bridge: key_bridge,
-        events: TokioMutex::new(events),
-        tiles: TokioMutex::new(tiles),
-        local: TokioMutex::new(local),
-        interruptions: TokioMutex::new(interruptions),
-        own_identity,
-    }))
+    }
 }
 
 /// A live media session on a joined slot: the participant roster, the
@@ -138,15 +119,44 @@ async fn build_media_session(
 pub struct MediaSession {
     engine: CallEngine,
     /// The own-focus connection; `None` for a receive-only call.
-    connection: Option<LiveKitTransportConnection>,
-    /// Keeps the key bridge alive alongside the session for clarity; the
+    connection: Option<Arc<dyn TransportConnection>>,
+    /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
-    _bridge: Arc<MediaKeyBridge>,
+    _bridge: Arc<MediaKeyHandler>,
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
     tiles: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::TileRoster>>,
     local: TokioMutex<watch::Receiver<Option<matrix_rtc_call_sdk::LocalState>>>,
     interruptions: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::Interruptions>>,
     own_identity: String,
+}
+
+impl MediaSession {
+    /// The session over an attachment, whatever its transport.
+    pub(crate) fn new<C: TransportConnection + 'static>(
+        media: MediaAttachment<C>,
+        key_handler: Arc<MediaKeyHandler>,
+    ) -> Arc<Self> {
+        let MediaAttachment {
+            engine,
+            own_connection,
+            own_identity,
+            events,
+        } = media;
+        let tiles = engine.subscribe_tiles();
+        let local = engine.subscribe_local_state();
+        let interruptions = engine.subscribe_interruptions();
+        Arc::new(MediaSession {
+            engine,
+            connection: own_connection
+                .map(|connection| Arc::new(connection) as Arc<dyn TransportConnection>),
+            _bridge: key_handler,
+            events: TokioMutex::new(events),
+            tiles: TokioMutex::new(tiles),
+            local: TokioMutex::new(local),
+            interruptions: TokioMutex::new(interruptions),
+            own_identity,
+        })
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
