@@ -582,7 +582,7 @@ async fn the_hand_follows_our_membership_event_across_a_refresh() {
     );
 
     assert!(call.rtc_mut().keep_alive(SLOT).await);
-    assert!(call.reannotate_hand_if_moved(SLOT).await);
+    call.drive_hand(SLOT).await;
 
     assert_eq!(
         call.rtc().own_membership_event_id(SLOT).as_deref(),

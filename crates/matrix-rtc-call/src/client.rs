@@ -35,13 +35,16 @@ use matrix_rtc_core::{
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::direct_call::{CallKind, DirectCall, DirectCallEnd, DirectCallState};
-use crate::reactions::{RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction};
-use crate::room_state::{CallJoinParams, CallRoomState};
+use crate::reactions::{
+    HandRequests, RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction,
+};
+use crate::room_state::{CallJoinParams, CallRoomState, HandNext};
 use crate::status::{CallStatus, CallStatusCell, MediaStatusReporter};
 use crate::transports::{self, JoinTransport};
 use matrix_rtc_core::RoomOptions;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::feeder::RoomAlreadyOpen;
+use matrix_rtc_core::outbox::{BACKOFF_INITIAL, BACKOFF_MAX};
 
 type Backend<B> = DialectBackend<B>;
 
@@ -218,9 +221,6 @@ impl Default for CallJoinOptions {
 
 /// The MSC4143 application type of a call.
 const CALL_APPLICATION: &str = "m.call";
-
-/// How long the raised hand waits before retrying a failed re-annotation.
-const RETRY: Duration = Duration::from_millis(matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS);
 
 /// One per backend. Creating it does no I/O (R1).
 pub struct RtcClient<B: MatrixBackend + 'static> {
@@ -435,6 +435,8 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
         let event_moves = state.rtc().subscribe_own_membership_event_id(&slot_id);
+        let hand_requests = state.subscribe_hand_requests(&slot_id);
+        let outbox = state.rtc().outbox().clone();
         drop(state);
         let session = self.session(slot_id.clone(), member_id, transport, upkeep, auto_leaves);
         session.end.report_to(joined.status.clone());
@@ -451,7 +453,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             self.follow_direct_call(slot_id.clone(), direct.clone(), session.end.clone())
         });
         Ok(RtcCall {
-            _hand: event_moves.map(|moves| self.follow_hand(slot_id, moves)),
+            _hand: event_moves.zip(hand_requests).map(|(moves, requests)| {
+                self.follow_hand(slot_id, moves, requests, outbox, session.end.clone())
+            }),
             status: joined.status,
             _ring: ring,
             _follow_direct: follow_direct,
@@ -604,20 +608,54 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
     }
 
-    /// Re-raises our hand on each new membership event a sticky refresh puts
-    /// in place (see `CallRoomState::reannotate_hand_if_moved`), retrying a
-    /// failed re-send every keep-alive interval. Ends when the join's machine
-    /// goes, at leave.
+    /// Our hand's sender (034 R5): sends what the hand needs, one attempt at
+    /// a time and without the room's lock, whenever a raise or lower is asked
+    /// for or a sticky refresh moves our membership event, until it stands
+    /// where it was asked to be. A transient failure waits on capped backoff,
+    /// cut short by a new request, a move, or signalling coming back. Ends
+    /// with the participation.
     fn follow_hand(
         &self,
         slot_id: String,
         mut moves: watch::Receiver<Option<String>>,
+        mut requests: watch::Receiver<HandRequests>,
+        outbox: Outbox,
+        end: Arc<SessionEnd>,
     ) -> AbortOnDrop<()> {
         let state = self.state.clone();
         executor::spawn(async move {
-            while moves.changed().await.is_ok() {
-                while !state.lock().await.reannotate_hand_if_moved(&slot_id).await {
-                    executor::sleep(RETRY).await;
+            let mut ended = end.ended.subscribe();
+            let mut recoveries = outbox.subscribe_recoveries();
+            let mut backoff = BACKOFF_INITIAL;
+            loop {
+                moves.borrow_and_update();
+                requests.borrow_and_update();
+                recoveries.borrow_and_update();
+                let step = state.lock().await.hand_step(&slot_id);
+                let delay = match step {
+                    None => None,
+                    Some(step) => {
+                        let outcome = step.send().await;
+                        match state.lock().await.hand_sent(&slot_id, &step, outcome) {
+                            HandNext::Again => {
+                                backoff = BACKOFF_INITIAL;
+                                continue;
+                            }
+                            HandNext::Stop => break,
+                            HandNext::Backoff(retry_after) => {
+                                let delay = retry_after.map_or(backoff, |after| after.max(backoff));
+                                backoff = (backoff * 2).min(BACKOFF_MAX);
+                                Some(delay)
+                            }
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = executor::sleep(delay.unwrap_or_default()), if delay.is_some() => {}
+                    changed = moves.changed() => if changed.is_err() { break },
+                    changed = requests.changed() => if changed.is_err() { break },
+                    Ok(()) = recoveries.changed(), if delay.is_some() => {}
+                    _ = ended.wait_for(Option::is_some) => break,
                 }
             }
         })
@@ -955,24 +993,44 @@ impl<B: MatrixBackend + 'static> RtcCall<B> {
     /// Sends an emoji reaction relating to our membership. Only the first
     /// grapheme of `emoji` is sent; `name` selects the sound peers play.
     /// Returns the event id.
+    ///
+    /// Retried for at most 5 s, without the room's lock, and failing with
+    /// [`ReactionError::NotSent`](crate::ReactionError::NotSent) rather than
+    /// landing late (034 R4).
     pub async fn send_reaction(&self, emoji: &str, name: &str) -> Result<String, RtcError> {
         self.check_live()?;
-        Ok(self
+        let reaction = self
             .state
             .lock()
             .await
-            .send_reaction(&self.slot_id, emoji, name)
-            .await?)
+            .prepare_reaction(&self.slot_id, emoji, name)?;
+        let event_id = reaction.send().await?;
+        self.state.lock().await.reaction_sent(&self.slot_id);
+        Ok(event_id)
     }
 
+    /// Raises our hand: shown at once, and returns once it has landed, a
+    /// lower superseded it, or the call ended (034 R5). Fails only when the
+    /// homeserver refuses it for good, the hand back where it was. Dropping
+    /// the future leaves the request standing; only a lower withdraws it.
     pub async fn raise_hand(&self) -> Result<(), RtcError> {
-        self.check_live()?;
-        Ok(self.state.lock().await.raise_hand(&self.slot_id).await?)
+        self.request_hand(true).await
     }
 
+    /// Lowers our hand, as [`Self::raise_hand`] raises it.
     pub async fn lower_hand(&self) -> Result<(), RtcError> {
+        self.request_hand(false).await
+    }
+
+    async fn request_hand(&self, up: bool) -> Result<(), RtcError> {
         self.check_live()?;
-        Ok(self.state.lock().await.lower_hand(&self.slot_id).await?)
+        let answered = self.state.lock().await.request_hand(&self.slot_id, up)?;
+        let mut ended = self.session.end.ended.subscribe();
+        tokio::select! {
+            result = answered => Ok(result?),
+            // The hand went with the membership: nothing to report.
+            _ = ended.wait_for(Option::is_some) => Ok(()),
+        }
     }
 
     /// The slot's raised hands, oldest first.

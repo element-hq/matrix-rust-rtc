@@ -391,7 +391,8 @@ impl WasmRtcCall {
 
     /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
     /// by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
-    /// sent. Resolves to the event id; rejects inside the send cooldown.
+    /// sent. Resolves to the event id; rejects inside the send cooldown, and
+    /// with "not sent" when it has not landed within 5 s (034 R4).
     #[wasm_bindgen(js_name = sendReaction)]
     pub async fn send_reaction(&self, emoji: String, name: String) -> Result<String, JsError> {
         self.call
@@ -400,13 +401,15 @@ impl WasmRtcCall {
             .map_err(js_error)
     }
 
-    /// Raises our hand. Idempotent while it is up.
+    /// Raises our hand: shown at once, resolving once it has landed, a lower
+    /// superseded it or the call ended; rejects only on a permanent refusal,
+    /// the hand back where it was (034 R5). Idempotent while it is up.
     #[wasm_bindgen(js_name = raiseHand)]
     pub async fn raise_hand(&self) -> Result<(), JsError> {
         self.call.raise_hand().await.map_err(js_error)
     }
 
-    /// Lowers our hand. A no-op when it is down.
+    /// Lowers our hand, as `raiseHand` raises it. A no-op when it is down.
     #[wasm_bindgen(js_name = lowerHand)]
     pub async fn lower_hand(&self) -> Result<(), JsError> {
         self.call.lower_hand().await.map_err(js_error)

@@ -28,6 +28,8 @@ log only.
 - Our membership's refresh, delayed-leave restart and re-arm are retried until they land, the refresh falls due at a third of the lifetime instead of half, and when signalling returns the library re-arms and republishes only what the outage lost (034 R1, R18, R19).
 - A member whose delayed leave fires stays on the roster for 10 s and is not reported gone if they come back within it, so a homeserver restart no longer flickers everyone out (034 R21).
 - Joins and leaves are announced from our first roster on, through a lapse of our own membership, so a member who joined while our homeserver was unreachable is announced when it returns (034 R16).
+- A reaction is retried for at most 5 s and then fails with the new `ReactionError::NotSent` (FFI and web `Reaction("not sent")`) instead of landing late, and the cooldown starts only once it lands (034 R4).
+- `raise_hand`/`lower_hand` show the hand at once and resolve once it has landed, retrying through an outage; a reversal or the call ending resolves them `Ok`, and only a permanent refusal fails them, the hand back where it was (034 R5).
 
 ## v0.5.0-rc.5 - 2026-10-15
 

@@ -650,7 +650,9 @@ impl RtcCall {
     /// sent. Returns the event id.
     ///
     /// Fails inside the send cooldown (Element Call's three seconds by
-    /// default), since peers would drop the reaction anyway.
+    /// default), since peers would drop the reaction anyway, and with
+    /// `Reaction("not sent")` when it has not landed within 5 s: it is dropped,
+    /// never delivered late, and the cooldown does not start (034 R4).
     pub async fn send_reaction(
         &self,
         emoji: String,
@@ -659,13 +661,18 @@ impl RtcCall {
         Ok(self.call.send_reaction(&emoji, &name).await?)
     }
 
-    /// Raises our hand. Idempotent while it is up; the hand follows our
-    /// membership across sticky refreshes on its own.
+    /// Raises our hand. Shown on our tile at once; suspends until the hand
+    /// has landed, however long signalling is away, and resolves `Ok` early
+    /// when a lower supersedes it or the call ends. Fails only on a permanent
+    /// refusal, the hand back where it was. Cancelling the call leaves the
+    /// request standing: only a lower withdraws it (034 R5). Idempotent while
+    /// it is up; the hand follows our membership across sticky refreshes.
     pub async fn raise_hand(&self) -> Result<(), MatrixRtcFfiError> {
         Ok(self.call.raise_hand().await?)
     }
 
-    /// Lowers our hand by redacting the annotation. A no-op when it is down.
+    /// Lowers our hand by redacting the annotation, as [`Self::raise_hand`]
+    /// raises it. A no-op when it is down.
     pub async fn lower_hand(&self) -> Result<(), MatrixRtcFfiError> {
         Ok(self.call.lower_hand().await?)
     }
