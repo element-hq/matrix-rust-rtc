@@ -171,7 +171,9 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         Self { rtc, shared }
     }
 
-    /// A call over a fresh core room for `room_id`, sending through `backend`.
+    /// A call over a fresh core room for `room_id`, sending through `backend`
+    /// and retrying through an outbox of its own.
+    #[cfg(test)]
     pub fn with_backend(room_id: impl Into<String>, backend: Arc<T>) -> Self {
         Self::new(BaseRtcRoom::with_backend(room_id, backend))
     }

@@ -73,8 +73,8 @@ pub const DEFAULT_REACTION_ACTIVE_MS: u64 = 3_000;
 pub const DEFAULT_REACTION_MAX_AGE_MS: u64 = 10_000;
 
 /// How many membership event ids are remembered per member for validating a
-/// reaction against an older one of their events. Refreshes are half an hour
-/// apart by default, so this covers hours of a call; the bound only exists so
+/// reaction against an older one of their events. Refreshes are twenty
+/// minutes apart by default, so this covers hours of a call; the bound only exists so
 /// a member cannot grow the set without limit.
 const KNOWN_MEMBERSHIP_EVENTS_PER_MEMBER: usize = 8;
 

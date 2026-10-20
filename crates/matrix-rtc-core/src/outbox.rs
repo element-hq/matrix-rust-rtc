@@ -26,6 +26,7 @@ use tokio::sync::watch;
 use crate::encryption::RtcClock;
 use crate::error::CommandError;
 use crate::executor::{self, Instant};
+use crate::host::backend::BackendError;
 
 #[cfg(test)]
 mod tests;
@@ -39,13 +40,16 @@ pub const BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
 /// What a send is, for supersession: one pending send per kind and scope.
+///
+/// A kind is a slot, so sends that must not overtake one another share one: a
+/// leave's membership supersedes a pending refresh and waits for one in flight,
+/// and a fresh arm supersedes a pending restart of the old delayed leave.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SendKind {
-    MembershipPublish,
-    MembershipRefresh,
-    DelayedLeaveArm,
-    DelayedLeaveRestart,
-    DelayedLeaveCancel,
+    /// Our membership event: the join, each refresh and republish, the leave.
+    Membership,
+    /// Our delayed leave: arming, restarting and cancelling it.
+    DelayedLeave,
     /// The media key to one member.
     KeyDistribution {
         member_id: String,
@@ -77,6 +81,7 @@ pub struct SendPolicy {
     deadline: Option<Duration>,
     tolerance: Option<Duration>,
     retry_timed_out: bool,
+    single_attempt: bool,
 }
 
 impl Default for SendPolicy {
@@ -85,6 +90,7 @@ impl Default for SendPolicy {
             deadline: None,
             tolerance: None,
             retry_timed_out: true,
+            single_attempt: false,
         }
     }
 }
@@ -115,6 +121,16 @@ impl SendPolicy {
         self.retry_timed_out = false;
         self
     }
+
+    /// One attempt, never retried: a leave (R8). It still waits for the slot's
+    /// attempt in flight, so it cannot overtake an earlier send of its kind.
+    pub fn single_attempt() -> Self {
+        Self {
+            single_attempt: true,
+            retry_timed_out: false,
+            ..Self::default()
+        }
+    }
 }
 
 /// Why a send through the [`Outbox`] did not land.
@@ -136,6 +152,29 @@ pub enum SendFailure {
     /// because it may have landed.
     #[error("the attempt timed out and may have landed")]
     TimedOut,
+    /// The one attempt a single-attempt policy allows failed transiently.
+    #[error("failed: {0}")]
+    Failed(CommandError),
+}
+
+impl SendFailure {
+    /// As the error the caller would have had from a single send.
+    pub fn into_command_error(self) -> CommandError {
+        match self {
+            SendFailure::Refused(error) | SendFailure::Failed(error) => error,
+            SendFailure::DeadlineElapsed { last: Some(error) } => error,
+            other => CommandError::from_message(other.to_string()),
+        }
+    }
+
+    /// The host's failure behind this, if one was reported.
+    pub fn command_error(&self) -> Option<&CommandError> {
+        match self {
+            SendFailure::Refused(error) | SendFailure::Failed(error) => Some(error),
+            SendFailure::DeadlineElapsed { last } => last.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the homeserver is answering our sends (R9). One per client.
@@ -163,6 +202,9 @@ struct Inner {
     /// Bumped by each "online" report, so a send in backoff retries at once.
     online_epoch: AtomicU64,
     health: watch::Sender<SignallingHealth>,
+    /// Bumped on every unreachable → reachable transition, so a recovery is
+    /// never missed when the health watch coalesces a quick flap.
+    recoveries: watch::Sender<u64>,
     clock: RtcClock,
 }
 
@@ -196,9 +238,16 @@ impl Outbox {
                 poke: watch::Sender::new(0),
                 online_epoch: AtomicU64::new(0),
                 health: watch::Sender::new(SignallingHealth::Reachable),
+                recoveries: watch::Sender::new(0),
                 clock,
             }),
         }
+    }
+
+    /// The clock health timestamps come from, which a membership machine
+    /// sending through this outbox shares.
+    pub fn clock(&self) -> RtcClock {
+        self.inner.clock.clone()
     }
 
     /// Signalling health now.
@@ -209,6 +258,12 @@ impl Outbox {
     /// Signalling health, current value first.
     pub fn subscribe_health(&self) -> watch::Receiver<SignallingHealth> {
         self.inner.health.subscribe()
+    }
+
+    /// Counts the times signalling became reachable again; a change is a
+    /// recovery to run (R19), however quickly it followed the loss.
+    pub fn subscribe_recoveries(&self) -> watch::Receiver<u64> {
+        self.inner.recoveries.subscribe()
     }
 
     /// The host reports its Matrix client offline or online (R11). Offline
@@ -244,17 +299,40 @@ impl Outbox {
         &self,
         key: SlotKey,
         policy: SendPolicy,
+        attempt: F,
+    ) -> Result<T, SendFailure>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, CommandError>>,
+    {
+        self.begin(key).run(policy, attempt).await
+    }
+
+    /// Takes the slot `key` now, superseding its pending send, and returns the
+    /// send to [`PendingSend::run`]. Synchronous, so a caller can decide and
+    /// register under one lock: a membership machine checks it is still joined
+    /// in the same critical section as a leave's [`Self::cancel_scope`].
+    pub fn begin(&self, key: SlotKey) -> PendingSend {
+        let generation = self.register(&key);
+        PendingSend {
+            outbox: self.clone(),
+            key,
+            generation,
+        }
+    }
+
+    async fn run<T, F, Fut>(
+        &self,
+        key: &SlotKey,
+        generation: u64,
+        policy: SendPolicy,
         mut attempt: F,
     ) -> Result<T, SendFailure>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, CommandError>>,
     {
-        let generation = self.register(&key);
-        let _waiting = Waiting {
-            outbox: self,
-            key: &key,
-        };
+        let key = key.clone();
         let started = Instant::now();
         let deadline = policy.deadline.map(|deadline| started + deadline);
         let tolerance = policy.tolerance.map(|tolerance| started + tolerance);
@@ -300,6 +378,15 @@ impl Outbox {
                 }
                 Ok(Err(error)) if error.is_permanent() => {
                     return Err(SendFailure::Refused(error));
+                }
+                Ok(Err(error)) if policy.single_attempt => {
+                    if !error
+                        .backend_error()
+                        .is_some_and(BackendError::is_rate_limited)
+                    {
+                        self.mark_unreachable();
+                    }
+                    return Err(SendFailure::Failed(error));
                 }
                 Ok(Err(error)) => {
                     let rate_limited = error
@@ -478,7 +565,7 @@ impl Outbox {
 
     /// `true` if this changed the health.
     fn mark_reachable(&self) -> bool {
-        self.inner.health.send_if_modified(|health| {
+        let recovered = self.inner.health.send_if_modified(|health| {
             if *health == SignallingHealth::Reachable {
                 false
             } else {
@@ -486,7 +573,13 @@ impl Outbox {
                 *health = SignallingHealth::Reachable;
                 true
             }
-        })
+        });
+        if recovered {
+            self.inner
+                .recoveries
+                .send_modify(|n| *n = n.wrapping_add(1));
+        }
+        recovered
     }
 }
 
@@ -536,15 +629,30 @@ enum Claim {
     Ended(SendFailure),
 }
 
-/// Counts a running send on its slot, so the slot is dropped with the last.
-struct Waiting<'a> {
-    outbox: &'a Outbox,
-    key: &'a SlotKey,
+/// A send that has taken its slot ([`Outbox::begin`]) and not yet run. It
+/// counts on the slot until dropped, so the slot is dropped with the last.
+pub struct PendingSend {
+    outbox: Outbox,
+    key: SlotKey,
+    generation: u64,
 }
 
-impl Drop for Waiting<'_> {
+impl PendingSend {
+    /// Runs the send; see [`Outbox::send`].
+    pub async fn run<T, F, Fut>(self, policy: SendPolicy, attempt: F) -> Result<T, SendFailure>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, CommandError>>,
+    {
+        self.outbox
+            .run(&self.key, self.generation, policy, attempt)
+            .await
+    }
+}
+
+impl Drop for PendingSend {
     fn drop(&mut self) {
-        self.outbox.release(self.key, |slot| {
+        self.outbox.release(&self.key, |slot| {
             slot.waiting = slot.waiting.saturating_sub(1)
         });
     }

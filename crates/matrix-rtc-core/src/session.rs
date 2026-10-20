@@ -23,7 +23,8 @@ use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::membership_listener::MembershipScope;
-use crate::own_membership::{MembershipTimings, OwnMembershipMachine, transport_to_json};
+use crate::outbox::Outbox;
+use crate::own_membership::{MembershipTimings, OwnEntry, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 use crate::upkeep::{self, SessionUpkeep};
@@ -157,6 +158,8 @@ pub struct SlotSession<T: MatrixBackend> {
     /// from a multi-call client is attributable. Pre-formatted because it is
     /// used on paths that run per event.
     log_tag: String,
+    /// The client's retry layer, handed to each join's membership machine.
+    outbox: Outbox,
 }
 
 impl<T: MatrixBackend> Clone for SlotSession<T> {
@@ -178,6 +181,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             slot_id: self.slot_id.clone(),
             membership_scope: self.membership_scope.clone(), // Shares the watch, so shares its listeners
             log_tag: self.log_tag.clone(),
+            outbox: self.outbox.clone(),
         }
     }
 }
@@ -190,6 +194,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         slot_id: String,
         backend: Option<Arc<T>>,
         membership_scope: MembershipScope,
+        outbox: Outbox,
     ) -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
         let log_tag = format!("{room_id}/{slot_id}");
@@ -211,6 +216,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             slot_id,
             membership_scope,
             log_tag,
+            outbox,
         }
     }
 
@@ -400,7 +406,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             },
         };
         let keep_alive_interval = Duration::from_millis(params.effective_keep_alive_interval_ms());
-        let machine = OwnMembershipMachine::new(
+        let mut machine = OwnMembershipMachine::new(
             backend.clone(),
             self.room_id.clone(),
             self.slot_id.clone(),
@@ -412,6 +418,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 degraded_lifetime_ms: params.effective_degraded_lifetime_ms(),
             },
         );
+
+        machine.set_outbox(self.outbox.clone());
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
         let membership_event_id = machine.join(transports).await?;
@@ -654,6 +662,23 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .map(|machine| machine.subscribe_membership_event_id())
     }
 
+    /// Whether our membership has lapsed for the other members (034 R17):
+    /// predicted from our own deadlines while our sends fail, until a send
+    /// lands. `None` while not joined.
+    pub fn own_membership_lapsed(&self) -> Option<bool> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.is_lapsed())
+    }
+
+    /// Follows [`Self::own_membership_lapsed`] for this join; `None` while not
+    /// joined.
+    pub fn subscribe_own_membership_lapsed(&self) -> Option<watch::Receiver<bool>> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.subscribe_lapsed())
+    }
+
     /// Stops this join's upkeep when aborted, for an owner that lets go of
     /// the join without leaving; `None` while not joined or without one.
     pub fn upkeep_abort_handle(&self) -> Option<AbortHandle> {
@@ -726,6 +751,22 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 self.log_tag,
                 dropped.len(),
             );
+        }
+
+        // A complete set is what a recovery waits for to see whether our own
+        // membership survived the outage (034 R19).
+        if let (Some(machine), Some(own)) = (&self.own_membership_machine, &self.own_participation)
+        {
+            let entry = self
+                .candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.sender == own.user_id && candidate.sticky_key == own.member_id
+                })
+                .map_or(OwnEntry::Absent, |candidate| {
+                    OwnEntry::Present(candidate.membership_event_id.clone())
+                });
+            machine.on_catch_up(entry);
         }
 
         // `apply_membership_event` refreshes only when it changed something, so

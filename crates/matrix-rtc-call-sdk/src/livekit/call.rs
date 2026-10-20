@@ -133,8 +133,8 @@ pub struct LiveKitCallOptions {
     /// until this elapses. A tool that expects to be killed — a load generator,
     /// a test — wants it short.
     ///
-    /// Not free: the keep-alive re-sends the membership once it is halfway to
-    /// expiring, so halving this doubles that signalling rate. Keep it well
+    /// Not free: the keep-alive re-sends the membership once a third of it has
+    /// passed, so halving this doubles that signalling rate. Keep it well
     /// above twice [`keep_alive_interval_ms`](Self::keep_alive_interval_ms), or the
     /// entry can lapse between ticks.
     pub sticky_duration_ms: Option<u64>,

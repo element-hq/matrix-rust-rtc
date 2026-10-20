@@ -136,15 +136,16 @@ pub struct FfiJoinSessionParams {
     ///
     /// A different clock from `keep_alive_timeout_ms`: this is how long the
     /// homeserver keeps the membership at all. The SDK re-sends the membership
-    /// at half this interval, so shortening it buys nothing but traffic.
+    /// once a third of it has passed, so shortening it buys nothing but traffic.
     pub sticky_duration_ms: Option<u64>,
     /// Optional membership lifetime to fall back to on a homeserver that
     /// refuses MSC4140 delayed events, in milliseconds (default: 300000).
     ///
     /// Only ever used on such a homeserver, where nothing clears a crashed
     /// client's membership except this lifetime running out. Raising it trades a
-    /// slower cleanup for less signalling; the SDK re-sends the membership at
-    /// half this interval, so 300000 means a membership event every 2½ minutes.
+    /// slower cleanup for less signalling; the SDK re-sends the membership once
+    /// a third of it has passed, so 300000 means a membership event every 100 s,
+    /// and an outage of up to about 3 min 20 s never lapses it.
     /// Do not lower it below 300000 — MSC4354 says a sticky duration "SHOULD NOT
     /// be set to below 5 minutes", because a server whose clock runs behind
     /// expires sticky events early and a shorter duration cannot absorb that.

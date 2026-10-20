@@ -232,10 +232,10 @@ impl<B: MatrixBackend + 'static> BaseRtcClient<B> {
         options: RoomOptions,
     ) -> Result<BaseRtcRoomHandle<B>, OpenError> {
         let room_id = room_id.into();
-        let room = Arc::new(Mutex::new(BaseRtcRoom::with_backend(
-            room_id.clone(),
-            self.shared.backend.clone(),
-        )));
+        let room = Arc::new(Mutex::new(
+            BaseRtcRoom::with_backend(room_id.clone(), self.shared.backend.clone())
+                .with_outbox(self.shared.outbox.clone()),
+        ));
         self.open_with(room_id, room, options).await
     }
 }

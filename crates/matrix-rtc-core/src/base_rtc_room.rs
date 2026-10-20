@@ -23,6 +23,7 @@ use crate::host::backend::MatrixBackend;
 use crate::host::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
+use crate::outbox::Outbox;
 use crate::session::{JoinedMembership, LeaveReason, RtcMembershipEvent, SlotSession};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
@@ -46,6 +47,9 @@ pub struct BaseRtcRoom<T: MatrixBackend> {
     room_members: Option<HashSet<String>>,
     room_encryption: Option<RoomEncryption>,
     membership_listeners: MembershipListeners,
+    /// The retry layer this room's joins send through: its own, or the
+    /// client's once [`Self::with_outbox`] hands it over.
+    outbox: Outbox,
 }
 
 impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
@@ -60,7 +64,21 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             room_members: None,
             room_encryption: None,
             membership_listeners: MembershipListeners::default(),
+            outbox: Outbox::new(),
         }
+    }
+
+    /// Sends this room's joins through `outbox`, the client's, so one
+    /// homeserver's signalling health covers every room (034 R9). Set before
+    /// the first slot is used.
+    pub fn with_outbox(mut self, outbox: Outbox) -> Self {
+        self.outbox = outbox;
+        self
+    }
+
+    /// The retry layer this room's joins send through.
+    pub fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 
     /// Creates an empty room with a backend.
@@ -355,6 +373,14 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         self.sessions
             .get(slot_id)
             .and_then(|session| session.own_membership_event_id())
+    }
+
+    /// Follows whether our membership in one slot has lapsed for the other
+    /// members (034 R17), current value first; `None` if it is not joined.
+    pub fn subscribe_own_membership_lapsed(&self, slot_id: &str) -> Option<watch::Receiver<bool>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(|session| session.subscribe_own_membership_lapsed())
     }
 
     /// Re-signals every key one slot already holds to its signal handler.
@@ -717,6 +743,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         let slot = self.slot_state(slot_id);
         let room_members = self.room_members.clone();
         let backend = self.backend.clone();
+        let outbox = self.outbox.clone();
         let room_id = self.room_id.clone();
         let membership_scope = MembershipScope {
             slot_id: slot_id.to_owned(),
@@ -735,7 +762,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             );
 
             let mut session =
-                SlotSession::new(room_id, slot_id.to_owned(), backend, membership_scope);
+                SlotSession::new(room_id, slot_id.to_owned(), backend, membership_scope, outbox);
             if let Some(slot) = slot {
                 session.seed_slot_state(slot);
             }

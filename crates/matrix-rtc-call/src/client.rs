@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use std::time::Duration;
 
 use matrix_rtc_core::{
-    ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoomHandle, CommandError,
+    ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoom, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
     LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError,
     ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SignallingHealth, SlotEncryption, SlotState,
@@ -269,9 +269,9 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         let room_id = room_id.into();
         let mode = options.format;
         let backend = self.base.backend().clone();
-        let state = Arc::new(Mutex::new(CallRoomState::with_backend(
-            room_id.clone(),
-            backend.clone(),
+        let state = Arc::new(Mutex::new(CallRoomState::new(
+            BaseRtcRoom::with_backend(room_id.clone(), backend.clone())
+                .with_outbox(self.base.outbox().clone()),
         )));
         let handle = self
             .base

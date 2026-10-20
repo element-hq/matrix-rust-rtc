@@ -240,6 +240,199 @@ mod tests {
         room
     }
 
+    /// 034 through a room's upkeep, the path every host takes: recovery on
+    /// the health transition, the catch-up republish, the lapse.
+    mod resilience {
+        use super::*;
+        use crate::host::backend::{BackendError, MockBackend, MockMethod, MockOutcome};
+        use std::time::Duration;
+
+        const T0_MS: u64 = 1_000_000_000;
+
+        fn fail() -> MockOutcome {
+            MockOutcome::Fail(BackendError::new("offline"))
+        }
+
+        /// A room whose client outbox, and so whose machines, keep paused
+        /// tokio time.
+        async fn room(mock: &Arc<MockBackend>) -> (BaseRtcRoom<MockBackend>, Outbox) {
+            let origin = tokio::time::Instant::now();
+            let outbox = Outbox::with_clock(Arc::new(move || {
+                T0_MS + origin.elapsed().as_millis() as u64
+            }));
+            let mut room =
+                BaseRtcRoom::with_backend(ROOM_ID, mock.clone()).with_outbox(outbox.clone());
+            room.on_slots_received(vec![open_call_slot()]).await;
+            (room, outbox)
+        }
+
+        fn own_event(event_id: &str) -> RawStickyEvent {
+            RawStickyEvent {
+                event_id: Some(event_id.to_owned()),
+                origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+                ..joined_event("@alice:example.org", "m.call#room", "alice-a")
+            }
+        }
+
+        /// R10, R19, R22: the host's "online" starts a recovery: within the
+        /// random wait, a restart probes the delayed leave.
+        #[tokio::test(start_paused = true)]
+        async fn signalling_coming_back_starts_a_recovery() {
+            let mock = alice_backend();
+            let (mut room, outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            outbox.report_connectivity(false);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let before = mock.calls_to(MockMethod::RestartDelayedEvent).len();
+            outbox.report_connectivity(true);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            let restarts = mock.calls_to(MockMethod::RestartDelayedEvent);
+            assert_eq!(restarts.len(), before + 1, "one probe: {restarts:?}");
+            let probe = *restarts.last().unwrap();
+            assert!(probe >= Duration::from_secs(5) && probe <= Duration::from_secs(8));
+        }
+
+        /// R19: after a recovery, a complete set without our membership makes
+        /// the upkeep republish it once; one with our current event id does
+        /// nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_catch_up_missing_our_membership_republishes_once() {
+            let mock = alice_backend();
+            let (mut room, outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let joined = room.own_membership_event_id("m.call#room").unwrap();
+
+            // Intact: our current event id is in the set.
+            outbox.report_connectivity(false);
+            outbox.report_connectivity(true);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            room.set_current_sticky_state(vec![own_event(&joined)])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                mock.sticky_events.lock().unwrap().len(),
+                1,
+                "intact: nothing"
+            );
+
+            // Gone: the set no longer holds us.
+            outbox.report_connectivity(false);
+            outbox.report_connectivity(true);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            room.set_current_sticky_state(Vec::new()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let sticky = mock.sticky_events.lock().unwrap().clone();
+            assert_eq!(sticky.len(), 2, "one republish");
+            assert_eq!(sticky[0].2, sticky[1].2, "the same member id");
+            assert_eq!(
+                room.own_member_id("m.call#room").as_deref(),
+                Some("alice-a")
+            );
+        }
+
+        /// R17: the upkeep notices the lapse on its own, at the delayed leave's
+        /// deadline, while every restart fails; and clears it when one lands.
+        #[tokio::test(start_paused = true)]
+        async fn the_upkeep_reports_our_membership_lapsing() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let mut lapsed = room.subscribe_own_membership_lapsed("m.call#room").unwrap();
+            mock.script(
+                MockMethod::RestartDelayedEvent,
+                std::iter::repeat_n(fail(), 7),
+            );
+
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            assert!(!*lapsed.borrow_and_update());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(*lapsed.borrow_and_update(), "lapsed at 30 s");
+        }
+
+        fn peer(user_id: &str, device_id: &str, member_id: &str) -> RawStickyEvent {
+            RawStickyEvent {
+                origin: EventOrigin::encrypted(Some(device_id.to_owned())),
+                ..joined_event(user_id, "m.call#room", member_id)
+            }
+        }
+
+        /// R20: the catch-up set's rollout serves, in one batch, every member
+        /// not yet served — the ones who arrived during the outage — and not
+        /// the ones who already hold the key.
+        #[tokio::test(start_paused = true)]
+        async fn the_catch_up_rollout_serves_every_member_not_yet_served_in_one_batch() {
+            let mock = alice_backend();
+            let mut room = encrypted_call_room(mock.clone()).await;
+            join_as(&mut room, "alice-a").await;
+            admit_peer(&mut room, "@bob:example.org", "BOBDEV", "bob-a").await;
+            assert!(
+                !mock
+                    .to_device_messages_for("@bob:example.org", "BOBDEV")
+                    .is_empty()
+            );
+            let batches = mock.calls_to(MockMethod::ToDevice).len();
+            let sent = mock.to_device_messages.lock().unwrap().len();
+
+            room.set_current_sticky_state(vec![
+                peer("@bob:example.org", "BOBDEV", "bob-a"),
+                peer("@carol:example.org", "CAROLDEV", "carol-a"),
+                peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            ])
+            .await
+            .unwrap();
+
+            assert_eq!(
+                mock.calls_to(MockMethod::ToDevice).len(),
+                batches + 1,
+                "one batch"
+            );
+            let mut recipients: Vec<String> = mock.to_device_messages.lock().unwrap()[sent..]
+                .iter()
+                .map(|(user, _, _, _)| user.clone())
+                .collect();
+            recipients.sort();
+            assert_eq!(recipients, ["@carol:example.org", "@dave:example.org"]);
+        }
+
+        /// R14: signalling unreachable for ten minutes ends nothing: the join
+        /// stays, and the session keeps trying.
+        #[tokio::test(start_paused = true)]
+        async fn signalling_unreachable_for_ten_minutes_never_ends_the_join() {
+            let mock = alice_backend();
+            let (mut room, outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            for method in [
+                MockMethod::RestartDelayedEvent,
+                MockMethod::StickyEvent,
+                MockMethod::DelayedEvent,
+            ] {
+                mock.script(method, std::iter::repeat_n(fail(), 1_000));
+            }
+
+            tokio::time::sleep(Duration::from_secs(600)).await;
+
+            assert!(matches!(
+                outbox.health(),
+                SignallingHealth::Unreachable { .. }
+            ));
+            assert_eq!(
+                room.own_member_id("m.call#room").as_deref(),
+                Some("alice-a")
+            );
+            assert_eq!(room.joined_slots(), ["m.call#room"]);
+            let late = mock
+                .calls()
+                .into_iter()
+                .filter(|call| call.at > Duration::from_secs(570))
+                .count();
+            assert!(late > 0, "still trying at ten minutes");
+        }
+    }
+
     /// An MSC4354 sticky entry expires when its owner stops refreshing it — a
     /// crashed client — and the lapse produces no event at all. So the current
     /// state simply arrives smaller, and the member has to go: this call

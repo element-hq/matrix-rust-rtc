@@ -132,7 +132,10 @@ impl CommandError {
         let unsupported = match error.errcode.as_deref() {
             Some("M_UNRECOGNIZED") => true,
             Some("M_FORBIDDEN") => error.message.to_ascii_lowercase().contains("delayed"),
-            _ => error.status == Some(404),
+            // A bare 404 is a missing endpoint; a 404 with a code is the
+            // endpoint answering, such as `M_NOT_FOUND` for a delay that is gone.
+            Some(_) => false,
+            None => error.status == Some(404),
         };
         if unsupported {
             CommandError::DelayedEventsNotSupported(error.message)
@@ -185,6 +188,16 @@ mod tests {
         let other_forbidden = delayed(Some("M_FORBIDDEN"), Some(403), "not in room");
         assert!(!other_forbidden.is_delayed_events_unsupported());
         assert!(other_forbidden.is_permanent(), "still a refusal, code kept");
+
+        let gone = delayed(Some("M_NOT_FOUND"), Some(404), "Delayed event not found");
+        assert!(
+            !gone.is_delayed_events_unsupported(),
+            "a restart of a fired delay"
+        );
+        assert!(gone.is_permanent());
+
+        let missing_endpoint = delayed(None, Some(404), "Not Found");
+        assert!(missing_endpoint.is_delayed_events_unsupported());
 
         let transient = delayed(None, Some(502), "Bad Gateway");
         assert!(!transient.is_delayed_events_unsupported());

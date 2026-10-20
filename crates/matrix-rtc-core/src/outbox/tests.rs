@@ -80,13 +80,7 @@ async fn a_transient_failure_is_retried_with_capped_backoff() {
     let mock = Arc::new(MockBackend::new());
     mock.script(MockMethod::StickyEvent, std::iter::repeat_n(fail(), 7));
 
-    let sent = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    )
-    .await;
+    let sent = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await;
 
     assert_eq!(sent.unwrap(), "$sticky-1");
     assert_eq!(
@@ -103,21 +97,10 @@ async fn a_newer_send_of_the_same_kind_supersedes_the_pending_one() {
     let mock = Arc::new(MockBackend::new());
     mock.script(MockMethod::StickyEvent, [fail()]);
 
-    let older = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipPublish,
-        SendPolicy::new(),
-    );
+    let older = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new());
     let newer = async {
         executor::sleep(Duration::from_millis(500)).await;
-        sticky(
-            &outbox,
-            &mock,
-            SendKind::MembershipPublish,
-            SendPolicy::new(),
-        )
-        .await
+        sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await
     };
     let (older, newer) = tokio::join!(older, newer);
 
@@ -144,21 +127,10 @@ async fn a_newer_send_waits_for_the_attempt_in_flight() {
         )],
     );
 
-    let older = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    );
+    let older = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new());
     let newer = async {
         executor::sleep(Duration::from_secs(1)).await;
-        sticky(
-            &outbox,
-            &mock,
-            SendKind::MembershipRefresh,
-            SendPolicy::new(),
-        )
-        .await
+        sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await
     };
     let (older, newer) = tokio::join!(older, newer);
 
@@ -177,20 +149,10 @@ async fn a_leave_drains_every_slot() {
     let mock = Arc::new(MockBackend::new());
     mock.script(MockMethod::StickyEvent, std::iter::repeat_n(fail(), 100));
 
-    let restart = sticky(
-        &outbox,
-        &mock,
-        SendKind::DelayedLeaveRestart,
-        SendPolicy::new(),
-    );
-    let refresh = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    );
+    let restart = sticky(&outbox, &mock, SendKind::DelayedLeave, SendPolicy::new());
+    let refresh = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new());
     let other_room = outbox.send(
-        SlotKey::new("!other:example.org/m.call#", SendKind::MembershipRefresh),
+        SlotKey::new("!other:example.org/m.call#", SendKind::Membership),
         SendPolicy::new(),
         || async { Ok::<_, CommandError>(()) },
     );
@@ -255,12 +217,7 @@ async fn an_attempt_that_does_not_answer_in_30s_is_a_transient_failure() {
     mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
     let mut health = outbox.subscribe_health();
 
-    let sent = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    );
+    let sent = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new());
     let observed = async {
         health.changed().await.unwrap();
         *health.borrow_and_update()
@@ -287,13 +244,7 @@ async fn a_late_answer_to_a_timed_out_attempt_is_ignored() {
         ],
     );
 
-    let sent = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    )
-    .await;
+    let sent = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await;
     executor::sleep(Duration::from_secs(60)).await;
 
     assert_eq!(sent.unwrap(), "$sticky-1", "the retry's event id");
@@ -326,13 +277,7 @@ async fn a_failure_the_host_marks_permanent_is_not_retried() {
         )],
     );
 
-    let sent = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipPublish,
-        SendPolicy::new(),
-    )
-    .await;
+    let sent = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await;
 
     assert!(matches!(sent, Err(SendFailure::Refused(_))));
     assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 1);
@@ -388,13 +333,7 @@ async fn a_rate_limit_waits_the_servers_retry_after() {
     let mock = Arc::new(MockBackend::new());
     mock.script(MockMethod::StickyEvent, [rate_limited(7_000)]);
 
-    let sent = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    )
-    .await;
+    let sent = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await;
 
     assert!(sent.is_ok());
     assert_eq!(mock.calls_to(MockMethod::StickyEvent), secs(&[0, 7]));
@@ -416,7 +355,7 @@ async fn a_retry_after_past_the_lapse_reports_signalling_unreachable() {
     let sent = sticky(
         &outbox,
         &mock,
-        SendKind::DelayedLeaveRestart,
+        SendKind::DelayedLeave,
         SendPolicy::new().tolerance(Duration::from_secs(30)),
     );
     let observed = async {
@@ -442,13 +381,7 @@ async fn health_flips_on_the_first_transient_failure_and_the_first_success() {
 
     let sent = async {
         executor::sleep(Duration::from_secs(5)).await;
-        sticky(
-            &outbox,
-            &mock,
-            SendKind::MembershipRefresh,
-            SendPolicy::new(),
-        )
-        .await
+        sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()).await
     };
     let transitions = async {
         let mut seen = Vec::new();
@@ -489,18 +422,8 @@ async fn online_retries_every_pending_slot_at_once() {
 
     let sends = async {
         tokio::join!(
-            sticky(
-                &outbox,
-                &mock,
-                SendKind::MembershipRefresh,
-                SendPolicy::new()
-            ),
-            sticky(
-                &outbox,
-                &mock,
-                SendKind::DelayedLeaveRestart,
-                SendPolicy::new()
-            ),
+            sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new()),
+            sticky(&outbox, &mock, SendKind::DelayedLeave, SendPolicy::new()),
             sticky(&outbox, &mock, SendKind::Notification, SendPolicy::new()),
         )
     };
@@ -539,6 +462,22 @@ async fn offline_sets_signalling_unreachable_at_once() {
     );
 }
 
+/// R19: a quick offline/online flap still counts one recovery, though the
+/// health watch shows no change.
+#[tokio::test(start_paused = true)]
+async fn a_quick_flap_still_counts_a_recovery() {
+    let outbox = outbox();
+    let mut health = outbox.subscribe_health();
+    let mut recoveries = outbox.subscribe_recoveries();
+
+    outbox.report_connectivity(false);
+    outbox.report_connectivity(true);
+
+    assert_eq!(*health.borrow_and_update(), SignallingHealth::Reachable);
+    assert!(recoveries.has_changed().unwrap());
+    assert_eq!(*recoveries.borrow_and_update(), 1);
+}
+
 /// R11: "online" while reachable is a no-op: it wakes nothing.
 #[tokio::test(start_paused = true)]
 async fn online_while_reachable_wakes_nothing() {
@@ -546,12 +485,7 @@ async fn online_while_reachable_wakes_nothing() {
     let mock = Arc::new(MockBackend::new());
     mock.script(MockMethod::StickyEvent, [rate_limited(10_000)]);
 
-    let sent = sticky(
-        &outbox,
-        &mock,
-        SendKind::MembershipRefresh,
-        SendPolicy::new(),
-    );
+    let sent = sticky(&outbox, &mock, SendKind::Membership, SendPolicy::new());
     let online = async {
         executor::sleep(Duration::from_secs(2)).await;
         outbox.report_connectivity(true);
@@ -631,8 +565,8 @@ mod properties {
     }
 
     const KINDS: [SendKind; 3] = [
-        SendKind::MembershipRefresh,
-        SendKind::DelayedLeaveRestart,
+        SendKind::Membership,
+        SendKind::DelayedLeave,
         SendKind::Notification,
     ];
 

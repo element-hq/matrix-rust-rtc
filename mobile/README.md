@@ -152,7 +152,7 @@ stops it — **there is nothing to call.**
 | Clock | Default | Kept alive by |
 | --- | --- | --- |
 | Delayed leave (dead man's switch) | 30 s | Restarting its timer every 10 s |
-| Sticky-map entry for your membership | 1 h | Re-sending the membership once it is halfway to expiry |
+| Sticky-map entry for your membership | 1 h | Re-sending the membership once a third of it has passed |
 
 Both are configurable per join via `keepAliveTimeoutMs` and `stickyDurationMs`.
 Shortening `stickyDurationMs` buys nothing but extra traffic — the refresh

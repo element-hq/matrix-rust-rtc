@@ -16,6 +16,11 @@ log only.
 ### Added
 
 - `RtcClient` reports signalling health (`signalling_health`/`subscribe_signalling_health`, web `signallingHealth`/`onSignallingHealth`) and takes the host's `report_connectivity` (web `reportConnectivity`) (034 R9–R11).
+- `BaseRtcRoom::subscribe_own_membership_lapsed` reports when our membership has lapsed for the other members while our sends fail (034 R17).
+
+### Changed
+
+- Our membership's refresh, delayed-leave restart and re-arm are retried until they land, the refresh falls due at a third of the lifetime instead of half, and when signalling returns the library re-arms and republishes only what the outage lost (034 R1, R18, R19).
 
 ## v0.5.0-rc.5 - 2026-10-15
 
