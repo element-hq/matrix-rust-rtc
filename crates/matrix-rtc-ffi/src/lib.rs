@@ -298,6 +298,25 @@ impl RtcClient {
         })
     }
 
+    /// Whether the homeserver is answering the library's sends (034 R9).
+    pub fn signalling_health(&self) -> FfiSignallingHealth {
+        self.client.signalling_health().into()
+    }
+
+    /// Signalling health, current value first, then each change. Live from
+    /// the client, before any call or media exists.
+    pub fn subscribe_signalling_health(&self) -> Arc<SignallingHealthSubscription> {
+        SignallingHealthSubscription::new(self.client.subscribe_signalling_health())
+    }
+
+    /// Reports the host's Matrix client offline, or online once a request to
+    /// the homeserver has succeeded since it was offline — never on sync merely
+    /// starting (034 R11). Online retries every pending send at once. Optional:
+    /// a host that never reports leaves the library to its own sends.
+    pub fn report_connectivity(&self, online: bool) {
+        self.client.report_connectivity(online);
+    }
+
     /// Opens a room: the library subscribes to what the room needs in the
     /// given mode and applies its current state. Resolves once that state is
     /// applied, so a `join_call` issued afterwards sees it.
@@ -803,6 +822,55 @@ impl From<call::CallStatus> for FfiCallStatus {
     }
 }
 
+/// Whether the homeserver is answering the library's sends (034 R9). Distinct
+/// from the media `degraded` flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSignallingHealth {
+    Reachable,
+    /// Since the first transient failure of a library send, or the host's
+    /// offline report, in epoch milliseconds; stable until reachable again.
+    Unreachable {
+        since_ms: u64,
+    },
+}
+
+impl From<call::SignallingHealth> for FfiSignallingHealth {
+    fn from(value: call::SignallingHealth) -> Self {
+        match value {
+            call::SignallingHealth::Reachable => Self::Reachable,
+            call::SignallingHealth::Unreachable { since_ms } => Self::Unreachable { since_ms },
+        }
+    }
+}
+
+/// Signalling health, pulled with an async [`Self::next`] like the call status.
+#[derive(uniffi::Object)]
+pub struct SignallingHealthSubscription {
+    receiver: tokio::sync::Mutex<watch::Receiver<call::SignallingHealth>>,
+}
+
+impl SignallingHealthSubscription {
+    fn new(mut receiver: watch::Receiver<call::SignallingHealth>) -> Arc<Self> {
+        // The first `next` yields the health as it is now.
+        receiver.mark_changed();
+        Arc::new(Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl SignallingHealthSubscription {
+    /// The current health on the first call, then each change. `None` once
+    /// the client is gone.
+    pub async fn next(&self) -> Option<FfiSignallingHealth> {
+        let mut receiver = self.receiver.lock().await;
+        receiver.changed().await.ok()?;
+        let health = *receiver.borrow_and_update();
+        Some(health.into())
+    }
+}
+
 /// A call's status, pulled with an async [`Self::next`] like the roster.
 #[derive(uniffi::Object)]
 pub struct CallStatusSubscription {
@@ -1035,6 +1103,28 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// 034 C3, C4: health is live from the client, current value first, and
+    /// follows the host's connectivity report.
+    #[tokio::test]
+    async fn signalling_health_follows_the_connectivity_report() {
+        let client = RtcClient::new(MockHost::new());
+        let health = client.subscribe_signalling_health();
+        assert_eq!(health.next().await, Some(FfiSignallingHealth::Reachable));
+
+        client.report_connectivity(false);
+        let Some(FfiSignallingHealth::Unreachable { since_ms }) = health.next().await else {
+            panic!("offline is unreachable at once");
+        };
+        assert!(since_ms > 0);
+        assert_eq!(
+            client.signalling_health(),
+            FfiSignallingHealth::Unreachable { since_ms }
+        );
+
+        client.report_connectivity(true);
+        assert_eq!(health.next().await, Some(FfiSignallingHealth::Reachable));
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ mod host;
 mod join;
 mod maybe_send;
 mod membership_listener;
+pub mod outbox;
 mod own_membership;
 mod session;
 mod slot;
@@ -57,6 +58,7 @@ pub use join::{
 };
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
+pub use outbox::{Outbox, SendFailure, SendKind, SendPolicy, SignallingHealth, SlotKey};
 pub use own_membership::{
     DelayedLeaveSupport, KeepAliveInfo, MembershipTimings, OwnMembershipMachine,
     OwnMembershipState, transport_to_json,

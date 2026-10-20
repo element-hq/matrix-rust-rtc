@@ -11,6 +11,11 @@ log only.
 ### Breaking
 
 - `EventEncryption`'s `sender_cross_signed` is `sender_confirmed` (FFI `senderConfirmed`), the client's verdict on the sender under its own trust settings; `require_cross_signed_sender` is `require_confirmed_sender` and `KeyRejection::NotCrossSigned` is `SenderNotConfirmed` (web `sender_not_confirmed`).
+- `CommandError::SendError(String)` is `CommandError::Backend(BackendError)`, and `BackendError` (FFI `FfiBackendError.Failed`, web via `data.retry_after_ms` and `permanent`) gains `retry_after_ms` and `permanent`, so the library classifies a host's failure on its error code (034 R3).
+
+### Added
+
+- `RtcClient` reports signalling health (`signalling_health`/`subscribe_signalling_health`, web `signallingHealth`/`onSignallingHealth`) and takes the host's `report_connectivity` (web `reportConnectivity`) (034 R9–R11).
 
 ## v0.5.0-rc.5 - 2026-10-15
 

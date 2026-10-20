@@ -75,23 +75,26 @@ impl ToDeviceDelivery {
     }
 }
 
-/// A failure reported by the host's Matrix client, with the Matrix error code
-/// and HTTP status when it had them. The library classifies; the host does not.
+/// A failure reported by the host's Matrix client, with the Matrix error code,
+/// HTTP status and rate-limit delay when it had them. The library classifies
+/// ([`Self::is_permanent`]); the host only marks what its client knows is final
+/// and has no Matrix code for ([`Self::permanent`]).
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct BackendError {
     pub errcode: Option<String>,
     pub status: Option<u16>,
+    /// The server's `retry_after_ms`, from a rate-limit answer.
+    pub retry_after_ms: Option<u64>,
+    /// Set by the host for a condition its client knows cannot succeed, such
+    /// as a room the user is not in.
+    pub permanent: bool,
     pub message: String,
 }
 
 impl BackendError {
     pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            errcode: None,
-            status: None,
-            message: message.into(),
-        }
+        Self::with_matrix_error(None, None, message)
     }
 
     pub fn with_matrix_error(
@@ -102,8 +105,42 @@ impl BackendError {
         Self {
             errcode,
             status,
+            retry_after_ms: None,
+            permanent: false,
             message: message.into(),
         }
+    }
+
+    /// Carries the server's rate-limit delay.
+    pub fn with_retry_after_ms(mut self, retry_after_ms: Option<u64>) -> Self {
+        self.retry_after_ms = retry_after_ms;
+        self
+    }
+
+    /// Marks the failure final: the host's client knows it cannot succeed.
+    pub fn permanent(mut self) -> Self {
+        self.permanent = true;
+        self
+    }
+
+    /// Whether retrying cannot help (R3): the host marked it final, or it
+    /// carries a Matrix error code that denotes refusal. A rate limit, an
+    /// `M_UNKNOWN`, a code on a 5xx and no code at all are transient; the
+    /// status alone never decides.
+    pub fn is_permanent(&self) -> bool {
+        if self.permanent {
+            return true;
+        }
+        let Some(errcode) = self.errcode.as_deref() else {
+            return false;
+        };
+        let server_error = self.status.is_some_and(|status| status >= 500);
+        !matches!(errcode, "M_LIMIT_EXCEEDED" | "M_UNKNOWN") && !server_error
+    }
+
+    /// Whether the server rate-limited the send (R7).
+    pub fn is_rate_limited(&self) -> bool {
+        self.errcode.as_deref() == Some("M_LIMIT_EXCEEDED")
     }
 
     /// The default answer of a read-half method a backend did not override.

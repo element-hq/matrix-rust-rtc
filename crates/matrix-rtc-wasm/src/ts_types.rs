@@ -74,6 +74,12 @@ export interface RoomOptionsIn {
  * sticky events, state events and joined members every call carries the
  * room's complete current set, the first one on subscribe; an empty set
  * means none.
+ *
+ * A send rejects with whatever its client threw; the library reads `errcode`,
+ * `httpStatus` and `data.retry_after_ms` off a matrix-js-sdk `MatrixError`,
+ * and `permanent: true` set by the host on a failure its client knows is final
+ * and has no Matrix code for (a room the user is not in). Attempt each send
+ * once and settle within 30 s: the library does the retrying.
  */
 export interface MatrixBackendHost {
     ownUserId(): string;
@@ -101,6 +107,11 @@ export interface MatrixBackendHost {
     /** The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`; `[]` when the endpoint is missing. */
     rtcTransports(): Promise<unknown[]>;
 }
+
+/** Whether the homeserver is answering the library's sends; distinct from the media `degraded` flag. */
+export type RtcSignallingHealth =
+    | { type: "reachable" }
+    | { type: "unreachable"; since_ms: number };
 
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
 export type MembershipFormatMode = "current" | "sticky_2025" | "room_state";

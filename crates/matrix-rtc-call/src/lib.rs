@@ -27,6 +27,7 @@ pub mod transports;
 
 pub use client::{CallJoinOptions, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession};
 pub use direct_call::{CallKind, DECLINE_EVENT_TYPES, GroupNotify, RING_SEND_DEADLINE, RingConfig};
+pub use matrix_rtc_core::SignallingHealth;
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,

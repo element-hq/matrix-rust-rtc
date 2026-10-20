@@ -1744,7 +1744,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         let key_bytes = general_purpose::STANDARD
             .decode(&received.key_b64)
-            .map_err(|e| CommandError::SendError(format!("Failed to decode key: {}", e)))?;
+            .map_err(|e| {
+                CommandError::SerializationError(format!("Failed to decode key: {}", e))
+            })?;
 
         if key_bytes.len() != 32 {
             log::warn!(

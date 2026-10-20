@@ -28,7 +28,8 @@ use matrix_rtc_core::{
     ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
     LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError,
-    ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SlotEncryption, SlotState, TransportIntent,
+    ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SignallingHealth, SlotEncryption, SlotState,
+    TransportIntent,
     executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -233,6 +234,24 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
     /// the rooms (a media layer's token exchange).
     pub fn backend(&self) -> &Arc<DialectBackend<B>> {
         self.base.backend()
+    }
+
+    /// Whether the homeserver is answering the library's sends (034 R9).
+    pub fn signalling_health(&self) -> SignallingHealth {
+        self.base.signalling_health()
+    }
+
+    /// Signalling health, current value first; live before any call or media
+    /// exists.
+    pub fn subscribe_signalling_health(&self) -> watch::Receiver<SignallingHealth> {
+        self.base.subscribe_signalling_health()
+    }
+
+    /// The host reports its Matrix client offline, or online once a request
+    /// has succeeded since it was offline (R11). Optional: without it the
+    /// library goes by its own sends.
+    pub fn report_connectivity(&self, online: bool) {
+        self.base.report_connectivity(online);
     }
 
     /// Opens `room_id` (R2) through the core's

@@ -18,9 +18,11 @@ use matrix_rtc_core::{
 };
 use serde_json::Value;
 
-/// A failure reported by the host's Matrix client. Carry the Matrix `errcode`
-/// and HTTP status when the client has them: the library classifies them (a
-/// delayed-event refusal, for one); the host does not.
+/// A failure reported by the host's Matrix client. Carry the Matrix `errcode`,
+/// HTTP status and rate-limit `retry_after_ms` when the client has them: the
+/// library classifies them (034 R3, R7); the host does not. Set `permanent`
+/// only for a condition the client knows is final and has no Matrix code for,
+/// such as a room the user is not in: a permanent failure is never retried.
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum FfiBackendError {
     // `reason`, not `message`: Kotlin's generated exception already has a
@@ -29,33 +31,35 @@ pub enum FfiBackendError {
     Failed {
         errcode: Option<String>,
         status: Option<u16>,
+        retry_after_ms: Option<u64>,
+        permanent: bool,
         reason: String,
     },
 }
 
 impl FfiBackendError {
-    fn into_parts(self) -> (Option<String>, Option<u16>, String) {
+    fn into_backend_error(self) -> BackendError {
         match self {
             Self::Failed {
                 errcode,
                 status,
+                retry_after_ms,
+                permanent,
                 reason,
-            } => (errcode, status, reason),
+            } => {
+                let error = BackendError::with_matrix_error(errcode, status, reason)
+                    .with_retry_after_ms(retry_after_ms);
+                if permanent { error.permanent() } else { error }
+            }
         }
     }
 
-    fn into_backend_error(self) -> BackendError {
-        let (errcode, status, message) = self.into_parts();
-        BackendError::with_matrix_error(errcode, status, message)
-    }
-
     fn into_send_error(self) -> CommandError {
-        CommandError::SendError(self.into_parts().2)
+        CommandError::Backend(self.into_backend_error())
     }
 
     fn into_delayed_error(self) -> CommandError {
-        let (errcode, status, message) = self.into_parts();
-        CommandError::delayed_event_failure(errcode.as_deref(), status, message)
+        CommandError::delayed_event_failure(self.into_backend_error())
     }
 }
 
@@ -68,6 +72,8 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for FfiBackendError {
         Self::Failed {
             errcode: None,
             status: None,
+            retry_after_ms: None,
+            permanent: false,
             reason: format!("the host threw an unexpected error: {}", error.reason),
         }
     }
@@ -837,6 +843,8 @@ pub(crate) mod test_support {
                 .then(|| FfiBackendError::Failed {
                     errcode: Some("M_FORBIDDEN".to_owned()),
                     status: Some(403),
+                    retry_after_ms: None,
+                    permanent: false,
                     reason: "Sending delayed events has been disallowed".to_owned(),
                 })
         }
@@ -1032,9 +1040,15 @@ mod tests {
         let FfiBackendError::Failed {
             errcode,
             status,
+            retry_after_ms,
+            permanent,
             reason,
         } = lifted.expect_err("an error");
-        assert_eq!((errcode, status), (None, None));
+        assert_eq!((errcode, status, retry_after_ms), (None, None, None));
+        assert!(
+            !permanent,
+            "an exception the host did not describe is transient"
+        );
         assert!(reason.contains("java.io.IOException: boom"), "{reason}");
     }
 }

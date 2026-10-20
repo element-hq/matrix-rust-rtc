@@ -7,7 +7,7 @@
 //! DTO so the serde shape is ours to keep, whatever the call layer's enums
 //! become.
 
-use matrix_rtc_call::{CallEnd, CallStatus, MediaPhase, RingPhase};
+use matrix_rtc_call::{CallEnd, CallStatus, MediaPhase, RingPhase, SignallingHealth};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -83,6 +83,23 @@ impl From<CallStatus> for WasmCallStatus {
                 };
                 Self::Ended { reason, message }
             }
+        }
+    }
+}
+
+/// `RtcSignallingHealth` in `ts_types`.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum WasmSignallingHealth {
+    Reachable,
+    Unreachable { since_ms: u64 },
+}
+
+impl From<SignallingHealth> for WasmSignallingHealth {
+    fn from(value: SignallingHealth) -> Self {
+        match value {
+            SignallingHealth::Reachable => Self::Reachable,
+            SignallingHealth::Unreachable { since_ms } => Self::Unreachable { since_ms },
         }
     }
 }

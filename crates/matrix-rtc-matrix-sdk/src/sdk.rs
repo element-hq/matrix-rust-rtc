@@ -26,12 +26,13 @@ use matrix_sdk::deserialized_responses::{
 use matrix_sdk::encryption::identities::Device;
 use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::room::{IncludeRelations, RelationsOptions};
+use matrix_sdk::ruma;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::{
     DelayParameters, delayed_message_event, delayed_state_event, update_delayed_event,
 };
 use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
-use matrix_sdk::ruma::api::error::ErrorKind;
+use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::{
     AnyMessageLikeEventContent, AnyStateEventContent, AnySyncMessageLikeEvent, AnyToDeviceEvent,
@@ -58,8 +59,56 @@ use tokio::task::JoinHandle;
 // query parameters on the same `PUT /send`, but ruma's request types cannot
 // express both, and neither MSC states that the two compose.
 
-fn command_error(error: impl std::fmt::Display) -> CommandError {
-    CommandError::from_message(error.to_string())
+/// An SDK error that may carry the server's standard error body.
+trait ClientApiError: std::fmt::Display {
+    fn client_api_error(&self) -> Option<&ruma::api::error::Error>;
+}
+
+impl ClientApiError for matrix_sdk::Error {
+    fn client_api_error(&self) -> Option<&ruma::api::error::Error> {
+        self.as_client_api_error()
+    }
+}
+
+impl ClientApiError for matrix_sdk::HttpError {
+    fn client_api_error(&self) -> Option<&ruma::api::error::Error> {
+        self.as_client_api_error()
+    }
+}
+
+/// What the homeserver said, for the core to classify (034 R3, R7): the
+/// `errcode`, the HTTP status and a rate limit's delay. The SDK's own request
+/// config still retries underneath, bounded by [`rtc_request_config`].
+fn sdk_backend_error(error: &impl ClientApiError) -> BackendError {
+    let api_error = error.client_api_error();
+    let kind = api_error.and_then(ruma::api::error::Error::error_kind);
+    let retry_after_ms = match kind {
+        Some(ErrorKind::LimitExceeded(limit)) => limit.retry_after.as_ref().map(|retry_after| {
+            let delay = match retry_after {
+                RetryAfter::Delay(delay) => *delay,
+                RetryAfter::DateTime(at) => at
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default(),
+            };
+            delay.as_millis() as u64
+        }),
+        _ => None,
+    };
+    BackendError::with_matrix_error(
+        kind.map(|kind| kind.errcode().to_string()),
+        api_error.map(|error| error.status_code.as_u16()),
+        error.to_string(),
+    )
+    .with_retry_after_ms(retry_after_ms)
+}
+
+fn command_error(error: impl ClientApiError) -> CommandError {
+    CommandError::Backend(sdk_backend_error(&error))
+}
+
+/// A request this backend could not even build: final, nothing to retry.
+fn local_error(error: impl std::fmt::Display) -> CommandError {
+    CommandError::ClientRejected(error.to_string())
 }
 
 /// [`command_error`] for the MSC4140 endpoints: `M_UNRECOGNIZED` is a
@@ -85,15 +134,17 @@ fn wire_event_type(event_type: String) -> MessageLikeEventType {
     MessageLikeEventType::from(event_type)
 }
 
-/// Bounded request behaviour for RTC signalling sends: the SDK default
-/// retries without limit, which turns a wedged homeserver into a send that
-/// never returns. Five attempts let a rate limit clear (a join is two events,
-/// and synapse's default burst is ten) while a dead homeserver still fails in
-/// readable time; the waits are the server's own `Retry-After`.
+/// Bounded request behaviour for RTC signalling sends, kept inside the core's
+/// 30 s attempt deadline (034 R2): the core's outbox does the retrying. The
+/// SDK's one retry resends the same request, so the same transaction id, and
+/// cannot duplicate an event whose first attempt landed but timed out. 10 s
+/// is far past a large homeserver's send time (250–700 ms, tail to ~3 s);
+/// two attempts with the SDK's 500 ms backoff fit in about 21 s. A rate limit
+/// still makes the SDK wait the server's `Retry-After` before its retry.
 fn rtc_request_config() -> matrix_sdk::config::RequestConfig {
     matrix_sdk::config::RequestConfig::new()
-        .timeout(Duration::from_secs(15))
-        .retry_limit(5)
+        .timeout(Duration::from_secs(10))
+        .retry_limit(2)
 }
 
 /// How long wakes are coalesced before a room's subjects are re-read: a sync
@@ -119,10 +170,13 @@ impl SdkMatrixBackend {
     }
 
     fn room(&self, room_id: &str) -> Result<Room, CommandError> {
-        let room_id = RoomId::parse(room_id).map_err(command_error)?;
-        self.client
-            .get_room(&room_id)
-            .ok_or_else(|| CommandError::from_message(format!("room {room_id} not found")))
+        let room_id = RoomId::parse(room_id).map_err(local_error)?;
+        // The client knows the room; one it does not know is final (R3).
+        self.client.get_room(&room_id).ok_or_else(|| {
+            CommandError::Backend(
+                BackendError::new(format!("room {room_id} not found")).permanent(),
+            )
+        })
     }
 
     fn room_for_read(&self, room_id: &str) -> Result<Room, BackendError> {
@@ -280,11 +334,11 @@ impl MatrixBackend for SdkMatrixBackend {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        let room_id = RoomId::parse(&room_id).map_err(command_error)?;
+        let room_id = RoomId::parse(&room_id).map_err(local_error)?;
         let delay = DelayParameters::Timeout {
             timeout: Duration::from_millis(delay_ms),
         };
-        let raw = serde_json::value::to_raw_value(&content).map_err(command_error)?;
+        let raw = serde_json::value::to_raw_value(&content).map_err(local_error)?;
 
         // Returns the MSC4140 delay id, which is what restart/cancel take.
         let delay_id = match state_key {
@@ -417,7 +471,7 @@ impl MatrixBackend for SdkMatrixBackend {
         }
 
         let raw: Raw<AnyToDeviceEventContent> =
-            Raw::new(&content).map_err(command_error)?.cast_unchecked();
+            Raw::new(&content).map_err(local_error)?.cast_unchecked();
         let failures = encryption
             .encrypt_and_send_raw_to_device(
                 devices.iter().collect(),
@@ -465,7 +519,7 @@ impl MatrixBackend for SdkMatrixBackend {
         // through here, as time-critical as the sticky one. The type is
         // normalised through ruma, which registers `m.rtc.slot` as
         // an alias of the MSC4143 id.
-        let raw = serde_json::value::to_raw_value(&content).map_err(command_error)?;
+        let raw = serde_json::value::to_raw_value(&content).map_err(local_error)?;
         let request = send_state_event::v3::Request::new_raw(
             room.room_id().to_owned(),
             StateEventType::from(event_type),
@@ -498,7 +552,7 @@ impl MatrixBackend for SdkMatrixBackend {
         reason: Option<String>,
     ) -> Result<(), CommandError> {
         let room = self.room(&room_id)?;
-        let event_id = EventId::parse(&event_id).map_err(command_error)?;
+        let event_id = EventId::parse(&event_id).map_err(local_error)?;
         room.redact(&event_id, reason.as_deref(), None)
             .await
             .map_err(command_error)?;
