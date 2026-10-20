@@ -1033,6 +1033,22 @@ impl<B: MatrixBackend + 'static> RtcCall<B> {
         }
     }
 
+    /// The client's signalling health (034 R9), for the call's media to
+    /// report beside its own.
+    pub async fn subscribe_signalling_health(&self) -> watch::Receiver<SignallingHealth> {
+        self.state.lock().await.rtc().outbox().subscribe_health()
+    }
+
+    /// Whether our membership has lapsed for the other members (034 R17);
+    /// `None` once we are no longer joined.
+    pub async fn subscribe_own_membership_lapsed(&self) -> Option<watch::Receiver<bool>> {
+        self.state
+            .lock()
+            .await
+            .rtc()
+            .subscribe_own_membership_lapsed(&self.slot_id)
+    }
+
     /// The slot's raised hands, oldest first.
     pub async fn raised_hands(&self) -> Vec<RaisedHand> {
         self.state

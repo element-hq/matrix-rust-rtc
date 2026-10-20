@@ -37,8 +37,8 @@ pub mod stats;
 pub mod stream;
 
 pub use connection::{
-    ConnectionContext, ConnectionEvent, FrameEncryptionState, FrameStream, MediaTransport,
-    OwnFocusTransport, OwnMemberClaims, RemoteTrackHandle, SpeakingParticipant,
+    ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, FrameStream,
+    MediaTransport, OwnFocusTransport, OwnMemberClaims, RemoteTrackHandle, SpeakingParticipant,
     TransportConnection, TransportError,
 };
 pub use constraints::{

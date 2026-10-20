@@ -121,6 +121,8 @@ where
     let raised_hands = call.subscribe_raised_hands().await;
     let reactions = call.subscribe_reactions().await;
     let ended = call.subscribe_ended();
+    let signalling = call.subscribe_signalling_health().await;
+    let own_membership_lapsed = call.subscribe_own_membership_lapsed().await;
 
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
@@ -159,6 +161,8 @@ where
             ended: Some(ended),
             media_status: Some(call.media_status_reporter()),
             stability: options.stability,
+            signalling: Some(signalling),
+            own_membership_lapsed,
         },
         memberships,
     );

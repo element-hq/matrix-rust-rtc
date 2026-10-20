@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use super::session::{MediaSessionConfig, connect_media_session};
 use super::types::{
-    FfiLocalState, FfiMediaConstraints, FfiQualityLimitation, FfiSendStats, FfiStreamKind,
-    FfiStreamRef, FfiTileId, FfiTileRoster, FfiVideoDetail, zip_stream_stats,
+    FfiConnectionState, FfiInterruptions, FfiLocalState, FfiMediaConstraints, FfiQualityLimitation,
+    FfiSendStats, FfiStreamKind, FfiStreamRef, FfiTileId, FfiTileRoster, FfiVideoDetail,
+    zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 
@@ -213,12 +214,45 @@ fn participant(id: &str) -> matrix_rtc_call_sdk::Participant {
         user_id: format!("@{id}:example.org"),
         device_id: None,
         is_local: false,
-        reachable: true,
+        connection: matrix_rtc_call_sdk::ConnectionState::Connected,
+        decryptable: true,
         streams: vec![],
         hand_raised_at_ms: None,
         hand_raised_position: None,
         joined_at_ms: None,
     }
+}
+
+/// 034 C5, C6: the interruptions record and the connection state cross the
+/// FFI field for field.
+#[test]
+fn interruptions_cross_the_ffi_cause_by_cause() {
+    use matrix_rtc_call_sdk::{ConnectionState, Interruptions};
+    let record = Interruptions {
+        signalling: matrix_rtc_call::SignallingHealth::Unreachable { since_ms: 7 },
+        own_membership_lapsed: true,
+        own_media: ConnectionState::Reconnecting,
+        members_reconnecting: vec!["bob".to_owned()],
+        members_unreachable: vec!["carol".to_owned()],
+        undecryptable: vec!["dave".to_owned()],
+        unmappable: vec!["id-erin".to_owned()],
+    };
+    assert_eq!(
+        FfiInterruptions::from(record),
+        FfiInterruptions {
+            signalling: crate::FfiSignallingHealth::Unreachable { since_ms: 7 },
+            own_membership_lapsed: true,
+            own_media: FfiConnectionState::Reconnecting,
+            members_reconnecting: vec!["bob".to_owned()],
+            members_unreachable: vec!["carol".to_owned()],
+            undecryptable: vec!["dave".to_owned()],
+            unmappable: vec!["id-erin".to_owned()],
+        }
+    );
+    assert_eq!(
+        FfiInterruptions::from(Interruptions::default()).own_media,
+        FfiConnectionState::Connected
+    );
 }
 
 #[test]

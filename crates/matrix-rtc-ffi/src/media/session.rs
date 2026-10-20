@@ -21,9 +21,9 @@ use matrix_rtc_transport::{MediaStreamKind, TransportConnection as _};
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
-    FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
-    FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef, FfiStreamStats, FfiTileId,
-    FfiTileRoster, zip_stream_stats,
+    FfiCallEvent, FfiInterruptions, FfiLocalState, FfiMediaConstraints, FfiParticipant,
+    FfiPublishOptions, FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef,
+    FfiStreamStats, FfiTileId, FfiTileRoster, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcCall;
@@ -101,6 +101,7 @@ async fn build_media_session(
 
     let tiles = engine.subscribe_tiles();
     let local = engine.subscribe_local_state();
+    let interruptions = engine.subscribe_interruptions();
     Ok(Arc::new(MediaSession {
         engine,
         connection: own_connection,
@@ -108,6 +109,7 @@ async fn build_media_session(
         events: TokioMutex::new(events),
         tiles: TokioMutex::new(tiles),
         local: TokioMutex::new(local),
+        interruptions: TokioMutex::new(interruptions),
         own_identity,
     }))
 }
@@ -128,6 +130,7 @@ pub struct MediaSession {
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
     tiles: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::TileRoster>>,
     local: TokioMutex<watch::Receiver<Option<matrix_rtc_call_sdk::LocalState>>>,
+    interruptions: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::Interruptions>>,
     own_identity: String,
 }
 
@@ -209,6 +212,22 @@ impl MediaSession {
     /// is on the roster.
     pub fn local_state(&self) -> Option<FfiLocalState> {
         self.engine.local_state().map(Into::into)
+    }
+
+    /// What is interrupting the call now, cause by cause (034 R38).
+    /// Contract C5.
+    pub fn interruptions(&self) -> FfiInterruptions {
+        self.engine.interruptions().into()
+    }
+
+    /// The next interruptions record. Suspends until it changes; `None`
+    /// means the session is over. Latest-value-wins, as
+    /// [`Self::next_roster`]; for any one change it comes after the roster
+    /// and local state, so the tiles read on waking already agree with it.
+    pub async fn next_interruptions(&self) -> Option<FfiInterruptions> {
+        let mut interruptions = self.interruptions.lock().await;
+        interruptions.changed().await.ok()?;
+        Some(interruptions.borrow_and_update().clone().into())
     }
 
     /// Declare which tiles get full records in [`FfiTileRoster::detail`]:

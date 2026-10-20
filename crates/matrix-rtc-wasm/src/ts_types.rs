@@ -113,6 +113,21 @@ export type RtcSignallingHealth =
     | { type: "reachable" }
     | { type: "unreachable"; since_ms: number };
 
+/** The connection carrying someone's media (034 R23, R28). */
+export type RtcConnectionState = "connected" | "reconnecting" | "unreachable";
+
+/** What is interrupting the call now, cause by cause (034 R38); empty when nothing is. Member lists hold `member_id`s, `unmappable` transport identities. */
+export interface RtcInterruptions {
+    signalling: RtcSignallingHealth;
+    own_membership_lapsed: boolean;
+    /** Our own SFU, from the first value, before our own entry is on the roster. */
+    own_media: RtcConnectionState;
+    members_reconnecting: string[];
+    members_unreachable: string[];
+    undecryptable: string[];
+    unmappable: string[];
+}
+
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
 export type MembershipFormatMode = "current" | "sticky_2025" | "room_state";
 
@@ -122,7 +137,10 @@ export interface RtcParticipant {
     user_id: string;
     device_id: string | null;
     is_local: boolean;
-    reachable: boolean;
+    /** The connection carrying their media; for our own entry, our own SFU's. */
+    connection: RtcConnectionState;
+    /** Whether their media decrypts; always true for our own entry. Draw the avatar when false or not connected. */
+    decryptable: boolean;
     /** The livekit-js participant identity — the join key for `room.getParticipantByIdentity()`. */
     rtc_identity: string | null;
     streams: { kind: RtcStreamKind; muted: boolean }[];
@@ -219,6 +237,8 @@ export interface MediaDelegate {
     onEvent?(event: RtcCallEvent): void;
     /** The call's status: as it is first, then each change, last the end. */
     onStatus?(status: RtcCallStatus): void;
+    /** What is interrupting the call: as it is first, then each change, after the roster of the same change. */
+    onInterruptions?(record: RtcInterruptions): void;
 }
 
 /** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */

@@ -26,19 +26,20 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_call::{MediaStatusReporter, RaisedHand, ReceivedReaction};
+use matrix_rtc_call::{MediaStatusReporter, RaisedHand, ReceivedReaction, SignallingHealth};
 use matrix_rtc_core::{DiscardedKey, JoinedMembership, LeaveReason};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use matrix_rtc_core::executor as rt;
 use matrix_rtc_transport::pool::{MediaPool, PoolConfig, PoolEvent, PoolMessage, RemoteTracks};
 use matrix_rtc_transport::{
-    ConnectionContext, ConnectionEvent, FrameEncryptionState, LocalTrackHandle, MediaConstraints,
-    MediaStreamKind, MediaTransport, PublishOptions, ReceiveStats, RemoteTrackHandle,
-    TransportConnection, TransportError,
+    ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, LocalTrackHandle,
+    MediaConstraints, MediaStreamKind, MediaTransport, PublishOptions, ReceiveStats,
+    RemoteTrackHandle, TransportConnection, TransportError,
 };
 
 use crate::event::{CallEvent, FrameEncryptionDiagnostic, SpeakingMember};
+use crate::interruptions::Interruptions;
 use crate::participant::{Participant, StreamState};
 use crate::tile::{
     CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
@@ -112,6 +113,14 @@ pub struct EngineConfig {
     pub media_status: Option<MediaStatusReporter>,
     /// Damping of the tile order; see [`StabilityConfig`].
     pub stability: StabilityConfig,
+    /// The client's signalling health (`RtcCall::subscribe_signalling_health`),
+    /// copied into [`Interruptions::signalling`]. `None` reports it reachable.
+    pub signalling: Option<watch::Receiver<SignallingHealth>>,
+    /// Whether our membership has lapsed for the other members
+    /// (`RtcCall::subscribe_own_membership_lapsed`, 034 R17): our
+    /// publications are paused at the transport while it is. `None` relies
+    /// on the snapshots alone.
+    pub own_membership_lapsed: Option<watch::Receiver<bool>>,
 }
 
 /// Everything the engine can be told from outside its actor task.
@@ -220,6 +229,7 @@ pub struct CallEngine {
     participants_rx: watch::Receiver<Vec<Participant>>,
     tiles_rx: watch::Receiver<TileRoster>,
     local_rx: watch::Receiver<Option<LocalState>>,
+    interruptions_rx: watch::Receiver<Interruptions>,
     tracks: RemoteTracks,
     task: rt::JoinHandle<()>,
 }
@@ -253,6 +263,11 @@ impl CallEngine {
             own_connection_key: config.own_connection_key,
         });
         let tracks = pool.remote_tracks();
+        // Present from the first value: our own SFU before our tile exists.
+        let (interruptions_tx, interruptions_rx) = watch::channel(Interruptions {
+            own_media: pool.own_connection_state(),
+            ..Interruptions::default()
+        });
 
         let actor = Actor {
             pool,
@@ -262,6 +277,10 @@ impl CallEngine {
             participants_tx,
             tiles_tx,
             local_tx,
+            interruptions_tx,
+            signalling: SignallingHealth::Reachable,
+            core_lapsed: false,
+            observed_lapse: false,
             window: DetailWindow::default(),
             ranking_threshold: 0,
             speaking: HashSet::new(),
@@ -283,9 +302,13 @@ impl CallEngine {
             memberships,
             messages_rx,
             pool_inbox,
-            config.raised_hands,
-            config.reactions,
-            config.ended,
+            ActorInputs {
+                raised_hands: config.raised_hands,
+                reactions: config.reactions,
+                ended: config.ended,
+                signalling: config.signalling,
+                lapsed: config.own_membership_lapsed,
+            },
         ));
 
         CallEngine {
@@ -295,6 +318,7 @@ impl CallEngine {
             participants_rx,
             tiles_rx,
             local_rx,
+            interruptions_rx,
             tracks,
             task,
         }
@@ -354,6 +378,18 @@ impl CallEngine {
     /// Watch our local state.
     pub fn subscribe_local_state(&self) -> watch::Receiver<Option<LocalState>> {
         self.local_rx.clone()
+    }
+
+    /// What is interrupting the call now, cause by cause (034 R38).
+    pub fn interruptions(&self) -> Interruptions {
+        self.interruptions_rx.borrow().clone()
+    }
+
+    /// Watch [`Self::interruptions`]. For any one change it moves after the
+    /// participants, tiles and local state, so a reader woken by it reads
+    /// those already agreeing with it.
+    pub fn subscribe_interruptions(&self) -> watch::Receiver<Interruptions> {
+        self.interruptions_rx.clone()
     }
 
     /// Declare which tiles get full records: ranks `[offset, offset + len)`
@@ -575,6 +611,14 @@ struct Actor {
     participants_tx: watch::Sender<Vec<Participant>>,
     tiles_tx: watch::Sender<TileRoster>,
     local_tx: watch::Sender<Option<LocalState>>,
+    interruptions_tx: watch::Sender<Interruptions>,
+    /// Copied into the interruptions record.
+    signalling: SignallingHealth,
+    /// The core's prediction that our membership has lapsed (034 R17).
+    core_lapsed: bool,
+    /// A snapshot without us arrived after we had arrived, while the call is
+    /// live: the lapse observed, which beats the prediction.
+    observed_lapse: bool,
     /// Which tiles get full records. Defaults to everything.
     window: DetailWindow,
     /// At or below this many remote tiles, activity does not reorder them.
@@ -628,6 +672,16 @@ struct Actor {
     ended: bool,
 }
 
+/// What the actor follows besides the memberships and its own mailboxes,
+/// each optional (see [`EngineConfig`]).
+struct ActorInputs {
+    raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
+    reactions: Option<broadcast::Receiver<ReceivedReaction>>,
+    ended: Option<watch::Receiver<Option<LeaveReason>>>,
+    signalling: Option<watch::Receiver<SignallingHealth>>,
+    lapsed: Option<watch::Receiver<bool>>,
+}
+
 /// One of our own live publications.
 ///
 /// The mute state is kept here rather than read back from the handle:
@@ -635,7 +689,11 @@ struct Actor {
 /// entry when our membership lands after the publish.
 struct LocalPublication {
     track: Arc<dyn LocalTrackHandle>,
+    /// The user's mute: what the roster shows.
     muted: bool,
+    /// What the transport was last told: the user's mute, or the lapse's
+    /// pause on top of it (034 R17).
+    applied_muted: bool,
 }
 
 /// Waits for the raised-hands watch to change; never resolves when there is
@@ -647,6 +705,16 @@ async fn hands_changed(
         Some(hands) => hands.changed().await,
         None => std::future::pending().await,
     }
+}
+
+/// The next value of an optional watch; `None` once its sender is gone.
+/// Never resolves without a receiver.
+async fn watch_changed<T: Clone>(receiver: &mut Option<watch::Receiver<T>>) -> Option<T> {
+    let Some(receiver) = receiver else {
+        return std::future::pending().await;
+    };
+    receiver.changed().await.ok()?;
+    Some(receiver.borrow_and_update().clone())
 }
 
 /// Resolves once the participation has ended; `None` once the channel closes.
@@ -688,11 +756,22 @@ impl Actor {
         mut memberships: watch::Receiver<Vec<JoinedMembership>>,
         mut messages: mpsc::UnboundedReceiver<ActorMessage>,
         mut pool_inbox: mpsc::UnboundedReceiver<PoolMessage>,
-        mut raised_hands: Option<watch::Receiver<Vec<RaisedHand>>>,
-        mut reactions: Option<broadcast::Receiver<ReceivedReaction>>,
-        mut ended: Option<watch::Receiver<Option<LeaveReason>>>,
+        inputs: ActorInputs,
     ) {
+        let ActorInputs {
+            mut raised_hands,
+            mut reactions,
+            mut ended,
+            mut signalling,
+            mut lapsed,
+        } = inputs;
         // The watch channels always have a value; start from it.
+        if let Some(signalling) = signalling.as_mut() {
+            self.signalling = *signalling.borrow_and_update();
+        }
+        if let Some(lapsed) = lapsed.as_mut() {
+            self.core_lapsed = *lapsed.borrow_and_update();
+        }
         let initial = memberships.borrow_and_update().clone();
         self.apply_snapshot(initial);
         if let Some(hands) = raised_hands.as_mut() {
@@ -700,9 +779,18 @@ impl Actor {
             self.apply_raised_hands(initial, false);
         }
 
+        self.sync_media_state();
         let mut memberships_open = true;
         loop {
             tokio::select! {
+                changed = watch_changed(&mut signalling) => match changed {
+                    Some(health) => self.signalling = health,
+                    None => signalling = None,
+                },
+                changed = watch_changed(&mut lapsed) => match changed {
+                    Some(core_lapsed) => self.core_lapsed = core_lapsed,
+                    None => lapsed = None,
+                },
                 changed = memberships.changed(), if memberships_open => match changed {
                     Ok(()) => {
                         let snapshot = memberships.borrow_and_update().clone();
@@ -750,6 +838,106 @@ impl Actor {
                     // All senders gone: the engine handle was dropped.
                     None => break,
                 },
+            }
+            self.sync_media_state();
+        }
+    }
+
+    // ---- interruptions -----------------------------------------------------
+
+    /// Whether our membership has lapsed, predicted or observed (034 R17).
+    fn lapsed(&self) -> bool {
+        (self.core_lapsed || self.observed_lapse) && !self.ended
+    }
+
+    /// Brings what every change can move into line, once per actor turn: each
+    /// roster entry's connection and decryptability, the pause of our
+    /// publications, and last the interruptions record, so it never runs
+    /// ahead of the roster and tiles it describes (034 R38).
+    fn sync_media_state(&mut self) {
+        let own_media = self.pool.own_connection_state();
+        let mut changed = false;
+        for participant in &mut self.roster {
+            let (connection, decryptable) = if participant.is_local {
+                (own_media, true)
+            } else {
+                (
+                    self.pool
+                        .member_connection(&participant.member_id)
+                        .unwrap_or_default(),
+                    self.encryption_states
+                        .get(&participant.member_id)
+                        .is_none_or(|state| !state.is_failure()),
+                )
+            };
+            if participant.connection != connection || participant.decryptable != decryptable {
+                participant.connection = connection;
+                participant.decryptable = decryptable;
+                changed = true;
+            }
+        }
+        if changed {
+            self.publish_roster();
+        }
+        self.apply_pause();
+
+        let remote = || self.roster.iter().filter(|p| !p.is_local);
+        let mut record = Interruptions {
+            signalling: self.signalling,
+            own_membership_lapsed: self.lapsed(),
+            own_media,
+            members_reconnecting: remote()
+                .filter(|p| p.connection == ConnectionState::Reconnecting)
+                .map(|p| p.member_id.clone())
+                .collect(),
+            members_unreachable: remote()
+                .filter(|p| p.connection == ConnectionState::Unreachable)
+                .map(|p| p.member_id.clone())
+                .collect(),
+            undecryptable: remote()
+                .filter(|p| !p.decryptable)
+                .map(|p| p.member_id.clone())
+                .collect(),
+            unmappable: self.pool.unmappable(),
+        };
+        record.members_reconnecting.sort();
+        record.members_unreachable.sort();
+        record.undecryptable.sort();
+        self.interruptions_tx.send_if_modified(|current| {
+            if *current == record {
+                return false;
+            }
+            log::info!("interruptions: {record:?}");
+            *current = record;
+            true
+        });
+    }
+
+    /// While our membership has lapsed, every publication is muted at the
+    /// transport, peers having dropped us: the user's own mute is kept apart
+    /// in `LocalPublication::muted`, so the roster never moves and a track
+    /// comes back unmuted only if the user had not muted it (034 R17).
+    fn apply_pause(&mut self) {
+        let paused = self.lapsed();
+        for (kind, publication) in &mut self.local_tracks {
+            let effective = publication.muted || paused;
+            if publication.applied_muted == effective {
+                continue;
+            }
+            match publication.track.set_muted(effective) {
+                Ok(()) => {
+                    log::info!(
+                        "{kind:?} {} at the transport ({})",
+                        if effective { "paused" } else { "resumed" },
+                        if paused {
+                            "our membership lapsed"
+                        } else {
+                            "our membership is back"
+                        },
+                    );
+                    publication.applied_muted = effective;
+                }
+                Err(error) => log::warn!("could not pause/resume {kind:?}: {error}"),
             }
         }
     }
@@ -817,8 +1005,14 @@ impl Actor {
                 }
             }
             ActorMessage::LocalPublished { kind, muted, track } => {
-                self.local_tracks
-                    .insert(kind, LocalPublication { track, muted });
+                self.local_tracks.insert(
+                    kind,
+                    LocalPublication {
+                        track,
+                        muted,
+                        applied_muted: muted,
+                    },
+                );
                 let own_member_id = self.own_member_id.clone();
                 self.add_local_stream(&own_member_id, kind);
             }
@@ -827,8 +1021,11 @@ impl Actor {
                 muted,
                 respond,
             } => {
+                // A mute set while paused holds, and only reaches the
+                // transport once the pause would not override it (034 R17).
+                let paused = self.lapsed();
                 let outcome = match self.local_tracks.get(&kind) {
-                    Some(publication) => publication.track.set_muted(muted),
+                    Some(publication) => publication.track.set_muted(muted || paused),
                     None => Err(TransportError::Unsupported(format!(
                         "nothing of kind {kind:?} is published locally"
                     ))),
@@ -840,6 +1037,7 @@ impl Actor {
                     // `add_member` can seed it from.
                     if let Some(publication) = self.local_tracks.get_mut(&kind) {
                         publication.muted = muted;
+                        publication.applied_muted = muted || paused;
                     }
                     let own_member_id = self.own_member_id.clone();
                     self.set_member_muted(&own_member_id, kind, muted);
@@ -931,9 +1129,11 @@ impl Actor {
         // Announced once we have arrived, and never after the call ended for
         // us (see `arrived`).
         let announce = self.arrived && !self.ended;
-        self.arrived |= snapshot
+        let with_us = snapshot
             .iter()
             .any(|member| member.member_id == self.own_member_id);
+        self.arrived |= with_us;
+        self.observed_lapse = self.arrived && !with_us;
         let own_member_id = self.own_member_id.clone();
         let announce_for =
             |member_id: &str, count: u32| (announce && member_id != own_member_id).then_some(count);
@@ -1029,6 +1229,12 @@ impl Actor {
                 PoolEvent::UnknownParticipant { identity } => {
                     self.emit(CallEvent::UnknownParticipant { identity });
                 }
+                // Read back per member by `sync_media_state` at the end of
+                // the turn.
+                PoolEvent::ConnectionState {
+                    connection_key,
+                    state,
+                } => log::info!("media connection {connection_key} is {state:?}"),
                 PoolEvent::Degraded(degraded) => {
                     if let Some(status) = &self.media_status {
                         status.degraded(degraded);
@@ -1108,7 +1314,14 @@ impl Actor {
             user_id: member.sender.clone(),
             device_id: member.origin.sender_device_id().map(str::to_owned),
             is_local: member.member_id == self.own_member_id,
-            reachable,
+            // Settled by `sync_media_state` at the end of this turn, before
+            // anything is read from the roster.
+            connection: if reachable {
+                ConnectionState::Connected
+            } else {
+                ConnectionState::Unreachable
+            },
+            decryptable: true,
             streams: own_streams.clone(),
             hand_raised_at_ms,
             hand_raised_position: None,
@@ -1884,6 +2097,8 @@ mod tests {
         raised_hands: watch::Sender<Vec<RaisedHand>>,
         reactions: broadcast::Sender<ReceivedReaction>,
         ended: watch::Sender<Option<LeaveReason>>,
+        signalling: watch::Sender<SignallingHealth>,
+        lapsed: watch::Sender<bool>,
         /// The status a call would show, our media already connected.
         status: watch::Receiver<CallStatus>,
         state: Arc<TransportState>,
@@ -1907,6 +2122,8 @@ mod tests {
         let (raised_hands, raised_hands_rx) = watch::channel(Vec::new());
         let (reactions, reactions_rx) = broadcast::channel(8);
         let (ended, ended_rx) = watch::channel(None);
+        let (signalling, signalling_rx) = watch::channel(SignallingHealth::Reachable);
+        let (lapsed, lapsed_rx) = watch::channel(false);
         let (media_status, status) = MediaStatusReporter::standalone();
         media_status.connected();
         let engine = CallEngine::new(
@@ -1930,6 +2147,8 @@ mod tests {
                 ended: Some(ended_rx),
                 media_status: Some(media_status),
                 stability,
+                signalling: Some(signalling_rx),
+                own_membership_lapsed: Some(lapsed_rx),
             },
             memberships_rx,
         );
@@ -1940,6 +2159,8 @@ mod tests {
             raised_hands,
             reactions,
             ended,
+            signalling,
+            lapsed,
             status,
             state,
         }
@@ -2288,7 +2509,7 @@ mod tests {
         assert!(own.is_local);
         let bob = participants.iter().find(|p| p.member_id == "bob").unwrap();
         assert!(!bob.is_local);
-        assert!(bob.reachable);
+        assert_eq!(bob.connection, ConnectionState::Connected);
         assert_eq!(bob.device_id.as_deref(), Some("DEVICE"));
 
         // Everyone is on the own focus, which awaits adoption: the engine
@@ -2459,7 +2680,7 @@ mod tests {
 
         rostered(&fx, &["eve"]).await;
         let participants = fx.engine.participants();
-        assert!(!participants[0].reachable);
+        assert_eq!(participants[0].connection, ConnectionState::Unreachable);
     }
 
     #[tokio::test]
@@ -4451,5 +4672,412 @@ mod tests {
         );
         after(200).await;
         assert_eq!(order_ids(&fx), ["c", "a"]);
+    }
+
+    /// 034: connection state, decryptability, the lapse's pause and the
+    /// interruptions record.
+    mod resilience {
+        use super::*;
+        use crate::tile::TileKind;
+
+        fn record(fx: &Fixture) -> Interruptions {
+            fx.engine.interruptions()
+        }
+
+        fn unsupported(member_id: &str) -> JoinedMembership {
+            let mut member = member(member_id, &format!("@{member_id}:example.org"));
+            member.transports = vec![RtcTransport::Unsupported(
+                matrix_rtc_core::UnsupportedTransport {
+                    transport_type: "p2p".to_owned(),
+                    extra_fields: Default::default(),
+                },
+            )];
+            member
+        }
+
+        fn tile(fx: &Fixture, member_id: &str) -> CallTile {
+            fx.engine
+                .tiles()
+                .detail
+                .into_iter()
+                .find(|tile| tile.member_id == member_id && tile.kind == TileKind::Person)
+                .expect("a tile")
+        }
+
+        async fn with_bob_on_a_peer_focus(fx: &Fixture) -> UnboundedSender<ConnectionEvent> {
+            adopt(fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member_on("bob", "@bob:example.org", PEER_FOCUS),
+                    unsupported("carol"),
+                ])
+                .unwrap();
+            rostered(fx, &["own", "bob", "carol"]).await;
+            wait_until(|| peer_sender(fx, PEER_FOCUS).is_some()).await;
+            peer_sender(fx, PEER_FOCUS).unwrap()
+        }
+
+        /// R28: each tile carries its member's connection; `degraded` stays.
+        #[tokio::test]
+        async fn each_members_tile_carries_its_connection_state() {
+            let fx = fixture();
+            let peer = with_bob_on_a_peer_focus(&fx).await;
+            wait_until(|| record(&fx).members_unreachable == ["carol"]).await;
+            assert_eq!(tile(&fx, "bob").connection, ConnectionState::Connected);
+            assert_eq!(tile(&fx, "carol").connection, ConnectionState::Unreachable);
+
+            peer.send(ConnectionEvent::Reconnecting).unwrap();
+            wait_until(|| record(&fx).members_reconnecting == ["bob"]).await;
+            assert_eq!(tile(&fx, "bob").connection, ConnectionState::Reconnecting);
+            assert_eq!(
+                participant(&fx, "bob").connection,
+                ConnectionState::Reconnecting
+            );
+            assert_eq!(
+                fx.engine.local_state().unwrap().tile.connection,
+                ConnectionState::Connected
+            );
+            assert_eq!(degraded(&fx), Some(true));
+
+            peer.send(ConnectionEvent::Reconnected).unwrap();
+            wait_until(|| record(&fx).members_reconnecting.is_empty()).await;
+            assert_eq!(tile(&fx, "bob").connection, ConnectionState::Connected);
+            assert_eq!(degraded(&fx), Some(false));
+        }
+
+        /// R23: the own tile and the record both carry our own SFU's state.
+        #[tokio::test]
+        async fn the_own_tile_reports_our_connection_state() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            wait_until(|| record(&fx).own_media == ConnectionState::Connected).await;
+
+            own.send(ConnectionEvent::Reconnecting).unwrap();
+            wait_until(|| record(&fx).own_media == ConnectionState::Reconnecting).await;
+            assert_eq!(
+                fx.engine.local_state().unwrap().tile.connection,
+                ConnectionState::Reconnecting
+            );
+            own.send(ConnectionEvent::Reconnected).unwrap();
+            wait_until(|| record(&fx).own_media == ConnectionState::Connected).await;
+            assert_eq!(
+                fx.engine.local_state().unwrap().tile.connection,
+                ConnectionState::Connected
+            );
+        }
+
+        /// R23, C5: `own_media` is in the record from its first value, before
+        /// our own tile exists.
+        #[tokio::test]
+        async fn own_media_is_in_the_first_record_before_our_membership_lands() {
+            let fx = fixture();
+            assert_eq!(
+                record(&fx).own_media,
+                ConnectionState::Reconnecting,
+                "not adopted"
+            );
+            let own = adopt(&fx);
+            wait_until(|| record(&fx).own_media == ConnectionState::Connected).await;
+            own.send(ConnectionEvent::Reconnecting).unwrap();
+            wait_until(|| record(&fx).own_media == ConnectionState::Reconnecting).await;
+            assert!(fx.engine.local_state().is_none());
+        }
+
+        /// R33: an undecryptable member is flagged; `has_video` and the order
+        /// do not move.
+        #[tokio::test]
+        async fn an_undecryptable_member_is_flagged_and_has_video_is_untouched() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("bob", "@bob:example.org"),
+                    member("carol", "@carol:example.org"),
+                ])
+                .unwrap();
+            rostered(&fx, &["own", "bob", "carol"]).await;
+            own.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
+            wait_until(|| tile(&fx, "bob").has_video).await;
+            let order = order_ids(&fx);
+
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+            wait_until(|| record(&fx).undecryptable == ["bob"]).await;
+            assert!(!tile(&fx, "bob").decryptable);
+            assert!(tile(&fx, "bob").has_video);
+            assert_eq!(order_ids(&fx), order);
+
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::Ok,
+            })
+            .unwrap();
+            wait_until(|| record(&fx).undecryptable.is_empty()).await;
+            assert!(tile(&fx, "bob").decryptable);
+        }
+
+        /// R33: nothing of ours is decrypted, so our own tile always is.
+        #[tokio::test]
+        async fn the_own_tile_is_always_decryptable() {
+            let mut fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-own".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+            let _ = next_event(&mut fx.events).await; // FrameEncryptionState, logged
+            settle(&fx.engine).await;
+            assert!(fx.engine.local_state().unwrap().tile.decryptable);
+            assert!(record(&fx).undecryptable.is_empty());
+        }
+
+        async fn published(fx: &Fixture, options: PublishOptions) {
+            fx.engine.publish(options).await.expect("publish");
+            settle(&fx.engine).await;
+        }
+
+        fn mutes(fx: &Fixture) -> Vec<(MediaStreamKind, bool)> {
+            fx.state.local_mutes.lock().unwrap().clone()
+        }
+
+        /// R17: a lapse pauses publishing at the transport; the user's mute is
+        /// kept apart and holds when the lapse clears.
+        #[tokio::test]
+        async fn a_lapsed_membership_pauses_publishing_and_keeps_the_users_mute() {
+            let fx = fixture();
+            in_call(&fx).await;
+            adopt(&fx);
+            published(&fx, PublishOptions::microphone()).await;
+            published(
+                &fx,
+                PublishOptions::camera(VideoSourceConfig {
+                    width: 640,
+                    height: 480,
+                }),
+            )
+            .await;
+
+            fx.lapsed.send(true).unwrap();
+            wait_until(|| record(&fx).own_membership_lapsed).await;
+            let mut paused = mutes(&fx);
+            paused.sort();
+            assert_eq!(
+                paused,
+                [
+                    (MediaStreamKind::Microphone, true),
+                    (MediaStreamKind::Camera, true)
+                ]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+            );
+
+            // The user mutes the microphone during the lapse.
+            fx.engine
+                .set_local_muted(MediaStreamKind::Microphone, true)
+                .await
+                .expect("mute");
+            fx.state.local_mutes.lock().unwrap().clear();
+
+            fx.lapsed.send(false).unwrap();
+            wait_until(|| !record(&fx).own_membership_lapsed).await;
+            assert_eq!(
+                mutes(&fx),
+                [(MediaStreamKind::Camera, false)],
+                "only what the user had not muted resumes"
+            );
+            fx.engine
+                .set_local_muted(MediaStreamKind::Microphone, false)
+                .await
+                .expect("unmute");
+            assert_eq!(
+                mutes(&fx).last(),
+                Some(&(MediaStreamKind::Microphone, false))
+            );
+        }
+
+        /// R17, C7: the pause never moves the own tile or the share flag.
+        #[tokio::test]
+        async fn the_pause_never_moves_the_own_tile_or_the_share_flag() {
+            let fx = fixture();
+            in_call(&fx).await;
+            adopt(&fx);
+            published(
+                &fx,
+                PublishOptions::camera(VideoSourceConfig {
+                    width: 640,
+                    height: 480,
+                }),
+            )
+            .await;
+            published(
+                &fx,
+                PublishOptions::screen_share(VideoSourceConfig {
+                    width: 1920,
+                    height: 1080,
+                }),
+            )
+            .await;
+            let before = fx.engine.local_state().unwrap();
+            assert!(before.tile.has_video && before.is_screen_sharing);
+
+            fx.lapsed.send(true).unwrap();
+            wait_until(|| mutes(&fx).len() == 2).await;
+            settle(&fx.engine).await;
+            assert_eq!(fx.engine.local_state().unwrap(), before);
+        }
+
+        /// R17: a snapshot without us after we arrived is the lapse observed.
+        #[tokio::test]
+        async fn a_snapshot_without_us_is_a_lapse_observed() {
+            let fx = fixture();
+            in_call(&fx).await;
+            fx.memberships
+                .send(vec![member("bob", "@bob:example.org")])
+                .unwrap();
+            wait_until(|| record(&fx).own_membership_lapsed).await;
+            in_call(&fx).await;
+            wait_until(|| !record(&fx).own_membership_lapsed).await;
+        }
+
+        /// R38: each cause in its own field; clearing one clears only it.
+        #[tokio::test]
+        async fn interruptions_list_every_cause_separately() {
+            let fx = fixture();
+            let peer = with_bob_on_a_peer_focus(&fx).await;
+            let own = wait_sender(&fx, OWN_FOCUS);
+            peer.send(ConnectionEvent::Reconnecting).unwrap();
+            own.send(ConnectionEvent::RemoteJoined {
+                identity: "id-stranger".to_owned(),
+            })
+            .unwrap();
+            peer.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::DecryptionFailed,
+            })
+            .unwrap();
+            fx.signalling
+                .send(SignallingHealth::Unreachable { since_ms: 5 })
+                .unwrap();
+            fx.lapsed.send(true).unwrap();
+
+            let all = Interruptions {
+                signalling: SignallingHealth::Unreachable { since_ms: 5 },
+                own_membership_lapsed: true,
+                own_media: ConnectionState::Connected,
+                members_reconnecting: vec!["bob".to_owned()],
+                members_unreachable: vec!["carol".to_owned()],
+                undecryptable: vec!["bob".to_owned()],
+                unmappable: vec!["id-stranger".to_owned()],
+            };
+            wait_until(|| record(&fx) == all).await;
+
+            fx.signalling.send(SignallingHealth::Reachable).unwrap();
+            wait_until(|| record(&fx).signalling == SignallingHealth::Reachable).await;
+            assert_eq!(
+                record(&fx),
+                Interruptions {
+                    signalling: SignallingHealth::Reachable,
+                    ..all
+                }
+            );
+        }
+
+        /// R38: a reader woken by the record finds the tiles already agreeing.
+        #[tokio::test]
+        async fn the_record_follows_the_roster_within_one_change() {
+            let fx = fixture();
+            let peer = with_bob_on_a_peer_focus(&fx).await;
+            let mut records = fx.engine.subscribe_interruptions();
+            records.borrow_and_update();
+            peer.send(ConnectionEvent::Reconnecting).unwrap();
+            loop {
+                records.changed().await.unwrap();
+                if records.borrow_and_update().members_reconnecting == ["bob"] {
+                    break;
+                }
+            }
+            assert_eq!(tile(&fx, "bob").connection, ConnectionState::Reconnecting);
+        }
+
+        /// R16: an identity on an SFU with no membership is listed until it
+        /// maps or leaves.
+        #[tokio::test]
+        async fn an_unmappable_participant_is_reported_until_it_maps_or_leaves() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            for identity in ["id-dave", "id-erin"] {
+                own.send(ConnectionEvent::RemoteJoined {
+                    identity: identity.to_owned(),
+                })
+                .unwrap();
+            }
+            wait_until(|| record(&fx).unmappable == ["id-dave", "id-erin"]).await;
+
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("dave", "@dave:example.org"),
+                ])
+                .unwrap();
+            wait_until(|| record(&fx).unmappable == ["id-erin"]).await;
+            own.send(ConnectionEvent::RemoteLeft {
+                identity: "id-erin".to_owned(),
+            })
+            .unwrap();
+            wait_until(|| record(&fx).unmappable.is_empty()).await;
+        }
+
+        /// R31: a peer's focus down for an hour never ends the call.
+        #[tokio::test(start_paused = true)]
+        async fn a_peers_focus_down_for_an_hour_never_ends_the_call() {
+            let fx = fixture();
+            let peer = with_bob_on_a_peer_focus(&fx).await;
+            fx.state.fail_attempts.store(u32::MAX, Ordering::SeqCst);
+            peer.send(ConnectionEvent::Closed {
+                message: "gone".to_owned(),
+            })
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(3_600)).await;
+            assert_eq!(
+                degraded(&fx),
+                Some(true),
+                "connected, degraded, never ended"
+            );
+            assert_eq!(record(&fx).members_reconnecting, ["bob"]);
+        }
+
+        /// R12: signalling unreachable for five minutes never touches our own
+        /// connection.
+        #[tokio::test(start_paused = true)]
+        async fn signalling_loss_does_not_touch_the_own_connection() {
+            let fx = fixture();
+            in_call(&fx).await;
+            adopt(&fx);
+            fx.signalling
+                .send(SignallingHealth::Unreachable { since_ms: 1 })
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(300)).await;
+            assert!(!closed(&fx, OWN_FOCUS));
+            assert_eq!(connect_count(&fx, OWN_FOCUS), 0);
+            assert_eq!(degraded(&fx), Some(false));
+            assert_eq!(record(&fx).own_media, ConnectionState::Connected);
+        }
     }
 }

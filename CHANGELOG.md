@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- `Participant`/`CallTile` (FFI `FfiParticipant`/`FfiCallTile`, web roster entries) replace `reachable` with `connection` (`Connected`, `Reconnecting`, `Unreachable`) and gain `decryptable`; `EngineConfig` takes the signalling health and our membership's lapse (034 R23, R28, R33).
 - `EventEncryption`'s `sender_cross_signed` is `sender_confirmed` (FFI `senderConfirmed`), the client's verdict on the sender under its own trust settings; `require_cross_signed_sender` is `require_confirmed_sender` and `KeyRejection::NotCrossSigned` is `SenderNotConfirmed` (web `sender_not_confirmed`).
 - `RtcCall::leave` (FFI `leave`, web `leave`) returns once the call has ended, without waiting for the one-attempt leave send, and fails only when the call was already over (034 R8).
 - `notify_session_started` takes the client's `Outbox` and the join's deadline, and `OwnMembershipMachine::join` a deadline (034 R1, R6).
@@ -19,6 +20,8 @@ log only.
 
 - `RtcClient` reports signalling health (`signalling_health`/`subscribe_signalling_health`, web `signallingHealth`/`onSignallingHealth`) and takes the host's `report_connectivity` (web `reportConnectivity`) (034 R9–R11).
 - `BaseRtcRoom::subscribe_own_membership_lapsed` reports when our membership has lapsed for the other members while our sends fail (034 R17).
+- `CallEngine::interruptions`/`subscribe_interruptions` (FFI `MediaSession.interruptions`/`next_interruptions`, web `interruptions()` and `onInterruptions`) report every cause interrupting the call in its own field, after the roster of the same change (034 R16, R38).
+- While our membership has lapsed, our publications are muted at the transport and resume as the user left them, with nothing moving on our own tile (034 R17).
 - A media key a rollout could not deliver is retried to that member on backoff until it lands or they leave, and a rotation supersedes it (`undelivered_key_members`) (034 R32).
 
 ### Changed

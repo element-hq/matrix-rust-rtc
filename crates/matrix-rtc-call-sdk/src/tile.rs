@@ -14,7 +14,7 @@
 use std::cmp::Reverse;
 use std::collections::HashSet;
 
-use matrix_rtc_transport::MediaStreamKind;
+use matrix_rtc_transport::{ConnectionState, MediaStreamKind};
 
 use crate::participant::{Participant, StreamState};
 
@@ -74,7 +74,12 @@ pub struct CallTile {
     /// See [`Participant::hand_raised_position`].
     pub hand_raised_position: Option<u32>,
     pub joined_at_ms: Option<u64>,
-    pub reachable: bool,
+    /// See [`Participant::connection`]. Neither it nor `decryptable` moves
+    /// `has_video` or the order: a host draws the avatar over a remote tile
+    /// that is not `Connected` or not `decryptable` (contract C6).
+    pub connection: ConnectionState,
+    /// See [`Participant::decryptable`].
+    pub decryptable: bool,
 }
 
 impl CallTile {
@@ -229,7 +234,8 @@ fn tile(p: &Participant, kind: TileKind, speaking: &HashSet<String>) -> CallTile
         hand_raised_at_ms: p.hand_raised_at_ms,
         hand_raised_position: p.hand_raised_position,
         joined_at_ms: p.joined_at_ms,
-        reachable: p.reachable,
+        connection: p.connection,
+        decryptable: p.decryptable,
     }
 }
 
@@ -291,7 +297,8 @@ mod tests {
             user_id: format!("@{id}:example.org"),
             device_id: None,
             is_local: false,
-            reachable: true,
+            connection: ConnectionState::Connected,
+            decryptable: true,
             streams: vec![],
             hand_raised_at_ms: None,
             hand_raised_position: None,

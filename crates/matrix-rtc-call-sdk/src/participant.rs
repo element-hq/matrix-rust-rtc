@@ -11,7 +11,7 @@
 //! of truth for who is in the call; transports only attach media to entries
 //! that already exist.
 
-use matrix_rtc_transport::MediaStreamKind;
+use matrix_rtc_transport::{ConnectionState, MediaStreamKind};
 
 /// Live state of one media stream of a participant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,10 +32,15 @@ pub struct Participant {
     pub device_id: Option<String>,
     /// Whether this is our own membership.
     pub is_local: bool,
-    /// Whether any registered transport can reach this member's media. A
-    /// member publishing only unsupported transports stays in the roster
+    /// The connection carrying this member's media (034 R28); for our own
+    /// entry, our own SFU's (R23). `Unreachable` when no registered
+    /// transport can reach their media: such a member stays in the roster
     /// (signalling truth) but never gets streams.
-    pub reachable: bool,
+    pub connection: ConnectionState,
+    /// Whether their media decrypts: false from a frame-encryption failure
+    /// until frames decrypt again (034 R33). Always true for our own entry,
+    /// which nothing decrypts. `streams` is untouched by it.
+    pub decryptable: bool,
     /// Streams currently published by this participant, in arrival order.
     pub streams: Vec<StreamState>,
     /// When this participant raised their hand (ms since the epoch, by the

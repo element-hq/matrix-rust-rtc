@@ -35,6 +35,19 @@ use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::stats::ReceiveStats;
 use crate::stream::MediaStreamKind;
 
+/// Whether the connection carrying someone's media is up (034 R23, R28).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ConnectionState {
+    /// Up, or being opened for the first time.
+    #[default]
+    Connected,
+    /// Being re-established after a loss, or failing to connect, for as long
+    /// as that takes: a connection is never given up while a member is on it.
+    Reconnecting,
+    /// No transport can serve what the member advertises.
+    Unreachable,
+}
+
 /// Whether a participant's frames are encrypting and decrypting cleanly.
 ///
 /// Reported per participant rather than per stream: the transport's frame

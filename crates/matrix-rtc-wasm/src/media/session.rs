@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_call_sdk::{
-    AttachOptions, CallEngine, CallEvent, FrameEncryptionDiagnostic, MediaAttachment, Participant,
-    StabilityConfig, attach_media,
+    AttachOptions, CallEngine, CallEvent, ConnectionState, FrameEncryptionDiagnostic,
+    Interruptions, MediaAttachment, Participant, StabilityConfig, attach_media,
 };
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_transport::keys::MediaKeyHandler;
@@ -30,7 +30,7 @@ use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
 use crate::WasmRtcCall;
-use crate::status::WasmCallStatus;
+use crate::status::{WasmCallStatus, WasmSignallingHealth};
 use matrix_rtc_call::CallStatus;
 
 /// livekit-js's `ExternalE2EEKeyProvider` default `keyringSize`.
@@ -249,6 +249,22 @@ impl WasmRtcCall {
             });
         }
 
+        if let Some(on_interruptions) = delegate_callback(&delegate, "onInterruptions") {
+            let mut interruptions = engine.subscribe_interruptions();
+            interruptions.mark_changed();
+            wasm_bindgen_futures::spawn_local(async move {
+                while interruptions.changed().await.is_ok() {
+                    let record = WasmInterruptions::from(interruptions.borrow_and_update().clone());
+                    match serde_wasm_bindgen::to_value(&record) {
+                        Ok(record) => {
+                            let _ = on_interruptions.call1(&JsValue::NULL, &record);
+                        }
+                        Err(error) => log::warn!("media: interruptions did not serialize: {error}"),
+                    }
+                }
+            });
+        }
+
         if let Some(on_status) = delegate_callback(&delegate, "onStatus") {
             let mut status = self.inner().subscribe_status();
             status.mark_changed();
@@ -325,6 +341,13 @@ impl WasmMediaSession {
         serde_wasm_bindgen::to_value(&roster).map_err(|err| JsError::new(&err.to_string()))
     }
 
+    /// What is interrupting the call now, cause by cause (034 R38).
+    #[wasm_bindgen(unchecked_return_type = "RtcInterruptions")]
+    pub fn interruptions(&self) -> Result<JsValue, JsError> {
+        serde_wasm_bindgen::to_value(&WasmInterruptions::from(self.engine.interruptions()))
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
     /// Our own livekit-js participant identity (the MSC4195 pseudonymous
     /// identity, or the legacy `{user}:{device}` in that compatibility mode).
     #[wasm_bindgen(js_name = ownRtcIdentity)]
@@ -361,7 +384,8 @@ fn to_wasm_participant(
         user_id: participant.user_id.clone(),
         device_id: participant.device_id.clone(),
         is_local: participant.is_local,
-        reachable: participant.reachable,
+        connection: connection_str(participant.connection),
+        decryptable: participant.decryptable,
         rtc_identity,
         hand_raised_at_ms: participant.hand_raised_at_ms,
         hand_raised_position: participant.hand_raised_position,
@@ -373,6 +397,41 @@ fn to_wasm_participant(
                 muted: stream.muted,
             })
             .collect(),
+    }
+}
+
+/// `RtcConnectionState` in `ts_types`.
+fn connection_str(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Connected => "connected",
+        ConnectionState::Reconnecting => "reconnecting",
+        ConnectionState::Unreachable => "unreachable",
+    }
+}
+
+/// `RtcInterruptions` in `ts_types`.
+#[derive(Serialize)]
+struct WasmInterruptions {
+    signalling: WasmSignallingHealth,
+    own_membership_lapsed: bool,
+    own_media: &'static str,
+    members_reconnecting: Vec<String>,
+    members_unreachable: Vec<String>,
+    undecryptable: Vec<String>,
+    unmappable: Vec<String>,
+}
+
+impl From<Interruptions> for WasmInterruptions {
+    fn from(record: Interruptions) -> Self {
+        Self {
+            signalling: record.signalling.into(),
+            own_membership_lapsed: record.own_membership_lapsed,
+            own_media: connection_str(record.own_media),
+            members_reconnecting: record.members_reconnecting,
+            members_unreachable: record.members_unreachable,
+            undecryptable: record.undecryptable,
+            unmappable: record.unmappable,
+        }
     }
 }
 
@@ -390,7 +449,8 @@ struct WasmParticipant {
     user_id: String,
     device_id: Option<String>,
     is_local: bool,
-    reachable: bool,
+    connection: &'static str,
+    decryptable: bool,
     /// The livekit-js participant identity, when derivable — the join key for
     /// `room.getParticipantByIdentity()`.
     rtc_identity: Option<String>,

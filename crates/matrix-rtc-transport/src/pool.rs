@@ -43,7 +43,7 @@
 //! running beside it could not. Connects and timers run on
 //! [`matrix_rtc_core::executor`] and report back through the inbox.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -52,8 +52,8 @@ use matrix_rtc_core::executor as rt;
 use tokio::sync::mpsc;
 
 use crate::{
-    ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaConstraints, MediaStreamKind,
-    MediaTransport, RemoteTrackHandle, TransportConnection, TransportError,
+    ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, MediaConstraints,
+    MediaStreamKind, MediaTransport, RemoteTrackHandle, TransportConnection, TransportError,
 };
 
 /// How long a connection with no remaining members is kept before closing,
@@ -143,6 +143,13 @@ pub enum PoolEvent {
     },
     /// A transport participant joined that maps to no membership.
     UnknownParticipant { identity: String },
+    /// A connection's state moved (034 R28): its members', or our own
+    /// media's for the own focus. Read a member's through
+    /// [`MediaPool::member_connection`].
+    ConnectionState {
+        connection_key: String,
+        state: ConnectionState,
+    },
     /// Whether any connection is impaired (reconnecting or failing to
     /// connect). Reported on transitions only.
     Degraded(bool),
@@ -297,6 +304,11 @@ pub struct MediaPool {
     /// Connections currently impaired (reconnecting or failing to connect);
     /// media is reported degraded while this is non-empty.
     degraded_keys: HashSet<String>,
+    /// Transport identities present on a connection that map to no
+    /// membership, with the connection they are on (034 R16).
+    unmapped: HashMap<String, String>,
+    /// The own-focus connection was adopted, then lost.
+    own_lost: bool,
     /// Events produced by the call in progress, handed back when it returns.
     out: Vec<PoolEvent>,
 }
@@ -326,6 +338,8 @@ impl MediaPool {
             pool: HashMap::new(),
             connection_generation: 0,
             degraded_keys: HashSet::new(),
+            unmapped: HashMap::new(),
+            own_lost: false,
             out: Vec::new(),
         };
         (pool, messages_rx)
@@ -340,6 +354,47 @@ impl MediaPool {
     /// transports — i.e. whether their media can reach us at all.
     pub fn is_reachable(&self, member: &JoinedMembership) -> bool {
         select_transport(&self.transports, member).is_some()
+    }
+
+    /// The state of the connection carrying `member_id`'s media, per the
+    /// latest snapshot (034 R28); `None` for someone not in it.
+    pub fn member_connection(&self, member_id: &str) -> Option<ConnectionState> {
+        let member = self
+            .members_snapshot
+            .iter()
+            .find(|member| member.member_id == member_id)?;
+        Some(match select_transport(&self.transports, member) {
+            None => ConnectionState::Unreachable,
+            Some((_, key)) if self.degraded_keys.contains(&key) => ConnectionState::Reconnecting,
+            Some(_) => ConnectionState::Connected,
+        })
+    }
+
+    /// The state of our own media's connection (034 R23): `Connected` with no
+    /// own focus to publish on, `Reconnecting` until it is adopted and while
+    /// it recovers, `Unreachable` once it is lost.
+    pub fn own_connection_state(&self) -> ConnectionState {
+        let Some(key) = &self.own_connection_key else {
+            return ConnectionState::Connected;
+        };
+        if self.own_lost {
+            ConnectionState::Unreachable
+        } else if !self.pool.contains_key(key) || self.degraded_keys.contains(key) {
+            ConnectionState::Reconnecting
+        } else {
+            ConnectionState::Connected
+        }
+    }
+
+    /// Transport identities present that map to no membership, sorted
+    /// (034 R16): a participant whose membership we have not seen.
+    pub fn unmappable(&self) -> Vec<String> {
+        self.unmapped
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     /// The own-focus connection, while it is up.
@@ -545,6 +600,7 @@ impl MediaPool {
             member.member_id,
             member.sender,
         );
+        self.unmapped.remove(&identity);
         self.identity_map
             .insert(identity.clone(), member.member_id.clone());
         self.member_identities
@@ -887,9 +943,16 @@ impl MediaPool {
             return;
         }
 
+        self.unmapped.retain(|_, on| on != key);
         if entry.is_own {
             log::warn!("own-focus connection {key} is gone: {message}");
             self.pool.remove(key);
+            self.own_lost = true;
+            self.clear_degraded(key);
+            self.out.push(PoolEvent::ConnectionState {
+                connection_key: key.to_owned(),
+                state: ConnectionState::Unreachable,
+            });
             self.out.push(PoolEvent::OwnConnectionLost {
                 message: message.to_owned(),
             });
@@ -973,12 +1036,16 @@ impl MediaPool {
                     log::debug!(
                         "remote participant {identity} on {connection_key} has no known membership"
                     );
+                    self.unmapped
+                        .insert(identity.clone(), connection_key.to_owned());
                     self.out.push(PoolEvent::UnknownParticipant { identity });
                 }
             }
-            ConnectionEvent::RemoteLeft { .. } => {
+            ConnectionEvent::RemoteLeft { identity } => {
                 // Membership is the truth; a transport-level leave on its own
-                // changes nothing (tracks get their own events).
+                // changes nothing for a member (tracks get their own events),
+                // only for a participant we could not map.
+                self.unmapped.remove(&identity);
             }
             ConnectionEvent::TrackAdded {
                 identity,
@@ -1066,14 +1133,26 @@ impl MediaPool {
 
     fn mark_degraded(&mut self, key: &str) {
         let was_clear = self.degraded_keys.is_empty();
-        if self.degraded_keys.insert(key.to_owned()) && was_clear {
-            self.out.push(PoolEvent::Degraded(true));
+        if self.degraded_keys.insert(key.to_owned()) {
+            if was_clear {
+                self.out.push(PoolEvent::Degraded(true));
+            }
+            self.out.push(PoolEvent::ConnectionState {
+                connection_key: key.to_owned(),
+                state: ConnectionState::Reconnecting,
+            });
         }
     }
 
     fn clear_degraded(&mut self, key: &str) {
-        if self.degraded_keys.remove(key) && self.degraded_keys.is_empty() {
-            self.out.push(PoolEvent::Degraded(false));
+        if self.degraded_keys.remove(key) {
+            if self.degraded_keys.is_empty() {
+                self.out.push(PoolEvent::Degraded(false));
+            }
+            self.out.push(PoolEvent::ConnectionState {
+                connection_key: key.to_owned(),
+                state: ConnectionState::Connected,
+            });
         }
     }
 }
