@@ -437,6 +437,12 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         &self.outbox
     }
 
+    /// The outbox scope of this participation's sends, `room/slot/member`:
+    /// the leave cancels everything under it.
+    pub(crate) fn scope(&self) -> &str {
+        &self.scope
+    }
+
     /// Creates a new own membership machine with the default keep-alive timeout.
     pub fn with_default_timeout(
         backend: Arc<T>,

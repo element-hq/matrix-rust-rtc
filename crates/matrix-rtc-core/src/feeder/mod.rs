@@ -402,7 +402,17 @@ where
     pub async fn run(mut self) {
         loop {
             let input = if *self.seeded.borrow() {
-                self.rx.recv().await
+                // A delayed-leave hold ending is an input of its own (034 R21).
+                let hold = self.room.lock().await.rtc().hold_expires_at();
+                let hold_in =
+                    hold.map(|at| at.saturating_duration_since(crate::executor::Instant::now()));
+                tokio::select! {
+                    input = self.rx.recv() => input,
+                    () = crate::executor::sleep(hold_in.unwrap_or_default()), if hold_in.is_some() => {
+                        self.room.lock().await.rtc().expire_holds().await;
+                        continue;
+                    }
+                }
             } else {
                 tokio::select! {
                     input = self.rx.recv() => input,

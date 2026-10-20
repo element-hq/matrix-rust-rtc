@@ -319,6 +319,31 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         Ok(())
     }
 
+    /// The members of one slot a key rollout has not reached yet, retried on
+    /// backoff (034 R32); `None` while the slot has no joined session.
+    pub fn undelivered_key_members(&self, slot_id: &str) -> Option<Vec<String>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(SlotSession::undelivered_key_members)
+    }
+
+    /// When the earliest delayed-leave hold of any slot ends (see
+    /// [`SlotSession::hold_expires_at`]).
+    pub fn hold_expires_at(&self) -> Option<crate::executor::Instant> {
+        self.sessions
+            .values()
+            .filter_map(SlotSession::hold_expires_at)
+            .min()
+    }
+
+    /// Applies every delayed leave whose hold has ended, in every slot (see
+    /// [`SlotSession::expire_holds`]).
+    pub async fn expire_holds(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.expire_holds().await;
+        }
+    }
+
     /// One keep-alive tick for one slot (see [`SlotSession::keep_alive`]).
     /// Returns `false` if the slot is not joined.
     pub async fn keep_alive(&mut self, slot_id: &str) -> bool {

@@ -19,12 +19,15 @@ log only.
 
 - `RtcClient` reports signalling health (`signalling_health`/`subscribe_signalling_health`, web `signallingHealth`/`onSignallingHealth`) and takes the host's `report_connectivity` (web `reportConnectivity`) (034 R9–R11).
 - `BaseRtcRoom::subscribe_own_membership_lapsed` reports when our membership has lapsed for the other members while our sends fail (034 R17).
+- A media key a rollout could not deliver is retried to that member on backoff until it lands or they leave, and a rotation supersedes it (`undelivered_key_members`) (034 R32).
 
 ### Changed
 
 - A join completes or fails within 30 s of the call: transient failures of the transports read, the publish and the notification are retried inside it, and it fails with `JoinError::TimedOut` or `JoinError::Refused` (FFI `JoinTimedOut`, `JoinRefused`) (034 R6, R27).
 
 - Our membership's refresh, delayed-leave restart and re-arm are retried until they land, the refresh falls due at a third of the lifetime instead of half, and when signalling returns the library re-arms and republishes only what the outage lost (034 R1, R18, R19).
+- A member whose delayed leave fires stays on the roster for 10 s and is not reported gone if they come back within it, so a homeserver restart no longer flickers everyone out (034 R21).
+- Joins and leaves are announced from our first roster on, through a lapse of our own membership, so a member who joined while our homeserver was unreachable is announced when it returns (034 R16).
 
 ## v0.5.0-rc.5 - 2026-10-15
 

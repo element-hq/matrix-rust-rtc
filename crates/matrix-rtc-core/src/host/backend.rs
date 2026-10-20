@@ -721,6 +721,9 @@ pub struct MockBackend {
     pub call_log: std::sync::Mutex<Vec<MockCall>>,
     /// The origin of [`MockCall::at`].
     pub created_at: crate::executor::Instant,
+    /// `(user_id, device_id)` recipients a to-device send answers as not
+    /// delivered; the rest of the batch is delivered.
+    pub undeliverable: std::sync::Mutex<std::collections::HashSet<(String, String)>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -748,6 +751,7 @@ impl Default for MockBackend {
             scripted: Default::default(),
             call_log: Default::default(),
             created_at: crate::executor::Instant::now(),
+            undeliverable: Default::default(),
         }
     }
 }
@@ -951,16 +955,23 @@ impl MatrixBackend for MockBackend {
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
         self.attempt(MockMethod::ToDevice).await?;
+        let undeliverable = self.undeliverable.lock().unwrap().clone();
         let mut guard = self.to_device_messages.lock().unwrap();
-        for recipient in &recipients {
+        let mut deliveries = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            if undeliverable.contains(&(recipient.user_id.clone(), recipient.device_id.clone())) {
+                deliveries.push(ToDeviceDelivery::failed(recipient, "undeliverable"));
+                continue;
+            }
             guard.push((
                 recipient.user_id.clone(),
                 recipient.device_id.clone(),
                 message_type.clone(),
                 content.clone(),
             ));
+            deliveries.push(ToDeviceDelivery::sent(recipient));
         }
-        Ok(recipients.into_iter().map(ToDeviceDelivery::sent).collect())
+        Ok(deliveries)
     }
 
     async fn send_state_event(

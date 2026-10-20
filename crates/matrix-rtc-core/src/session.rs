@@ -10,7 +10,7 @@
 //! by its [`BaseRtcRoom`](crate::BaseRtcRoom), the only thing that creates one.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
@@ -31,6 +31,12 @@ use crate::upkeep::{self, SessionUpkeep};
 
 #[allow(unused_imports)]
 use log::*;
+
+/// How long a member whose delayed leave fired stays on the roster, waiting
+/// for them to come back (034 R21). A homeserver restart fires every overdue
+/// delayed leave on it at once, and each live client restarts or republishes
+/// well inside this.
+pub const DELAYED_LEAVE_HOLD: Duration = Duration::from_secs(10);
 
 /// What a session knows about the room state governing its slot.
 ///
@@ -151,6 +157,9 @@ pub struct SlotSession<T: MatrixBackend> {
     /// candidates only: the remaining MSC4143 join conditions depend on room
     /// state, which can change under them at any time.
     candidates: Vec<JoinedMembership>,
+    /// Candidates whose delayed leave fired, kept until the instant here
+    /// unless they come back first (034 R21), by `(sender, sticky_key)`.
+    held: HashMap<(String, String), executor::Instant>,
     /// The candidates that currently satisfy every join condition. This is what
     /// gets published and what the encryption manager distributes keys to.
     members: Vec<JoinedMembership>,
@@ -193,6 +202,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
     fn clone(&self) -> Self {
         Self {
             candidates: self.candidates.clone(),
+            held: self.held.clone(),
             members: self.members.clone(),
             slot: self.slot.clone(),
             room_members: self.room_members.clone(),
@@ -228,6 +238,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         Self {
             candidates: Vec::new(),
+            held: HashMap::new(),
             members: Vec::new(),
             slot: SlotKnowledge::default(),
             room_members: None,
@@ -506,6 +517,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         );
         let manage_media_keys = encryption_config.manage_media_keys;
         encryption_manager.set_config(encryption_config);
+        // One clock per client: key timings and the membership's share it.
+        encryption_manager.set_clock(self.outbox.clock());
 
         // Start the encryption manager (creates first key)
         encryption_manager.join().await.map_err(|e| {
@@ -771,7 +784,26 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // member in the call for good, and force every host to diff snapshots
         // itself to notice.
         let previous = std::mem::take(&mut self.candidates);
+        let previously_held = std::mem::take(&mut self.held);
         for event in events {
+            // A delayed leave in the set keeps the candidate it replaces, on
+            // the hold it already had or a new one (034 R21). Any other leave
+            // finds nothing to remove: the set is being rebuilt.
+            if let RtcMembershipEvent::Left(left) = &event
+                && let Some(candidate) = previous.iter().find(|candidate| {
+                    candidate.sender == left.sender && candidate.sticky_key == left.sticky_key
+                })
+                && self.holds(left)
+            {
+                let key = (left.sender.clone(), left.sticky_key.clone());
+                let until = previously_held
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| self.hold_from_now(left));
+                self.candidates.push(candidate.clone());
+                self.held.insert(key, until);
+                continue;
+            }
             // Deliberately *not* `apply_membership_event`: this loop rebuilds
             // the whole candidate set, and publishing after each event would
             // announce every partial set of joined memberships on the way — starting with a
@@ -855,6 +887,20 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                     candidate.sender == joined.sender && candidate.sticky_key == joined.sticky_key
                 });
 
+                // A return inside the hold is no change of membership (034 R21).
+                if self
+                    .held
+                    .remove(&(joined.sender.clone(), joined.sticky_key.clone()))
+                    .is_some()
+                {
+                    log::info!(
+                        "[{}] {}/{} came back inside the delayed-leave hold",
+                        self.log_tag,
+                        joined.sender,
+                        joined.sticky_key,
+                    );
+                }
+
                 match existing {
                     Some(index) if self.candidates[index] == joined => {
                         log::trace!(
@@ -886,6 +932,18 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 }
             }
             RtcMembershipEvent::Left(left) => {
+                let key = (left.sender.clone(), left.sticky_key.clone());
+                let known = self.candidates.iter().any(|candidate| {
+                    candidate.sender == left.sender && candidate.sticky_key == left.sticky_key
+                });
+                if known && self.holds(&left) {
+                    if !self.held.contains_key(&key) {
+                        let until = self.hold_from_now(&left);
+                        self.held.insert(key, until);
+                    }
+                    return false;
+                }
+                self.held.remove(&key);
                 let before = self.candidates.len();
                 self.candidates.retain(|candidate| {
                     !(candidate.sender == left.sender && candidate.sticky_key == left.sticky_key)
@@ -911,6 +969,76 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         true
+    }
+
+    /// Whether `left` is held rather than applied (034 R21): a delayed leave
+    /// firing, for anyone but our own current participation, whose lapse the
+    /// recovery has to see.
+    fn holds(&self, left: &LeftMembership) -> bool {
+        let delayed = left
+            .leave_reason
+            .as_ref()
+            .is_some_and(|reason| reason.code == LeaveCode::DelayedLeave);
+        let ours = self
+            .own_participation
+            .as_ref()
+            .is_some_and(|own| left.sender == own.user_id && left.sticky_key == own.member_id);
+        delayed && !ours
+    }
+
+    fn hold_from_now(&self, left: &LeftMembership) -> executor::Instant {
+        log::info!(
+            "[{}] {}/{}'s delayed leave fired; holding them {}s for a return",
+            self.log_tag,
+            left.sender,
+            left.sticky_key,
+            DELAYED_LEAVE_HOLD.as_secs(),
+        );
+        executor::Instant::now() + DELAYED_LEAVE_HOLD
+    }
+
+    /// The members a key rollout has not reached yet (034 R32), or `None`
+    /// while not joined.
+    pub fn undelivered_key_members(&self) -> Option<Vec<String>> {
+        self.encryption_manager
+            .as_ref()
+            .map(EncryptionManager::undelivered_members)
+    }
+
+    /// When the earliest delayed-leave hold ends, if one is running; the room's
+    /// feeder calls [`Self::expire_holds`] then.
+    pub fn hold_expires_at(&self) -> Option<executor::Instant> {
+        self.held.values().min().copied()
+    }
+
+    /// Applies every delayed leave whose hold has ended: the member is gone,
+    /// with the key rotation any departure brings (034 R21).
+    pub async fn expire_holds(&mut self) {
+        let now = executor::Instant::now();
+        let expired: Vec<(String, String)> = self
+            .held
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for key in &expired {
+            self.held.remove(key);
+            log::info!(
+                "[{}] {}/{} did not come back within the hold; gone",
+                self.log_tag,
+                key.0,
+                key.1,
+            );
+        }
+        self.candidates.retain(|candidate| {
+            !expired.iter().any(|(sender, sticky_key)| {
+                candidate.sender == *sender && candidate.sticky_key == *sticky_key
+            })
+        });
+        self.refresh().await;
     }
 
     /// Whether `candidate` satisfies the MSC4143 join conditions that depend on

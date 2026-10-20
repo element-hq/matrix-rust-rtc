@@ -276,7 +276,7 @@ impl CallEngine {
             encryption_states: HashMap::new(),
             installed_keys: HashMap::new(),
             raised_hands: Vec::new(),
-            in_call: false,
+            arrived: false,
             ended: false,
         };
         let task = rt::spawn(actor.run(
@@ -619,11 +619,12 @@ struct Actor {
     /// and of the membership it belongs to through different channels, and a
     /// hand that arrives first must not be lost.
     raised_hands: Vec<RaisedHand>,
-    /// Whether the last applied snapshot held our own membership. Joins and
-    /// leaves are announced only between two snapshots that both do: the
-    /// roster we find on arrival, or on return after our membership lapsed,
-    /// was there before us and is not news.
-    in_call: bool,
+    /// Whether a snapshot has held our own membership yet. The roster we
+    /// find on arrival was there before us and is not news; every change
+    /// after it is, through a lapse of our own membership too (034 R16): a
+    /// member who joined while our homeserver was unreachable arrives in the
+    /// catch-up set and is announced then. Our own entry is never announced.
+    arrived: bool,
     ended: bool,
 }
 
@@ -927,15 +928,15 @@ impl Actor {
     // ---- roster ----------------------------------------------------------
 
     fn apply_snapshot(&mut self, snapshot: Vec<JoinedMembership>) {
-        // Announced only while we are in the call on both sides of the change,
-        // and never after it ended for us (see `in_call`). A snapshot without
-        // us is the slot closing or our membership lapsing: the roster follows
-        // it, silently.
-        let in_call = snapshot
+        // Announced once we have arrived, and never after the call ended for
+        // us (see `arrived`).
+        let announce = self.arrived && !self.ended;
+        self.arrived |= snapshot
             .iter()
             .any(|member| member.member_id == self.own_member_id);
-        let announce = self.in_call && in_call && !self.ended;
-        self.in_call = in_call;
+        let own_member_id = self.own_member_id.clone();
+        let announce_for =
+            |member_id: &str, count: u32| (announce && member_id != own_member_id).then_some(count);
 
         // Departures first, so a member_id rejoining in the same snapshot
         // (new membership, same key space) starts clean.
@@ -955,7 +956,7 @@ impl Actor {
         for participant in departed {
             self.remove_member(
                 &participant.member_id,
-                announce.then_some(participant_count),
+                announce_for(&participant.member_id, participant_count),
             );
         }
 
@@ -963,7 +964,7 @@ impl Actor {
             if self.roster.iter().any(|p| p.member_id == member.member_id) {
                 continue;
             }
-            self.add_member(member, announce.then_some(participant_count));
+            self.add_member(member, announce_for(&member.member_id, participant_count));
         }
 
         // After the roster, so media the pool releases for a member who just
@@ -1148,7 +1149,7 @@ impl Actor {
     /// we attach to: those hands were up before us.
     fn apply_raised_hands(&mut self, hands: Vec<RaisedHand>, announce: bool) {
         self.raised_hands = hands;
-        let announce = announce && self.in_call && !self.ended;
+        let announce = announce && self.arrived && !self.ended;
 
         let mut changed = false;
         let mut events = Vec::new();
@@ -1231,7 +1232,7 @@ impl Actor {
     /// validated it against a membership, so this is a hand-off race, not a
     /// stranger.
     fn apply_reaction(&mut self, reaction: ReceivedReaction) {
-        if !self.in_call || self.ended {
+        if !self.arrived || self.ended {
             log::debug!(
                 "dropping reaction from {}: we are not in the call",
                 reaction.member_id,
@@ -2157,10 +2158,10 @@ mod tests {
         assert_eq!(participant(&fx, "carol").hand_raised_position, Some(2));
     }
 
-    /// While our membership is missing, hands and reactions still land on
+    /// Until our membership first lands, hands and reactions still land on
     /// the roster (or are dropped) silently.
     #[tokio::test]
-    async fn no_hand_or_reaction_is_announced_while_our_membership_is_missing() {
+    async fn no_hand_or_reaction_is_announced_before_our_membership_lands() {
         let mut fx = fixture();
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
@@ -2355,11 +2356,11 @@ mod tests {
         );
     }
 
-    /// While our own membership is missing — lapsed before its refresh, or
-    /// the slot closing — the roster follows the snapshots silently, and the
-    /// one that brings us back is a new arrival roster, not news.
+    /// 034 R16: our membership lapses while bob is with us; the catch-up set
+    /// brings us back with carol, who joined meanwhile. carol is announced as
+    /// a join, bob is not re-announced, and our own entry never is.
     #[tokio::test]
-    async fn nothing_is_announced_while_our_membership_is_missing() {
+    async fn a_member_found_in_the_catch_up_is_announced_as_a_join() {
         let mut fx = fixture();
         in_call(&fx).await;
         fx.memberships
@@ -2370,6 +2371,37 @@ mod tests {
             .unwrap();
         let _ = next_event(&mut fx.events).await; // ParticipantJoined
 
+        // Our membership lapses: the roster follows, nothing about us is said.
+        fx.memberships
+            .send(vec![member("bob", "@bob:example.org")])
+            .unwrap();
+        wait_until(|| fx.engine.participants().len() == 1).await;
+        assert!(fx.events.try_recv().is_err());
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("bob", "@bob:example.org"),
+                member("carol", "@carol:example.org"),
+            ])
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "carol".to_owned(),
+                user_id: "@carol:example.org".to_owned(),
+                participant_count: 3,
+            }
+        );
+        rostered(&fx, &["own", "bob", "carol"]).await;
+        assert!(fx.events.try_recv().is_err(), "nothing else");
+    }
+
+    /// The roster found before our own membership first lands was there
+    /// before us: none of it is announced.
+    #[tokio::test]
+    async fn the_roster_before_our_membership_lands_is_not_announced() {
+        let mut fx = fixture();
         fx.memberships
             .send(vec![member("bob", "@bob:example.org")])
             .unwrap();
@@ -2378,26 +2410,10 @@ mod tests {
             .send(vec![
                 member("own", "@alice:example.org"),
                 member("bob", "@bob:example.org"),
-                member("carol", "@carol:example.org"),
             ])
             .unwrap();
-        rostered(&fx, &["own", "bob", "carol"]).await;
+        rostered(&fx, &["own", "bob"]).await;
         assert!(fx.events.try_recv().is_err());
-
-        // Back in the call, changes are news again.
-        fx.memberships
-            .send(vec![
-                member("own", "@alice:example.org"),
-                member("bob", "@bob:example.org"),
-            ])
-            .unwrap();
-        assert_eq!(
-            next_event(&mut fx.events).await,
-            CallEvent::ParticipantLeft {
-                member_id: "carol".to_owned(),
-                participant_count: 2,
-            }
-        );
     }
 
     /// Once the call has ended for us, the roster may still be torn down by
