@@ -202,6 +202,9 @@ impl WasmRtcCall {
                     matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
                     Duration::from_millis,
                 ),
+                // The page's livekit-js rooms cannot be handed between
+                // connections (034 R25).
+                sfu_fallback: false,
             },
         )
         .await

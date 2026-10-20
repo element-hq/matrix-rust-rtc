@@ -17,6 +17,7 @@
 //! `livekit_alias`), while every other focus needs its own subscribe-side
 //! connection.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -192,9 +193,10 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     backend: self.backend.clone(),
                     key_provider: self.key_provider.clone(),
                     auto_subscribe: self.auto_subscribe,
-                    config,
-                    token: tokio::sync::Mutex::new(None),
+                    config: Mutex::new(config),
+                    token: Mutex::new(None),
                 },
+                installs: Mutex::new(0),
             }),
         }
     }
@@ -275,6 +277,17 @@ struct ConnectionShared {
     /// room. Weak: an unpublished or dropped one simply goes.
     local_tracks: Mutex<Vec<Weak<LiveKitLocalTrack>>>,
     connector: Connector,
+    /// Bumped by every take-over, under which a connected room is installed:
+    /// a reconnect that started before one is abandoned (034 R25).
+    installs: Mutex<u64>,
+}
+
+/// What [`TransportConnection::hand_over`] gives: the connected room and how
+/// to reach its focus again.
+struct Handover {
+    session: Arc<LiveKitSession>,
+    config: LiveKitTransportConfig,
+    token: Option<SfuToken>,
 }
 
 /// What a (re)connect needs: the token exchange and the room options.
@@ -283,21 +296,24 @@ struct Connector {
     backend: Arc<dyn MatrixBackend>,
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     auto_subscribe: bool,
-    config: LiveKitTransportConfig,
+    /// The focus connects go to; a take-over moves it (034 R25).
+    config: Mutex<LiveKitTransportConfig>,
     /// The token the last connect used, reused until the SFU rejects it.
-    token: tokio::sync::Mutex<Option<SfuToken>>,
+    token: Mutex<Option<SfuToken>>,
 }
 
 impl Connector {
     async fn token(&self, fresh: bool) -> Result<SfuToken, TransportError> {
-        let mut token = self.token.lock().await;
-        if fresh || token.is_none() {
-            let acquired = acquire_token(&self.http, &self.config, self.backend.as_ref())
-                .await
-                .map_err(classify_token_error)?;
-            *token = Some(acquired);
+        let cached = self.token.lock().expect("token mutex poisoned").clone();
+        if let Some(token) = cached.filter(|_| !fresh) {
+            return Ok(token);
         }
-        Ok(token.clone().expect("set above"))
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        let acquired = acquire_token(&self.http, &config, self.backend.as_ref())
+            .await
+            .map_err(classify_token_error)?;
+        *self.token.lock().expect("token mutex poisoned") = Some(acquired.clone());
+        Ok(acquired)
     }
 }
 
@@ -438,6 +454,11 @@ impl TransportConnection for LiveKitTransportConnection {
         fresh_token: bool,
     ) -> Result<UnboundedReceiver<ConnectionEvent>, TransportError> {
         let connector = &self.shared.connector;
+        let started = *self
+            .shared
+            .installs
+            .lock()
+            .expect("installs mutex poisoned");
         let token = connector.token(fresh_token).await?;
         let connection = LiveKitSession::connect_with_options(
             &token,
@@ -447,12 +468,23 @@ impl TransportConnection for LiveKitTransportConnection {
         .map_err(classify_room_error)?;
 
         let session = Arc::new(connection.session);
-        if let Some(previous) = self.shared.session.send_replace(Some(session.clone())) {
-            tokio::spawn(async move {
-                if let Err(error) = previous.room().close().await {
-                    log::debug!("closing the previous room: {error}");
-                }
-            });
+        let previous = {
+            let installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            if *installs != started {
+                drop(installs);
+                close_room(session);
+                return Err(TransportError::Closed(
+                    "abandoned: the handle took another connection over".into(),
+                ));
+            }
+            self.shared.session.send_replace(Some(session.clone()))
+        };
+        if let Some(previous) = previous {
+            close_room(previous);
         }
         // The receiver returned by the room connect carries events from the
         // very beginning (nothing can be missed); hand it to the translator.
@@ -461,6 +493,63 @@ impl TransportConnection for LiveKitTransportConnection {
         self.republish_local_tracks(&session).await;
         self.reassert_local_key_index();
         Ok(events_rx)
+    }
+
+    fn hand_over(&self) -> Option<Box<dyn Any>> {
+        let session = self.current_session()?;
+        let connector = &self.shared.connector;
+        Some(Box::new(Handover {
+            session,
+            config: connector
+                .config
+                .lock()
+                .expect("config mutex poisoned")
+                .clone(),
+            token: connector
+                .token
+                .lock()
+                .expect("token mutex poisoned")
+                .clone(),
+        }))
+    }
+
+    /// Installs the handed-over room as this handle's, abandoning any
+    /// reconnect in flight; our publications are carried onto it in the
+    /// background, as after a reconnect.
+    fn take_over(&self, handover: Box<dyn Any>) -> Result<(), TransportError> {
+        let handover = handover.downcast::<Handover>().map_err(|_| {
+            TransportError::Unsupported("not a LiveKit connection's handover".into())
+        })?;
+        let Handover {
+            session,
+            config,
+            token,
+        } = *handover;
+        log::info!(
+            "our own handle takes over the room of {}",
+            config.livekit_service_url
+        );
+        let previous = {
+            let mut installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            *installs += 1;
+            let connector = &self.shared.connector;
+            *connector.config.lock().expect("config mutex poisoned") = config;
+            *connector.token.lock().expect("token mutex poisoned") = token;
+            self.shared.session.send_replace(Some(session.clone()))
+        };
+        if let Some(previous) = previous {
+            close_room(previous);
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.republish_local_tracks(&session).await;
+            this.reassert_local_key_index();
+        });
+        Ok(())
     }
 
     /// Before the first connect the publication is held, and goes out with
@@ -623,6 +712,15 @@ impl TransportConnection for LiveKitTransportConnection {
             Err(error) => Err(TransportError::Closed(error.to_string())),
         }
     }
+}
+
+/// Closes a room this handle no longer uses, in the background.
+fn close_room(session: Arc<LiveKitSession>) {
+    tokio::spawn(async move {
+        if let Err(error) = session.room().close().await {
+            log::debug!("closing the previous room: {error}");
+        }
+    });
 }
 
 /// The native source behind a local publication, which outlives every room

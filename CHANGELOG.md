@@ -10,6 +10,7 @@ log only.
 
 ### Breaking
 
+- `AttachOptions`, `LiveKitAttachOptions`, `EngineConfig` and `PoolConfig` take `sfu_fallback`, and `PoolEvent` gains `OwnFocusMoved` (034 R25).
 - `CallEnd::ConnectionClosed` (FFI `FfiCallEnd`, web `loss_reason`) carries a `ConnectionLossReason` (`Budget`, `Refused`, `NeverConnected`), `MediaStatusReporter::lost` takes it, and `OwnFocusTransport` gains `prepare_own` and `TransportConnection` `reconnect` (034 R24, R27).
 - `attach_media` (FFI `connect_media_session`, web `connectMedia`) returns without waiting for our own SFU, which connects under the reconnect budget like a loss; `LiveKitTransportConnection::session` returns an `Option<Arc<_>>` (034 R24, C10).
 - `Participant`/`CallTile` (FFI `FfiParticipant`/`FfiCallTile`, web roster entries) replace `reachable` with `connection` (`Connected`, `Reconnecting`, `Unreachable`) and gain `decryptable`; `EngineConfig` takes the signalling health and our membership's lapse (034 R23, R28, R33).
@@ -20,6 +21,7 @@ log only.
 
 ### Added
 
+- With `sfu_fallback` on (FFI `MediaSessionConfig.sfu_fallback`, off by default), our media moves to the busiest other member's SFU after our own has been down 10 s while signalling works and a peer connection is up, and our membership is republished naming it under the same member id (034 R25).
 - `RtcClient` reports signalling health (`signalling_health`/`subscribe_signalling_health`, web `signallingHealth`/`onSignallingHealth`) and takes the host's `report_connectivity` (web `reportConnectivity`) (034 R9–R11).
 - `BaseRtcRoom::subscribe_own_membership_lapsed` reports when our membership has lapsed for the other members while our sends fail (034 R17).
 - `CallEngine::interruptions`/`subscribe_interruptions` (FFI `MediaSession.interruptions`/`next_interruptions`, web `interruptions()` and `onInterruptions`) report every cause interrupting the call in its own field, after the roster of the same change (034 R16, R38).

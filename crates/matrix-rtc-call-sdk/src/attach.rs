@@ -48,6 +48,9 @@ pub struct AttachOptions {
     /// (034 R24): [`OWN_RECONNECT_BUDGET`](matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET)
     /// unless a host configured another.
     pub own_reconnect_budget: Duration,
+    /// Whether our media may move to a peer's SFU while ours is down
+    /// (034 R25, contract C11): only where that SFU accepts our token.
+    pub sfu_fallback: bool,
 }
 
 /// A call with media attached.
@@ -169,6 +172,7 @@ where
             signalling: Some(signalling),
             own_membership_lapsed,
             own_reconnect_budget: options.own_reconnect_budget,
+            sfu_fallback: options.sfu_fallback,
         },
         memberships,
     );

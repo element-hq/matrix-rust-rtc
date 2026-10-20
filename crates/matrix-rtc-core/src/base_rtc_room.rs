@@ -30,6 +30,7 @@ use crate::session::{
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
+use crate::transport::RtcTransport;
 
 /// One room's RTC state and the slot sessions in it.
 pub struct BaseRtcRoom<T: MatrixBackend> {
@@ -459,6 +460,18 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         self.sessions
             .get(slot_id)
             .and_then(|session| session.key_rotation_due_at_ms())
+    }
+
+    /// Our membership in one slot republished naming `transport`
+    /// (see [`SlotSession::republish_transports`]).
+    pub fn republish_transports(
+        &self,
+        slot_id: &str,
+        transport: RtcTransport,
+    ) -> Option<impl Future<Output = ()> + use<T>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(|session| session.republish_transports(transport))
     }
 
     /// Follows our membership event id in one slot, which moves on every

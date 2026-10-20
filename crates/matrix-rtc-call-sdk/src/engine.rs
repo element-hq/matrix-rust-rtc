@@ -129,6 +129,10 @@ pub struct EngineConfig {
     /// (034 R24); [`matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET`] by
     /// default.
     pub own_reconnect_budget: Duration,
+    /// Whether our media may move to a peer's focus while ours is down
+    /// (034 R25): see [`PoolConfig::sfu_fallback`]. Our membership is
+    /// republished naming it through [`Self::media_status`].
+    pub sfu_fallback: bool,
 }
 
 /// Everything the engine can be told from outside its actor task.
@@ -275,6 +279,7 @@ impl CallEngine {
             ctx: config.ctx,
             own_connection_key: config.own_connection_key,
             own_reconnect_budget: config.own_reconnect_budget,
+            sfu_fallback: config.sfu_fallback,
         });
         let tracks = pool.remote_tracks();
         // Present from the first value: our own SFU before our tile exists.
@@ -792,7 +797,8 @@ impl Actor {
         } = inputs;
         // The watch channels always have a value; start from it.
         if let Some(signalling) = signalling.as_mut() {
-            self.signalling = *signalling.borrow_and_update();
+            let health = *signalling.borrow_and_update();
+            self.set_signalling(health);
         }
         if let Some(lapsed) = lapsed.as_mut() {
             self.core_lapsed = *lapsed.borrow_and_update();
@@ -809,7 +815,7 @@ impl Actor {
         loop {
             tokio::select! {
                 changed = watch_changed(&mut signalling) => match changed {
-                    Some(health) => self.signalling = health,
+                    Some(health) => self.set_signalling(health),
                     None => signalling = None,
                 },
                 changed = watch_changed(&mut lapsed) => match changed {
@@ -1207,6 +1213,16 @@ impl Actor {
         log::debug!("roster reconciled: {} participant(s)", self.roster.len());
     }
 
+    /// Signalling health, kept for the interruptions record and told to the
+    /// pool, whose fallback needs it (034 R25).
+    fn set_signalling(&mut self, health: SignallingHealth) {
+        self.signalling = health;
+        let events = self
+            .pool
+            .set_signalling_reachable(health == SignallingHealth::Reachable);
+        self.apply_pool_events(events);
+    }
+
     /// Put what the pool reports onto the roster and the event stream.
     fn apply_pool_events(&mut self, events: Vec<PoolEvent>) {
         for event in events {
@@ -1293,6 +1309,16 @@ impl Actor {
                         );
                     }
                     self.end();
+                }
+                PoolEvent::OwnFocusMoved {
+                    connection_key,
+                    transport,
+                } => {
+                    log::info!("our media moved to {connection_key}");
+                    self.own_connection_key = Some(connection_key);
+                    if let Some(status) = &self.media_status {
+                        status.moved(transport);
+                    }
                 }
             }
         }
@@ -2198,6 +2224,7 @@ mod tests {
                 signalling: Some(signalling_rx),
                 own_membership_lapsed: Some(lapsed_rx),
                 own_reconnect_budget: matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
+                sfu_fallback: false,
             },
             memberships_rx,
         );

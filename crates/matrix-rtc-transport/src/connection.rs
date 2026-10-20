@@ -22,6 +22,7 @@
 //! bounds vanish ([`MaybeSend`]): a browser transport wraps livekit-js through
 //! `JsValue`s, which are `!Send`, and the engine runs on the JS event loop.
 
+use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -307,7 +308,9 @@ pub trait MediaTransport: MaybeSend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait TransportConnection: MaybeSend {
-    /// The grouping key this connection serves.
+    /// The grouping key this connection was opened for. A handle that took
+    /// another over ([`Self::take_over`]) serves that one's from then on,
+    /// which its owner keeps track of.
     fn connection_key(&self) -> &str;
 
     /// Publish a local track on this connection (only ever called on the own
@@ -354,6 +357,27 @@ pub trait TransportConnection: MaybeSend {
     ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
         Err(TransportError::Unsupported(
             "this connection cannot be re-established".into(),
+        ))
+    }
+
+    /// This connection's established session, for another handle of the
+    /// same transport to [`take_over`](Self::take_over) (034 R25): opaque,
+    /// and only meaningful to that transport. Changes nothing by itself; once
+    /// taken over, this handle is no longer used. `None` while not connected,
+    /// and by default.
+    fn hand_over(&self) -> Option<Box<dyn Any>> {
+        None
+    }
+
+    /// Move this handle onto the session another connection
+    /// [handed over](Self::hand_over) (034 R25): its focus becomes this
+    /// handle's, every publication made through this handle goes out there,
+    /// and a later [`reconnect`](Self::reconnect) goes there too. A reconnect
+    /// still in flight is abandoned. Synchronous, so its owner decides
+    /// between it and such a reconnect in one step. The default refuses.
+    fn take_over(&self, _handover: Box<dyn Any>) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this connection cannot take another over".into(),
         ))
     }
 

@@ -32,6 +32,8 @@ struct TransportState {
     reconnect_outcomes: StdMutex<std::collections::VecDeque<Reconnect>>,
     /// `(when, fresh_token)` of every `reconnect` call.
     reconnects: StdMutex<Vec<(tokio::time::Instant, bool)>>,
+    /// Every connection key the own handle took over.
+    takeovers: StdMutex<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,6 +141,16 @@ impl TransportConnection for FakeConnection {
         }
     }
 
+    fn hand_over(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.key.clone()))
+    }
+
+    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<(), TransportError> {
+        let key = handover.downcast::<String>().expect("a fake's handover");
+        self.state.takeovers.lock().unwrap().push(*key);
+        Ok(())
+    }
+
     async fn close(&self) -> Result<(), TransportError> {
         self.state.closes.lock().unwrap().push(self.key.clone());
         Ok(())
@@ -199,6 +211,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_fallback(false)
+    }
+
+    fn with_fallback(sfu_fallback: bool) -> Self {
         let state = Arc::new(TransportState::default());
         let (pool, inbox) = MediaPool::new(PoolConfig {
             transports: vec![Arc::new(FakeTransport(state.clone()))],
@@ -213,6 +229,7 @@ impl Fixture {
             },
             own_connection_key: Some(OWN_FOCUS.to_owned()),
             own_reconnect_budget: OWN_RECONNECT_BUDGET,
+            sfu_fallback,
         });
         Self { pool, inbox, state }
     }
@@ -776,5 +793,367 @@ async fn unmappable_identities_and_unreachable_members_are_reported() {
     assert_eq!(
         fx.pool.member_connection("bob"),
         Some(ConnectionState::Reconnecting)
+    );
+}
+
+mod fallback {
+    //! 034 R25: our own focus down past the grace, with signalling working
+    //! and a peer connection up, moves our media onto the busiest peer focus.
+
+    use super::*;
+
+    const THIRD_FOCUS: &str = "https://sfu-c.example.org";
+
+    /// Own focus adopted; bob and carol on the peer focus, dave on a third.
+    async fn call(sfu_fallback: bool) -> (Fixture, UnboundedSender<ConnectionEvent>) {
+        let mut fx = Fixture::with_fallback(sfu_fallback);
+        let own = fx.adopt();
+        fx.pool.apply_snapshot(&[
+            member_on("own", OWN_FOCUS),
+            member_on("bob", PEER_FOCUS),
+            member_on("carol", PEER_FOCUS),
+            member_on("dave", THIRD_FOCUS),
+        ]);
+        fx.drain().await;
+        (fx, own)
+    }
+
+    /// The transport gives our own focus up, and every reconnect fails.
+    fn lose_own(fx: &Fixture, own: &UnboundedSender<ConnectionEvent>) {
+        fx.state
+            .reconnect_outcomes
+            .lock()
+            .unwrap()
+            .extend([Reconnect::Fail; 40]);
+        own.send(ConnectionEvent::Closed {
+            message: "gone".into(),
+        })
+        .unwrap();
+    }
+
+    /// Runs `secs` seconds a second at a time; every event with the second
+    /// it came at, counted from `start`.
+    async fn run(
+        fx: &mut Fixture,
+        start: tokio::time::Instant,
+        secs: u64,
+    ) -> Vec<(u64, PoolEvent)> {
+        let mut events = Vec::new();
+        for _ in 0..secs {
+            let at = (tokio::time::Instant::now() - start).as_secs();
+            events.extend(fx.drain().await.into_iter().map(|event| (at, event)));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        events
+    }
+
+    fn moved(events: &[(u64, PoolEvent)]) -> Option<(u64, String)> {
+        events.iter().find_map(|(at, event)| match event {
+            PoolEvent::OwnFocusMoved {
+                connection_key,
+                transport,
+            } => {
+                assert_eq!(
+                    *transport,
+                    RtcTransport::LiveKit(LiveKitTransport {
+                        livekit_service_url: connection_key.clone(),
+                    })
+                );
+                Some((*at, connection_key.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    fn lost_at(events: &[(u64, PoolEvent)]) -> Option<(u64, OwnConnectionLoss)> {
+        events.iter().find_map(|(at, event)| match event {
+            PoolEvent::OwnConnectionLost { reason, .. } => Some((*at, *reason)),
+            _ => None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_busiest_peer_connection_is_taken_over_at_ten_seconds() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+
+        assert_eq!(moved(&events), Some((10, PEER_FOCUS.to_owned())));
+        assert_eq!(*fx.state.takeovers.lock().unwrap(), [PEER_FOCUS]);
+        assert_eq!(lost_at(&events), None);
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+        let after: Vec<u64> = fx
+            .state
+            .reconnects
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(at, _)| (*at - start).as_secs())
+            .filter(|at| *at >= 10)
+            .collect();
+        assert!(after.is_empty(), "the own attempt dropped: {after:?}");
+        // The old focus has nobody else on it: nothing to reconnect.
+        assert_eq!(fx.connects(OWN_FOCUS), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_the_host_flag_the_budget_runs_out() {
+        let (mut fx, own) = call(false).await;
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+        assert_eq!(moved(&events), None);
+        assert_eq!(lost_at(&events), Some((60, OwnConnectionLoss::Budget)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_fallback_while_every_connection_is_down() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        fx.sender(PEER_FOCUS)
+            .send(ConnectionEvent::Reconnecting)
+            .unwrap();
+        fx.sender(THIRD_FOCUS)
+            .send(ConnectionEvent::Reconnecting)
+            .unwrap();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+        assert_eq!(moved(&events), None);
+        assert!(fx.state.takeovers.lock().unwrap().is_empty());
+        assert_eq!(lost_at(&events), Some((60, OwnConnectionLoss::Budget)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_fallback_in_a_single_sfu_call() {
+        let mut fx = Fixture::with_fallback(true);
+        let own = fx.adopt();
+        fx.pool
+            .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+        fx.drain().await;
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+        assert_eq!(moved(&events), None);
+        assert_eq!(lost_at(&events), Some((60, OwnConnectionLoss::Budget)));
+    }
+
+    /// The busiest focus is down while another peer's is up: the move waits
+    /// for it, and happens as it comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_connection_coming_back_mid_outage_enables_the_fallback() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        let peer = fx.sender(PEER_FOCUS);
+        peer.send(ConnectionEvent::Reconnecting).unwrap();
+        lose_own(&fx, &own);
+        let mut events = run(&mut fx, start, 25).await;
+        assert_eq!(moved(&events), None);
+        peer.send(ConnectionEvent::Reconnected).unwrap();
+        events.extend(run(&mut fx, start, 5).await);
+        assert_eq!(moved(&events), Some((25, PEER_FOCUS.to_owned())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fallback_needs_signalling() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        fx.pool.set_signalling_reachable(false);
+        lose_own(&fx, &own);
+        let mut events = run(&mut fx, start, 20).await;
+        assert_eq!(moved(&events), None);
+        events.extend(
+            fx.pool
+                .set_signalling_reachable(true)
+                .into_iter()
+                .map(|event| (20, event)),
+        );
+        assert_eq!(moved(&events), Some((20, PEER_FOCUS.to_owned())));
+    }
+
+    /// Our own focus back first: the pending fallback is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn our_own_focus_back_first_wins() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        let peer = fx.sender(PEER_FOCUS);
+        peer.send(ConnectionEvent::Reconnecting).unwrap();
+        fx.state
+            .reconnect_outcomes
+            .lock()
+            .unwrap()
+            .extend([Reconnect::Fail; 4]);
+        own.send(ConnectionEvent::Closed {
+            message: "gone".into(),
+        })
+        .unwrap();
+        // Attempts at 0, 1, 3, 7 fail; the one at 15 lands.
+        let mut events = run(&mut fx, start, 18).await;
+        peer.send(ConnectionEvent::Reconnected).unwrap();
+        events.extend(run(&mut fx, start, 5).await);
+        assert_eq!(moved(&events), None);
+        assert!(fx.state.takeovers.lock().unwrap().is_empty());
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    }
+
+    /// Whoever else publishes on the old focus is subscribed to as a peer's.
+    #[tokio::test(start_paused = true)]
+    async fn the_old_focus_is_connected_as_a_peer_when_others_remain_there() {
+        let (mut fx, own) = call(true).await;
+        fx.pool.apply_snapshot(&[
+            member_on("own", OWN_FOCUS),
+            member_on("erin", OWN_FOCUS),
+            member_on("bob", PEER_FOCUS),
+            member_on("carol", PEER_FOCUS),
+        ]);
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 12).await;
+        assert_eq!(moved(&events), Some((10, PEER_FOCUS.to_owned())));
+        assert_eq!(fx.connects(OWN_FOCUS), 1);
+        assert_eq!(
+            fx.pool.member_connection("erin"),
+            Some(ConnectionState::Connected)
+        );
+    }
+    #[derive(Clone, Debug)]
+    enum Step {
+        OwnClosed,
+        PeerReconnecting,
+        PeerReconnected,
+        Signalling(bool),
+        Wait(u64),
+    }
+
+    fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(Step::OwnClosed),
+            Just(Step::PeerReconnecting),
+            Just(Step::PeerReconnected),
+            any::<bool>().prop_map(Step::Signalling),
+            (1u64..20).prop_map(Step::Wait),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Whatever the order of losses, reconnect outcomes, peer outages and
+        /// signalling: our media moves only with the host flag, only while
+        /// signalling is reachable, first to the busiest focus, never back to
+        /// our own, and again (or given up) only once the focus it moved to
+        /// was lost in turn.
+        #[test]
+        fn a_fallback_is_taken_only_on_its_terms(
+            sfu_fallback: bool,
+            fails in proptest::collection::vec(proptest::bool::ANY, 0..40),
+            steps in proptest::collection::vec(step(), 1..30),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (mut fx, own) = call(sfu_fallback).await;
+                fx.state.reconnect_outcomes.lock().unwrap().extend(
+                    fails
+                        .iter()
+                        .map(|fail| if *fail { Reconnect::Fail } else { Reconnect::Ok }),
+                );
+                let peer = fx.sender(PEER_FOCUS);
+                let mut reachable = true;
+                let mut moves = 0;
+                let mut new_focus_lost = false;
+                for step in steps {
+                    new_focus_lost |= moves > 0 && matches!(step, Step::PeerReconnecting);
+                    let events = match step {
+                        Step::OwnClosed => {
+                            let _ = own.send(ConnectionEvent::Closed {
+                                message: "gone".into(),
+                            });
+                            fx.drain().await
+                        }
+                        Step::PeerReconnecting => {
+                            let _ = peer.send(ConnectionEvent::Reconnecting);
+                            fx.drain().await
+                        }
+                        Step::PeerReconnected => {
+                            let _ = peer.send(ConnectionEvent::Reconnected);
+                            fx.drain().await
+                        }
+                        Step::Signalling(now) => {
+                            reachable = now;
+                            let mut events = fx.pool.set_signalling_reachable(now);
+                            events.extend(fx.drain().await);
+                            events
+                        }
+                        Step::Wait(secs) => {
+                            let mut events = Vec::new();
+                            for _ in 0..secs {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                events.extend(fx.drain().await);
+                            }
+                            events
+                        }
+                    };
+                    for event in &events {
+                        if let PoolEvent::OwnFocusMoved { connection_key, .. } = event {
+                            assert!(sfu_fallback, "moved without the host flag");
+                            assert!(reachable, "moved while signalling was down");
+                            assert_ne!(connection_key, OWN_FOCUS, "never back");
+                            if moves == 0 {
+                                assert_eq!(connection_key, PEER_FOCUS, "the busiest focus");
+                            } else {
+                                assert!(new_focus_lost, "moved again with no new loss");
+                            }
+                            moves += 1;
+                        }
+                        if matches!(event, PoolEvent::OwnConnectionLost { .. }) {
+                            assert!(moves == 0 || new_focus_lost, "given up after moving away");
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// 034 R25: a member moving focus is added on the new connection before the
+/// old one removes them; that late removal leaves the new track alone.
+#[tokio::test(start_paused = true)]
+async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    own.send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    fx.drain().await;
+
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    fx.sender(PEER_FOCUS)
+        .send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    own.send(ConnectionEvent::TrackRemoved {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+    })
+    .unwrap();
+    let events = fx.drain().await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::StreamRemoved { .. })),
+        "{events:?}"
+    );
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_some()
     );
 }

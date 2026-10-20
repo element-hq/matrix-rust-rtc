@@ -1158,6 +1158,37 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         }
     }
 
+    /// Re-sends our join content naming `transport` as the one focus we
+    /// publish on, after our media moved there (034 R25); the same sticky
+    /// key, so the same member id, and peers see an update rather than a
+    /// leave and a join. Retried like [`Self::republish`], and what refreshes
+    /// from then on.
+    pub async fn republish_transports(&self, transport: &RtcTransport) {
+        {
+            let mut guard = self.last_sticky.lock().unwrap();
+            let Some(sticky) = guard.as_mut() else {
+                return;
+            };
+            let published = sticky
+                .content
+                .pointer_mut("/transports/published")
+                .and_then(Value::as_array_mut);
+            let Some(published) = published else {
+                log::warn!(
+                    "[{}] our membership names no published transport to move",
+                    self.room_id
+                );
+                return;
+            };
+            *published = vec![transport_to_json(transport)];
+        }
+        log::info!(
+            "[{}] our media moved to {transport:?}; republishing our membership",
+            self.room_id
+        );
+        self.republish().await;
+    }
+
     /// Re-sends our membership event once a third of its lifetime has passed,
     /// keeping us in the map for another full lifetime (R18).
     ///
@@ -1897,6 +1928,56 @@ mod tests {
             machine.on_catch_up(OwnEntry::Present(machine.membership_event_id()));
             assert!(!republish.has_changed().unwrap(), "no second publish");
             let _ = republish.borrow_and_update();
+        }
+
+        /// 034 R25: our media moving to another focus republishes the join
+        /// content naming it, under the same member id, and that content is
+        /// what refreshes from then on.
+        #[tokio::test(start_paused = true)]
+        async fn a_focus_move_republishes_the_join_naming_the_new_focus() {
+            use crate::transport::{LiveKitTransport, RawRtcTransport};
+
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            machine
+                .join(
+                    MemberTransports::publishing(RawRtcTransport {
+                        transport_type: "livekit".to_owned(),
+                        extra_fields: [("livekit_service_url".to_owned(), "https://a".into())]
+                            .into(),
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let joined = mock.last_sticky_event().unwrap().2;
+
+            machine
+                .republish_transports(&RtcTransport::LiveKit(LiveKitTransport {
+                    livekit_service_url: "https://b".to_owned(),
+                }))
+                .await;
+
+            let moved = mock.last_sticky_event().unwrap().2;
+            assert_eq!(
+                moved["transports"],
+                json!({
+                    "published": [{ "type": "livekit", "livekit_service_url": "https://b" }],
+                    "can_subscribe": ["livekit"],
+                })
+            );
+            assert_eq!(moved["member"], joined["member"], "same member id");
+            assert_eq!(
+                machine
+                    .last_sticky
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .content,
+                moved,
+                "what refreshes from now on"
+            );
         }
 
         /// R19: a delay that survived leaves the decision to the next complete

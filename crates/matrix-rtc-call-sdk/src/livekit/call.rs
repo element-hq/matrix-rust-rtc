@@ -343,6 +343,7 @@ impl LiveKitCall {
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),
                 own_reconnect_budget: None,
+                sfu_fallback: false,
             },
         )
         .await;

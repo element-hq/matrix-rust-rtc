@@ -713,6 +713,17 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .and_then(|machine| machine.membership_event_id())
     }
 
+    /// Our membership republished naming `transport` as the focus we publish
+    /// on, after our media moved there (034 R25): the send, to await outside
+    /// the room's lock. `None` while not joined.
+    pub fn republish_transports(
+        &self,
+        transport: RtcTransport,
+    ) -> Option<impl Future<Output = ()> + use<T>> {
+        let machine = self.own_membership_machine.clone()?;
+        Some(async move { machine.republish_transports(&transport).await })
+    }
+
     /// Follows [`Self::own_membership_event_id`] for this join, which moves on
     /// every sticky refresh; `None` while not joined.
     pub fn subscribe_own_membership_event_id(&self) -> Option<watch::Receiver<Option<String>>> {

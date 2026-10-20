@@ -607,6 +607,43 @@ mod tests {
             room.expire_holds().await;
         }
 
+        /// 034 R25: a peer republishing on another focus under the same
+        /// member id is an update, not a leave and a join: present throughout,
+        /// the snapshot naming the new focus.
+        #[tokio::test(start_paused = true)]
+        async fn a_republish_with_new_transports_is_a_move_not_a_leave() {
+            use crate::transport::{LiveKitTransport, RawRtcTransport, RtcTransport};
+
+            let on = |focus: &str, event_id: &str| {
+                let mut event = member("@bob:x", "bob", event_id);
+                event.content.transports = Some(MemberTransports::publishing(RawRtcTransport {
+                    transport_type: "livekit".to_owned(),
+                    extra_fields: [("livekit_service_url".to_owned(), focus.into())].into(),
+                }));
+                event
+            };
+            let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+            room.set_current_sticky_state(vec![on("https://a", "$b1")])
+                .await
+                .unwrap();
+            let mut snapshots = room.subscribe_membership_snapshots(SLOT).unwrap();
+            snapshots.mark_unchanged();
+
+            room.set_current_sticky_state(vec![on("https://b", "$b2")])
+                .await
+                .unwrap();
+            let snapshot = snapshots.borrow_and_update().clone();
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot[0].member_id, "bob");
+            assert_eq!(
+                snapshot[0].transports,
+                [RtcTransport::LiveKit(LiveKitTransport {
+                    livekit_service_url: "https://b".to_owned(),
+                })]
+            );
+            assert_eq!(room.hold_expires_at(), None, "nothing held");
+        }
+
         #[tokio::test(start_paused = true)]
         async fn a_delayed_leave_is_held_ten_seconds_and_a_return_cancels_it() {
             let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);

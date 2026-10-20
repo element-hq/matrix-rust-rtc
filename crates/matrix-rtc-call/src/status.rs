@@ -15,7 +15,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use matrix_rtc_core::{LeaveCode, LeaveReason};
+use matrix_rtc_core::{LeaveCode, LeaveReason, RtcTransport};
 use tokio::sync::watch;
 
 use crate::direct_call::{DirectCallEnd, DirectCallState};
@@ -128,6 +128,9 @@ pub(crate) struct CallStatusCell {
     /// Whether a follower takes media losses; see
     /// [`MediaStatusReporter::lost`].
     loss_followed: AtomicBool,
+    /// The focus our media last moved to, for the follower to republish our
+    /// membership naming it (034 R25).
+    moved: watch::Sender<Option<RtcTransport>>,
 }
 
 struct Inputs {
@@ -233,6 +236,7 @@ impl CallStatusCell {
             status: watch::channel(status).0,
             loss: watch::channel(None).0,
             loss_followed: AtomicBool::new(false),
+            moved: watch::channel(None).0,
         })
     }
 
@@ -268,6 +272,11 @@ impl CallStatusCell {
     pub(crate) fn follow_losses(&self) -> watch::Receiver<Option<(ConnectionLossReason, String)>> {
         self.loss_followed.store(true, Ordering::SeqCst);
         self.loss.subscribe()
+    }
+
+    /// Follows the focus our media moves to: see [`MediaStatusReporter::moved`].
+    pub(crate) fn follow_moves(&self) -> watch::Receiver<Option<RtcTransport>> {
+        self.moved.subscribe()
     }
 
     /// Reports the end by our own connection being given up.
@@ -336,6 +345,13 @@ impl MediaStatusReporter {
         } else {
             self.cell.connection_closed(reason, message);
         }
+    }
+
+    /// Our media moved to another focus while ours was down (034 R25): the
+    /// call republishes our membership naming `transport`, under the same
+    /// member id.
+    pub fn moved(&self, transport: RtcTransport) {
+        self.cell.moved.send_replace(Some(transport));
     }
 
     fn set(&self, media: MediaPhase) {

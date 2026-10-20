@@ -714,7 +714,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 
     /// Ends the call when its media gives our own connection up (034 R26):
     /// publishing stops first, then our one leave attempt is issued, then the
-    /// end is reported, without waiting for the leave's outcome.
+    /// end is reported, without waiting for the leave's outcome. Until then,
+    /// republishes our membership naming each focus our media moves to
+    /// (034 R25).
     fn follow_media_loss(
         &self,
         slot_id: String,
@@ -722,16 +724,36 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         status: Arc<CallStatusCell>,
     ) -> AbortOnDrop<()> {
         let mut losses = status.follow_losses();
+        let mut moves = status.follow_moves();
         let state = self.state.clone();
         let tag = format!("{}/{slot_id}", self.room_id);
         executor::spawn(async move {
             let mut ended = end.ended.subscribe();
-            let (reason, message) = tokio::select! {
-                loss = losses.wait_for(Option::is_some) => match loss.as_deref() {
-                    Ok(Some(loss)) => loss.clone(),
-                    _ => return,
-                },
-                _ = ended.wait_for(Option::is_some) => return,
+            let (reason, message) = loop {
+                let transport = tokio::select! {
+                    loss = losses.wait_for(Option::is_some) => match loss.as_deref() {
+                        Ok(Some(loss)) => break loss.clone(),
+                        _ => return,
+                    },
+                    moved = moves.changed() => match moved {
+                        Ok(()) => moves.borrow_and_update().clone(),
+                        Err(_) => return,
+                    },
+                    _ = ended.wait_for(Option::is_some) => return,
+                };
+                let Some(transport) = transport else {
+                    continue;
+                };
+                // Detached: retried until it lands, is superseded or the join
+                // leaves, while a loss must still be followed.
+                let send = state
+                    .lock()
+                    .await
+                    .rtc()
+                    .republish_transports(&slot_id, transport);
+                if let Some(send) = send {
+                    executor::spawn(send);
+                }
             };
             let leave_reason = LeaveReason::with_reason(
                 LeaveCode::Other("connection_lost".to_owned()),
