@@ -25,7 +25,9 @@ pub use status::{CallEnd, CallStatus, MediaPhase, MediaStatusReporter, RingPhase
 mod room_state;
 pub mod transports;
 
-pub use client::{CallJoinOptions, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession};
+pub use client::{
+    CallJoinOptions, JOIN_BUDGET, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession,
+};
 pub use direct_call::{CallKind, DECLINE_EVENT_TYPES, GroupNotify, RING_SEND_DEADLINE, RingConfig};
 pub use matrix_rtc_core::SignallingHealth;
 pub use notification::{

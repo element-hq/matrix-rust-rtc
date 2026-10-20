@@ -53,8 +53,9 @@ pub use host::event::{
     RawTimelineEvent, RelationsRequest, StickyEventsUpdate,
 };
 pub use join::{
-    DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS, JoinSessionParams,
-    LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent, generate_member_id,
+    DEFAULT_JOIN_BUDGET_MS, DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
+    JoinSessionParams, LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent,
+    generate_member_id,
 };
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
@@ -65,7 +66,7 @@ pub use own_membership::{
 };
 pub use session::{
     ApplicationInfo, JoinedMembership, LeaveCode, LeaveReason, LeftMembership, MemberInfo,
-    Membership, RtcMembershipEvent, SlotSession,
+    Membership, PendingLeave, RtcMembershipEvent, SlotSession,
 };
 pub use slot::{
     EncryptionMechanism, OpenSlot, RawSlotEvent, RawSlotEventContent, RoomEncryption,

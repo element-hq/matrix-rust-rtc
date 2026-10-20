@@ -27,7 +27,7 @@ use std::time::Duration;
 use matrix_rtc_core::{
     ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoom, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError,
+    LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError, Outbox,
     ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SignallingHealth, SlotEncryption, SlotState,
     TransportIntent,
     executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
@@ -44,6 +44,10 @@ use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::feeder::RoomAlreadyOpen;
 
 type Backend<B> = DialectBackend<B>;
+
+/// How long [`RtcRoom::join`] and [`RtcRoom::join_call`] may take, from the
+/// call to our membership being published (034 R6).
+pub const JOIN_BUDGET: Duration = Duration::from_millis(matrix_rtc_core::DEFAULT_JOIN_BUDGET_MS);
 type State<B> = CallRoomState<Backend<B>>;
 type SharedState<B> = Arc<Mutex<State<B>>>;
 
@@ -269,9 +273,9 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         let room_id = room_id.into();
         let mode = options.format;
         let backend = self.base.backend().clone();
+        let outbox = self.base.outbox().clone();
         let state = Arc::new(Mutex::new(CallRoomState::new(
-            BaseRtcRoom::with_backend(room_id.clone(), backend.clone())
-                .with_outbox(self.base.outbox().clone()),
+            BaseRtcRoom::with_backend(room_id.clone(), backend.clone()).with_outbox(outbox.clone()),
         )));
         let handle = self
             .base
@@ -283,6 +287,7 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
             mode,
             state,
             backend,
+            outbox,
             handle: Some(handle),
             sessions: StdMutex::new(HashMap::new()),
         })
@@ -297,6 +302,9 @@ pub struct RtcRoom<B: MatrixBackend + 'static> {
     mode: MembershipFormat,
     state: SharedState<B>,
     backend: Arc<Backend<B>>,
+    /// The client's retry layer, for the join's steps taken before the room's
+    /// lock is.
+    outbox: Outbox,
     /// The core's open room, which feeds `state`; `None` once detached.
     handle: Option<BaseRtcRoomHandle<B, State<B>>>,
     /// Each slot's current session, shared with it so closing the room ends it.
@@ -373,15 +381,21 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 
     /// Joins a slot of any application (R6). Refused while the slot is joined
     /// through a live session of this room (R8).
+    ///
+    /// Completes or fails within [`JOIN_BUDGET`] of this call (034 R6): every
+    /// step's transient failures are retried inside it, a refusal fails it at
+    /// once ([`JoinError::Refused`]), and the budget's end fails it with
+    /// [`JoinError::TimedOut`].
     pub async fn join(&self, options: JoinOptions) -> Result<RtcSession<B>, RtcError> {
+        let deadline = executor::Instant::now() + JOIN_BUDGET;
         let slot_id = options.slot_id.clone();
-        let transport = self.transport(options.transport.clone()).await?;
+        let transport = self.transport(options.transport.clone(), deadline).await?;
         let mut state = self.state.lock().await;
         let params = self
             .prepare_join(&mut state, options, transport.clone())
             .await?;
         let member_id = params.membership_id();
-        state.rtc_mut().join(params).await?;
+        state.rtc_mut().join_within(params, Some(deadline)).await?;
         let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
         drop(state);
@@ -391,25 +405,32 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// Joins a call slot: the generic join, then the call layer — reactions
     /// for this participation, a group's notification, or a DM call's ring and
     /// lifecycle.
+    ///
+    /// Under the same budget as [`Self::join`] (034 R6); a group's
+    /// notification shares it and never fails the join.
     pub async fn join_call(&self, options: CallJoinOptions) -> Result<RtcCall<B>, RtcError> {
+        let deadline = executor::Instant::now() + JOIN_BUDGET;
         let CallJoinOptions {
             join,
             kind,
             reactions,
         } = options;
         let slot_id = join.slot_id.clone();
-        let transport = self.transport(join.transport.clone()).await?;
+        let transport = self.transport(join.transport.clone(), deadline).await?;
         let mut state = self.state.lock().await;
         let rtc = self
             .prepare_join(&mut state, join, transport.clone())
             .await?;
         let member_id = rtc.membership_id();
         let joined = state
-            .join(CallJoinParams {
-                rtc,
-                kind,
-                reactions,
-            })
+            .join_within(
+                CallJoinParams {
+                    rtc,
+                    kind,
+                    reactions,
+                },
+                Some(deadline),
+            )
             .await?;
         let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
@@ -464,8 +485,19 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// What the join's [`JoinTransport`] resolves to. Asked before the room's
     /// lock is taken: it may be a request to the homeserver, and the feed would
     /// wait on it otherwise.
-    async fn transport(&self, chosen: JoinTransport) -> Result<TransportIntent, RtcError> {
-        Ok(transports::resolve(self.backend.as_ref(), chosen).await?)
+    async fn transport(
+        &self,
+        chosen: JoinTransport,
+        deadline: executor::Instant,
+    ) -> Result<TransportIntent, RtcError> {
+        Ok(transports::resolve(
+            self.backend.as_ref(),
+            &self.outbox,
+            &self.room_id,
+            chosen,
+            deadline,
+        )
+        .await?)
     }
 
     /// Everything else a join needs that the host does not say: who we are,
@@ -839,8 +871,13 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
                 .await
     }
 
-    /// Leaves the slot; the session is over afterwards (R9), even when the
-    /// send fails — the delayed leave then removes the membership.
+    /// Leaves the slot; the session is over afterwards (R9).
+    ///
+    /// Returns once our participation has ended, without waiting for the
+    /// leave to be sent (034 R8): the leave is one attempt, made on its own,
+    /// and if it fails the delayed leave — or, without one, the membership's
+    /// lifetime — removes us. Fails only with [`RtcError::SessionOver`], when
+    /// the session was already over.
     pub async fn leave(&self, params: LeaveSessionParams) -> Result<(), RtcError> {
         let reason = params
             .leave_reason
@@ -851,7 +888,30 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
         if !self.end.end(reason) {
             return Err(RtcError::SessionOver);
         }
-        self.state.lock().await.leave(&self.slot_id, params).await?;
+        let pending = self
+            .state
+            .lock()
+            .await
+            .begin_leave(&self.slot_id, params)
+            .await;
+        let tag = format!("{}/{}", self.room_id, self.slot_id);
+        let send = async move {
+            match pending {
+                Ok(pending) => {
+                    if let Err(error) = pending.send().await {
+                        log::warn!(
+                            "[{tag}] our leave was not sent ({error}); the delayed leave removes us"
+                        );
+                    }
+                }
+                Err(error) => log::warn!("[{tag}] nothing to leave: {error}"),
+            }
+        };
+        if executor::can_spawn() {
+            executor::spawn(send);
+        } else {
+            send.await;
+        }
         Ok(())
     }
 

@@ -57,6 +57,9 @@ pub enum SendKind {
     Notification,
     Hand,
     Reaction,
+    /// The homeserver's `rtc_transports`: a read, retried only as the first
+    /// step of a join, under its budget.
+    RtcTransports,
 }
 
 /// A slot: a [`SendKind`] within a scope, such as one room's slot session.

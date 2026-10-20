@@ -41,6 +41,11 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
 /// [`keep_alive`]: crate::OwnMembershipMachine::keep_alive
 pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
 
+/// How long a join may take from the moment the library receives it to our
+/// membership being published (034 R6): every step's transient failures are
+/// retried inside it, and a join still not through at its end fails.
+pub const DEFAULT_JOIN_BUDGET_MS: u64 = 30_000;
+
 /// The longest sticky lifetime that is actually honoured (1 hour).
 ///
 /// Homeservers (and matrix-rust-sdk) clamp longer requests down to an hour.

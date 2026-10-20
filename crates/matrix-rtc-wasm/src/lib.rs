@@ -426,8 +426,10 @@ impl WasmRtcCall {
         serde_wasm_bindgen::to_value(&self.call.raised_hands().await).map_err(js_error)
     }
 
-    /// Leaves the slot; the call is over and its media stopped at once, even
-    /// when the send fails — the delayed leave then removes the membership.
+    /// Leaves the slot; the call is over and its media stopped at once, and
+    /// this resolves without waiting for the leave to be sent (034 R8). The
+    /// send is one attempt; if it fails, the delayed leave removes the
+    /// membership. Rejects only when the call was already over.
     ///
     /// `params` is `{ leave_reason?: { code, reason? } }` — e.g.
     /// `{ code: "leave" }` for an intentional hang-up. Defaults to that.

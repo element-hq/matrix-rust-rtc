@@ -18,7 +18,8 @@ use std::sync::{Arc, Mutex};
 use matrix_rtc_core::compat::DialectBackend;
 use matrix_rtc_core::{
     ApplicationIntake, BaseRtcRoom, CommandError, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveError, LeaveSessionParams, MatrixBackend, RawTimelineEvent, RelationsRequest,
+    LeaveError, LeaveSessionParams, MatrixBackend, PendingLeave, RawTimelineEvent,
+    RelationsRequest, executor,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -69,6 +70,43 @@ impl CallJoinParams {
 impl From<JoinSessionParams> for CallJoinParams {
     fn from(rtc: JoinSessionParams) -> Self {
         Self::new(rtc)
+    }
+}
+
+/// A leave whose participation has ended ([`CallRoomState::begin_leave`]) and
+/// whose sends have not: our raised hand lowered, then the core's leave, each
+/// one attempt (034 R8). Owns what it needs, so it runs without the room.
+pub struct CallPendingLeave<T: MatrixBackend + 'static> {
+    room_id: String,
+    slot_id: String,
+    /// The backend and the annotation to redact, when our hand was up.
+    lower_hand: Option<(Arc<T>, String)>,
+    core: PendingLeave<T>,
+}
+
+impl<T: MatrixBackend + 'static> CallPendingLeave<T> {
+    /// Sends the leave; a failure is the leave event's. The hand is best
+    /// effort: peers drop it with the membership anyway.
+    pub async fn send(self) -> Result<(), LeaveError> {
+        let Self {
+            room_id,
+            slot_id,
+            lower_hand,
+            core,
+        } = self;
+        if let Some((backend, event_id)) = lower_hand {
+            match backend
+                .redact_event(room_id.clone(), event_id.clone(), None)
+                .await
+            {
+                Ok(()) => log::info!("[{room_id}/{slot_id}] hand lowered ({event_id} redacted)"),
+                Err(error) => log::warn!(
+                    "[{room_id}/{slot_id}] the raised hand was not lowered before leaving \
+                     ({error}); peers drop it with the membership",
+                ),
+            }
+        }
+        core.send().await
     }
 }
 
@@ -221,6 +259,41 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
             .backend()
             .cloned()
             .ok_or_else(|| CommandError::from_message("no backend configured"))
+    }
+
+    /// The part of [`Self::leave`] that needs the room: our participation
+    /// ends here, and what is returned sends the leave without the room
+    /// (034 R8) — our raised hand lowered first, while the membership it
+    /// annotates still stands, then the core's leave.
+    pub async fn begin_leave(
+        &mut self,
+        slot_id: &str,
+        params: LeaveSessionParams,
+    ) -> Result<CallPendingLeave<T>, LeaveError> {
+        let room_id = self.room_id();
+        let hand = self
+            .with_state(slot_id, |state| state.reactions.own_raised_hand().cloned())
+            .flatten()
+            .filter(|_| self.rtc.own_member_id(slot_id).is_some());
+        let lower_hand = hand
+            .zip(self.rtc.backend().cloned())
+            .map(|(hand, backend)| (backend, hand.reaction_event_id));
+
+        if let Some(Some(direct)) = self.with_state(slot_id, |state| state.direct.clone()) {
+            direct.finish_left();
+        }
+        let core = self.rtc.begin_leave(slot_id, params).await?;
+
+        self.with_state(slot_id, |state| {
+            state.own = None;
+            state.reactions.reset_own();
+        });
+        Ok(CallPendingLeave {
+            room_id,
+            slot_id: slot_id.to_owned(),
+            lower_hand,
+            core,
+        })
     }
 
     /// Lowers our hand first, while the membership it annotates still stands.
@@ -585,12 +658,23 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
 impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
     /// The core join, then what the call's kind asks for: a group's
     /// notification, or a DM call's lifecycle and the ring to send.
+    #[cfg(test)]
     pub async fn join(&mut self, params: CallJoinParams) -> Result<CallJoined, JoinError> {
+        self.join_within(params, None).await
+    }
+
+    /// [`Self::join`] under the join's budget, which ends at `deadline`
+    /// (034 R6): the core join and a group's notification share it.
+    pub async fn join_within(
+        &mut self,
+        params: CallJoinParams,
+        deadline: Option<executor::Instant>,
+    ) -> Result<CallJoined, JoinError> {
         let reactions = params.reactions();
         let CallJoinParams { rtc, kind, .. } = params;
         let slot_id = rtc.slot_id.clone();
 
-        let member_event_id = self.rtc.join(rtc.clone()).await?;
+        let member_event_id = self.rtc.join_within(rtc.clone(), deadline).await?;
         // The join succeeded, so the room has a backend.
         let user_id = self.backend()?.own_user_id();
 
@@ -615,11 +699,17 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             CallKind::Group {
                 notify: Some(notify),
             } => {
-                self.notify_session_started(&notify.into(), &rtc, &joined.member_event_id)
-                    .await;
+                self.notify_session_started(
+                    &notify.into(),
+                    &rtc,
+                    &joined.member_event_id,
+                    deadline,
+                )
+                .await;
             }
             CallKind::Direct { ring } => {
-                self.join_direct(&rtc, &user_id, ring, &mut joined).await;
+                self.join_direct(&rtc, &user_id, ring, &mut joined, deadline)
+                    .await;
             }
         }
         Ok(joined)
@@ -632,13 +722,19 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         user_id: &str,
         ring: Option<crate::RingConfig>,
         joined: &mut CallJoined,
+        deadline: Option<executor::Instant>,
     ) {
         let tag = format!("{}/{}", self.room_id(), rtc.slot_id);
         let Some(callee) = callee_of(self.rtc.room_members(), user_id) else {
             log::info!("[{tag}] DM is not one-to-one: no ring, no direct-call lifecycle");
             if let Some(ring) = ring {
-                self.notify_session_started(&ring.demoted(), rtc, &joined.member_event_id)
-                    .await;
+                self.notify_session_started(
+                    &ring.demoted(),
+                    rtc,
+                    &joined.member_event_id,
+                    deadline,
+                )
+                .await;
             }
             return;
         };
@@ -708,6 +804,7 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         notify: &NotifyConfig,
         params: &JoinSessionParams,
         member_event_id: &str,
+        deadline: Option<executor::Instant>,
     ) {
         let Ok(backend) = self.backend() else {
             return;
@@ -719,11 +816,13 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             .unwrap_or_default();
         notify_session_started(
             backend.as_ref(),
+            self.rtc.outbox(),
             self.rtc.room_id(),
             notify,
             params,
             &members,
             member_event_id,
+            deadline,
         )
         .await;
     }

@@ -11,6 +11,8 @@ log only.
 ### Breaking
 
 - `EventEncryption`'s `sender_cross_signed` is `sender_confirmed` (FFI `senderConfirmed`), the client's verdict on the sender under its own trust settings; `require_cross_signed_sender` is `require_confirmed_sender` and `KeyRejection::NotCrossSigned` is `SenderNotConfirmed` (web `sender_not_confirmed`).
+- `RtcCall::leave` (FFI `leave`, web `leave`) returns once the call has ended, without waiting for the one-attempt leave send, and fails only when the call was already over (034 R8).
+- `notify_session_started` takes the client's `Outbox` and the join's deadline, and `OwnMembershipMachine::join` a deadline (034 R1, R6).
 - `CommandError::SendError(String)` is `CommandError::Backend(BackendError)`, and `BackendError` (FFI `FfiBackendError.Failed`, web via `data.retry_after_ms` and `permanent`) gains `retry_after_ms` and `permanent`, so the library classifies a host's failure on its error code (034 R3).
 
 ### Added
@@ -19,6 +21,8 @@ log only.
 - `BaseRtcRoom::subscribe_own_membership_lapsed` reports when our membership has lapsed for the other members while our sends fail (034 R17).
 
 ### Changed
+
+- A join completes or fails within 30 s of the call: transient failures of the transports read, the publish and the notification are retried inside it, and it fails with `JoinError::TimedOut` or `JoinError::Refused` (FFI `JoinTimedOut`, `JoinRefused`) (034 R6, R27).
 
 - Our membership's refresh, delayed-leave restart and re-arm are retried until they land, the refresh falls due at a third of the lifetime instead of half, and when signalling returns the library re-arms and republishes only what the outage lost (034 R1, R18, R19).
 

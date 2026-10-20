@@ -24,7 +24,9 @@ use crate::host::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
 use crate::outbox::Outbox;
-use crate::session::{JoinedMembership, LeaveReason, RtcMembershipEvent, SlotSession};
+use crate::session::{
+    JoinedMembership, LeaveReason, PendingLeave, RtcMembershipEvent, SlotSession,
+};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
@@ -132,6 +134,16 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
     /// Returns the event id of the membership event this join sent; see
     /// [`SlotSession::join`].
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
+        self.join_within(params, None).await
+    }
+
+    /// [`Self::join`] under a budget that ends at `deadline` (034 R6); see
+    /// [`SlotSession::join_within`].
+    pub async fn join_within(
+        &mut self,
+        params: JoinSessionParams,
+        deadline: Option<crate::executor::Instant>,
+    ) -> Result<String, JoinError> {
         let backend = self
             .backend
             .as_ref()
@@ -175,7 +187,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             session.set_backend(backend);
         }
 
-        session.join(params).await
+        session.join_within(params, deadline).await
     }
 
     /// Leaves one slot.
@@ -199,6 +211,24 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         })?;
 
         session.leave(params).await
+    }
+
+    /// The part of [`Self::leave`] that needs the room; the returned leave
+    /// sends without it (034 R8). See [`SlotSession::begin_leave`].
+    pub async fn begin_leave(
+        &mut self,
+        slot_id: &str,
+        params: LeaveSessionParams,
+    ) -> Result<PendingLeave<T>, LeaveError> {
+        let session = self.sessions.get_mut(slot_id).ok_or_else(|| {
+            log::warn!(
+                "[{}/{slot_id}] leave rejected: no such session",
+                self.room_id
+            );
+            LeaveError::CommandError(CommandError::from_message("session not found"))
+        })?;
+
+        session.begin_leave(params).await
     }
 
     /// Applies the **complete** current sticky state of the room.

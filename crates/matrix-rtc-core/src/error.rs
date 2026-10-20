@@ -11,6 +11,7 @@
 use thiserror::Error;
 
 pub use crate::host::backend::BackendError;
+use crate::outbox::SendFailure;
 
 /// Errors that can occur when executing commands via the `MatrixBackend`.
 #[derive(Debug, Error)]
@@ -78,6 +79,34 @@ pub enum JoinError {
     /// has to open the slot first.
     #[error("slot '{slot_id}' is not open in this room")]
     SlotClosed { slot_id: String },
+
+    /// The join did not complete within its budget: every step kept failing
+    /// transiently, or did not answer (034 R6).
+    #[error("the join did not complete within its budget")]
+    TimedOut,
+
+    /// The homeserver refused a step of the join for good (034 R3, R6).
+    #[error("the join was refused: {message}")]
+    Refused {
+        errcode: Option<String>,
+        message: String,
+    },
+}
+
+impl JoinError {
+    /// What a join step that went through the outbox ended as.
+    pub fn from_send_failure(failure: SendFailure) -> Self {
+        match failure {
+            SendFailure::Refused(error) => JoinError::Refused {
+                errcode: error
+                    .backend_error()
+                    .and_then(|error| error.errcode.clone()),
+                message: error.to_string(),
+            },
+            SendFailure::DeadlineElapsed { .. } | SendFailure::TimedOut => JoinError::TimedOut,
+            other => JoinError::CommandError(other.into_command_error()),
+        }
+    }
 }
 
 /// Errors that can occur when attempting to leave an RTC session.

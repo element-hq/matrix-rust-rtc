@@ -18,7 +18,7 @@ use tokio::sync::{broadcast, watch};
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::executor::{AbortHandle, AbortOnDrop};
+use crate::executor::{self, AbortHandle, AbortOnDrop};
 use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
@@ -117,6 +117,33 @@ struct OwnParticipation {
 /// Buffer of [`SlotSession::subscribe_auto_leaves`]. One auto-leave ends a
 /// join, so a subscriber only falls behind across several rejoins.
 const AUTO_LEAVES_CAPACITY: usize = 4;
+
+/// A leave whose participation has ended ([`SlotSession::begin_leave`]) and
+/// whose sends have not: our leave membership, then the delayed leave
+/// cancelled, each one attempt (034 R8). Owns everything it needs, so it runs
+/// without the session or its room.
+pub struct PendingLeave<T: MatrixBackend + 'static> {
+    machine: Arc<OwnMembershipMachine<T>>,
+    upkeep: Option<AbortOnDrop<()>>,
+    leave_reason: Option<LeaveReason>,
+    log_tag: String,
+}
+
+impl<T: MatrixBackend + 'static> PendingLeave<T> {
+    /// Sends the leave. A failure is the leave event's; the delayed leave
+    /// removes the membership then.
+    pub async fn send(self) -> Result<(), LeaveError> {
+        let sent = self
+            .machine
+            .leave(self.leave_reason)
+            .await
+            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
+        drop(self.upkeep);
+        sent?;
+        log::info!("[{}] left", self.log_tag);
+        Ok(())
+    }
+}
 
 /// Per-session MatrixRTC state machine and membership store.
 pub struct SlotSession<T: MatrixBackend> {
@@ -358,6 +385,17 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// application relates its own events to (a call's MSC4075 notification).
     /// Returns `Err(JoinError)` if validation fails, backend not configured, or commands fail.
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
+        self.join_within(params, None).await
+    }
+
+    /// [`Self::join`] under a budget that ends at `deadline` (034 R6), counted
+    /// from when the caller received the join; `None` is
+    /// [`DEFAULT_JOIN_BUDGET_MS`](crate::DEFAULT_JOIN_BUDGET_MS) from now.
+    pub async fn join_within(
+        &mut self,
+        params: JoinSessionParams,
+        deadline: Option<executor::Instant>,
+    ) -> Result<String, JoinError> {
         params.validate().map_err(|missing| {
             log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
             JoinError::MissingParameter(missing)
@@ -422,7 +460,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         machine.set_outbox(self.outbox.clone());
 
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        let membership_event_id = machine.join(transports).await?;
+        let membership_event_id = machine.join(transports, deadline).await?;
 
         // Store the machine
         self.own_membership_machine = Some(Arc::new(machine));
@@ -567,34 +605,37 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// A failed send still ends the join here, since the machine is gone and
     /// cannot retry; the delayed leave removes the membership.
     pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
+        self.begin_leave(params).await?.send().await
+    }
+
+    /// The part of [`Self::leave`] that needs the session: our participation
+    /// ends here — the machine stops sending, keys stop going out, and the
+    /// joined memberships are republished without us — and what remains is the
+    /// leave's own sends, returned to run without holding the session (034 R8).
+    pub async fn begin_leave(
+        &mut self,
+        params: LeaveSessionParams,
+    ) -> Result<PendingLeave<T>, LeaveError> {
         // Check if we have a membership machine (i.e., we've joined)
         let machine = self.own_membership_machine.take().ok_or_else(|| {
             log::warn!("[{}] leave rejected: not joined", self.log_tag);
             LeaveError::NotJoined
         })?;
-        // A tick in flight finishes first (the machine serialises the two),
-        // and finds nothing joined afterwards.
-        let upkeep = self.upkeep.take();
-
         log::info!(
             "[{}] leaving as {} (reason {:?})",
             self.log_tag,
             machine.sticky_key(),
             params.leave_reason,
         );
-
-        // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        let sent = machine
-            .leave(params.leave_reason.clone())
-            .await
-            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
+        // Nothing this join retries is sent from here on; a send already at
+        // the host finishes first, and the leave waits for it.
+        machine.begin_leave();
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
             encryption_manager.leave();
         }
         self.own_participation = None;
-        drop(upkeep);
 
         // Republish the joined memberships now that we are no longer among them, rather than
         // waiting for the host's next sticky delta. Room state and peer
@@ -603,9 +644,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // want to see who is left in the call.
         self.refresh().await;
 
-        sent?;
-        log::info!("[{}] left", self.log_tag);
-        Ok(())
+        Ok(PendingLeave {
+            machine,
+            // Kept until the leave is sent: its sends in flight must finish
+            // rather than be dropped mid-attempt under the leave.
+            upkeep: self.upkeep.take(),
+            leave_reason: params.leave_reason,
+            log_tag: self.log_tag.clone(),
+        })
     }
 
     /// One keep-alive tick: restarts the delayed leave, refreshes the sticky

@@ -735,6 +735,8 @@ pub(crate) mod test_support {
         /// Model a homeserver with MSC4140 switched off, the way matrix.org
         /// answers: every delayed send is refused.
         pub refuse_delayed: AtomicBool,
+        /// When set, every sticky send fails with it.
+        pub refuse_sticky: Mutex<Option<FfiBackendError>>,
         pub room_sinks: Mutex<HashMap<String, (FfiRoomSubjects, Arc<RoomSink>)>>,
         pub to_device_sink: Mutex<Option<(Vec<String>, Arc<ToDeviceSink>)>>,
         pub transports_json: Mutex<String>,
@@ -867,6 +869,9 @@ pub(crate) mod test_support {
             content_json: String,
             duration_ms: u64,
         ) -> Result<String, FfiBackendError> {
+            if let Some(error) = self.refuse_sticky.lock().unwrap().clone() {
+                return Err(error);
+            }
             self.record(&event_type);
             *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
             self.record_send(Carrier::Sticky, &event_type, None, &content_json);

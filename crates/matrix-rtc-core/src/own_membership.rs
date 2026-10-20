@@ -76,7 +76,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::encryption::RtcClock;
-use crate::error::CommandError;
+use crate::error::{CommandError, JoinError};
 use crate::executor;
 use crate::host::backend::MatrixBackend;
 use crate::host::event::RawStickyEventContent;
@@ -630,71 +630,73 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 
     /// Joins the session by implementing the dead man's switch strategy.
     ///
-    /// This method:
-    /// 1. Schedules a delayed leave event FIRST (safety net) - **awaited for completion**
-    /// 2. Sends the join membership event - **awaited for completion**
-    /// 3. The delayed leave will be restarted by heartbeat calls
+    /// 1. Schedules a delayed leave FIRST (the safety net).
+    /// 2. Sends the join membership event.
+    /// 3. The upkeep restarts the delayed leave from then on.
     ///
-    /// The async design ensures that we verify the delayed leave is successfully scheduled
-    /// before sending the join event, providing a proper safety net for the dead man's switch.
-    ///
-    /// # Arguments
-    ///
-    /// * `transports` - The `transports` object to publish for this member
+    /// Both sends go through the outbox and the whole join runs under one
+    /// budget (034 R6): `deadline`, or [`DEFAULT_JOIN_BUDGET_MS`] from now.
     ///
     /// A homeserver that refuses step 1 does not fail the join. MSC4140 is
     /// optional, and losing it costs only the *speed* of the cleanup — the
-    /// membership still expires on its own. Step 1 therefore degrades (see
-    /// [`DelayedLeaveSupport`]) and the membership goes out with the shorter
-    /// [`Self::membership_lifetime_ms`] instead. Step 2 failing is different:
-    /// that means we are not in the call, and it still fails the join.
+    /// membership still expires on its own. Step 1 is one attempt, given at most
+    /// half the budget so step 2 keeps time; when it fails the machine degrades
+    /// (see [`DelayedLeaveSupport`]) and the membership goes out with the shorter
+    /// [`Self::membership_lifetime_ms`] instead. Step 2 is retried on transient
+    /// failures until the deadline: a refusal fails the join at once
+    /// ([`JoinError::Refused`]), the deadline fails it with
+    /// [`JoinError::TimedOut`], and a join that fails after arming its delayed
+    /// leave cancels it with one detached attempt.
     ///
     /// # Returns
     ///
     /// The event id of the membership event if the join was sent successfully;
     /// an error if it was not. The caller needs the id to relate an MSC4075
     /// notification to the membership that justifies it.
-    pub async fn join(&self, transports: MemberTransports) -> Result<String, CommandError> {
+    ///
+    /// [`DEFAULT_JOIN_BUDGET_MS`]: crate::join::DEFAULT_JOIN_BUDGET_MS
+    pub async fn join(
+        &self,
+        transports: MemberTransports,
+        deadline: Option<executor::Instant>,
+    ) -> Result<String, JoinError> {
         let room_id = self.room_id.clone();
-        let slot_id = self.slot_id.clone();
-        let sticky_key = self.sticky_key.clone();
-        let application = self.application.clone();
         let keep_alive_timeout_ms = self.keep_alive_timeout_ms;
+        let deadline = deadline.unwrap_or_else(|| {
+            executor::Instant::now() + Duration::from_millis(crate::join::DEFAULT_JOIN_BUDGET_MS)
+        });
+        let remaining = || deadline.saturating_duration_since(executor::Instant::now());
 
-        // Update state to Joining first
-        {
-            let mut state_guard = self.state.lock().unwrap();
-            *state_guard = OwnMembershipState::Joining;
-        }
+        *self.state.lock().unwrap() = OwnMembershipState::Joining;
 
-        // Step 1: Schedule delayed leave event FIRST (safety net)
-        // If client dies at any point, worst case we're cleaning up.
-        // **We await this to ensure the delayed event is scheduled before proceeding.**
-        let delayed_content = self.build_delayed_leave_content(&slot_id, &sticky_key);
-
+        // Step 1: the delayed leave FIRST (safety net). If the client dies at
+        // any point from here, the worst case is cleaning up.
+        let delayed_content = self.build_delayed_leave_content(&self.slot_id, &self.sticky_key);
         log::info!(
             "[{}] Scheduling delayed leave event (dead man's switch safety net)",
             room_id
         );
-
-        // Schedule the delayed leave (Step 1 of dead man's switch)
-        // This returns the event_id on success
-        match self
-            .backend
-            .send_delayed_event(
-                room_id.clone(),
-                "m.rtc.member".to_string(),
-                None,
-                delayed_content,
-                keep_alive_timeout_ms,
+        let armed = self
+            .outbox
+            .send(
+                self.key(SendKind::DelayedLeave),
+                SendPolicy::single_attempt().deadline(remaining() / 2),
+                || {
+                    self.backend.send_delayed_event(
+                        room_id.clone(),
+                        "m.rtc.member".to_string(),
+                        None,
+                        delayed_content.clone(),
+                        keep_alive_timeout_ms,
+                    )
+                },
             )
-            .await
-        {
+            .await;
+        match armed {
             // Store the delayed event ID for later cancellation
             Ok(delayed_event_id) => {
                 *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
-                let mut info_guard = self.keep_alive_info.lock().unwrap();
-                *info_guard = Some(KeepAliveInfo {
+                *self.keep_alive_info.lock().unwrap() = Some(KeepAliveInfo {
                     delayed_event_id,
                     timeout_ms: keep_alive_timeout_ms,
                     last_restart_ms: self.now_ms(),
@@ -707,7 +709,8 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             //
             // Here, before the first publish, is the only place that shortening
             // can happen; see `published_lifetime_ms`.
-            Err(error) => {
+            Err(failure) => {
+                let error = failure.into_command_error();
                 self.mark_delayed_leave_unsupported(&error);
                 self.published_lifetime_ms
                     .store(self.degraded_lifetime_ms, Ordering::Relaxed);
@@ -721,53 +724,51 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             }
         }
 
-        // Step 2: Send join membership event
-        let join_content = self.build_join_content(&slot_id, &sticky_key, application, transports);
-
+        // Step 2: the join membership event.
+        let join_content = self.build_join_content(
+            &self.slot_id,
+            &self.sticky_key,
+            self.application.clone(),
+            transports,
+        );
         log::info!(
             "[{}] Sending join membership event (step 2 of dead man's switch)",
             room_id
         );
-
-        // Send the join event (Step 2 of dead man's switch)
-        let event_id = self
-            .backend
-            .send_sticky_event(
-                room_id.clone(),
-                "m.rtc.member".to_string(),
-                join_content.clone(),
-                self.membership_lifetime_ms(),
+        let published = self
+            .outbox
+            .send(
+                self.key(SendKind::Membership),
+                SendPolicy::new().deadline(remaining()),
+                || self.publish_once(join_content.clone()),
             )
-            .await
-            .inspect_err(|error| {
+            .await;
+        let event_id = match published {
+            Ok(event_id) => event_id,
+            Err(failure) => {
                 // Back to NotJoined, not left at `Joining`: we never made it
                 // into the call, and a state that says otherwise would have
-                // `heartbeat` arming delayed leaves for a membership that does
+                // the beat arming delayed leaves for a membership that does
                 // not exist.
                 *self.state.lock().unwrap() = OwnMembershipState::NotJoined;
                 log::warn!(
                     "[{room_id}] join aborted at step 2: the join membership event was not \
-                     sent ({error}). The delayed leave, if one is armed, will clean up.",
-                )
-            })?;
+                     sent ({failure})",
+                );
+                self.cancel_armed_delayed_leave();
+                return Err(JoinError::from_send_failure(failure));
+            }
+        };
 
         // Remember it so the heartbeat can refresh the sticky entry before the
         // server expires it. Recorded only on success: a failed send left
         // nothing in the map, so there is nothing to refresh.
-        {
-            let mut guard = self.last_sticky.lock().unwrap();
-            *guard = Some(SentSticky {
-                content: join_content,
-                sent_at_ms: self.now_ms(),
-            });
-        }
+        *self.last_sticky.lock().unwrap() = Some(SentSticky {
+            content: join_content,
+            sent_at_ms: self.now_ms(),
+        });
         self.latest_event_id.send_replace(Some(event_id.clone()));
-
-        // Both steps completed successfully, transition to Joined state
-        {
-            let mut state_guard = self.state.lock().unwrap();
-            *state_guard = OwnMembershipState::Joined;
-        }
+        *self.state.lock().unwrap() = OwnMembershipState::Joined;
 
         log::info!(
             "[{}] Successfully joined with dead man's switch armed",
@@ -775,6 +776,36 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         );
 
         Ok(event_id)
+    }
+
+    /// A join that failed after arming its delayed leave cancels it (R6), with
+    /// one attempt that the failed join does not wait for. Where nothing can
+    /// spawn it, the delay fires its leave for a membership that never went
+    /// out, which nobody sees.
+    fn cancel_armed_delayed_leave(&self) {
+        let Some(info) = self.keep_alive_info.lock().unwrap().take() else {
+            return;
+        };
+        if !executor::can_spawn() {
+            return;
+        }
+        let backend = self.backend.clone();
+        let outbox = self.outbox.clone();
+        let key = self.key(SendKind::DelayedLeave);
+        let room_id = self.room_id.clone();
+        executor::spawn(async move {
+            let cancelled = outbox
+                .send(key, SendPolicy::single_attempt(), || {
+                    backend.cancel_delayed_event(room_id.clone(), info.delayed_event_id.clone())
+                })
+                .await;
+            if let Err(failure) = cancelled {
+                log::debug!(
+                    "[{room_id}] the failed join's delayed leave was not cancelled ({failure}); \
+                     it fires for a membership that never went out",
+                );
+            }
+        });
     }
 
     /// Records that an attempt to arm a delayed leave failed.
@@ -845,12 +876,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         ))
         .expect("m.rtc.member content is always serializable");
 
-        {
-            let mut state_guard = self.state.lock().unwrap();
-            *state_guard = OwnMembershipState::Leaving;
-            self.outbox.cancel_scope(&self.scope);
-        }
-        self.update_lapsed();
+        self.begin_leave();
 
         log::info!("[{}] Sending leave membership event", room_id);
 
@@ -915,6 +941,24 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         log::info!("[{}] Successfully left session", room_id);
 
         Ok(())
+    }
+
+    /// Stops this join sending: `Leaving` from now, and every pending send of
+    /// the join cancelled in the same critical section, so none registers
+    /// after. Idempotent; [`Self::leave`] does it first.
+    pub fn begin_leave(&self) {
+        {
+            let mut state_guard = self.state.lock().unwrap();
+            if matches!(
+                *state_guard,
+                OwnMembershipState::Leaving | OwnMembershipState::Left
+            ) {
+                return;
+            }
+            *state_guard = OwnMembershipState::Leaving;
+            self.outbox.cancel_scope(&self.scope);
+        }
+        self.update_lapsed();
     }
 
     /// One keep-alive beat, run to completion: the sticky refresh if due, then
@@ -1356,7 +1400,7 @@ mod tests {
         );
 
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -1398,7 +1442,7 @@ mod tests {
         );
 
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -1437,7 +1481,10 @@ mod tests {
             .collect(),
         });
 
-        machine.join(transport).await.expect("join should succeed");
+        machine
+            .join(transport, None)
+            .await
+            .expect("join should succeed");
 
         // Check that the join event includes the transport
         let sticky_events = mock_sender.sticky_events.lock().unwrap();
@@ -1514,7 +1561,7 @@ mod tests {
 
         // Join to start the initial delayed leave
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -1558,7 +1605,7 @@ mod tests {
             APPLICATION_TYPE.to_string(),
         );
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
         let delay_id = machine.delayed_event_id().expect("armed by join");
@@ -1599,7 +1646,7 @@ mod tests {
             Arc::new(move || now.load(Ordering::SeqCst))
         });
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -1677,7 +1724,10 @@ mod tests {
         async fn degraded_join(mock: &Arc<MockBackend>) -> OwnMembershipMachine<MockBackend> {
             mock.script(MockMethod::DelayedEvent, [fail_with("M_UNRECOGNIZED", 404)]);
             let machine = machine(mock, MembershipTimings::default());
-            machine.join(MemberTransports::default()).await.unwrap();
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
             assert_eq!(machine.membership_lifetime_ms(), 300_000);
             machine
         }
@@ -1739,7 +1789,10 @@ mod tests {
             // The delayed-leave path: every restart fails from the start.
             let mock = Arc::new(MockBackend::new());
             let machine = machine(&mock, MembershipTimings::default());
-            machine.join(MemberTransports::default()).await.unwrap();
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
             mock.script(
                 MockMethod::RestartDelayedEvent,
                 std::iter::repeat_n(fail(), 100),
@@ -1799,7 +1852,10 @@ mod tests {
         async fn recovery_restarts_then_rearms_and_republishes_when_the_delay_is_gone() {
             let mock = Arc::new(MockBackend::new());
             let machine = machine(&mock, MembershipTimings::default());
-            machine.join(MemberTransports::default()).await.unwrap();
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
             mock.script(
                 MockMethod::RestartDelayedEvent,
                 [fail_with("M_NOT_FOUND", 404)],
@@ -1845,7 +1901,10 @@ mod tests {
         async fn the_catch_up_republishes_only_what_the_outage_lost() {
             let mock = Arc::new(MockBackend::new());
             let machine = machine(&mock, MembershipTimings::default());
-            let joined = machine.join(MemberTransports::default()).await.unwrap();
+            let joined = machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
             let mut republish = machine.subscribe_republish_requests();
 
             machine.on_catch_up(OwnEntry::Absent);
@@ -1887,7 +1946,10 @@ mod tests {
             let mock = Arc::new(MockBackend::new());
             let mut machine = machine(&mock, MembershipTimings::default());
             machine.set_recovery_jitter(|| Duration::from_millis(2_400));
-            machine.join(MemberTransports::default()).await.unwrap();
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
 
             machine.recover().await;
 
@@ -1897,6 +1959,99 @@ mod tests {
             );
         }
 
+        /// R6: inside its budget a join retries a transient failure of its
+        /// publish.
+        #[tokio::test(start_paused = true)]
+        async fn a_join_retries_transient_failures_inside_its_budget() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::StickyEvent, [fail(), fail()]);
+
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
+
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent), secs(&[0, 1, 3]));
+            assert_eq!(machine.state(), OwnMembershipState::Joined);
+        }
+
+        /// R6, R27: a refusal fails the join at once, naming the code.
+        #[tokio::test(start_paused = true)]
+        async fn a_join_fails_at_once_on_a_refusal() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::StickyEvent, [fail_with("M_FORBIDDEN", 403)]);
+
+            let failed = machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                failed,
+                JoinError::Refused { errcode: Some(ref code), .. } if code == "M_FORBIDDEN"
+            ));
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent), [Duration::ZERO]);
+        }
+
+        /// R6: a publish that never answers fails the join at the budget, and
+        /// the delayed leave it armed is cancelled with one attempt.
+        #[tokio::test(start_paused = true)]
+        async fn a_join_that_hangs_times_out_and_cancels_its_delayed_leave() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+            let started = tokio::time::Instant::now();
+
+            let failed = machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(failed, JoinError::TimedOut));
+            assert_eq!(started.elapsed(), Duration::from_secs(30));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(mock.calls_to(MockMethod::CancelDelayedEvent).len(), 1);
+            assert_eq!(machine.state(), OwnMembershipState::NotJoined);
+        }
+
+        /// R6: the budget is the caller's: a deadline already half spent
+        /// leaves the join the other half.
+        #[tokio::test(start_paused = true)]
+        async fn the_join_budget_is_counted_from_the_callers_deadline() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+            let failed = machine
+                .join(MemberTransports::default(), Some(deadline))
+                .await
+                .unwrap_err();
+
+            assert!(matches!(failed, JoinError::TimedOut));
+            assert_eq!(tokio::time::Instant::now(), deadline);
+        }
+
+        /// R6: an arm that does not answer degrades the join at half the
+        /// budget, and the publish still has time to land.
+        #[tokio::test(start_paused = true)]
+        async fn an_arm_that_hangs_degrades_and_the_join_still_lands() {
+            let mock = Arc::new(MockBackend::new());
+            let machine = machine(&mock, MembershipTimings::default());
+            mock.script(MockMethod::DelayedEvent, [MockOutcome::Hang]);
+
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
+
+            assert_eq!(mock.calls_to(MockMethod::StickyEvent), secs(&[15]));
+            assert!(!machine.delayed_leave_supported());
+            assert_eq!(machine.membership_lifetime_ms(), 300_000);
+        }
+
         /// R1: a leave ends every send this join is retrying, and nothing of
         /// the join is sent after the leave.
         #[tokio::test(start_paused = true)]
@@ -1904,7 +2059,10 @@ mod tests {
             let origin = tokio::time::Instant::now();
             let mock = Arc::new(MockBackend::new());
             let machine = machine(&mock, MembershipTimings::default());
-            machine.join(MemberTransports::default()).await.unwrap();
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
             mock.script(
                 MockMethod::RestartDelayedEvent,
                 std::iter::repeat_n(fail(), 100),
@@ -1935,7 +2093,10 @@ mod tests {
                     ..MembershipTimings::default()
                 },
             );
-            machine.join(MemberTransports::default()).await.unwrap();
+            machine
+                .join(MemberTransports::default(), None)
+                .await
+                .unwrap();
             mock.script(
                 MockMethod::StickyEvent,
                 [MockOutcome::After(
@@ -2267,7 +2428,7 @@ mod tests {
         let machine = degraded_machine(sender.clone());
 
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("a refused delayed leave must not fail the join");
 
@@ -2288,7 +2449,7 @@ mod tests {
         let sender = Arc::new(NoDelayedEventsSender::permanent());
         let machine = degraded_machine(sender.clone());
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2313,7 +2474,7 @@ mod tests {
         let machine = degraded_machine(sender.clone());
 
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2332,7 +2493,7 @@ mod tests {
         let sender = Arc::new(NoDelayedEventsSender::permanent());
         let machine = degraded_machine(sender.clone());
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2361,7 +2522,7 @@ mod tests {
         let sender = Arc::new(NoDelayedEventsSender::permanent());
         let machine = degraded_machine(sender.clone());
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2377,7 +2538,7 @@ mod tests {
         let sender = Arc::new(NoDelayedEventsSender::permanent());
         let machine = degraded_machine(sender.clone());
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2400,7 +2561,7 @@ mod tests {
         let sender = Arc::new(NoDelayedEventsSender::default());
         let machine = degraded_machine(sender.clone());
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
         assert!(!machine.delayed_leave_supported());
@@ -2431,7 +2592,7 @@ mod tests {
         let sender = Arc::new(NoDelayedEventsSender::permanent());
         let machine = degraded_machine(sender.clone());
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2444,7 +2605,7 @@ mod tests {
     /// A join that never published a membership is not a join. Leaving the
     /// state at `Joining` would have the heartbeat arming delayed leaves for a
     /// membership nobody can see.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_join_returns_to_not_joined() {
         let sender = Arc::new(CancelFailsSender {
             fail_sticky: true,
@@ -2458,11 +2619,15 @@ mod tests {
             APPLICATION_TYPE.to_string(),
         );
 
-        machine
-            .join(MemberTransports::default())
+        let failed = machine
+            .join(MemberTransports::default(), None)
             .await
             .expect_err("the membership send fails");
 
+        assert!(
+            matches!(failed, JoinError::TimedOut),
+            "a transient failure is retried until the budget runs out: {failed:?}"
+        );
         assert_eq!(machine.state(), OwnMembershipState::NotJoined);
     }
 
@@ -2474,7 +2639,7 @@ mod tests {
         // A zero lifetime is always due.
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2493,7 +2658,7 @@ mod tests {
         let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 60 * 60 * 1000);
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2524,7 +2689,7 @@ mod tests {
         let mock_sender = Arc::new(MockBackend::new());
         let machine = test_machine_with_sticky_duration(mock_sender.clone(), 0);
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
         machine.leave(None).await.expect("leave should succeed");
@@ -2552,7 +2717,7 @@ mod tests {
             APPLICATION_TYPE.to_string(),
         );
         machine
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 
@@ -2604,7 +2769,7 @@ mod tests {
     async fn test_join_and_delayed_leave_use_unstable_sticky_key() {
         let mock_sender = Arc::new(MockBackend::new());
         test_machine(mock_sender.clone())
-            .join(MemberTransports::default())
+            .join(MemberTransports::default(), None)
             .await
             .expect("join should succeed");
 

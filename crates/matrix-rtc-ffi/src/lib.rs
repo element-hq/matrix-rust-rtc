@@ -72,6 +72,17 @@ pub enum MatrixRtcFfiError {
     /// refused; somebody with the power level has to open it first.
     #[error("slot '{0}' is not open in this room")]
     SlotClosed(String),
+    /// The join did not complete within its 30 s budget: the homeserver kept
+    /// failing, or did not answer (034 R6, R27).
+    #[error("the join timed out")]
+    JoinTimedOut,
+    /// The homeserver refused the join for good (034 R6, R27); `errcode` is
+    /// its Matrix error code when it gave one.
+    #[error("the join was refused: {reason}")]
+    JoinRefused {
+        errcode: Option<String>,
+        reason: String,
+    },
 }
 
 impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
@@ -89,6 +100,13 @@ impl From<RtcError> for MatrixRtcFfiError {
             error @ RtcError::SessionOver => Self::CallOver(error.to_string()),
             RtcError::Join(matrix_rtc_core::JoinError::SlotClosed { slot_id }) => {
                 Self::SlotClosed(slot_id)
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::TimedOut) => Self::JoinTimedOut,
+            RtcError::Join(matrix_rtc_core::JoinError::Refused { errcode, message }) => {
+                Self::JoinRefused {
+                    errcode,
+                    reason: message,
+                }
             }
             error => Self::InvalidInput(error.to_string()),
         }
@@ -678,8 +696,11 @@ impl RtcCall {
         CallStatusSubscription::new(self.call.subscribe_status())
     }
 
-    /// Leaves the slot; the call is over and its media stopped at once, even
-    /// when the send fails — the delayed leave then removes the membership.
+    /// Leaves the slot; the call is over and its media stopped at once, and
+    /// this returns without waiting for the leave to be sent (034 R8). The
+    /// send is one attempt; if it fails, the delayed leave — or the
+    /// membership's lifetime — removes us. Fails only with `CallOver`, when the
+    /// call was already over.
     pub async fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
         log::info!(
             "call: [{}/{}] leave requested reason={:?}",
@@ -1103,6 +1124,37 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// 034 R27: a refused join names the code; a timed-out one says so, as
+    /// its own error.
+    #[tokio::test]
+    async fn join_failures_are_distinguishable() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        *mock.refuse_sticky.lock().unwrap() = Some(FfiBackendError::Failed {
+            errcode: Some("M_FORBIDDEN".to_owned()),
+            status: Some(403),
+            retry_after_ms: None,
+            permanent: false,
+            reason: "not allowed".to_owned(),
+        });
+
+        let refused = room.clone().join_call(join_params()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MatrixRtcFfiError::JoinRefused { errcode: Some(ref code), .. }) if code == "M_FORBIDDEN"
+            ),
+            "{:?}",
+            refused.err()
+        );
+
+        assert!(matches!(
+            MatrixRtcFfiError::from(RtcError::Join(matrix_rtc_core::JoinError::TimedOut)),
+            MatrixRtcFfiError::JoinTimedOut
+        ));
     }
 
     /// 034 C3, C4: health is live from the client, current value first, and
