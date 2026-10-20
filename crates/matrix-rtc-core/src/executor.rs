@@ -140,6 +140,16 @@ mod sys {
 
 pub use sys::{AbortHandle, JoinError, JoinHandle, spawn};
 
+/// A monotonic instant on the target's timer: tokio's off wasm32, so paused
+/// test time moves it; the browser's on wasm32-unknown-unknown, where std's
+/// panics.
+#[cfg(all(target_arch = "wasm32", not(target_os = "unknown")))]
+pub use std::time::Instant;
+#[cfg(not(target_arch = "wasm32"))]
+pub use tokio::time::Instant;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use web_time::Instant;
+
 /// Whether [`spawn`] has somewhere to run: a current tokio runtime off wasm,
 /// always on it (the JS event loop). Callers that can degrade check this
 /// instead of letting `spawn` panic.
@@ -150,6 +160,29 @@ pub fn can_spawn() -> bool {
 /// Waits for `duration` on the target's timer.
 pub async fn sleep(duration: Duration) {
     sys::sleep(duration).await;
+}
+
+/// The error [`timeout`] returns when the future did not finish in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Elapsed;
+
+impl std::fmt::Display for Elapsed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "deadline elapsed")
+    }
+}
+
+impl std::error::Error for Elapsed {}
+
+/// Runs `future` for at most `duration` on the target's timer, dropping it at
+/// the deadline. Dropping stops our waiting, not work the future handed to a
+/// host: an answer that comes later is never seen.
+pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, Elapsed> {
+    tokio::select! {
+        biased;
+        output = future => Ok(output),
+        _ = sleep(duration) => Err(Elapsed),
+    }
 }
 
 /// A task aborted when this is dropped.
@@ -224,6 +257,24 @@ mod tests {
         drop(task);
         sleep(Duration::from_secs(2)).await;
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_future_that_finishes_in_time_yields_its_output() {
+        let output = timeout(Duration::from_secs(2), async {
+            sleep(Duration::from_secs(1)).await;
+            7
+        })
+        .await;
+        assert_eq!(output, Ok(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_future_past_its_deadline_is_dropped() {
+        let start = tokio::time::Instant::now();
+        let output = timeout(Duration::from_secs(30), std::future::pending::<()>()).await;
+        assert_eq!(output, Err(Elapsed));
+        assert_eq!(start.elapsed(), Duration::from_secs(30));
     }
 
     #[test]

@@ -601,9 +601,52 @@ impl Subscription for MockToDeviceSubscription {
 #[cfg(any(test, feature = "testing"))]
 pub type RecordedDelayedEvent = (String, String, Option<String>, Value, u64);
 
+/// A [`MockBackend`] method whose outcome a test can script.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MockMethod {
+    StickyEvent,
+    DelayedEvent,
+    RestartDelayedEvent,
+    CancelDelayedEvent,
+    ToDevice,
+    StateEvent,
+    RoomEvent,
+    Redaction,
+    RtcTransports,
+}
+
+/// What one scripted call to a [`MockBackend`] method does.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Debug)]
+pub enum MockOutcome {
+    /// Answers as the unscripted mock does: recorded, then success.
+    Ok,
+    /// Fails with this error and records nothing.
+    Fail(BackendError),
+    /// Never answers, as a send the host holds open for ever.
+    Hang,
+    /// Waits this long on the executor's timer, then does the inner outcome.
+    After(std::time::Duration, Box<MockOutcome>),
+}
+
+/// One call a [`MockBackend`] received, whatever its outcome.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MockCall {
+    pub method: MockMethod,
+    /// Since the mock was created, on the executor's clock (paused test time
+    /// moves it).
+    pub at: std::time::Duration,
+}
+
 /// A backend that records every send and keeps the sinks it was given, so a
 /// test can check what went out and play sets in. Exported under the `testing`
 /// feature.
+///
+/// Each send method answers from its scripted outcome queue first
+/// ([`Self::script`]) and succeeds once the queue is empty; every call is
+/// logged with its time ([`Self::calls`]), failed or not.
 #[cfg(any(test, feature = "testing"))]
 pub struct MockBackend {
     pub user_id: String,
@@ -633,6 +676,14 @@ pub struct MockBackend {
     pub room_subscription_error: std::sync::Mutex<Option<BackendError>>,
     /// When set, sticky sends fail with this message and are not recorded.
     pub sticky_event_error: std::sync::Mutex<Option<String>>,
+    /// Outcomes still to play, per method, in order.
+    pub scripted: std::sync::Mutex<
+        std::collections::HashMap<MockMethod, std::collections::VecDeque<MockOutcome>>,
+    >,
+    /// Every call received, in order.
+    pub call_log: std::sync::Mutex<Vec<MockCall>>,
+    /// The origin of [`MockCall::at`].
+    pub created_at: crate::executor::Instant,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -657,6 +708,9 @@ impl Default for MockBackend {
             transports_requests: Default::default(),
             room_subscription_error: Default::default(),
             sticky_event_error: Default::default(),
+            scripted: Default::default(),
+            call_log: Default::default(),
+            created_at: crate::executor::Instant::now(),
         }
     }
 }
@@ -699,6 +753,58 @@ impl MockBackend {
             .filter(|(u, d, _, _)| u == user_id && d == device_id)
             .map(|(_, _, t, c)| (t.clone(), c.clone()))
             .collect()
+    }
+
+    /// Queues `outcomes` for the next calls to `method`, after any already
+    /// queued.
+    pub fn script(&self, method: MockMethod, outcomes: impl IntoIterator<Item = MockOutcome>) {
+        self.scripted
+            .lock()
+            .unwrap()
+            .entry(method)
+            .or_default()
+            .extend(outcomes);
+    }
+
+    /// Every call received so far, in order.
+    pub fn calls(&self) -> Vec<MockCall> {
+        self.call_log.lock().unwrap().clone()
+    }
+
+    /// When each call to `method` was received.
+    pub fn calls_to(&self, method: MockMethod) -> Vec<std::time::Duration> {
+        self.calls()
+            .into_iter()
+            .filter(|call| call.method == method)
+            .map(|call| call.at)
+            .collect()
+    }
+
+    /// Logs a call to `method` and plays its next scripted outcome: `Ok(())`
+    /// to go on as unscripted, the error to fail with, or never for a hang.
+    async fn attempt(&self, method: MockMethod) -> Result<(), BackendError> {
+        self.call_log.lock().unwrap().push(MockCall {
+            method,
+            at: self.created_at.elapsed(),
+        });
+        let mut outcome = self
+            .scripted
+            .lock()
+            .unwrap()
+            .get_mut(&method)
+            .and_then(|queue| queue.pop_front())
+            .unwrap_or(MockOutcome::Ok);
+        loop {
+            match outcome {
+                MockOutcome::Ok => return Ok(()),
+                MockOutcome::Fail(error) => return Err(error),
+                MockOutcome::Hang => std::future::pending::<()>().await,
+                MockOutcome::After(delay, then) => {
+                    crate::executor::sleep(delay).await;
+                    outcome = *then;
+                }
+            }
+        }
     }
 
     /// The live room subscription for `room_id`, if any.
@@ -745,6 +851,7 @@ impl MatrixBackend for MockBackend {
         content: Value,
         duration_ms: u64,
     ) -> Result<String, CommandError> {
+        self.attempt(MockMethod::StickyEvent).await?;
         if let Some(message) = self.sticky_event_error.lock().unwrap().clone() {
             return Err(CommandError::from_message(message));
         }
@@ -763,6 +870,7 @@ impl MatrixBackend for MockBackend {
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
+        self.attempt(MockMethod::DelayedEvent).await?;
         self.delayed_events.lock().unwrap().push((
             room_id.clone(),
             event_type.clone(),
@@ -778,6 +886,7 @@ impl MatrixBackend for MockBackend {
         room_id: String,
         delay_id: String,
     ) -> Result<(), CommandError> {
+        self.attempt(MockMethod::RestartDelayedEvent).await?;
         self.restarted_events
             .lock()
             .unwrap()
@@ -790,6 +899,7 @@ impl MatrixBackend for MockBackend {
         room_id: String,
         delay_id: String,
     ) -> Result<(), CommandError> {
+        self.attempt(MockMethod::CancelDelayedEvent).await?;
         self.cancelled_events
             .lock()
             .unwrap()
@@ -803,6 +913,7 @@ impl MatrixBackend for MockBackend {
         message_type: String,
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        self.attempt(MockMethod::ToDevice).await?;
         let mut guard = self.to_device_messages.lock().unwrap();
         for recipient in &recipients {
             guard.push((
@@ -822,6 +933,7 @@ impl MatrixBackend for MockBackend {
         state_key: String,
         content: Value,
     ) -> Result<String, CommandError> {
+        self.attempt(MockMethod::StateEvent).await?;
         let mut guard = self.state_events.lock().unwrap();
         guard.push((room_id, event_type, state_key, content));
         Ok(format!("$state-{}", guard.len()))
@@ -833,6 +945,7 @@ impl MatrixBackend for MockBackend {
         event_type: String,
         content: Value,
     ) -> Result<String, CommandError> {
+        self.attempt(MockMethod::RoomEvent).await?;
         let mut guard = self.room_events.lock().unwrap();
         guard.push((room_id, event_type, content));
         // Numbered by send order, so a test can name the event a redaction is
@@ -846,6 +959,7 @@ impl MatrixBackend for MockBackend {
         event_id: String,
         reason: Option<String>,
     ) -> Result<(), CommandError> {
+        self.attempt(MockMethod::Redaction).await?;
         self.redactions
             .lock()
             .unwrap()
@@ -925,6 +1039,88 @@ impl MatrixBackend for MockBackend {
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
         self.transports_requests
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.attempt(MockMethod::RtcTransports).await?;
         self.transports.lock().unwrap().clone()
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod mock_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::executor;
+
+    fn offline() -> MockOutcome {
+        MockOutcome::Fail(BackendError::new("offline"))
+    }
+
+    async fn send(mock: &MockBackend) -> Result<String, CommandError> {
+        mock.send_sticky_event("!r".into(), "m.rtc.member".into(), Value::Null, 1000)
+            .await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scripted_outcomes_play_in_order_then_the_mock_succeeds() {
+        let mock = MockBackend::new();
+        mock.script(MockMethod::StickyEvent, [offline(), MockOutcome::Ok]);
+
+        assert!(send(&mock).await.is_err());
+        executor::sleep(Duration::from_secs(1)).await;
+        assert_eq!(send(&mock).await.unwrap(), "$sticky-1");
+        assert_eq!(send(&mock).await.unwrap(), "$sticky-2");
+
+        assert_eq!(
+            mock.calls_to(MockMethod::StickyEvent),
+            [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(1)
+            ],
+        );
+        assert_eq!(
+            mock.sticky_events.lock().unwrap().len(),
+            2,
+            "a failed send is logged as a call, not recorded as sent",
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_call_never_answers_and_a_late_one_answers_after_its_delay() {
+        let mock = MockBackend::new();
+        mock.script(
+            MockMethod::StickyEvent,
+            [
+                MockOutcome::Hang,
+                MockOutcome::After(Duration::from_secs(40), Box::new(MockOutcome::Ok)),
+            ],
+        );
+
+        let hung = executor::timeout(Duration::from_secs(600), send(&mock)).await;
+        assert!(hung.is_err());
+
+        let start = executor::Instant::now();
+        assert!(send(&mock).await.is_ok());
+        assert_eq!(start.elapsed(), Duration::from_secs(40));
+    }
+
+    #[tokio::test]
+    async fn scripts_are_per_method() {
+        let mock = MockBackend::new();
+        mock.script(MockMethod::RoomEvent, [offline()]);
+
+        assert!(send(&mock).await.is_ok());
+        assert!(
+            mock.send_room_event("!r".into(), "m.reaction".into(), Value::Null)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            mock.calls()
+                .iter()
+                .map(|call| call.method)
+                .collect::<Vec<_>>(),
+            [MockMethod::StickyEvent, MockMethod::RoomEvent],
+        );
     }
 }

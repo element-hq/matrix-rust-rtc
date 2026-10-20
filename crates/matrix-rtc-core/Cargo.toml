@@ -53,4 +53,5 @@ testing = []
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
 futures = "0.3"
+proptest = "1"
 

@@ -64,6 +64,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::encryption::RtcClock;
 use crate::error::CommandError;
 use crate::host::backend::MatrixBackend;
 use crate::host::event::RawStickyEventContent;
@@ -268,6 +269,8 @@ pub struct OwnMembershipMachine<T: MatrixBackend> {
     /// flight could re-send the join content after the leave content and put
     /// us back in the call.
     sending: AsyncMutex<()>,
+    /// Where "now" comes from (see [`Self::set_clock`]).
+    clock: RtcClock,
 }
 
 /// The membership event we last put in the sticky map, and when.
@@ -320,7 +323,21 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             last_sticky: Arc::new(Mutex::new(None)),
             latest_event_id: watch::Sender::new(None),
             sending: AsyncMutex::new(()),
+            clock: Arc::new(now_ms),
         }
+    }
+
+    /// Replaces the source of "now", in epoch milliseconds (see [`RtcClock`]).
+    ///
+    /// Every deadline the machine keeps — the delayed leave's, the sticky
+    /// refresh's, the probe interval — is a comparison against this, so a test
+    /// drives a clock it advances itself instead of waiting in real time.
+    pub fn set_clock(&mut self, clock: RtcClock) {
+        self.clock = clock;
+    }
+
+    fn now_ms(&self) -> u64 {
+        (self.clock)()
     }
 
     /// Creates a new own membership machine with the default keep-alive timeout.
@@ -476,7 +493,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 *info_guard = Some(KeepAliveInfo {
                     delayed_event_id,
                     timeout_ms: keep_alive_timeout_ms,
-                    last_restart_ms: now_ms(),
+                    last_restart_ms: self.now_ms(),
                 });
             }
             // Not fatal: the dead man's switch is a cleanup optimisation, not a
@@ -537,7 +554,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             let mut guard = self.last_sticky.lock().unwrap();
             *guard = Some(SentSticky {
                 content: join_content,
-                sent_at_ms: now_ms(),
+                sent_at_ms: self.now_ms(),
             });
         }
         self.latest_event_id.send_replace(Some(event_id.clone()));
@@ -564,7 +581,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// [`DELAYED_LEAVE_PROBE_INTERVAL_MS`].
     fn mark_delayed_leave_unsupported(&self, error: &CommandError) {
         *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Unsupported {
-            last_probe_ms: now_ms(),
+            last_probe_ms: self.now_ms(),
             permanent: error.is_delayed_events_unsupported(),
         };
     }
@@ -753,7 +770,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 if let Some(info) = guard.as_mut()
                     && info.delayed_event_id == event_id
                 {
-                    info.last_restart_ms = now_ms();
+                    info.last_restart_ms = self.now_ms();
                 }
             }
             Err(error) => {
@@ -785,7 +802,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             DelayedLeaveSupport::Unsupported {
                 last_probe_ms,
                 permanent: false,
-            } => now_ms().saturating_sub(last_probe_ms) >= DELAYED_LEAVE_PROBE_INTERVAL_MS,
+            } => self.now_ms().saturating_sub(last_probe_ms) >= DELAYED_LEAVE_PROBE_INTERVAL_MS,
         }
     }
 
@@ -805,7 +822,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         let Some(info) = self.keep_alive_info.lock().unwrap().clone() else {
             return;
         };
-        if now_ms().saturating_sub(info.last_restart_ms) <= info.timeout_ms {
+        if self.now_ms().saturating_sub(info.last_restart_ms) <= info.timeout_ms {
             // It may well still be armed; leave it alone and retry the restart.
             return;
         }
@@ -850,7 +867,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         // due and what it re-publishes — a refresh that stated a different
         // duration is what MSC4354 asks clients not to do.
         let lifetime_ms = self.membership_lifetime_ms();
-        let elapsed = now_ms().saturating_sub(sticky.sent_at_ms);
+        let elapsed = self.now_ms().saturating_sub(sticky.sent_at_ms);
         if elapsed < lifetime_ms / 2 {
             return;
         }
@@ -882,7 +899,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 if let Some(current) = guard.as_mut()
                     && current.content == sticky.content
                 {
-                    current.sent_at_ms = now_ms();
+                    current.sent_at_ms = self.now_ms();
                 }
             }
             Err(error) => {
@@ -936,7 +953,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             *info_guard = Some(KeepAliveInfo {
                 delayed_event_id,
                 timeout_ms: keep_alive_timeout_ms,
-                last_restart_ms: now_ms(),
+                last_restart_ms: self.now_ms(),
             });
         }
 
@@ -949,7 +966,6 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     use crate::host::backend::{MockBackend, NoopBackend, ToDeviceDelivery, ToDeviceRecipient};
     use crate::transport::RawRtcTransport;
@@ -1243,7 +1259,7 @@ mod tests {
     async fn a_delay_that_must_have_fired_is_replaced() {
         let sender = Arc::new(CancelFailsSender::default());
         // A zero-length delay has always "already fired".
-        let machine = OwnMembershipMachine::new(
+        let mut machine = OwnMembershipMachine::new(
             sender.clone(),
             "!room:example.org".to_string(),
             "m.call#room".to_string(),
@@ -1254,14 +1270,19 @@ mod tests {
                 ..MembershipTimings::default()
             },
         );
+        let now = Arc::new(AtomicU64::new(1_000_000));
+        machine.set_clock({
+            let now = now.clone();
+            Arc::new(move || now.load(Ordering::SeqCst))
+        });
         machine
             .join(MemberTransports::default())
             .await
             .expect("join should succeed");
 
-        // Let real time pass the (zero) delay, so the check has unambiguously
-        // elapsed rather than sitting exactly on the boundary.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Step past the (zero) delay, so the check has unambiguously elapsed
+        // rather than sitting exactly on the boundary.
+        now.fetch_add(5, Ordering::SeqCst);
         machine.keep_alive().await;
 
         assert_eq!(

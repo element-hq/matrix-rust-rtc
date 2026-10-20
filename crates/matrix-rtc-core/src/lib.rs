@@ -77,7 +77,10 @@ pub use wire::wire_event_type;
 /// Test doubles for crates built on the core, behind the `testing` feature.
 #[cfg(feature = "testing")]
 pub mod testing {
-    pub use crate::host::backend::{MockBackend, MockRoomSubscription, MockToDeviceSubscription};
+    pub use crate::host::backend::{
+        MockBackend, MockCall, MockMethod, MockOutcome, MockRoomSubscription,
+        MockToDeviceSubscription,
+    };
 }
 
 #[cfg(test)]
