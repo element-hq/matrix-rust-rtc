@@ -21,7 +21,9 @@ mod feeder_tests;
 pub mod notification;
 pub mod reactions;
 mod status;
-pub use status::{CallEnd, CallStatus, MediaPhase, MediaStatusReporter, RingPhase};
+pub use status::{
+    CallEnd, CallStatus, ConnectionLossReason, MediaPhase, MediaStatusReporter, RingPhase,
+};
 mod room_state;
 pub mod transports;
 

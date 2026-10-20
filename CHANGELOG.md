@@ -10,6 +10,8 @@ log only.
 
 ### Breaking
 
+- `CallEnd::ConnectionClosed` (FFI `FfiCallEnd`, web `loss_reason`) carries a `ConnectionLossReason` (`Budget`, `Refused`, `NeverConnected`), `MediaStatusReporter::lost` takes it, and `OwnFocusTransport` gains `prepare_own` and `TransportConnection` `reconnect` (034 R24, R27).
+- `attach_media` (FFI `connect_media_session`, web `connectMedia`) returns without waiting for our own SFU, which connects under the reconnect budget like a loss; `LiveKitTransportConnection::session` returns an `Option<Arc<_>>` (034 R24, C10).
 - `Participant`/`CallTile` (FFI `FfiParticipant`/`FfiCallTile`, web roster entries) replace `reachable` with `connection` (`Connected`, `Reconnecting`, `Unreachable`) and gain `decryptable`; `EngineConfig` takes the signalling health and our membership's lapse (034 R23, R28, R33).
 - `EventEncryption`'s `sender_cross_signed` is `sender_confirmed` (FFI `senderConfirmed`), the client's verdict on the sender under its own trust settings; `require_cross_signed_sender` is `require_confirmed_sender` and `KeyRejection::NotCrossSigned` is `SenderNotConfirmed` (web `sender_not_confirmed`).
 - `RtcCall::leave` (FFI `leave`, web `leave`) returns once the call has ended, without waiting for the one-attempt leave send, and fails only when the call was already over (034 R8).
@@ -26,6 +28,7 @@ log only.
 
 ### Changed
 
+- Our own SFU is reconnected behind the same handle, local publications and their mute included, for 60 s from the loss (`own_reconnect_budget_ms`), fetching a new token once if the SFU rejects it; only then, or on a refusal, does the call end, after issuing its leave (034 R24, R26).
 - A join completes or fails within 30 s of the call: transient failures of the transports read, the publish and the notification are retried inside it, and it fails with `JoinError::TimedOut` or `JoinError::Refused` (FFI `JoinTimedOut`, `JoinRefused`) (034 R6, R27).
 
 - Our membership's refresh, delayed-leave restart and re-arm are retried until they land, the refresh falls due at a third of the lifetime instead of half, and when signalling returns the library re-arms and republishes only what the outage lost (034 R1, R18, R19).

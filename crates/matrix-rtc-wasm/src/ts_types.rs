@@ -192,9 +192,10 @@ export type RtcCallStatus =
         media: RtcMediaPhase }
     /** Media up and somebody to talk to; `since_ms` holds through `degraded`. */
     | { type: "connected"; since_ms: number; degraded: boolean }
-    /** `message` is the transport's, for `connection_closed` only. */
+    /** `loss_reason` and `message` (the transport's, for logs) are for `connection_closed` only. */
     | { type: "ended";
         reason: "left" | "declined" | "unanswered" | "ring_not_sent" | "others_left" | "empty" | "slot_closed" | "connection_closed";
+        loss_reason: "budget" | "refused" | "never_connected" | null;
         message: string | null };
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
@@ -205,6 +206,8 @@ export interface MediaSessionConfigIn {
     format?: MembershipFormatMode;
     /** How much the tile order is damped; omitted fields take the defaults. */
     stability?: StabilityConfigIn;
+    /** How long our own SFU may stay unreachable before the call ends; 60 000 when omitted. */
+    own_reconnect_budget_ms?: number;
 }
 
 /**

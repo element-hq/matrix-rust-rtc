@@ -342,6 +342,7 @@ impl LiveKitCall {
                 http: options.http.clone(),
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),
+                own_reconnect_budget: None,
             },
         )
         .await;
@@ -383,9 +384,23 @@ impl LiveKitCall {
             options.slot_id
         );
 
+        // This facade hands out the connected room, so it waits for our own
+        // focus, which the attach no longer does (034 R24); a focus given up
+        // has ended the call, and its leave is already issued.
+        let mut status = call.subscribe_status();
+        let session = tokio::select! {
+            session = connection.wait_connected() => session,
+            _ = status.wait_for(|status| matches!(status, CallStatus::Ended { .. })) => {
+                return Err(LiveKitCallError::Signalling(format!(
+                    "our own focus was given up: {:?}",
+                    call.status(),
+                )));
+            }
+        };
+
         // Transition-period raw stream; subscribed immediately after connect,
         // so only events racing the connect itself can be missed here.
-        let raw_events = connection.session().room().subscribe();
+        let raw_events = session.room().subscribe();
 
         Ok(LiveKitCall {
             call,
@@ -532,8 +547,10 @@ impl LiveKitCall {
     ///
     /// Transition API: media access moves behind [`LiveKitCall::remote_track`] and
     /// the upcoming publish surface.
-    pub fn session(&self) -> &LiveKitSession {
-        self.connection.session()
+    pub fn session(&self) -> Arc<LiveKitSession> {
+        self.connection
+            .session()
+            .expect("connected before the join returned")
     }
 
     /// Our MSC4195 pseudonymous LiveKit identity (the JWT `sub`). Peers see

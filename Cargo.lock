@@ -2824,6 +2824,7 @@ dependencies = [
  "futures-util",
  "jni 0.21.1",
  "livekit",
+ "livekit-api",
  "log",
  "matrix-rtc-core",
  "matrix-rtc-transport",

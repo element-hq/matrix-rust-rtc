@@ -66,6 +66,10 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Retry delay ceiling.
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// How long our own focus may stay unreachable, from the loss or the first
+/// connect request, before the call ends (034 R24).
+pub const OWN_RECONNECT_BUDGET: Duration = Duration::from_secs(60);
+
 /// Constraint changes are coalesced for this long before being applied —
 /// scroll-driven visibility churn is the hot path, and only the final state
 /// matters to the transport.
@@ -104,6 +108,19 @@ pub struct PoolConfig {
     /// one itself — the owner establishes it (so a join can fail fast) and
     /// hands it over via [`MediaPool::adopt_own_connection`].
     pub own_connection_key: Option<String>,
+    /// [`OWN_RECONNECT_BUDGET`] unless a host configured another.
+    pub own_reconnect_budget: Duration,
+}
+
+/// Why our own focus was given up (034 R24, contract C10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OwnConnectionLoss {
+    /// Lost, and not back within the budget.
+    Budget,
+    /// The SFU or the token service refused us.
+    Refused,
+    /// Never established within the budget from the connect request.
+    NeverConnected,
 }
 
 /// What the pool reports, keyed by `member_id`.
@@ -153,8 +170,12 @@ pub enum PoolEvent {
     /// Whether any connection is impaired (reconnecting or failing to
     /// connect). Reported on transitions only.
     Degraded(bool),
-    /// The own-focus connection is gone; nothing we publish reaches anyone.
-    OwnConnectionLost { message: String },
+    /// The own-focus connection is gone for good; nothing we publish reaches
+    /// anyone. Only after the reconnect budget, or a refusal (034 R24).
+    OwnConnectionLost {
+        reason: OwnConnectionLoss,
+        message: String,
+    },
 }
 
 /// One speaking member and how loud they are.
@@ -204,6 +225,33 @@ enum Message {
         kind: MediaStreamKind,
         generation: u64,
     },
+    /// An own-focus (re)connect attempt resolved.
+    OwnConnectFinished {
+        attempt: u32,
+        result: Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError>,
+    },
+    /// An own-focus backoff timer elapsed.
+    OwnRetry { attempt: u32 },
+    /// The reconnect budget of the loss numbered `epoch` ran out.
+    OwnBudget { epoch: u64 },
+}
+
+/// Our own focus while it is being recovered (034 R24): the handle every
+/// connect goes through, and how long it has been down.
+struct OwnRecovery {
+    connection: Arc<dyn TransportConnection>,
+    /// Since when our media has not been carried; `None` while it is.
+    lost_since: Option<rt::Instant>,
+    /// Bumped on every loss and recovery, so a budget timer of an earlier
+    /// loss is stale.
+    epoch: u64,
+    /// A fresh token was asked for during this loss: a second rejection is
+    /// a refusal.
+    token_refetched: bool,
+    /// Ask for a fresh token on the next attempt.
+    refetch_next: bool,
+    /// The connection has been up at least once.
+    ever_up: bool,
 }
 
 /// Read access to the subscribed remote tracks, from outside the owner's
@@ -307,8 +355,13 @@ pub struct MediaPool {
     /// Transport identities present on a connection that map to no
     /// membership, with the connection they are on (034 R16).
     unmapped: HashMap<String, String>,
-    /// The own-focus connection was adopted, then lost.
+    /// The own-focus connection was given up.
     own_lost: bool,
+    /// Our own focus's handle and recovery, once adopted or requested.
+    own: Option<OwnRecovery>,
+    /// [`Self::close`] was called.
+    closed: bool,
+    own_reconnect_budget: Duration,
     /// Events produced by the call in progress, handed back when it returns.
     out: Vec<PoolEvent>,
 }
@@ -340,6 +393,9 @@ impl MediaPool {
             degraded_keys: HashSet::new(),
             unmapped: HashMap::new(),
             own_lost: false,
+            own: None,
+            closed: false,
+            own_reconnect_budget: config.own_reconnect_budget,
             out: Vec::new(),
         };
         (pool, messages_rx)
@@ -444,20 +500,64 @@ impl MediaPool {
         self.connection_generation += 1;
         let generation = self.connection_generation;
         let members = self.members_on_key(&key);
+        let connection: Arc<dyn TransportConnection> = Arc::from(connection);
+        self.own = Some(OwnRecovery {
+            connection: connection.clone(),
+            lost_since: None,
+            epoch: 0,
+            token_refetched: false,
+            refetch_next: false,
+            ever_up: true,
+        });
         self.pool.insert(
             key.clone(),
             ManagedConnection {
                 backend: None,
                 members,
                 is_own: true,
-                state: ConnState::Up {
-                    connection: Arc::from(connection),
-                },
+                state: ConnState::Up { connection },
                 generation,
                 idle_generation: 0,
             },
         );
         self.spawn_forwarder(key, generation, events);
+    }
+
+    /// Take the own-focus handle before it is connected, and connect it
+    /// (034 R24): the first connect runs under the reconnect budget from now,
+    /// as a connection lost at the moment of the request, so a join never
+    /// waits for the SFU.
+    pub fn connect_own(&mut self, connection: Box<dyn TransportConnection>) -> Vec<PoolEvent> {
+        let key = connection.connection_key().to_owned();
+        let members = self.members_on_key(&key);
+        self.own = Some(OwnRecovery {
+            connection: Arc::from(connection),
+            lost_since: None,
+            epoch: 0,
+            token_refetched: false,
+            refetch_next: false,
+            ever_up: false,
+        });
+        self.pool.insert(
+            key,
+            ManagedConnection {
+                backend: None,
+                members,
+                is_own: true,
+                state: ConnState::Connecting { attempt: 0 },
+                generation: 0,
+                idle_generation: 0,
+            },
+        );
+        self.start_own_loss();
+        self.spawn_own_attempt(0);
+        std::mem::take(&mut self.out)
+    }
+
+    /// The own-focus handle, connected or being reconnected: what our
+    /// publications go through. `None` before it is adopted and once given up.
+    pub fn own_handle(&self) -> Option<Arc<dyn TransportConnection>> {
+        self.own.as_ref().map(|own| own.connection.clone())
     }
 
     /// A media decryption key for a transport `identity` was imported.
@@ -513,6 +613,13 @@ impl MediaPool {
     /// own-focus connection is never closed here (its owner closes it; at
     /// this point it is usually already gone).
     pub fn close(&mut self) {
+        // Our own focus's recovery stops: its budget no longer runs, and a
+        // connect still in flight is closed when it lands.
+        self.closed = true;
+        if let Some(own) = self.own.as_mut() {
+            own.epoch += 1;
+            own.lost_since = None;
+        }
         for (_, entry) in self.pool.drain() {
             if let ConnState::Up { connection } = entry.state
                 && !entry.is_own
@@ -574,6 +681,11 @@ impl MediaPool {
                     self.apply_constraints_now(&member_id, kind);
                 }
             }
+            Message::OwnConnectFinished { attempt, result } => {
+                self.own_connect_finished(attempt, result);
+            }
+            Message::OwnRetry { attempt } => self.own_retry(attempt),
+            Message::OwnBudget { epoch } => self.own_budget(epoch),
         }
         std::mem::take(&mut self.out)
     }
@@ -944,22 +1056,16 @@ impl MediaPool {
         }
 
         self.unmapped.retain(|_, on| on != key);
-        if entry.is_own {
-            log::warn!("own-focus connection {key} is gone: {message}");
-            self.pool.remove(key);
-            self.own_lost = true;
-            self.clear_degraded(key);
-            self.out.push(PoolEvent::ConnectionState {
-                connection_key: key.to_owned(),
-                state: ConnectionState::Unreachable,
-            });
-            self.out.push(PoolEvent::OwnConnectionLost {
-                message: message.to_owned(),
-            });
+        let is_own = entry.is_own;
+        if is_own && self.own.is_none() {
+            self.give_up_own(OwnConnectionLoss::Budget, message.to_owned());
             return;
         }
-
-        log::warn!("peer-focus connection {key} is gone ({message}); reconnecting");
+        if is_own {
+            log::warn!("own-focus connection {key} is gone ({message}); reconnecting");
+        } else {
+            log::warn!("peer-focus connection {key} is gone ({message}); reconnecting");
+        }
         let members = entry.members.clone();
         let mut lost: Vec<(String, MediaStreamKind)> = self
             .tracks
@@ -977,6 +1083,13 @@ impl MediaPool {
         }
         self.mark_degraded(key);
 
+        if is_own {
+            // The transport gave up; we have not. At once, then on backoff,
+            // within the budget that started at the loss (034 R24).
+            self.start_own_loss();
+            self.spawn_own_attempt(0);
+            return;
+        }
         if members.is_empty() {
             self.pool.remove(key);
             self.clear_degraded(key);
@@ -1103,8 +1216,16 @@ impl MediaPool {
                     }
                 }
             }
-            ConnectionEvent::Reconnecting => self.mark_degraded(connection_key),
+            ConnectionEvent::Reconnecting => {
+                self.mark_degraded(connection_key);
+                if self.own_connection_key.as_deref() == Some(connection_key) {
+                    self.start_own_loss();
+                }
+            }
             ConnectionEvent::Reconnected => {
+                if self.own_connection_key.as_deref() == Some(connection_key) {
+                    self.end_own_loss();
+                }
                 self.clear_degraded(connection_key);
                 // Subscription settings are server-side connection state; a
                 // resumed connection may have lost them.
@@ -1119,6 +1240,195 @@ impl MediaPool {
                 self.connection_down(connection_key, generation, &message);
             }
         }
+    }
+
+    // ---- our own focus (034 R24) ---------------------------------------
+
+    /// Our media stopped being carried: the budget starts, unless a loss is
+    /// already running.
+    fn start_own_loss(&mut self) {
+        let Some(key) = self.own_connection_key.clone() else {
+            return;
+        };
+        let budget = self.own_reconnect_budget;
+        let Some(own) = self.own.as_mut() else {
+            return;
+        };
+        if own.lost_since.is_some() {
+            return;
+        }
+        own.lost_since = Some(rt::Instant::now());
+        own.epoch += 1;
+        let epoch = own.epoch;
+        let messages = self.messages_tx.clone();
+        rt::spawn(async move {
+            rt::sleep(budget).await;
+            let _ = messages.send(PoolMessage(Message::OwnBudget { epoch }));
+        });
+        self.mark_degraded(&key);
+    }
+
+    /// Our media is carried again. Logged with how long it took: the figure
+    /// a fallback grace is tuned from (034 R25).
+    fn end_own_loss(&mut self) {
+        let Some(own) = self.own.as_mut() else {
+            return;
+        };
+        if let Some(since) = own.lost_since.take() {
+            own.epoch += 1;
+            own.token_refetched = false;
+            own.refetch_next = false;
+            log::info!(
+                "own focus {} back after {} ms",
+                if own.ever_up {
+                    "connection"
+                } else {
+                    "first connect"
+                },
+                since.elapsed().as_millis(),
+            );
+        }
+    }
+
+    fn spawn_own_attempt(&mut self, attempt: u32) {
+        let Some(key) = self.own_connection_key.clone() else {
+            return;
+        };
+        let Some(own) = self.own.as_mut() else {
+            return;
+        };
+        let fresh_token = std::mem::take(&mut own.refetch_next);
+        let connection = own.connection.clone();
+        if let Some(entry) = self.pool.get_mut(&key) {
+            entry.state = ConnState::Connecting { attempt };
+        }
+        log::info!(
+            "connecting our own focus {key} (attempt {attempt}{})",
+            if fresh_token { ", fresh token" } else { "" },
+        );
+        let messages = self.messages_tx.clone();
+        rt::spawn(async move {
+            let result = connection.reconnect(fresh_token).await;
+            let _ = messages.send(PoolMessage(Message::OwnConnectFinished { attempt, result }));
+        });
+    }
+
+    fn own_connect_finished(
+        &mut self,
+        attempt: u32,
+        result: Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError>,
+    ) {
+        let Some(key) = self.own_connection_key.clone() else {
+            return;
+        };
+        let current = self.pool.get(&key).is_some_and(
+            |entry| matches!(entry.state, ConnState::Connecting { attempt: a } if a == attempt),
+        );
+        let Some(own) = self.own.as_mut() else {
+            return;
+        };
+        if !current {
+            if self.closed && result.is_ok() {
+                let connection = own.connection.clone();
+                rt::spawn(async move {
+                    let _ = connection.close().await;
+                });
+            }
+            return;
+        }
+        match result {
+            Ok(events) => {
+                own.ever_up = true;
+                let connection = own.connection.clone();
+                self.connection_generation += 1;
+                let generation = self.connection_generation;
+                let entry = self.pool.get_mut(&key).expect("entry checked above");
+                entry.generation = generation;
+                entry.state = ConnState::Up { connection };
+                self.spawn_forwarder(key.clone(), generation, events);
+                self.end_own_loss();
+                self.clear_degraded(&key);
+                self.reapply_connection_constraints(&key);
+            }
+            Err(TransportError::TokenRejected(message)) if !own.token_refetched => {
+                log::warn!("our own focus rejected the token ({message}); fetching a fresh one");
+                own.token_refetched = true;
+                own.refetch_next = true;
+                self.own_backoff(attempt + 1);
+            }
+            Err(TransportError::TokenRejected(message) | TransportError::Refused(message)) => {
+                log::warn!("our own focus refused us: {message}");
+                self.give_up_own(OwnConnectionLoss::Refused, message);
+            }
+            Err(error) => {
+                log::warn!("connecting our own focus failed (attempt {attempt}): {error}");
+                self.own_backoff(attempt + 1);
+            }
+        }
+    }
+
+    fn own_backoff(&mut self, attempt: u32) {
+        let Some(key) = self.own_connection_key.clone() else {
+            return;
+        };
+        if let Some(entry) = self.pool.get_mut(&key) {
+            entry.state = ConnState::Backoff { attempt };
+        }
+        let delay = backoff_delay(attempt);
+        let messages = self.messages_tx.clone();
+        rt::spawn(async move {
+            rt::sleep(delay).await;
+            let _ = messages.send(PoolMessage(Message::OwnRetry { attempt }));
+        });
+    }
+
+    fn own_retry(&mut self, attempt: u32) {
+        let due = self.own_connection_key.as_ref().is_some_and(|key| {
+            self.pool.get(key).is_some_and(
+                |entry| matches!(entry.state, ConnState::Backoff { attempt: a } if a == attempt),
+            )
+        });
+        if due {
+            self.spawn_own_attempt(attempt);
+        }
+    }
+
+    fn own_budget(&mut self, epoch: u64) {
+        let Some(own) = &self.own else {
+            return;
+        };
+        if own.epoch != epoch || own.lost_since.is_none() {
+            return;
+        }
+        let reason = if own.ever_up {
+            OwnConnectionLoss::Budget
+        } else {
+            OwnConnectionLoss::NeverConnected
+        };
+        let message = format!(
+            "no connection to our own focus for {} s",
+            self.own_reconnect_budget.as_secs()
+        );
+        self.give_up_own(reason, message);
+    }
+
+    /// Our own focus is given up: the call ends (034 R24, R26).
+    fn give_up_own(&mut self, reason: OwnConnectionLoss, message: String) {
+        let Some(key) = self.own_connection_key.clone() else {
+            return;
+        };
+        log::warn!("giving up our own focus {key} ({reason:?}): {message}");
+        self.unmapped.retain(|_, on| *on != key);
+        self.pool.remove(&key);
+        self.own = None;
+        self.own_lost = true;
+        self.clear_degraded(&key);
+        self.out.push(PoolEvent::ConnectionState {
+            connection_key: key,
+            state: ConnectionState::Unreachable,
+        });
+        self.out
+            .push(PoolEvent::OwnConnectionLost { reason, message });
     }
 
     fn muted(&mut self, identity: &str, kind: MediaStreamKind, muted: bool) {

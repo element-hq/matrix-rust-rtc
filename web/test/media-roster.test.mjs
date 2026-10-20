@@ -131,7 +131,11 @@ describe('web media roster over a fake transport delegate', () => {
     // The own focus was connected through the token exchange Rust built and
     // the delegate fetched. (No ordering with the pooled connect below: the
     // engine starts reconciling the moment it exists.)
-    const ownConnect = log.connects.find((c) => c.connectionKey === OWN_FOCUS);
+    // `connectMedia` does not wait for it (034 R24).
+    const ownConnect = await waitFor(
+      () => log.connects.find((c) => c.connectionKey === OWN_FOCUS),
+      'the own focus connected',
+    );
     expect(ownConnect).toEqual({
       connectionKey: OWN_FOCUS,
       sfuUrl: 'wss://sfu.example.org',

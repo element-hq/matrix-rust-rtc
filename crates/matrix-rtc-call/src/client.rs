@@ -453,6 +453,11 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             self.follow_direct_call(slot_id.clone(), direct.clone(), session.end.clone())
         });
         Ok(RtcCall {
+            _follow_media_loss: self.follow_media_loss(
+                slot_id.clone(),
+                session.end.clone(),
+                joined.status.clone(),
+            ),
             _hand: event_moves.zip(hand_requests).map(|(moves, requests)| {
                 self.follow_hand(slot_id, moves, requests, outbox, session.end.clone())
             }),
@@ -707,6 +712,44 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         .abort_on_drop()
     }
 
+    /// Ends the call when its media gives our own connection up (034 R26):
+    /// publishing stops first, then our one leave attempt is issued, then the
+    /// end is reported, without waiting for the leave's outcome.
+    fn follow_media_loss(
+        &self,
+        slot_id: String,
+        end: Arc<SessionEnd>,
+        status: Arc<CallStatusCell>,
+    ) -> AbortOnDrop<()> {
+        let mut losses = status.follow_losses();
+        let state = self.state.clone();
+        let tag = format!("{}/{slot_id}", self.room_id);
+        executor::spawn(async move {
+            let mut ended = end.ended.subscribe();
+            let (reason, message) = tokio::select! {
+                loss = losses.wait_for(Option::is_some) => match loss.as_deref() {
+                    Ok(Some(loss)) => loss.clone(),
+                    _ => return,
+                },
+                _ = ended.wait_for(Option::is_some) => return,
+            };
+            let leave_reason = LeaveReason::with_reason(
+                LeaveCode::Other("connection_lost".to_owned()),
+                message.clone(),
+            );
+            if !end.end_quietly(leave_reason.clone()) {
+                return;
+            }
+            log::warn!("[{tag}] our media connection was given up ({reason:?}): leaving");
+            let params = LeaveSessionParams {
+                leave_reason: Some(leave_reason),
+            };
+            issue_leave(&state, &slot_id, tag, params).await;
+            status.connection_closed(reason, message);
+        })
+        .abort_on_drop()
+    }
+
     fn end_sessions(&self, reason: LeaveReason) {
         for (_, end) in self.sessions().drain() {
             end.end(reason.clone());
@@ -747,6 +790,16 @@ impl SessionEnd {
         self.live.load(Ordering::SeqCst)
     }
 
+    /// [`Self::end`], leaving the call's status to the caller, which reports
+    /// a reason of its own once it has done what precedes it.
+    fn end_quietly(&self, reason: LeaveReason) -> bool {
+        let live = self.live.swap(false, Ordering::SeqCst);
+        if live {
+            self.ended.send_replace(Some(reason));
+        }
+        live
+    }
+
     /// `false` if it was already over.
     fn end(&self, reason: LeaveReason) -> bool {
         let status = self
@@ -766,6 +819,35 @@ impl SessionEnd {
     /// A dropped session sends no leave, so there is no ending to report.
     fn abandon(&self) {
         self.live.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Our participation's part of a leave under the room's lock, then its one
+/// send attempt detached (034 R8): returns once the leave is issued, never
+/// waiting for its outcome.
+async fn issue_leave<B: MatrixBackend + 'static>(
+    state: &SharedState<B>,
+    slot_id: &str,
+    tag: String,
+    params: LeaveSessionParams,
+) {
+    let pending = state.lock().await.begin_leave(slot_id, params).await;
+    let send = async move {
+        match pending {
+            Ok(pending) => {
+                if let Err(error) = pending.send().await {
+                    log::warn!(
+                        "[{tag}] our leave was not sent ({error}); the delayed leave removes us"
+                    );
+                }
+            }
+            Err(error) => log::warn!("[{tag}] nothing to leave: {error}"),
+        }
+    };
+    if executor::can_spawn() {
+        executor::spawn(send);
+    } else {
+        send.await;
     }
 }
 
@@ -926,30 +1008,8 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
         if !self.end.end(reason) {
             return Err(RtcError::SessionOver);
         }
-        let pending = self
-            .state
-            .lock()
-            .await
-            .begin_leave(&self.slot_id, params)
-            .await;
         let tag = format!("{}/{}", self.room_id, self.slot_id);
-        let send = async move {
-            match pending {
-                Ok(pending) => {
-                    if let Err(error) = pending.send().await {
-                        log::warn!(
-                            "[{tag}] our leave was not sent ({error}); the delayed leave removes us"
-                        );
-                    }
-                }
-                Err(error) => log::warn!("[{tag}] nothing to leave: {error}"),
-            }
-        };
-        if executor::can_spawn() {
-            executor::spawn(send);
-        } else {
-            send.await;
-        }
+        issue_leave(&self.state, &self.slot_id, tag, params).await;
         Ok(())
     }
 
@@ -978,6 +1038,8 @@ pub struct RtcCall<B: MatrixBackend + 'static> {
     session: RtcSession<B>,
     /// Keeps our raised hand on our current membership event.
     _hand: Option<AbortOnDrop<()>>,
+    /// Ends the call when its media gives our own connection up.
+    _follow_media_loss: AbortOnDrop<()>,
     status: Arc<CallStatusCell>,
     /// Sends the ring and times it.
     _ring: Option<AbortOnDrop<()>>,

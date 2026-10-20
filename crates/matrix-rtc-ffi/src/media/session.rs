@@ -36,6 +36,12 @@ pub struct MediaSessionConfig {
     /// How much the tile order is damped. `None` takes the defaults.
     #[uniffi(default = None)]
     pub stability: Option<FfiStabilityConfig>,
+    /// How long our own SFU may stay unreachable, from the loss or the
+    /// connect request, before the call ends with `ConnectionClosed`
+    /// (034 R24, contract C11). `None` takes 60 000; the spec's 60 s is not
+    /// a licence to shorten it.
+    #[uniffi(default = None)]
+    pub own_reconnect_budget_ms: Option<u64>,
 }
 
 /// Attach media to a joined call: wire frame-key signalling into the core,
@@ -91,6 +97,9 @@ async fn build_media_session(
             http: None,
             auto_subscribe: true,
             stability: config.stability.map(Into::into).unwrap_or_default(),
+            own_reconnect_budget: config
+                .own_reconnect_budget_ms
+                .map(std::time::Duration::from_millis),
         },
     )
     .await

@@ -590,7 +590,7 @@ async fn run(
     //    through the transport-agnostic media API — bob receiving alice's
     //    tone proves bob's engine connected to alice's focus, and vice versa.
     println!("[alice] publishing 440 Hz tone");
-    let _alice_tone = media::publish_tone(alice.call.session(), 440.0).await?;
+    let _alice_tone = media::publish_tone(&alice.call.session(), 440.0).await?;
 
     // Bound to the outer scope so the capture tasks are not aborted mid-call:
     // publishers stay alive through teardown, exactly like the single-focus
@@ -606,7 +606,7 @@ async fn run(
         ),
         Scenario::TwoFoci => {
             println!("[bob] publishing 660 Hz tone");
-            _bob_tone = Some(media::publish_tone(bob.call.session(), 660.0).await?);
+            _bob_tone = Some(media::publish_tone(&bob.call.session(), 660.0).await?);
             let bob_hears = record_peer_tone(&bob.call, "bob", 440.0).await?;
             let alice_hears = record_peer_tone(&alice.call, "alice", 660.0).await?;
 

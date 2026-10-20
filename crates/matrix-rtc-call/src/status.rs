@@ -12,6 +12,7 @@
 //! up seconds before a DM's callee answers. So they are combined here, once,
 //! and a host reads the result.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use matrix_rtc_core::{LeaveCode, LeaveReason};
@@ -84,8 +85,25 @@ pub enum CallEnd {
     Empty,
     /// The slot was closed, which ended our participation without us asking.
     SlotClosed,
-    /// The connection to our own focus closed and will not come back.
-    ConnectionClosed { message: String },
+    /// Our own media connection was given up (034 R24): `reason` says why,
+    /// `message` is diagnostic text for logs, never for the screen. By the
+    /// time this is reported, publishing has stopped and our leave has been
+    /// issued (R26).
+    ConnectionClosed {
+        reason: ConnectionLossReason,
+        message: String,
+    },
+}
+
+/// Why our own media connection was given up (034 R24, R27; contract C10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionLossReason {
+    /// Lost, and not back within the reconnect budget.
+    Budget,
+    /// The SFU or its token service refused us.
+    Refused,
+    /// Never established within the budget from the connect request.
+    NeverConnected,
 }
 
 impl From<DirectCallEnd> for CallEnd {
@@ -105,6 +123,11 @@ impl From<DirectCallEnd> for CallEnd {
 pub(crate) struct CallStatusCell {
     inputs: Mutex<Inputs>,
     status: watch::Sender<CallStatus>,
+    /// A media loss for the call's follower (034 R26).
+    loss: watch::Sender<Option<(ConnectionLossReason, String)>>,
+    /// Whether a follower takes media losses; see
+    /// [`MediaStatusReporter::lost`].
+    loss_followed: AtomicBool,
 }
 
 struct Inputs {
@@ -208,6 +231,8 @@ impl CallStatusCell {
         Arc::new(Self {
             inputs: Mutex::new(inputs),
             status: watch::channel(status).0,
+            loss: watch::channel(None).0,
+            loss_followed: AtomicBool::new(false),
         })
     }
 
@@ -238,6 +263,18 @@ impl CallStatusCell {
 
     /// The participation ended. A reason already published stands: a DM's
     /// own lifecycle publishes its end before it leaves.
+    /// Hands media losses to the call's follower instead of ending at once:
+    /// see [`MediaStatusReporter::lost`].
+    pub(crate) fn follow_losses(&self) -> watch::Receiver<Option<(ConnectionLossReason, String)>> {
+        self.loss_followed.store(true, Ordering::SeqCst);
+        self.loss.subscribe()
+    }
+
+    /// Reports the end by our own connection being given up.
+    pub(crate) fn connection_closed(&self, reason: ConnectionLossReason, message: String) {
+        self.update(|inputs| inputs.end(CallEnd::ConnectionClosed { reason, message }));
+    }
+
     pub(crate) fn on_session_ended(&self, reason: &LeaveReason) {
         let reason = match reason.code {
             LeaveCode::SlotClosed => CallEnd::SlotClosed,
@@ -289,12 +326,16 @@ impl MediaStatusReporter {
         self.set(MediaPhase::Connecting);
     }
 
-    /// The connection to our own focus closed for good, which ends the call.
-    pub fn lost(&self, message: impl Into<String>) {
-        let reason = CallEnd::ConnectionClosed {
-            message: message.into(),
-        };
-        self.cell.update(|inputs| inputs.end(reason));
+    /// Our own media connection was given up, which ends the call. With a
+    /// call behind it, the call stops publishing and issues its leave first,
+    /// then reports the end (034 R26); a standalone reporter ends at once.
+    pub fn lost(&self, reason: ConnectionLossReason, message: impl Into<String>) {
+        let message = message.into();
+        if self.cell.loss_followed.load(Ordering::SeqCst) {
+            self.cell.loss.send_replace(Some((reason, message)));
+        } else {
+            self.cell.connection_closed(reason, message);
+        }
     }
 
     fn set(&self, media: MediaPhase) {
@@ -397,7 +438,7 @@ mod tests {
             reason: DirectCallEnd::Declined,
         });
         cell.on_session_ended(&LeaveReason::with_reason(LeaveCode::Leave, "declined"));
-        media.lost("gone");
+        media.lost(ConnectionLossReason::Budget, "gone");
         assert_eq!(
             cell.status(),
             CallStatus::Ended {
@@ -419,11 +460,12 @@ mod tests {
 
         let (cell, media) = self::cell(None);
         media.connected();
-        media.lost("server went away");
+        media.lost(ConnectionLossReason::Budget, "server went away");
         assert_eq!(
             cell.status(),
             CallStatus::Ended {
                 reason: CallEnd::ConnectionClosed {
+                    reason: ConnectionLossReason::Budget,
                     message: "server went away".to_owned()
                 }
             }

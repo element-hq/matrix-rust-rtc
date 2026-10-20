@@ -107,20 +107,57 @@ fn connect_requires_a_live_call() {
     );
 }
 
-#[test]
-fn wiring_reaches_the_transport_and_fails_cleanly_without_an_sfu() {
-    let mock = MockHost::new();
-    let (_room, call) = joined_call(&mock, dead_sfu());
+/// 034 C10: the session returns at once whatever the SFU does; a dead one
+/// shows as our own media reconnecting, and is given up at the end of the
+/// budget, the call ending `NeverConnected`.
+fn a_dead_own_focus_is_given_up_at_the_end_of_the_budget(
+    transport: FfiJoinTransport,
+    mock: Arc<MockHost>,
+) {
+    let (_room, call) = joined_call(&mock, transport);
 
-    // Everything up to the SFU works — key bridge registration, engine
-    // startup, and the (Rust-implemented) backend's token call — and the dead
-    // endpoint surfaces as a clean Transport error, not a hang or a panic.
-    let result = runtime().block_on(connect_media_session(call, config()));
-    assert!(
-        matches!(result, Err(MediaFfiError::Transport(_))),
-        "expected a Transport error from the dead SFU endpoint, got {:?}",
-        result.as_ref().err(),
+    let session = runtime()
+        .block_on(connect_media_session(
+            call.clone(),
+            MediaSessionConfig {
+                own_reconnect_budget_ms: Some(1_000),
+                ..config()
+            },
+        ))
+        .expect("returns without waiting for the SFU");
+    assert_eq!(
+        session.interruptions().own_media,
+        FfiConnectionState::Reconnecting
     );
+    assert!(matches!(call.status(), crate::FfiCallStatus::Connecting));
+
+    let ended = runtime().block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let crate::FfiCallStatus::Ended { reason } = call.status() {
+                    return reason;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("ended within the budget")
+    });
+    assert!(
+        matches!(
+            ended,
+            crate::FfiCallEnd::ConnectionClosed {
+                reason: crate::FfiConnectionLossReason::NeverConnected,
+                ..
+            }
+        ),
+        "{ended:?}"
+    );
+}
+
+#[test]
+fn wiring_reaches_the_transport_and_gives_a_dead_sfu_up() {
+    a_dead_own_focus_is_given_up_at_the_end_of_the_budget(dead_sfu(), MockHost::new());
 }
 
 #[test]
@@ -128,15 +165,8 @@ fn an_advertised_join_connects_to_the_advertised_focus() {
     let mock = MockHost::new();
     *mock.transports_json.lock().unwrap() =
         serde_json::json!([{ "type": "livekit", "livekit_service_url": DEAD_SFU_URL }]).to_string();
-    let (_room, call) = joined_call(&mock, FfiJoinTransport::Advertised);
-
-    // The host passed no focus: reaching the dead one means it came from the call.
-    let result = runtime().block_on(connect_media_session(call, config()));
-    assert!(
-        matches!(result, Err(MediaFfiError::Transport(_))),
-        "expected a Transport error from the advertised dead SFU, got {:?}",
-        result.as_ref().err(),
-    );
+    // The host passed no focus: trying the dead one means it came from the call.
+    a_dead_own_focus_is_given_up_at_the_end_of_the_budget(FfiJoinTransport::Advertised, mock);
 }
 
 #[test]

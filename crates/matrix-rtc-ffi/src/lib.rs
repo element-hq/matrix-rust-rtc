@@ -741,8 +741,34 @@ pub enum FfiCallEnd {
     Empty,
     /// The slot was closed, which ended our participation without us asking.
     SlotClosed,
-    /// The connection to our own focus closed and will not come back.
-    ConnectionClosed { message: String },
+    /// Our own SFU connection was given up (034 R24): `reason` is for the
+    /// screen, `message` for logs only. Publishing has stopped and our leave
+    /// has been issued (contract C10).
+    ConnectionClosed {
+        reason: FfiConnectionLossReason,
+        message: String,
+    },
+}
+
+/// Why our own SFU connection was given up. Contract C10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConnectionLossReason {
+    /// Lost, and not back within the reconnect budget.
+    Budget,
+    /// The SFU or its token service refused us.
+    Refused,
+    /// Never established within the budget from the connect request.
+    NeverConnected,
+}
+
+impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
+    fn from(value: call::ConnectionLossReason) -> Self {
+        match value {
+            call::ConnectionLossReason::Budget => Self::Budget,
+            call::ConnectionLossReason::Refused => Self::Refused,
+            call::ConnectionLossReason::NeverConnected => Self::NeverConnected,
+        }
+    }
 }
 
 impl From<call::CallEnd> for FfiCallEnd {
@@ -755,7 +781,10 @@ impl From<call::CallEnd> for FfiCallEnd {
             call::CallEnd::OthersLeft => Self::OthersLeft,
             call::CallEnd::Empty => Self::Empty,
             call::CallEnd::SlotClosed => Self::SlotClosed,
-            call::CallEnd::ConnectionClosed { message } => Self::ConnectionClosed { message },
+            call::CallEnd::ConnectionClosed { reason, message } => Self::ConnectionClosed {
+                reason: reason.into(),
+                message,
+            },
         }
     }
 }

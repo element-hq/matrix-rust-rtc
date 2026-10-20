@@ -98,6 +98,14 @@ pub enum TransportError {
     /// The connection is gone.
     #[error("transport connection closed: {0}")]
     Closed(String),
+    /// The SFU rejected the token a connect presented; a fresh one may
+    /// succeed (034 R24).
+    #[error("the SFU rejected the token: {0}")]
+    TokenRejected(String),
+    /// The SFU or the token service refused us for good (a 4xx): retrying
+    /// cannot help (034 R24).
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 /// Our own membership identity, as transports need it for authentication and
@@ -332,6 +340,23 @@ pub trait TransportConnection: MaybeSend {
     /// without frame encryption.
     fn set_local_key_index(&self, _key_index: u8) {}
 
+    /// Establish this connection again behind the same handle, after a loss
+    /// or for a first connect (034 R24): the handle, and every local
+    /// publication made through it, stays valid and is carried onto the new
+    /// connection. `fresh_token` asks for a new token instead of the one the
+    /// last connect used. Resolves with the new connection's events.
+    ///
+    /// Only the own focus is reconnected this way; the default refuses, for
+    /// transports whose connections cannot be.
+    async fn reconnect(
+        &self,
+        _fresh_token: bool,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        Err(TransportError::Unsupported(
+            "this connection cannot be re-established".into(),
+        ))
+    }
+
     /// Close the connection. Idempotent.
     async fn close(&self) -> Result<(), TransportError>;
 }
@@ -351,4 +376,10 @@ pub trait OwnFocusTransport: MediaTransport {
         connection_key: &str,
         ctx: &ConnectionContext,
     ) -> Result<(Self::Connection, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError>;
+
+    /// The own-focus handle, not connected yet: the pool establishes it
+    /// through [`TransportConnection::reconnect`], so a join does not wait
+    /// for the SFU (034 R24, contract C10). Publications made through it
+    /// before then go out once it connects.
+    fn prepare_own(&self, connection_key: &str, ctx: &ConnectionContext) -> Self::Connection;
 }

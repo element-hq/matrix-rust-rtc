@@ -14,6 +14,7 @@
 //! ring, the token endpoint) stays with the caller.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::compat::MembershipFormat;
@@ -43,6 +44,10 @@ pub struct AttachOptions {
     pub format: MembershipFormat,
     /// Damping of the tile order.
     pub stability: StabilityConfig,
+    /// How long our own focus may stay unreachable before the call ends
+    /// (034 R24): [`OWN_RECONNECT_BUDGET`](matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET)
+    /// unless a host configured another.
+    pub own_reconnect_budget: Duration,
 }
 
 /// A call with media attached.
@@ -163,6 +168,7 @@ where
             stability: options.stability,
             signalling: Some(signalling),
             own_membership_lapsed,
+            own_reconnect_budget: options.own_reconnect_budget,
         },
         memberships,
     );
@@ -198,20 +204,20 @@ where
         (options.identity_mapper)(&options.own_user_id, &options.own_device_id, &member_id);
     let own_connection = match &own_key {
         Some(own_key) => {
-            let (connection, connection_events) = transport
-                .connect_own(own_key, &ctx)
-                .await
-                .inspect_err(|error| {
-                    log::warn!("media: own focus {own_key} refused the connection: {error}");
-                })?;
-            engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+            // Not awaited: the join already has the user in the call, and our
+            // own focus connects, or is given up, within the reconnect budget
+            // like any loss (034 R24, contract C10). The status stays
+            // connecting until it is up.
+            let connection = transport.prepare_own(own_key, &ctx);
+            engine.connect_own(Box::new(connection.clone()));
 
             // Move our sender onto each key we rotate to. Without this we
             // advertise a rotation to peers and keep encrypting with the
             // previous key, so anyone joining after it decrypts nothing — and
             // the forward secrecy the rotation exists for is not delivered.
-            // After the connect and the replay, so the first key is already in
-            // the ring; the hook only ever *moves* the index.
+            // After the replay, so the first key is already in the ring; the
+            // hook only ever *moves* the index, and the handle re-asserts it
+            // on every connection it makes.
             let for_keys = connection.clone();
             key_handler.set_local_sender(
                 own_identity.clone(),
@@ -224,11 +230,14 @@ where
             }
             Some(connection)
         }
-        None => None,
+        None => {
+            // Nothing of ours to connect: a receive-only call is up once
+            // attached.
+            call.media_status_reporter().connected();
+            None
+        }
     };
 
-    // Our side is up: the own focus connected, or there is none to connect.
-    call.media_status_reporter().connected();
     log::info!("media: attached as member {member_id}, local identity {own_identity}");
     Ok(MediaAttachment {
         engine,

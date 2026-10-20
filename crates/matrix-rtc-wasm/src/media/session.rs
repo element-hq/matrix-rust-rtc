@@ -55,6 +55,10 @@ struct WasmMediaSessionConfig {
     /// any field left out of the object.
     #[serde(default)]
     stability: Option<WasmStabilityConfig>,
+    /// How long our own SFU may stay unreachable before the call ends
+    /// (034 R24); omitted takes 60 000.
+    #[serde(default)]
+    own_reconnect_budget_ms: Option<u64>,
 }
 
 /// The tile-order damping a page can set (R10, R11). A product decision
@@ -194,6 +198,10 @@ impl WasmRtcCall {
                     .as_ref()
                     .map(Into::into)
                     .unwrap_or_default(),
+                own_reconnect_budget: config.own_reconnect_budget_ms.map_or(
+                    matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
+                    Duration::from_millis,
+                ),
             },
         )
         .await

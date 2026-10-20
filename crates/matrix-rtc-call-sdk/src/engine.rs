@@ -26,12 +26,16 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_call::{MediaStatusReporter, RaisedHand, ReceivedReaction, SignallingHealth};
+use matrix_rtc_call::{
+    ConnectionLossReason, MediaStatusReporter, RaisedHand, ReceivedReaction, SignallingHealth,
+};
 use matrix_rtc_core::{DiscardedKey, JoinedMembership, LeaveReason};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use matrix_rtc_core::executor as rt;
-use matrix_rtc_transport::pool::{MediaPool, PoolConfig, PoolEvent, PoolMessage, RemoteTracks};
+use matrix_rtc_transport::pool::{
+    MediaPool, OwnConnectionLoss, PoolConfig, PoolEvent, PoolMessage, RemoteTracks,
+};
 use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, LocalTrackHandle,
     MediaConstraints, MediaStreamKind, MediaTransport, PublishOptions, ReceiveStats,
@@ -121,6 +125,10 @@ pub struct EngineConfig {
     /// publications are paused at the transport while it is. `None` relies
     /// on the snapshots alone.
     pub own_membership_lapsed: Option<watch::Receiver<bool>>,
+    /// How long our own focus may stay unreachable before the call ends
+    /// (034 R24); [`matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET`] by
+    /// default.
+    pub own_reconnect_budget: Duration,
 }
 
 /// Everything the engine can be told from outside its actor task.
@@ -129,6 +137,10 @@ enum ActorMessage {
     AdoptConnection {
         connection: Box<dyn TransportConnection>,
         events: mpsc::UnboundedReceiver<ConnectionEvent>,
+    },
+    /// Take the own-focus handle unconnected and connect it.
+    ConnectOwn {
+        connection: Box<dyn TransportConnection>,
     },
     /// A media decryption key was imported for a transport identity.
     KeyImported {
@@ -257,10 +269,12 @@ impl CallEngine {
         let (participants_tx, participants_rx) = watch::channel(Vec::new());
         let (tiles_tx, tiles_rx) = watch::channel(TileRoster::default());
         let (local_tx, local_rx) = watch::channel(None);
+        let own_connection_key = config.own_connection_key.clone();
         let (pool, pool_inbox) = MediaPool::new(PoolConfig {
             transports: config.transports,
             ctx: config.ctx,
             own_connection_key: config.own_connection_key,
+            own_reconnect_budget: config.own_reconnect_budget,
         });
         let tracks = pool.remote_tracks();
         // Present from the first value: our own SFU before our tile exists.
@@ -271,6 +285,7 @@ impl CallEngine {
 
         let actor = Actor {
             pool,
+            own_connection_key,
             media_status: config.media_status,
             own_member_id: config.own_member_id,
             events_tx: events_tx.clone(),
@@ -412,6 +427,14 @@ impl CallEngine {
     /// Default 0: always rank.
     pub fn set_ranking_threshold(&self, tiles: u32) {
         let _ = self.messages.send(ActorMessage::SetRankingThreshold(tiles));
+    }
+
+    /// Hand the engine our own focus's handle before it is connected: the
+    /// engine connects it, and reconnects it whenever it is lost, within the
+    /// reconnect budget (034 R24). The call status stays connecting until it
+    /// is first up; publications made meanwhile go out once it is.
+    pub fn connect_own(&self, connection: Box<dyn TransportConnection>) {
+        let _ = self.messages.send(ActorMessage::ConnectOwn { connection });
     }
 
     /// Hand the caller-established own-focus connection to the engine, which
@@ -605,6 +628,8 @@ impl CallEngine {
 struct Actor {
     /// The call's media connections, and the identity mapping over them.
     pool: MediaPool,
+    /// The focus we publish on, if any.
+    own_connection_key: Option<String>,
     media_status: Option<MediaStatusReporter>,
     own_member_id: String,
     events_tx: broadcast::Sender<CallEvent>,
@@ -947,6 +972,10 @@ impl Actor {
             ActorMessage::AdoptConnection { connection, events } => {
                 self.pool.adopt_own_connection(connection, events);
             }
+            ActorMessage::ConnectOwn { connection } => {
+                let events = self.pool.connect_own(connection);
+                self.apply_pool_events(events);
+            }
             ActorMessage::KeyImported {
                 identity,
                 key_index,
@@ -973,8 +1002,9 @@ impl Actor {
             }
             ActorMessage::Publish { options, respond } => {
                 // Local tracks always go to the focus we announced in our
-                // membership — that is where peers subscribe to us.
-                match self.pool.own_connection() {
+                // membership — that is where peers subscribe to us. While it
+                // is down the handle takes them, and they go out once it is up.
+                match self.pool.own_handle() {
                     Some(connection) => {
                         // The publish itself is awaited off-actor so a slow SFU
                         // does not stall every other message; the actor learns
@@ -1234,15 +1264,33 @@ impl Actor {
                 PoolEvent::ConnectionState {
                     connection_key,
                     state,
-                } => log::info!("media connection {connection_key} is {state:?}"),
+                } => {
+                    log::info!("media connection {connection_key} is {state:?}");
+                    // Our own focus up: the call's media is (034 R24).
+                    if state == ConnectionState::Connected
+                        && self.own_connection_key.as_deref() == Some(connection_key.as_str())
+                        && let Some(status) = &self.media_status
+                    {
+                        status.connected();
+                    }
+                }
                 PoolEvent::Degraded(degraded) => {
                     if let Some(status) = &self.media_status {
                         status.degraded(degraded);
                     }
                 }
-                PoolEvent::OwnConnectionLost { message } => {
+                PoolEvent::OwnConnectionLost { reason, message } => {
                     if let Some(status) = &self.media_status {
-                        status.lost(message);
+                        status.lost(
+                            match reason {
+                                OwnConnectionLoss::Budget => ConnectionLossReason::Budget,
+                                OwnConnectionLoss::Refused => ConnectionLossReason::Refused,
+                                OwnConnectionLoss::NeverConnected => {
+                                    ConnectionLossReason::NeverConnected
+                                }
+                            },
+                            message,
+                        );
                     }
                     self.end();
                 }
@@ -2149,6 +2197,7 @@ mod tests {
                 stability,
                 signalling: Some(signalling_rx),
                 own_membership_lapsed: Some(lapsed_rx),
+                own_reconnect_budget: matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
             },
             memberships_rx,
         );
@@ -3361,8 +3410,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn closed_own_connection_ends_the_call() {
+    /// 034 R24: a closed own connection is reconnected, and only a budget
+    /// spent ends the call; never before 60 s.
+    #[tokio::test(start_paused = true)]
+    async fn the_reconnect_budget_ends_the_call_after_sixty_seconds() {
         let fx = fixture();
         let connection = adopt(&fx);
         connection
@@ -3370,16 +3421,25 @@ mod tests {
                 message: "server shutting down".to_owned(),
             })
             .unwrap();
+        tokio::time::sleep(Duration::from_secs(59)).await;
+        assert!(matches!(*fx.status.borrow(), CallStatus::Connected { .. }));
 
         wait_until(|| {
-            *fx.status.borrow()
-                == CallStatus::Ended {
+            matches!(
+                &*fx.status.borrow(),
+                CallStatus::Ended {
                     reason: CallEnd::ConnectionClosed {
-                        message: "server shutting down".to_owned(),
+                        reason: matrix_rtc_call::ConnectionLossReason::Budget,
+                        ..
                     },
                 }
+            )
         })
         .await;
+        assert_eq!(
+            fx.engine.interruptions().own_media,
+            ConnectionState::Unreachable
+        );
     }
 
     #[tokio::test]
@@ -5061,6 +5121,22 @@ mod tests {
                 "connected, degraded, never ended"
             );
             assert_eq!(record(&fx).members_reconnecting, ["bob"]);
+        }
+
+        /// R24, C10: our own focus is taken before it is up; a publication
+        /// made meanwhile goes through its handle rather than failing, and
+        /// our media reads reconnecting until it connects.
+        #[tokio::test]
+        async fn publishing_before_our_own_focus_is_up_goes_through_its_handle() {
+            let fx = fixture();
+            let (connection, _events) = fake_connection(&fx.state, OWN_FOCUS);
+            fx.engine.connect_own(connection);
+            fx.engine
+                .publish(PublishOptions::microphone())
+                .await
+                .expect("the handle takes it");
+            assert_eq!(fx.state.published.lock().unwrap().len(), 1);
+            assert_eq!(record(&fx).own_media, ConnectionState::Reconnecting);
         }
 
         /// R12: signalling unreachable for five minutes never touches our own

@@ -27,6 +27,19 @@ struct TransportState {
     /// Connect attempts that fail before one succeeds.
     fail_attempts: AtomicU32,
     applied: StdMutex<Vec<(String, MediaStreamKind, ResolvedConstraints)>>,
+    /// Outcomes of the own connection's `reconnect` calls, in order; `Ok`
+    /// once they run out.
+    reconnect_outcomes: StdMutex<std::collections::VecDeque<Reconnect>>,
+    /// `(when, fresh_token)` of every `reconnect` call.
+    reconnects: StdMutex<Vec<(tokio::time::Instant, bool)>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reconnect {
+    Ok,
+    Fail,
+    TokenRejected,
+    Refused,
 }
 
 struct FakeTransport(Arc<TransportState>);
@@ -92,6 +105,38 @@ impl TransportConnection for FakeConnection {
             .unwrap()
             .push((identity.to_owned(), kind, resolved));
         Ok(())
+    }
+
+    async fn reconnect(
+        &self,
+        fresh_token: bool,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        self.state
+            .reconnects
+            .lock()
+            .unwrap()
+            .push((tokio::time::Instant::now(), fresh_token));
+        let outcome = self
+            .state
+            .reconnect_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Reconnect::Ok);
+        match outcome {
+            Reconnect::Ok => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.state
+                    .senders
+                    .lock()
+                    .unwrap()
+                    .insert(self.key.clone(), tx);
+                Ok(rx)
+            }
+            Reconnect::Fail => Err(TransportError::Connect("unreachable".into())),
+            Reconnect::TokenRejected => Err(TransportError::TokenRejected("401".into())),
+            Reconnect::Refused => Err(TransportError::Refused("403".into())),
+        }
     }
 
     async fn close(&self) -> Result<(), TransportError> {
@@ -167,6 +212,7 @@ impl Fixture {
                 },
             },
             own_connection_key: Some(OWN_FOCUS.to_owned()),
+            own_reconnect_budget: OWN_RECONNECT_BUDGET,
         });
         Self { pool, inbox, state }
     }
@@ -427,34 +473,185 @@ async fn an_idle_peer_focus_closes_after_the_grace_unless_a_member_returns() {
     assert_eq!(fx.connects(PEER_FOCUS), 1);
 }
 
-#[tokio::test]
-async fn losing_the_own_focus_is_reported_and_close_spares_it() {
+/// 034 R24: the transport giving up is not the end: the own focus is
+/// reconnected behind the same handle, at once and then on backoff, reusing
+/// the token; `close` still spares it.
+#[tokio::test(start_paused = true)]
+async fn the_own_focus_is_reconnected_after_the_transport_gives_up() {
     let mut fx = Fixture::new();
     let own = fx.adopt();
-    assert!(fx.pool.own_connection().is_some());
-
+    let start = tokio::time::Instant::now();
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_secs(50)).await;
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Reconnect::Fail);
     own.send(ConnectionEvent::Closed {
-        message: "kicked".into(),
+        message: "ten attempts spent".into(),
     })
     .unwrap();
-    assert_eq!(
-        fx.drain().await,
-        vec![
-            PoolEvent::ConnectionState {
-                connection_key: OWN_FOCUS.into(),
-                state: ConnectionState::Unreachable,
-            },
-            PoolEvent::OwnConnectionLost {
-                message: "kicked".into(),
-            }
-        ]
+    let mut events = fx.drain().await;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        events.extend(fx.drain().await);
+    }
+
+    let attempts: Vec<(u64, bool)> = fx
+        .state
+        .reconnects
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(at, fresh)| ((*at - start).as_secs(), *fresh))
+        .collect();
+    assert_eq!(attempts, [(50, false), (51, false)], "token reused");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::OwnConnectionLost { .. }))
     );
-    assert!(fx.pool.own_connection().is_none());
-    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Unreachable);
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    assert!(fx.pool.own_connection().is_some());
 
     fx.pool.close();
     fx.drain().await;
     assert!(fx.state.closes.lock().unwrap().is_empty());
+}
+
+fn lost(events: &[PoolEvent]) -> Option<OwnConnectionLoss> {
+    events.iter().find_map(|event| match event {
+        PoolEvent::OwnConnectionLost { reason, .. } => Some(*reason),
+        _ => None,
+    })
+}
+
+/// 034 R24: a token the SFU rejects is fetched again, once.
+#[tokio::test(start_paused = true)]
+async fn a_rejected_token_is_fetched_again_once() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Reconnect::TokenRejected);
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fx.drain().await;
+    let fresh: Vec<bool> = fx
+        .state
+        .reconnects
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, fresh)| *fresh)
+        .collect();
+    assert_eq!(fresh, [false, true]);
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+}
+
+/// 034 R24: rejected again after the refetch, or any stated refusal, ends
+/// the budget at once.
+#[tokio::test(start_paused = true)]
+async fn a_token_rejected_again_after_one_refetch_ends_the_budget_at_once() {
+    for outcomes in [
+        vec![Reconnect::TokenRejected, Reconnect::TokenRejected],
+        vec![Reconnect::Refused],
+    ] {
+        let mut fx = Fixture::new();
+        let own = fx.adopt();
+        let start = tokio::time::Instant::now();
+        fx.state.reconnect_outcomes.lock().unwrap().extend(outcomes);
+        own.send(ConnectionEvent::Closed {
+            message: "gone".into(),
+        })
+        .unwrap();
+        let mut events = fx.drain().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        events.extend(fx.drain().await);
+        assert_eq!(lost(&events), Some(OwnConnectionLoss::Refused));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "at once, not at 60 s"
+        );
+        let attempts = fx.state.reconnects.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        fx.drain().await;
+        assert_eq!(
+            fx.state.reconnects.lock().unwrap().len(),
+            attempts,
+            "never retried"
+        );
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Unreachable);
+    }
+}
+
+/// 034 R24: the budget runs from the first sign of the loss, and ends the
+/// own focus at 60 s, not before.
+#[tokio::test(start_paused = true)]
+async fn the_reconnect_budget_ends_the_own_focus_after_sixty_seconds() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(Reconnect::Fail, 100));
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_millis(49_900)).await;
+    assert_eq!(lost(&fx.drain().await), None, "not before 60 s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(lost(&fx.drain().await), Some(OwnConnectionLoss::Budget));
+}
+
+/// 034 R24, C10: the first connect runs under the budget from the request;
+/// never established, it is `NeverConnected`; established, it is up.
+#[tokio::test(start_paused = true)]
+async fn the_first_connect_runs_under_the_budget() {
+    let mut fx = Fixture::new();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(Reconnect::Fail, 100));
+    let (connection, _) = fake_connection(&fx.state, OWN_FOCUS);
+    let events = fx.pool.connect_own(connection);
+    assert!(events.contains(&PoolEvent::Degraded(true)));
+    assert_eq!(
+        fx.pool.own_connection_state(),
+        ConnectionState::Reconnecting
+    );
+    assert!(
+        fx.pool.own_handle().is_some(),
+        "publishable before it is up"
+    );
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(
+        lost(&fx.drain().await),
+        Some(OwnConnectionLoss::NeverConnected)
+    );
+
+    let mut fx = Fixture::new();
+    let (connection, _) = fake_connection(&fx.state, OWN_FOCUS);
+    fx.pool.connect_own(connection);
+    let events = fx.drain().await;
+    assert!(events.contains(&connected(OWN_FOCUS)));
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    assert!(fx.pool.own_connection().is_some());
 }
 
 #[tokio::test(start_paused = true)]
