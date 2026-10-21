@@ -862,8 +862,18 @@ async fn issue_leave<B: MatrixBackend + 'static>(
     tag: String,
     params: LeaveSessionParams,
 ) {
-    let pending = state.lock().await.begin_leave(slot_id, params).await;
+    let (pending, dialect) = {
+        let mut state = state.lock().await;
+        // The room may be shut down before this goes out, and that forgets
+        // the format the leave has to be written in.
+        let dialect = state
+            .rtc()
+            .backend()
+            .map(|backend| backend.hold_dialect(state.rtc().room_id()));
+        (state.begin_leave(slot_id, params).await, dialect)
+    };
     let send = async move {
+        let _dialect = dialect;
         match pending {
             Ok(pending) => {
                 if let Err(error) = pending.send().await {
