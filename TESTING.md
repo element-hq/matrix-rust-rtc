@@ -96,6 +96,8 @@ proptest! {
 | `never_two_attempts_of_one_slot_in_flight`, `a_cancelled_send_never_attempts_again` | `crates/matrix-rtc-core/src/outbox/tests.rs` | The outbox under random sends, supersessions, cancels, connectivity reports and waits (034 R1) |
 | `hold_properties` | `crates/matrix-rtc-core/src/lib.rs` (`tests::hold`) | The delayed-leave hold against a model of who is present (034 R21) |
 | `a_fallback_is_taken_only_on_its_terms` | `crates/matrix-rtc-transport/src/pool/tests.rs` (`fallback`) | The SFU fallback under random losses, reconnect outcomes, peer outages and signalling (034 R25) |
+| `key_distribution_holds_whatever_the_roster_does` | `crates/matrix-rtc-core/tests/key_rotation.rs` (`properties`) | Media keys under solo and batch joins, leaves, redials, refused deliveries and time, every participant on its own manager: everyone decrypts everyone (or holds the key they switch to), leavers are locked out, nothing reaches a device not in the call, no one holds a key from before they joined |
+| `the_identity_mapping_holds_whatever_arrives_first` | `crates/matrix-rtc-transport/src/pool/tests.rs` (`identity`) | Tracks, keys and SFU participants against membership snapshots in any order: streams reported consistently, every current member's live media subscribed, keys and unmappable identities exact |
 
 ### What it found
 
@@ -110,9 +112,22 @@ We fall back to SFU-B at 10 s; SFU-B then drops too, and ten seconds later
 our media falls back again, to SFU-C. That is legitimate — the spec only rules
 out moving back to our own SFU — so the invariant was corrected, not the code,
 and the seed stays in `proptest-regressions/` so that path is replayed on
-every run. The hand-written scenarios had never combined those events. The
-same mechanism catches real bugs: two timers racing, a stale reconnect
-installed after a fallback, a retry outliving a cancel.
+every run. The hand-written scenarios had never combined those events.
+
+The same mechanism catches real bugs, and two of the properties above did on
+their first deep run:
+
+- **Key distribution** shrank to `JoinTogether(alice, bob), Advance(10 001 ms),
+  Join(carol)`: carol's arrival rotated everyone, and she was handed the key
+  still in use during `delayBeforeUse` — minted before she joined, so its
+  whole history came with it. Newcomers now get only the new key and decrypt
+  once it is used (`KEY_ROTATION.md`, "Exposure, stated plainly").
+- **Identity mapping** shrank to a member publishing, their membership going
+  and coming back under the same member id: the pool had dropped their tracks,
+  the SFU never re-announces them, so they returned with no media — what every
+  peer would see after we republish our membership following an outage. A
+  departed member's tracks are now buffered like media that beats a
+  membership.
 
 ### Running and writing them
 

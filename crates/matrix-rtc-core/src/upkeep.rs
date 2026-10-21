@@ -32,7 +32,7 @@ use crate::encryption::{EncryptionManager, KeyRetry, Undelivered};
 use crate::executor::{self, AbortOnDrop, JoinHandleExt};
 use crate::host::backend::MatrixBackend;
 use crate::outbox::{BACKOFF_INITIAL, BACKOFF_MAX, SendFailure, SendKind, SendPolicy, SlotKey};
-use crate::own_membership::{OwnMembershipMachine, OwnMembershipState, now_ms};
+use crate::own_membership::{OwnMembershipMachine, OwnMembershipState};
 
 /// What a joined slot session's upkeep needs.
 pub(crate) struct SessionUpkeep<T: MatrixBackend + 'static> {
@@ -117,7 +117,8 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                 .as_ref()
                 .and_then(|due| *due.borrow())
                 .filter(|due| Some(*due) != flushed_due);
-            let due_in = due.map(|due| Duration::from_millis(due.saturating_sub(now_ms())));
+            // The manager's deadline is on the outbox's clock, as the machine's is.
+            let due_in = due.map(|due| Duration::from_millis(due.saturating_sub(machine.now_ms())));
             let lapse_in = (!machine.is_lapsed())
                 .then(|| machine.lapse_at_ms())
                 .flatten()

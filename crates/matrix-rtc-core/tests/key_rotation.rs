@@ -42,7 +42,7 @@
 //! keys are usable for decryption at once — a frame cryptor keeps a ring of
 //! indexes, so holding a key never stops you decrypting an older one.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -100,6 +100,8 @@ struct Install {
     key: Vec<u8>,
     /// When this key may be used to *encrypt* (`now + delayBeforeUse`).
     usable_at_ms: u64,
+    /// When it was handed over: for an own key, when it was minted.
+    signalled_at_ms: u64,
 }
 
 /// Stands in for `MediaKeyBridge`: records signalled keys and when each becomes
@@ -188,6 +190,7 @@ impl EncryptionKeySignalHandler for MediaSim {
             index: signal.key_index,
             key: signal.key,
             usable_at_ms: self.clock.now() + signal.use_after_ms,
+            signalled_at_ms: self.clock.now(),
         });
     }
 }
@@ -205,6 +208,13 @@ struct KeyMessage {
     key: Vec<u8>,
 }
 
+/// One (message, recipient) send attempt.
+struct LoggedSend {
+    from_member_id: String,
+    index: u8,
+    to: ToDeviceRecipient,
+}
+
 /// The homeserver's to-device channel, and the meter on it.
 #[derive(Default)]
 struct Bus {
@@ -214,10 +224,10 @@ struct Bus {
     /// so counting only the accepted ones would make an unreachable member look
     /// cheap.
     sends: AtomicU64,
-    /// The same sends, kept in order with who sent what, so a scenario can be
-    /// broken down into "this change cost these keys and these messages" rather
-    /// than just a total. Feeds `Call::describe_since`.
-    log: Mutex<Vec<(String, u8)>>,
+    /// The same sends, kept in order with who sent what to which device, so a
+    /// scenario can be broken down into "this change cost these keys and these
+    /// messages" rather than just a total. Feeds `Call::describe_since`.
+    log: Mutex<Vec<LoggedSend>>,
     /// Devices the server refuses to deliver to, as a rate limit or a dead
     /// device would.
     blocked: Mutex<HashSet<(String, String)>>,
@@ -332,11 +342,11 @@ impl MatrixBackend for PeerSender {
         let mut deliveries = Vec::with_capacity(recipients.len());
         for recipient in recipients {
             self.bus.sends.fetch_add(1, Ordering::SeqCst);
-            self.bus
-                .log
-                .lock()
-                .unwrap()
-                .push((from_member_id.clone(), index));
+            self.bus.log.lock().unwrap().push(LoggedSend {
+                from_member_id: from_member_id.clone(),
+                index,
+                to: recipient.clone(),
+            });
             if blocked.contains(&(recipient.user_id.clone(), recipient.device_id.clone())) {
                 deliveries.push(ToDeviceDelivery::failed(recipient, "M_LIMIT_EXCEEDED"));
                 continue;
@@ -464,6 +474,21 @@ impl Call {
 
     /// Someone joins, and everybody reacts.
     async fn join(&mut self, name: &str) {
+        self.add_peer(name).await;
+        self.settle().await;
+    }
+
+    /// Several people join and the joined memberships change once.
+    async fn join_together(&mut self, names: &[&str]) {
+        for name in names {
+            self.add_peer(name).await;
+        }
+        self.settle().await;
+    }
+
+    /// A participant's manager joins and its membership is added; nobody has
+    /// reacted yet.
+    async fn add_peer(&mut self, name: &str) {
         self.joins += 1;
         let user_id = format!("@{name}:example.org");
         let device_id = format!("{}DEV", name.to_uppercase());
@@ -513,8 +538,6 @@ impl Call {
         };
         self.joined.lock().unwrap().push(peer.membership());
         self.peers.push(peer);
-
-        self.settle().await;
     }
 
     /// Someone leaves, and everybody reacts.
@@ -697,7 +720,12 @@ impl Call {
     fn describe_since(&self, mark: usize, label: &str) -> String {
         let log = self.bus.log.lock().unwrap();
         let mut counted: Vec<(String, u8, usize)> = Vec::new();
-        for (member_id, index) in log.iter().skip(mark) {
+        for LoggedSend {
+            from_member_id: member_id,
+            index,
+            ..
+        } in log.iter().skip(mark)
+        {
             let name = self
                 .peers
                 .iter()
@@ -900,7 +928,8 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
         call.join(name).await;
     }
 
-    call.assert_media_flows("four spaced-out arrivals");
+    call.assert_media_flows_once_settled("four spaced-out arrivals")
+        .await;
     assert_eq!(
         call.total_rotations(),
         6,
@@ -909,9 +938,8 @@ async fn arrivals_outside_the_grace_period_rotate_the_whole_call() {
     );
     assert_eq!(
         call.key_sends(),
-        25,
-        "against a floor of {} for a call of four: 13 of the extra sends are the re-keying, \
-         and 5 are outgoing keys handed to arrivals so a delayed switch does not blind them — {}",
+        20,
+        "against a floor of {} for a call of four: the extra sends are the re-keying — {}",
         ideal_sends(4),
         call.cost(),
     );
@@ -1096,15 +1124,16 @@ async fn a_departed_member_is_locked_out_when_the_delay_expires() {
     }
 }
 
-/// Somebody joins an established call.
+/// Somebody joins an established call whose keys are no longer fresh.
 ///
-/// They are handed a key and can decrypt from their first frame. Today a
-/// rotation on their arrival keeps every *existing* member decrypting through
-/// `delayBeforeUse` — by continuing to encrypt with a key the newcomer was
-/// never sent, so it is the newcomer who goes blind, for the whole delay, on
-/// every join.
+/// Everyone present rotates for them, and keeps encrypting with the old key
+/// through `delayBeforeUse` so they themselves never go blind. The newcomer is
+/// not handed that old key: it was minted before they joined and would let them
+/// read back over everything it encrypted, which is what rotating on their
+/// arrival prevents. They decrypt once the new keys come into use, at most
+/// `delayBeforeUse` after joining.
 #[tokio::test]
-async fn a_new_arrival_can_decrypt_immediately() {
+async fn a_new_arrival_decrypts_once_the_switch_happens() {
     let mut call = Call::with_defaults();
 
     call.join("alice").await;
@@ -1114,7 +1143,20 @@ async fn a_new_arrival_can_decrypt_immediately() {
 
     call.join("carol").await;
 
-    call.assert_media_flows("carol has just joined an established call");
+    let (index, key) = call
+        .peer("alice")
+        .media
+        .sending_key(call.clock.now())
+        .expect("alice is sending");
+    assert!(
+        !call
+            .peer("carol")
+            .media
+            .can_decrypt(&call.peer("alice").identity(), index, &key),
+        "carol holds alice's key from before she joined",
+    );
+    call.assert_media_flows_once_settled("carol has just joined an established call")
+        .await;
 }
 
 /// The grace period's edge, from both sides.
@@ -1151,12 +1193,11 @@ async fn the_grace_period_decides_whether_an_arrival_rotates() {
 
 /// Somebody joins while a rotation is still propagating.
 ///
-/// The trap: the key in `outbound_key` is the pending one, but what is on the wire
-/// is the key it replaced, and only the pending one would be handed to an arrival
-/// by default. They would hold a key nobody is using and wait out the rest of a
-/// window they had nothing to do with.
+/// What is on the wire is the key the rotation replaced, minted before they
+/// joined. They get only the pending key, fresh, and decrypt once it comes into
+/// use — the rest of a window they had nothing to do with, but never history.
 #[tokio::test]
-async fn an_arrival_during_a_switch_window_can_decrypt_immediately() {
+async fn an_arrival_during_a_switch_window_is_not_handed_the_old_key() {
     let mut call = Call::with_defaults();
 
     call.join("alice").await;
@@ -1169,7 +1210,20 @@ async fn an_arrival_during_a_switch_window_can_decrypt_immediately() {
     call.advance(1_000).await;
     call.join("dave").await;
 
-    call.assert_media_flows("dave joined mid-rotation");
+    let (index, key) = call
+        .peer("alice")
+        .media
+        .sending_key(call.clock.now())
+        .expect("alice is sending");
+    assert!(
+        !call
+            .peer("dave")
+            .media
+            .can_decrypt(&call.peer("alice").identity(), index, &key),
+        "dave holds alice's key from before he joined",
+    );
+    call.assert_media_flows_once_settled("dave joined mid-rotation")
+        .await;
 }
 
 /// A long, quiet call still replaces its key.
@@ -1270,14 +1324,9 @@ async fn churn_costs_one_rotation_per_grace_period() {
     }
 }
 
-/// An arrival inside a switch window is served from the key in flight, and no
-/// rotation is left owed for them once the window closes.
-///
-/// The alternative would be to rotate again at the end of the window purely
-/// because they arrived — denying them a key this rollout deliberately handed over
-/// so they would not sit blind. This pins the choice: an arrival mid-window can
-/// read from `delay_before_use_ms` before they joined, the same bargain the grace
-/// period strikes over a longer span.
+/// An arrival inside a switch window is handed the pending key, fresh, and no
+/// rotation is left owed for them once the window closes: what they hold is
+/// what the call uses from then on.
 #[tokio::test]
 async fn an_arrival_inside_a_window_leaves_no_rotation_owed() {
     let delay = EncryptionConfig::default().delay_before_use_ms;
@@ -1290,18 +1339,17 @@ async fn an_arrival_inside_a_window_leaves_no_rotation_owed() {
     call.join("carol").await;
     let after_carol = call.rotations("alice");
 
-    // Dave arrives inside it, and is served the key in flight.
+    // Dave arrives inside it, and is handed the pending key.
     call.advance(1_000).await;
     call.join("dave").await;
-    call.assert_media_flows("dave joined mid-window");
 
     // The window closes. Dave holds what the call is using, so nothing is owed.
     call.advance(delay).await;
     assert_eq!(
         call.rotations("alice"),
         after_carol,
-        "an arrival already served from the key in flight must not cost a further rotation \
-         when the window closes — {}",
+        "an arrival handed the pending key must not cost a further rotation when the \
+         window closes — {}",
         call.cost(),
     );
     call.assert_media_flows("the window closed with dave in the call");
@@ -1450,7 +1498,8 @@ async fn a_long_call_with_a_steady_trickle_of_arrivals() {
         call.join(name).await;
     }
 
-    call.assert_media_flows("eight arrivals over four minutes");
+    call.assert_media_flows_once_settled("eight arrivals over four minutes")
+        .await;
     assert_eq!(
         call.total_rotations(),
         28,
@@ -1459,7 +1508,7 @@ async fn a_long_call_with_a_steady_trickle_of_arrivals() {
     );
     assert_eq!(
         call.key_sends(),
-        195,
+        168,
         "against a floor of {} for a call of eight — {}",
         ideal_sends(8),
         call.cost(),
@@ -1528,7 +1577,7 @@ async fn documented_costs() {
             call.total_rotations(),
             call.key_sends()
         ),
-        (36, 28, 195)
+        (36, 28, 168)
     );
 
     // -- 3 leave in one membership change ---------------------------------------
@@ -1643,4 +1692,464 @@ async fn documented_costs() {
         (call.total_rotations() - settled, call.key_sends() - before),
         (3 * (4 * 60 * 60 * 1000 / lifetime) as usize, 12)
     );
+}
+
+// ===========================================================================
+// Properties
+// ===========================================================================
+
+/// The policy under arbitrary interleavings of solo and batch arrivals,
+/// departures, redials, delivery failures and time, every participant running
+/// its own manager. The scenarios above pin costs; these pin what must hold
+/// whatever happens, checked after every step:
+///
+/// 1. **Nobody left out** — every member present can decrypt what every other
+///    member present is encrypting with, or already holds the key that member
+///    switches to within `delayBeforeUse` (someone reached during a switch
+///    window waits for it rather than being handed the old key, see 7); a
+///    device refusing deliveries is exempt until a retry after it stops.
+/// 2. **Leavers locked out** — `freshness + delayBeforeUse` after a
+///    participation left, nothing anyone is encrypting with is a key it holds.
+/// 3. **Nothing sent to a device with no participation in the call.**
+/// 4. **At most one key per freshness period** — a member's consecutive keys
+///    are minted at least `max(grace, delayBeforeUse)` apart, so an arrival
+///    never forces a rotation on a fresh key.
+/// 5. **Indexes count up** — a participation mints 0, 1, 2, … and never reuses one.
+/// 6. **Nothing owed to a leaver** — no undelivered key is kept for someone
+///    who left.
+/// 7. **No history** — a participation never holds anyone's key minted more
+///    than `max(grace, delayBeforeUse)` before it joined: the grace is the one
+///    window MSC4143 lets an arrival read back over.
+#[cfg(feature = "testing")]
+mod properties {
+    use std::sync::Arc;
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const USERS: [&str; 6] = ["alice", "bob", "carol", "dave", "erin", "frank"];
+    const GRACE_MS: u64 = 10_000;
+    const DELAY_MS: u64 = 5_000;
+    const LIFETIME_MS: u64 = 60_000;
+    const FRESHNESS_MS: u64 = if GRACE_MS > DELAY_MS {
+        GRACE_MS
+    } else {
+        DELAY_MS
+    };
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        Join(usize),
+        JoinTogether(Vec<usize>),
+        Leave(usize),
+        LeaveTogether(Vec<usize>),
+        Rejoin(usize),
+        Block(usize),
+        Unblock(usize),
+        Advance(u64),
+    }
+
+    fn user() -> impl Strategy<Value = usize> {
+        0..USERS.len()
+    }
+
+    fn users() -> impl Strategy<Value = Vec<usize>> {
+        proptest::collection::btree_set(user(), 2..4).prop_map(|set| set.into_iter().collect())
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        prop_oneof![
+            4 => user().prop_map(Step::Join),
+            2 => users().prop_map(Step::JoinTogether),
+            3 => user().prop_map(Step::Leave),
+            2 => users().prop_map(Step::LeaveTogether),
+            1 => user().prop_map(Step::Rejoin),
+            1 => user().prop_map(Step::Block),
+            2 => user().prop_map(Step::Unblock),
+            // Mostly around the grace and the delay; sometimes past a lifetime.
+            5 => (0u64..15_000).prop_map(Step::Advance),
+            1 => (LIFETIME_MS..2 * LIFETIME_MS).prop_map(Step::Advance),
+        ]
+    }
+
+    /// A participation that left, and what its media layer was given.
+    struct Leaver {
+        name: &'static str,
+        member_id: String,
+        media: Arc<MediaSim>,
+        left_at_ms: u64,
+    }
+
+    /// The run's bookkeeping beside the call.
+    #[derive(Default)]
+    struct Model {
+        leavers: Vec<Leaver>,
+        /// When each participation joined, by `member_id`.
+        joined_at: HashMap<String, u64>,
+        /// Refusing deliveries now.
+        blocked: HashSet<&'static str>,
+        /// Unblocked, but not yet past an `advance` that retries what they
+        /// are owed.
+        recovering: HashSet<&'static str>,
+    }
+
+    fn in_call(call: &Call, name: &str) -> bool {
+        call.peers
+            .iter()
+            .any(|peer| peer.name == name && peer.in_call)
+    }
+
+    fn record_leavers(call: &Call, model: &mut Model, names: &[&'static str]) {
+        for name in names {
+            let peer = call.peer(name);
+            model.leavers.push(Leaver {
+                name,
+                member_id: peer.member_id.clone(),
+                media: peer.media.clone(),
+                left_at_ms: call.clock.now(),
+            });
+        }
+    }
+
+    /// Time passes the way the session's upkeep sees it: every deferred
+    /// rotation is flushed at its own deadline, not at the end of the jump,
+    /// and every key a member is owed is retried at each wake-up.
+    async fn run_for(call: &Call, model: &mut Model, ms: u64) {
+        let target = call.clock.now() + ms;
+        loop {
+            let now = call.clock.now();
+            let next_due = call
+                .peers
+                .iter()
+                .filter(|peer| peer.in_call)
+                .filter_map(|peer| peer.manager.rotation_due_at_ms())
+                .filter(|due| *due > now && *due <= target)
+                .min();
+            let Some(due) = next_due else {
+                break;
+            };
+            call.clock.set(due);
+            wake(call).await;
+        }
+        call.clock.set(target);
+        wake(call).await;
+        model.recovering.clear();
+    }
+
+    async fn wake(call: &Call) {
+        for peer in call.peers.iter().filter(|peer| peer.in_call) {
+            peer.manager
+                .flush_due_rotation()
+                .await
+                .expect("a deferred rotation should not fail");
+            for member_id in peer.manager.undelivered_members() {
+                peer.manager
+                    .retry_undelivered_key_now(&member_id)
+                    .await
+                    .expect("a retry should not fail");
+            }
+        }
+        call.deliver_all().await;
+    }
+
+    fn check(call: &Call, model: &Model, sends_before: usize, after: &Step) {
+        let now = call.clock.now();
+        let exempt = |name: &str| model.blocked.contains(name) || model.recovering.contains(name);
+
+        // 1. Nobody left out.
+        for sender in call.peers.iter().filter(|peer| peer.in_call) {
+            let (index, key) = sender
+                .media
+                .sending_key(now)
+                .unwrap_or_else(|| panic!("after {after:?}: {} has no key", sender.name));
+            let switching_to: Vec<Install> = sender
+                .media
+                .installs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|install| {
+                    install.identity == sender.media.own_identity
+                        && install.usable_at_ms > now
+                        && install.usable_at_ms <= now + DELAY_MS
+                })
+                .cloned()
+                .collect();
+            for receiver in call
+                .peers
+                .iter()
+                .filter(|peer| peer.in_call && peer.name != sender.name && !exempt(&peer.name))
+            {
+                let holds_next = switching_to.iter().any(|next| {
+                    receiver
+                        .media
+                        .can_decrypt(&sender.identity(), next.index, &next.key)
+                });
+                assert!(
+                    holds_next || receiver.media.can_decrypt(&sender.identity(), index, &key),
+                    "after {after:?}: {} cannot decrypt {} (index {index}) nor holds what it \
+                     switches to; {}",
+                    receiver.name,
+                    sender.name,
+                    call.cost(),
+                );
+            }
+        }
+
+        // 7. No history.
+        let minted_at = |identity: &str, index: u8, key: &[u8]| {
+            call.peers
+                .iter()
+                .map(|peer| &peer.media)
+                .chain(model.leavers.iter().map(|leaver| &leaver.media))
+                .flat_map(|media| {
+                    media
+                        .installs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|install| {
+                            install.identity == media.own_identity
+                                && install.identity == identity
+                                && install.index == index
+                                && install.key == key
+                        })
+                        .map(|install| install.signalled_at_ms)
+                        .collect::<Vec<_>>()
+                })
+                .min()
+        };
+        for receiver in call.peers.iter().filter(|peer| peer.in_call) {
+            let joined = model.joined_at[&receiver.member_id];
+            let holdings = receiver.media.installs.lock().unwrap().clone();
+            for held in &holdings {
+                if held.identity == receiver.media.own_identity {
+                    continue;
+                }
+                let Some(minted) = minted_at(&held.identity, held.index, &held.key) else {
+                    continue;
+                };
+                assert!(
+                    minted + FRESHNESS_MS >= joined,
+                    "after {after:?}: {} ({}) joined at +{} ms and holds {}'s index {}, \
+                     minted at +{} ms",
+                    receiver.name,
+                    receiver.member_id,
+                    joined - EPOCH,
+                    held.identity,
+                    held.index,
+                    minted - EPOCH,
+                );
+            }
+        }
+
+        // 2. Leavers locked out.
+        for leaver in &model.leavers {
+            if now < leaver.left_at_ms + FRESHNESS_MS + DELAY_MS {
+                continue;
+            }
+            for sender in call.peers.iter().filter(|peer| peer.in_call) {
+                let Some((index, key)) = sender.media.sending_key(now) else {
+                    continue;
+                };
+                assert!(
+                    !leaver.media.can_decrypt(&sender.identity(), index, &key),
+                    "after {after:?}: {} ({}), gone since {} ms, still decrypts {} (index {index})",
+                    leaver.name,
+                    leaver.member_id,
+                    now - leaver.left_at_ms,
+                    sender.name,
+                );
+            }
+        }
+
+        // 3. Nothing sent to a device with no participation in the call.
+        for send in call.bus.log.lock().unwrap().iter().skip(sends_before) {
+            assert!(
+                call.peers.iter().any(|peer| {
+                    peer.in_call
+                        && peer.user_id == send.to.user_id
+                        && peer.device_id == send.to.device_id
+                }),
+                "after {after:?}: {}'s key {} went to {} {}, not in the call",
+                send.from_member_id,
+                send.index,
+                send.to.user_id,
+                send.to.device_id,
+            );
+        }
+
+        for peer in call.peers.iter().filter(|peer| peer.in_call) {
+            let own: Vec<Install> = peer
+                .media
+                .installs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|install| install.identity == peer.media.own_identity)
+                .cloned()
+                .collect();
+            // 4. At most one key per freshness period.
+            for pair in own.windows(2) {
+                let gap = pair[1].signalled_at_ms - pair[0].signalled_at_ms;
+                assert!(
+                    gap >= FRESHNESS_MS,
+                    "after {after:?}: {} minted index {} {gap} ms after index {}",
+                    peer.name,
+                    pair[1].index,
+                    pair[0].index,
+                );
+            }
+            // 5. Indexes count up.
+            let indexes: Vec<u8> = own.iter().map(|install| install.index).collect();
+            let expected: Vec<u8> = (0..indexes.len()).map(|n| n as u8).collect();
+            assert_eq!(indexes, expected, "after {after:?}: {}", peer.name);
+            // 6. Nothing owed to a leaver.
+            for owed in peer.manager.undelivered_members() {
+                assert!(
+                    call.peers
+                        .iter()
+                        .any(|other| other.in_call && other.member_id == owed),
+                    "after {after:?}: {} still owes {owed}, who left",
+                    peer.name,
+                );
+            }
+        }
+    }
+
+    async fn run(steps: Vec<Step>) {
+        let mut call = Call::new(EncryptionConfig {
+            delay_before_use_ms: DELAY_MS,
+            key_rotation_grace_period_ms: GRACE_MS,
+            max_key_lifetime_ms: LIFETIME_MS,
+            ..EncryptionConfig::default()
+        });
+        let mut model = Model::default();
+        for step in steps
+            .iter()
+            .cloned()
+            .chain([Step::Advance(FRESHNESS_MS + DELAY_MS)])
+        {
+            let sends_before = call.mark();
+            match &step {
+                Step::Join(user) => {
+                    let name = USERS[*user];
+                    if !in_call(&call, name) {
+                        call.join(name).await;
+                    }
+                }
+                Step::JoinTogether(users) => {
+                    let names: Vec<&str> = users
+                        .iter()
+                        .map(|user| USERS[*user])
+                        .filter(|name| !in_call(&call, name))
+                        .collect();
+                    if !names.is_empty() {
+                        call.join_together(&names).await;
+                    }
+                }
+                Step::Leave(user) => {
+                    let name = USERS[*user];
+                    if in_call(&call, name) {
+                        record_leavers(&call, &mut model, &[name]);
+                        call.leave(name).await;
+                    }
+                }
+                Step::LeaveTogether(users) => {
+                    let names: Vec<&'static str> = users
+                        .iter()
+                        .map(|user| USERS[*user])
+                        .filter(|name| in_call(&call, name))
+                        .collect();
+                    if !names.is_empty() {
+                        record_leavers(&call, &mut model, &names);
+                        call.leave_together(&names).await;
+                    }
+                }
+                Step::Rejoin(user) => {
+                    let name = USERS[*user];
+                    if in_call(&call, name) {
+                        record_leavers(&call, &mut model, &[name]);
+                        call.leave(name).await;
+                        call.join(name).await;
+                    }
+                }
+                Step::Block(user) => {
+                    let name = USERS[*user];
+                    call.block_device(name);
+                    model.blocked.insert(name);
+                    model.recovering.remove(name);
+                }
+                Step::Unblock(user) => {
+                    let name = USERS[*user];
+                    call.unblock_device(name);
+                    if model.blocked.remove(name) {
+                        model.recovering.insert(name);
+                    }
+                }
+                Step::Advance(ms) => run_for(&call, &mut model, *ms).await,
+            }
+            for peer in call.peers.iter().filter(|peer| peer.in_call) {
+                model
+                    .joined_at
+                    .entry(peer.member_id.clone())
+                    .or_insert(call.clock.now());
+            }
+            check(&call, &model, sends_before, &step);
+        }
+    }
+
+    /// Found by the property: a member whose device refused our key is reached
+    /// on retry inside a switch window, while we still encrypt with the
+    /// previous key. The retry hands over only the pending key — the previous
+    /// one was minted before they could receive anything — so they decrypt
+    /// once it comes into use.
+    #[tokio::test]
+    async fn a_member_reached_on_retry_inside_a_switch_window_waits_for_the_switch() {
+        let mut call = Call::new(EncryptionConfig {
+            delay_before_use_ms: DELAY_MS,
+            key_rotation_grace_period_ms: GRACE_MS,
+            max_key_lifetime_ms: LIFETIME_MS,
+            ..EncryptionConfig::default()
+        });
+        let mut model = Model::default();
+        call.block_device("bob");
+        call.join_together(&["bob", "carol"]).await;
+        call.join("alice").await;
+        run_for(&call, &mut model, GRACE_MS).await;
+        // Not fresh any more: dave's arrival rotates everyone, and the new keys
+        // wait out delayBeforeUse.
+        call.join("dave").await;
+        call.unblock_device("bob");
+        run_for(&call, &mut model, 0).await;
+        let (index, key) = call
+            .peer("alice")
+            .media
+            .sending_key(call.clock.now())
+            .expect("alice is sending");
+        assert!(
+            !call
+                .peer("bob")
+                .media
+                .can_decrypt(&call.peer("alice").identity(), index, &key),
+            "bob was handed alice's key from before he could receive it",
+        );
+        run_for(&call, &mut model, DELAY_MS).await;
+        call.assert_media_flows("bob, once the switch window closed");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn key_distribution_holds_whatever_the_roster_does(
+            steps in proptest::collection::vec(step(), 1..40),
+        ) {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(run(steps));
+        }
+    }
 }

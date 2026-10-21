@@ -824,23 +824,53 @@ impl MediaPool {
 
     fn forget_member(&mut self, member_id: &str) {
         self.known_members.remove(member_id);
-        // Read the identity out before dropping the mappings, so the
-        // identity-keyed buffers can be cleared too: a stale index could
-        // otherwise resurface against a later member that reuses the identity,
-        // and in a long-lived process the maps would only ever grow.
-        if let Some(identity) = self.member_identities.remove(member_id) {
-            self.pending_keys.remove(&identity);
-            self.pending_tracks.remove(&identity);
+        let identity = self.member_identities.remove(member_id);
+        // A stale key index could otherwise resurface against the identity.
+        if let Some(identity) = &identity {
+            self.pending_keys.remove(identity);
         }
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
         // die with the membership.
         self.constraints
             .retain(|(member, _), _| member != member_id);
-        self.tracks
-            .lock()
-            .expect("track map mutex poisoned")
-            .retain(|(track_member, _), _| track_member != member_id);
+        // Their tracks go back to the buffer, not away: the same participation
+        // can return under the same member_id (a membership that lapsed and is
+        // republished, 034 R17/R19), and the SFU, which kept carrying their
+        // media, will not announce it again. A removal or the connection going
+        // clears the buffer as for any media that beat its membership.
+        let departed: Vec<(MediaStreamKind, PooledTrack)> = {
+            let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
+            let kinds: Vec<MediaStreamKind> = tracks
+                .keys()
+                .filter(|(track_member, _)| track_member == member_id)
+                .map(|(_, kind)| *kind)
+                .collect();
+            kinds
+                .into_iter()
+                .filter_map(|kind| {
+                    tracks
+                        .remove(&(member_id.to_owned(), kind))
+                        .map(|pooled| (kind, pooled))
+                })
+                .collect()
+        };
+        if let Some(identity) = identity
+            && !departed.is_empty()
+        {
+            self.pending_tracks
+                .entry(identity)
+                .or_default()
+                .extend(departed);
+        }
+    }
+
+    /// Media buffered from `key` is gone with its connection.
+    fn drop_pending_from(&mut self, key: &str) {
+        self.pending_tracks.retain(|_, pending| {
+            pending.retain(|(_, pooled)| pooled.connection_key != key);
+            !pending.is_empty()
+        });
     }
 
     // ---- streams ------------------------------------------------------
@@ -1056,6 +1086,8 @@ impl MediaPool {
             return;
         }
         log::debug!("closing idle connection {key}");
+        self.unmapped.retain(|_, on| on != key);
+        self.drop_pending_from(key);
         if let Some(entry) = self.pool.remove(key)
             && let ConnState::Up { connection } = entry.state
         {
@@ -1146,6 +1178,8 @@ impl MediaPool {
 
         self.unmapped.retain(|_, on| on != key);
         let is_own = entry.is_own;
+        let members_left = entry.members.is_empty();
+        self.drop_pending_from(key);
         if is_own && self.own.is_none() {
             self.give_up_own(OwnConnectionLoss::Budget, message.to_owned());
             return;
@@ -1155,7 +1189,6 @@ impl MediaPool {
         } else {
             log::warn!("peer-focus connection {key} is gone ({message}); reconnecting");
         }
-        let members_left = entry.members.is_empty();
         let mut lost: Vec<(String, MediaStreamKind)> = self
             .tracks
             .lock()
@@ -1276,7 +1309,9 @@ impl MediaPool {
                     Some(member_id) => self.remove_track(&member_id, kind, connection_key),
                     None => {
                         if let Some(pending) = self.pending_tracks.get_mut(&identity) {
-                            pending.retain(|(pending_kind, _)| *pending_kind != kind);
+                            pending.retain(|(pending_kind, pooled)| {
+                                *pending_kind != kind || pooled.connection_key != connection_key
+                            });
                         }
                     }
                 }
@@ -1570,6 +1605,7 @@ impl MediaPool {
         log::warn!("giving up our own focus {key} ({reason:?}): {message}");
         self.fallback_target = None;
         self.unmapped.retain(|_, on| *on != key);
+        self.drop_pending_from(&key);
         self.pool.remove(&key);
         self.own = None;
         self.own_lost = true;
@@ -1679,6 +1715,7 @@ impl MediaPool {
 
         self.pool.remove(own_key);
         self.unmapped.retain(|_, on| on != own_key);
+        self.drop_pending_from(own_key);
         let entry = self.pool.get_mut(target).expect("checked up above");
         entry.is_own = true;
         entry.backend = None;

@@ -37,7 +37,7 @@ one participant, so eight people each minting one is eight keys and no rotations
 | Scenario (default config) | Keys minted | To-device sends | Floor |
 | --- | --- | --- | --- |
 | 8 join an empty call, 1s apart | 8 — one each, no rotation | 56 | 56 |
-| 8 join, 30s apart (each into a settled call) | 36 — 8 plus 28 rotations | 195 | 56 |
+| 8 join, 30s apart (each into a settled call) | 36 — 8 plus 28 rotations | 168 | 56 |
 | then, in a settled 5-member call: | | | |
 | 3 leave in one roster update | +2 | +2 | — |
 | 3 leave 500ms apart, with no grace period | +9 | +20 | — |
@@ -76,19 +76,20 @@ heidi joins: 14 send(s) — ... heidi#0 x7
 ```
 
 **8 join, 30s apart.** The same arrivals, each meeting a settled key. Every incumbent
-rotates *and* hands the newcomer the key it is still encrypting with — which is the
-second entry per member, always `x1`, so `alice#7 x7, alice#6 x1` is one rotation
-broadcast to seven peers plus one hand-off to heidi.
+rotates and broadcasts the new key to everyone, the newcomer included, so
+`alice#7 x7` is one rotation of hers to seven peers. The newcomer is *not* handed the
+key the incumbents are still encrypting with during `delayBeforeUse` (see "Exposure,
+stated plainly"), so each arrival costs exactly one rotation per incumbent.
 
 ```
 bob joins:    2 send(s) — alice#1 x1, bob#0 x1
-carol joins:  8 send(s) — alice#2 x2, alice#1 x1, bob#1 x2, bob#0 x1, carol#0 x2
-dave joins:  15 send(s) — alice#3 x3, alice#2 x1, bob#2 x3, bob#1 x1, carol#1 x3, carol#0 x1, dave#0 x3
-erin joins:  24 send(s) — alice#4 x4, alice#3 x1, ... erin#0 x4
-frank joins: 35 send(s) — alice#5 x5, alice#4 x1, ... frank#0 x5
-grace joins: 48 send(s) — alice#6 x6, alice#5 x1, ... grace#0 x6
-heidi joins: 63 send(s) — alice#7 x7, alice#6 x1, ... heidi#0 x7
-                 total 195, and alice alone has burned indexes 0 through 7
+carol joins:  6 send(s) — alice#2 x2, bob#1 x2, carol#0 x2
+dave joins:  12 send(s) — alice#3 x3, bob#2 x3, carol#1 x3, dave#0 x3
+erin joins:  20 send(s) — alice#4 x4, ... erin#0 x4
+frank joins: 30 send(s) — alice#5 x5, ... frank#0 x5
+grace joins: 42 send(s) — alice#6 x6, ... grace#0 x6
+heidi joins: 56 send(s) — alice#7 x7, ... heidi#0 x7
+                 total 168, and alice alone has burned indexes 0 through 7
 ```
 
 **5-member call, 3 leave in one roster update.** One roster move, so one rotation
@@ -268,7 +269,6 @@ the one below it.
 | --- | --- | --- |
 | A member who leaves | Media sent after they left | `key_rotation_grace_period_ms` + `delay_before_use_ms` |
 | A member who joins while the key is fresh | Media sent before they arrived | `key_rotation_grace_period_ms` |
-| A member who joins a settled call | The key in use as they arrived, so its history | `max_key_lifetime_ms` — see below |
 | Whoever recovers one key from a device | The media that key encrypted | `max_key_lifetime_ms` |
 
 The last row is what the lifetime cap is for, and it is worth being exact about the
@@ -277,16 +277,22 @@ log, a key pulled off a device that has since been secured — against ciphertex
 colluding SFU recorded. It does nothing against a device that stays compromised,
 which is sent every later key as well.
 
-The third row is the one worth arguing about. When a joiner meets a stable key we
-rotate, and the rotation takes `delay_before_use_ms` to come into use, during which
-frames are still stamped with the *outgoing* key. The joiner is handed that outgoing
-key as well, or they would decrypt nothing at all until the window closed — a media
-blackout on every join into an established call. The cost is that the outgoing key
-may have been in use for a while, and its whole history comes with it — up to
-`max_key_lifetime_ms`, which is the other reason to keep that cap sane.
+What a member who joins a settled call does *not* get is the history. When a joiner
+meets a stable key we rotate, and the rotation takes `delay_before_use_ms` to come into
+use, during which frames are still stamped with the *outgoing* key. That outgoing key
+may have been in use for up to `max_key_lifetime_ms`, so handing it to the joiner would
+hand them its whole history — exactly what rotating on their arrival exists to prevent.
+It is withheld: the joiner holds only keys minted at most the grace period before they
+arrived, and decrypts the members who rotated for them once the new keys come into
+use, at most `delay_before_use_ms` after joining. The same holds for a member reached
+late by a retry. This was a UX-versus-history judgement and is decided in favour of
+history; a shorter `delay_before_use_ms` is what shortens the gap, at the price of less
+time for the new key to reach everyone.
 
-The alternative is to withhold it and accept the blackout. That is a UX-versus-history
-judgement, not a technical one, and it is currently decided in favour of UX.
+The property test `key_distribution_holds_whatever_the_roster_does`
+(`tests/key_rotation.rs`) checks this "no history" rule, the lockout of leavers and
+that everyone present decrypts everyone present (or holds the key they switch to)
+after every step of arbitrary joins, leaves, redials, delivery failures and time.
 
 ## Who performs a deferred rotation
 

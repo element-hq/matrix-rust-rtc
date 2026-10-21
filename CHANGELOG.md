@@ -43,6 +43,11 @@ log only.
 - A reaction is retried for at most 5 s and then fails with the new `ReactionError::NotSent` (FFI and web `Reaction("not sent")`) instead of landing late, and the cooldown starts only once it lands (034 R4).
 - `raise_hand`/`lower_hand` show the hand at once and resolve once it has landed, retrying through an outage; a reversal or the call ending resolves them `Ok`, and only a permanent refusal fails them, the hand back where it was (034 R5).
 
+### Fixed
+
+- A member arriving during a key switch is no longer handed the key still in use, which was minted before they joined and exposed its history; they decrypt once the new key is used, at most `delay_before_use_ms` later (034).
+- A member whose membership lapses and returns under the same member id gets their media back instead of reappearing silent (034 R19).
+
 ## v0.5.0-rc.5 - 2026-10-15
 
 ### Breaking

@@ -1172,7 +1172,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // What will be on the wire once this rollout settles, when that is not what
         // the rollout is about to hand out — during a switch window, the key we are
         // still encrypting with rather than the one in `outbound_key`. `None` when
-        // the two coincide and an arrival needs nothing extra.
+        // the two coincide.
         let key_still_in_use = match (rotating, use_after_ms) {
             // Switching at once: what we distribute is what we will use.
             (true, 0) => None,
@@ -1275,54 +1275,11 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             );
         }
 
-        // Whoever has just arrived holds only what this rollout sent them, and what
-        // we encrypt with is not necessarily that: a rotation waits out its
-        // `delayBeforeUse` first, and during that wait the key on the wire is the
-        // one it replaced. Unless the arrival is given *that* key too, they decrypt
-        // nothing until the window closes — a media blackout of
-        // `delay_before_use_ms` on every join into an established call, landing on
-        // the member least able to explain it.
-        //
-        // Handing it over widens what an arrival can read by the length of the
-        // window. The grace period already makes the same concession and for
-        // longer, by giving an arrival a key the call has been using for up to
-        // `key_rotation_grace_period_ms`.
-        //
-        // Restricted to the arrivals this rollout actually reached: a member the
-        // send could not be delivered to holds neither key, and a second
-        // undeliverable message buys them nothing. It also keeps a member we can
-        // never reach — who stays in `joined` for good, never being recorded as
-        // holding anything — from adding a send to every rollout for the rest of
-        // the call.
-        if let Some((in_use_index, in_use_key)) = &key_still_in_use
-            && *in_use_index != outbound_key_to_use.key_index
-        {
-            let arrivals_served: Vec<ParticipantDeviceInfo> = joined_participants
-                .iter()
-                .filter(|arrival| {
-                    served
-                        .iter()
-                        .any(|recipient| recipient.member_id == arrival.member_id)
-                })
-                .cloned()
-                .collect();
-            if !arrivals_served.is_empty() {
-                log::debug!(
-                    "[{}/{}] also handing key index {in_use_index} to {} arrival(s): it is what \
-                     we are encrypting with until index {} takes over",
-                    self.room_id,
-                    self.slot_id,
-                    arrivals_served.len(),
-                    outbound_key_to_use.key_index,
-                );
-                self.send_key_to_participants(
-                    &general_purpose::STANDARD.encode(in_use_key),
-                    *in_use_index,
-                    &arrivals_served,
-                )
-                .await;
-            }
-        }
+        // An arrival is never handed the key still in use during a switch
+        // window: it was minted before they joined, possibly long before, and
+        // would let them read back over everything it encrypted, which is what
+        // rotating on their arrival exists to prevent. They decrypt us once the
+        // window closes, at most `delay_before_use_ms` after joining.
 
         // Update or store the outbound key
         if use_new_key {
@@ -1504,6 +1461,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     ///
     /// The session's scheduler drives [`Self::flush_due_rotation`] at the
     /// instant it comes up; see [`Self::subscribe_rotation_due`].
+    /// [`Self::retry_undelivered_key`], for tests standing in for the upkeep
+    /// that drives it: `true` when the member now holds the key.
+    #[cfg(feature = "testing")]
+    pub async fn retry_undelivered_key_now(&self, member_id: &str) -> Result<bool, CommandError> {
+        Ok(matches!(
+            self.retry_undelivered_key(member_id).await?,
+            KeyRetry::Delivered
+        ))
+    }
+
     pub fn rotation_due_at_ms(&self) -> Option<u64> {
         *self.rotation_due_at.borrow()
     }
@@ -2862,14 +2829,15 @@ mod tests {
         );
     }
 
-    /// An arrival that rotates must still leave the newcomer able to decrypt.
+    /// An arrival that rotates hands the newcomer the new key only.
     ///
     /// The rotation is delayed to keep the members already present decrypting, so
-    /// for the length of the delay we go on encrypting with a key the newcomer was
-    /// never sent — which is a media blackout on every join into an established
-    /// call unless they are handed that key too.
+    /// for the length of the delay we go on encrypting with a key minted before
+    /// the newcomer joined. Handing it over would let them read back over
+    /// everything it encrypted, which is what rotating on their arrival prevents;
+    /// they decrypt us once the new key comes into use.
     #[tokio::test]
-    async fn an_arrival_is_handed_the_key_we_keep_encrypting_with() {
+    async fn an_arrival_is_not_handed_the_key_it_arrived_after() {
         let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
@@ -2933,9 +2901,9 @@ mod tests {
             "carol needs the key we are rotating to, got {sent_to_carol:?}"
         );
         assert!(
-            sent_to_carol.contains(&(index_in_use as u64)),
-            "carol also needs the key we go on encrypting with for the next {}ms, or she \
-             decrypts nothing until it elapses; got {sent_to_carol:?}",
+            !sent_to_carol.contains(&(index_in_use as u64)),
+            "carol must not get the key minted before she joined, which we go on \
+             encrypting with for {}ms; got {sent_to_carol:?}",
             signal.use_after_ms,
         );
     }

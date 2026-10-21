@@ -439,6 +439,39 @@ mod tests {
             assert!(room_undelivered(&room).is_empty());
         }
 
+        /// A rotation deferred by a departure inside the key's grace goes out
+        /// at its deadline, read on the same clock as the manager's, not at the
+        /// next keep-alive beat.
+        #[tokio::test(start_paused = true)]
+        async fn a_deferred_rotation_goes_out_at_its_deadline() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let bob = || peer("@bob:example.org", "BOBDEV", "bob-a");
+            let carol = || peer("@carol:example.org", "CAROLDEV", "carol-a");
+            let dave = peer("@dave:example.org", "DAVEDEV", "dave-a");
+            room.set_current_sticky_state(vec![bob(), carol(), dave])
+                .await
+                .unwrap();
+
+            // Dave leaves once the key is stale: a rotation at once, off the beat.
+            tokio::time::sleep(Duration::from_millis(13_500)).await;
+            room.set_current_sticky_state(vec![bob(), carol()])
+                .await
+                .unwrap();
+            // Carol leaves inside the new key's grace: deferred to 23.5 s.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            room.set_current_sticky_state(vec![bob()]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            assert_eq!(indices_to(&mock, "@bob:example.org", "BOBDEV"), [0, 1, 2]);
+            let last = *mock.calls_to(MockMethod::ToDevice).last().unwrap();
+            assert!(
+                last >= Duration::from_millis(23_500) && last < Duration::from_secs(24),
+                "the deferred rotation went out at {last:?}, not at 23.5 s"
+            );
+        }
+
         fn room_undelivered(room: &BaseRtcRoom<MockBackend>) -> Vec<String> {
             room.undelivered_key_members("m.call#room")
                 .unwrap_or_default()

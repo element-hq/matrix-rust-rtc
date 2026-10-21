@@ -1183,6 +1183,40 @@ mod fallback {
     }
 }
 
+/// Found by the identity property: a membership that lapses and returns
+/// under the same member id (a republish after an outage, 034 R17/R19) gets
+/// its media back. The SFU kept carrying it and will not announce it again.
+#[tokio::test(start_paused = true)]
+async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
+    let mut fx = Fixture::new();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    fx.sender(PEER_FOCUS)
+        .send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+
+    fx.pool.apply_snapshot(&[]);
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_none()
+    );
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+
+    assert!(events.contains(&PoolEvent::StreamAdded {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Microphone,
+    }));
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_some()
+    );
+}
+
 /// 034 R25: a member moving focus is added on the new connection before the
 /// old one removes them; that late removal leaves the new track alone.
 #[tokio::test(start_paused = true)]
@@ -1219,4 +1253,337 @@ async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
             .get("bob", MediaStreamKind::Camera)
             .is_some()
     );
+}
+
+mod identity {
+    //! The identity mapping under arbitrary interleavings of membership
+    //! snapshots, SFU events (members' and strangers'), key imports,
+    //! connections dropping and time, checked after every step against a
+    //! model of what is published where:
+    //!
+    //! 1. a stream is reported added only when absent and removed only when
+    //!    present, and the reported streams are exactly the subscribed tracks;
+    //! 2. every subscribed track is a current member's, and every track a
+    //!    current member has live on a connection is subscribed (media that
+    //!    beat its membership included);
+    //! 3. a key is reported only for a current member, under their identity,
+    //!    and one imported before the membership is reported when it lands;
+    //! 4. `unmappable()` is exactly the identities that joined a live
+    //!    connection while mapping to no member and have not left it or been
+    //!    mapped since (034 R16: a participant whose membership we have not
+    //!    seen; a member whose membership ends is not re-listed, or every
+    //!    hang-up would flash an unknown participant until the SFU drops them).
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const FOCI: [&str; 2] = ["https://sfu-a.example.org", "https://sfu-b.example.org"];
+    const MEMBERS: [&str; 3] = ["m0", "m1", "m2"];
+    const STRANGERS: [&str; 2] = ["s0", "s1"];
+    const KINDS: [MediaStreamKind; 2] = [MediaStreamKind::Microphone, MediaStreamKind::Camera];
+
+    /// Who an SFU event is about: a member (by index) or a stranger.
+    #[derive(Clone, Copy, Debug)]
+    enum Who {
+        Member(usize),
+        Stranger(usize),
+    }
+
+    impl Who {
+        fn identity(self) -> String {
+            match self {
+                Who::Member(n) => format!("id-{}", MEMBERS[n]),
+                Who::Stranger(n) => format!("id-{}", STRANGERS[n]),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// The members in the snapshot, each on one focus.
+        Snapshot(Vec<(usize, usize)>),
+        TrackAdded(usize, Who, usize),
+        TrackRemoved(usize, Who, usize),
+        RemoteJoined(usize, Who),
+        RemoteLeft(usize, Who),
+        KeyImported(Who, u8),
+        ConnectionDown(usize),
+        Advance(u64),
+    }
+
+    fn who() -> impl Strategy<Value = Who> {
+        prop_oneof![
+            3 => (0..MEMBERS.len()).prop_map(Who::Member),
+            1 => (0..STRANGERS.len()).prop_map(Who::Stranger),
+        ]
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        let focus = 0..FOCI.len();
+        let kind = 0..KINDS.len();
+        prop_oneof![
+            3 => proptest::collection::btree_map(0..MEMBERS.len(), 0..FOCI.len(), 0..=MEMBERS.len())
+                .prop_map(|members| Step::Snapshot(members.into_iter().collect())),
+            4 => (focus.clone(), who(), kind.clone())
+                .prop_map(|(f, w, k)| Step::TrackAdded(f, w, k)),
+            2 => (focus.clone(), who(), kind).prop_map(|(f, w, k)| Step::TrackRemoved(f, w, k)),
+            2 => (focus.clone(), who()).prop_map(|(f, w)| Step::RemoteJoined(f, w)),
+            1 => (focus.clone(), who()).prop_map(|(f, w)| Step::RemoteLeft(f, w)),
+            2 => (who(), 0u8..3).prop_map(|(w, i)| Step::KeyImported(w, i)),
+            1 => focus.prop_map(Step::ConnectionDown),
+            2 => (0u64..12_000).prop_map(Step::Advance),
+        ]
+    }
+
+    /// What the SFUs and the host have done, as far as the pool can know.
+    #[derive(Default)]
+    struct Model {
+        /// The latest snapshot: member id → focus.
+        snapshot: BTreeMap<String, String>,
+        /// Tracks live on a connection: (identity, kind) → focus.
+        published: BTreeMap<(String, MediaStreamKind), String>,
+        /// Identities that joined a connection unmapped: identity → focus.
+        unmapped: BTreeMap<String, String>,
+        /// Keys imported for an identity no member had: identity → indexes.
+        pending_keys: BTreeMap<String, BTreeSet<u8>>,
+        /// Streams as the pool reported them.
+        streams: BTreeSet<(String, MediaStreamKind)>,
+    }
+
+    fn member_of(identity: &str) -> Option<&'static str> {
+        MEMBERS
+            .iter()
+            .find(|member| format!("id-{member}") == identity)
+            .copied()
+    }
+
+    fn live(fx: &Fixture, focus: &str) -> Option<UnboundedSender<ConnectionEvent>> {
+        let up = fx
+            .pool
+            .pool
+            .get(focus)
+            .is_some_and(|entry| matches!(entry.state, ConnState::Up { .. }));
+        up.then(|| fx.state.senders.lock().unwrap().get(focus).cloned())
+            .flatten()
+    }
+
+    /// The connection to `focus` is gone, as the pool will see it: what was
+    /// on it is not any more.
+    fn connection_gone(model: &mut Model, focus: &str) {
+        model.published.retain(|_, on| on != focus);
+        model.unmapped.retain(|_, on| on != focus);
+    }
+
+    fn apply(model: &mut Model, events: &[PoolEvent], step: &Step) {
+        for event in events {
+            match event {
+                PoolEvent::StreamAdded { member_id, kind } => {
+                    assert!(
+                        model.streams.insert((member_id.clone(), *kind)),
+                        "after {step:?}: {member_id} {kind:?} added twice"
+                    );
+                }
+                PoolEvent::StreamRemoved { member_id, kind } => {
+                    assert!(
+                        model.streams.remove(&(member_id.clone(), *kind)),
+                        "after {step:?}: {member_id} {kind:?} removed while absent"
+                    );
+                }
+                PoolEvent::KeyImported {
+                    member_id,
+                    identity,
+                    key_index,
+                } => {
+                    assert!(
+                        model.snapshot.contains_key(member_id),
+                        "after {step:?}: a key reported for {member_id}, not a member"
+                    );
+                    assert_eq!(*identity, format!("id-{member_id}"), "after {step:?}");
+                    if let Some(pending) = model.pending_keys.get_mut(identity) {
+                        pending.remove(key_index);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check(fx: &Fixture, model: &Model, step: &Step) {
+        let tracks: BTreeSet<(String, MediaStreamKind)> =
+            fx.pool.tracks.lock().unwrap().keys().cloned().collect();
+        // 1.
+        assert_eq!(
+            tracks, model.streams,
+            "after {step:?}: the subscribed tracks are not the reported streams"
+        );
+        // 2.
+        for (member_id, _) in &tracks {
+            assert!(
+                model.snapshot.contains_key(member_id),
+                "after {step:?}: a track of {member_id}, not a member"
+            );
+        }
+        for (identity, kind) in model.published.keys() {
+            if let Some(member) = member_of(identity)
+                && model.snapshot.contains_key(member)
+            {
+                assert!(
+                    tracks.contains(&(member.to_owned(), *kind)),
+                    "after {step:?}: {member}'s live {kind:?} is not subscribed"
+                );
+            }
+        }
+        // 3.
+        for (identity, pending) in &model.pending_keys {
+            if member_of(identity).is_some_and(|member| model.snapshot.contains_key(member)) {
+                assert!(
+                    pending.is_empty(),
+                    "after {step:?}: keys {pending:?} of {identity} never reported"
+                );
+            }
+        }
+        // 4.
+        let expected: BTreeSet<String> = model.unmapped.keys().cloned().collect();
+        let unmappable: BTreeSet<String> = fx.pool.unmappable().into_iter().collect();
+        assert_eq!(
+            unmappable, expected,
+            "after {step:?}: unmappable identities"
+        );
+    }
+
+    async fn run(steps: Vec<Step>) {
+        let mut fx = Fixture::new();
+        let mut model = Model::default();
+        for step in steps {
+            let mut events = Vec::new();
+            match &step {
+                Step::Snapshot(members) => {
+                    let snapshot: Vec<JoinedMembership> = members
+                        .iter()
+                        .map(|(member, focus)| member_on(MEMBERS[*member], FOCI[*focus]))
+                        .collect();
+                    let departed: Vec<String> = model
+                        .snapshot
+                        .keys()
+                        .filter(|member| {
+                            !members.iter().any(|(m, _)| MEMBERS[*m] == member.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    // A departure takes its streams without events; the owner
+                    // drops the member as a whole.
+                    for member in &departed {
+                        model.streams.retain(|(m, _)| m != member);
+                    }
+                    model.snapshot = members
+                        .iter()
+                        .map(|(member, focus)| {
+                            (MEMBERS[*member].to_owned(), FOCI[*focus].to_owned())
+                        })
+                        .collect();
+                    model.unmapped.retain(|identity, _| {
+                        member_of(identity).is_none_or(|m| !model.snapshot.contains_key(m))
+                    });
+                    events.extend(fx.pool.apply_snapshot(&snapshot));
+                }
+                Step::TrackAdded(focus, who, kind) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(track_added(&who.identity(), KINDS[*kind]))
+                            .unwrap();
+                        model
+                            .published
+                            .insert((who.identity(), KINDS[*kind]), FOCI[*focus].to_owned());
+                    }
+                }
+                Step::TrackRemoved(focus, who, kind) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(ConnectionEvent::TrackRemoved {
+                                identity: who.identity(),
+                                kind: KINDS[*kind],
+                            })
+                            .unwrap();
+                        let key = (who.identity(), KINDS[*kind]);
+                        if model.published.get(&key).map(String::as_str) == Some(FOCI[*focus]) {
+                            model.published.remove(&key);
+                        }
+                    }
+                }
+                Step::RemoteJoined(focus, who) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(ConnectionEvent::RemoteJoined {
+                                identity: who.identity(),
+                            })
+                            .unwrap();
+                        let mapped = member_of(&who.identity())
+                            .is_some_and(|m| model.snapshot.contains_key(m));
+                        if !mapped {
+                            model
+                                .unmapped
+                                .insert(who.identity(), FOCI[*focus].to_owned());
+                        }
+                    }
+                }
+                Step::RemoteLeft(focus, who) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(ConnectionEvent::RemoteLeft {
+                                identity: who.identity(),
+                            })
+                            .unwrap();
+                        model.unmapped.remove(&who.identity());
+                    }
+                }
+                Step::KeyImported(who, index) => {
+                    let mapped =
+                        member_of(&who.identity()).is_some_and(|m| model.snapshot.contains_key(m));
+                    if !mapped {
+                        model
+                            .pending_keys
+                            .entry(who.identity())
+                            .or_default()
+                            .insert(*index);
+                    }
+                    events.extend(fx.pool.key_imported(who.identity(), *index));
+                }
+                Step::ConnectionDown(focus) => {
+                    if live(&fx, FOCI[*focus]).is_some() {
+                        fx.state.senders.lock().unwrap().remove(FOCI[*focus]);
+                        connection_gone(&mut model, FOCI[*focus]);
+                    }
+                }
+                Step::Advance(ms) => tokio::time::sleep(Duration::from_millis(*ms)).await,
+            }
+            events.extend(fx.drain().await);
+            // A connection closed for being idle took what was on it.
+            for focus in FOCI {
+                if !fx.pool.pool.contains_key(focus) {
+                    connection_gone(&mut model, focus);
+                }
+            }
+            apply(&mut model, &events, &step);
+            check(&fx, &model, &step);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn the_identity_mapping_holds_whatever_arrives_first(
+            steps in proptest::collection::vec(step(), 1..40),
+        ) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(run(steps));
+        }
+    }
 }
