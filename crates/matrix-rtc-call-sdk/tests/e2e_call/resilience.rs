@@ -29,7 +29,7 @@ use matrix_rtc_call::{CallEnd, CallStatus, ConnectionLossReason};
 use matrix_rtc_call_sdk::{CallEvent, ConnectionState, LiveKitCall, LiveKitCallOptions};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SignallingHealth, SlotEncryption};
-use matrix_rtc_livekit::media;
+use matrix_rtc_transport::{AudioFrame, AudioSourceConfig, PublishOptions};
 
 use super::{
     Config, Participant, create_encrypted_room, credentials, login_and_sync, open_slot,
@@ -90,6 +90,24 @@ async fn compose_async(args: &'static [&'static str]) -> Result<(), Box<dyn Erro
 /// stack whole for the next one.
 struct Restore(&'static [&'static str]);
 
+/// Each SFU with the token service living in its network namespace
+/// (`network_mode: service:…`): a token service left running across its
+/// SFU's restart keeps the dead namespace and never answers again.
+const LIVEKIT: &[&str] = &["livekit", "auth-service"];
+const BOTH_LIVEKITS: &[&str] = &["livekit", "auth-service", "livekit2", "auth-service2"];
+
+/// Stops `services` (SFUs with their token services), returning what starts
+/// them again.
+async fn stop(services: &'static [&'static str]) -> Result<Restore, Box<dyn Error>> {
+    let restore = Restore(services);
+    let mut args = vec!["stop"];
+    args.extend(services);
+    tokio::task::spawn_blocking(move || compose(&args))
+        .await?
+        .map_err(|error| -> Box<dyn Error> { error.to_string().into() })?;
+    Ok(restore)
+}
+
 impl Drop for Restore {
     fn drop(&mut self) {
         let mut args = vec!["start"];
@@ -98,6 +116,46 @@ impl Drop for Restore {
             eprintln!("[stack] WARNING: could not restart {:?}: {error}", self.0);
         }
     }
+}
+
+/// Publishes a microphone through the engine and feeds it a `freq_hz` sine
+/// until the publication closes. Unlike a track published on the raw
+/// room, the transport carries it onto every room our media moves to.
+async fn publish_tone(
+    call: &LiveKitCall,
+    freq_hz: f64,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn Error>> {
+    let track = call.engine().publish(PublishOptions::microphone()).await?;
+    let AudioSourceConfig {
+        sample_rate,
+        num_channels,
+    } = AudioSourceConfig::default();
+    let samples_per_channel = sample_rate / 100;
+    Ok(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(10));
+        let mut n: u64 = 0;
+        loop {
+            ticker.tick().await;
+            let mut data = Vec::with_capacity((samples_per_channel * num_channels) as usize);
+            for _ in 0..samples_per_channel {
+                let t = n as f64 / f64::from(sample_rate);
+                let sample =
+                    (0.5 * f64::from(i16::MAX) * (std::f64::consts::TAU * freq_hz * t).sin())
+                        as i16;
+                data.extend(std::iter::repeat_n(sample, num_channels as usize));
+                n += 1;
+            }
+            let frame = AudioFrame {
+                data,
+                sample_rate,
+                num_channels,
+                samples_per_channel,
+            };
+            if track.capture_audio(frame).await.is_err() {
+                break;
+            }
+        }
+    }))
 }
 
 /// Alice and bob in an open slot of a fresh encrypted room, alice publishing
@@ -225,7 +283,9 @@ fn verdict(checks: &[(&str, bool)]) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Synapse restarted under a call (R12, R19, R21): media keeps flowing, both
+/// Synapse down for 15 s under a call (R12, R19, R21), long enough for a
+/// keep-alive beat to fail (a bare restart can fall between two, and no
+/// failed send means nothing to report): media keeps flowing, both
 /// clients report signalling unreachable and then reachable again, neither
 /// call ends, the membership count is two throughout, and bob never sees
 /// alice leave — the delayed leave Synapse may fire on its way back up is
@@ -233,7 +293,7 @@ fn verdict(checks: &[(&str, bool)]) -> Result<(), Box<dyn Error>> {
 async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
     let url = cfg.livekit_service_url.clone();
     let (alice, bob) = two_in_a_call(&cfg, &url, &url, false).await?;
-    let _tone = media::publish_tone(&alice.call.session(), 440.0).await?;
+    let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let alice_member = alice.call.membership_id().to_owned();
 
@@ -241,11 +301,12 @@ async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
     let alice_unreachable = watch_unreachable(&alice.call);
     let bob_unreachable = watch_unreachable(&bob.call);
     let _restore = Restore(&["synapse"]);
-    let (restarted, during) = tokio::join!(compose_async(&["restart", "synapse"]), async {
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        record_peer_tone(&bob.call, "bob-during-restart", 440.0).await
-    });
-    restarted?;
+    compose_async(&["stop", "synapse"]).await?;
+    let (during, _) = tokio::join!(
+        record_peer_tone(&bob.call, "bob-during-restart", 440.0),
+        tokio::time::sleep(Duration::from_secs(15)),
+    );
+    compose_async(&["start", "synapse"]).await?;
 
     let reachable = |record: &matrix_rtc_call_sdk::Interruptions| {
         record.signalling == SignallingHealth::Reachable && !record.own_membership_lapsed
@@ -296,12 +357,11 @@ async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
 async fn own_sfu_back_in_time(cfg: Config) -> Result<(), Box<dyn Error>> {
     let url = cfg.livekit_service_url.clone();
     let (alice, bob) = two_in_a_call(&cfg, &url, &url, false).await?;
-    let _tone = media::publish_tone(&alice.call.session(), 440.0).await?;
+    let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let member = alice.call.membership_id().to_owned();
 
-    let restore = Restore(&["livekit"]);
-    compose_async(&["stop", "livekit"]).await?;
+    let restore = stop(LIVEKIT).await?;
     let reconnecting = until_interruptions(&alice.call, Duration::from_secs(20), |record| {
         record.own_media == ConnectionState::Reconnecting
     })
@@ -338,12 +398,11 @@ async fn own_sfu_fallback(cfg: Config) -> Result<(), Box<dyn Error>> {
         true,
     )
     .await?;
-    let _tone = media::publish_tone(&alice.call.session(), 440.0).await?;
+    let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let member = alice.call.membership_id().to_owned();
 
-    let _restore = Restore(&["livekit"]);
-    compose_async(&["stop", "livekit"]).await?;
+    let _restore = stop(LIVEKIT).await?;
     let moved = until_interruptions(&alice.call, Duration::from_secs(40), |record| {
         record.own_media == ConnectionState::Connected
     })
@@ -374,10 +433,21 @@ async fn every_sfu_down(cfg: Config) -> Result<(), Box<dyn Error>> {
     .await?;
     let mut status = alice.call.subscribe_status();
 
-    let _restore = Restore(&["livekit", "livekit2"]);
-    compose_async(&["stop", "livekit", "livekit2"]).await?;
-    let started = tokio::time::Instant::now();
-    tokio::time::sleep(Duration::from_secs(50)).await;
+    // From the loss as our media reports it: LiveKit drops its connections
+    // as its stop begins, seconds before `docker compose stop` returns.
+    let mut interruptions = alice.call.engine().subscribe_interruptions();
+    let (restore, started) = tokio::join!(stop(BOTH_LIVEKITS), async {
+        let _ = interruptions
+            .wait_for(|record| record.own_media != ConnectionState::Connected)
+            .await;
+        tokio::time::Instant::now()
+    });
+    let _restore = restore?;
+    println!(
+        "[alice] lost our media {:?} before the stop returned",
+        started.elapsed()
+    );
+    tokio::time::sleep_until(started + Duration::from_secs(50)).await;
     let alive_at_50 = !ended(&alice.call);
     let end = tokio::time::timeout(
         Duration::from_secs(60),

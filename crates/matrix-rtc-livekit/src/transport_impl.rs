@@ -333,15 +333,19 @@ fn classify_token_error(error: crate::Error) -> TransportError {
     }
 }
 
-/// An SFU connect failure: a 401 is the token, another 4xx a refusal,
-/// anything else may pass.
+/// An SFU connect failure: a 401 is the token, as is a 404. Our own SFU's
+/// token service creates the room when it issues our token (`auto_create`
+/// off), so a 404 there means the SFU restarted and forgot it, and a fresh
+/// token creates it again (on a peer's SFU taken over under 034 R25, its token
+/// service may not create rooms for us: the second 404 is then a refusal).
+/// Another 4xx is a refusal; anything else may pass.
 fn classify_room_error(error: crate::Error) -> TransportError {
     if let crate::Error::Room(livekit::RoomError::Engine(
         livekit::rtc_engine::EngineError::Signal(SignalError::Client(status, _)),
     )) = &error
     {
         return match status.as_u16() {
-            401 => TransportError::TokenRejected(error.to_string()),
+            401 | 404 => TransportError::TokenRejected(error.to_string()),
             _ => TransportError::Refused(error.to_string()),
         };
     }
@@ -1329,4 +1333,37 @@ fn copy_plane(
         dst[row * dst_stride..][..width].copy_from_slice(&src[row * src_stride..][..width]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signal_client_error(status: u16) -> crate::Error {
+        crate::Error::Room(livekit::RoomError::Engine(
+            livekit::rtc_engine::EngineError::Signal(SignalError::Client(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                "refused".into(),
+            )),
+        ))
+    }
+
+    /// A restarted SFU has forgotten the room our token names (LiveKit keeps
+    /// rooms in memory, and `auto_create` is off where the token service
+    /// creates them): a fresh token brings it back, so it is no refusal.
+    #[test]
+    fn a_forgotten_room_is_the_token_not_a_refusal() {
+        assert!(matches!(
+            classify_room_error(signal_client_error(404)),
+            TransportError::TokenRejected(_)
+        ));
+        assert!(matches!(
+            classify_room_error(signal_client_error(401)),
+            TransportError::TokenRejected(_)
+        ));
+        assert!(matches!(
+            classify_room_error(signal_client_error(403)),
+            TransportError::Refused(_)
+        ));
+    }
 }

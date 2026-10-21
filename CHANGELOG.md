@@ -47,6 +47,7 @@ log only.
 
 - A member arriving during a key switch is no longer handed the key still in use, which was minted before they joined and exposed its history; they decrypt once the new key is used, at most `delay_before_use_ms` later (034).
 - A member whose membership lapses and returns under the same member id gets their media back instead of reappearing silent (034 R19).
+- Our own SFU restarted under a call is reconnected with a fresh token instead of the call ending, the restarted SFU having forgotten the room (a 404) (034 R24).
 
 ## v0.5.0-rc.5 - 2026-10-15
 
