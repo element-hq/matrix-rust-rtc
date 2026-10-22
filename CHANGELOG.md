@@ -48,6 +48,7 @@ log only.
 ### Fixed
 
 - A member is shown unable to decrypt only once their frames have failed for `StabilityConfig::key_grace` (FFI `key_grace_ms`, 4 s by default) without a break, so key rotations no longer flicker their tile or the interruptions record (034 C6).
+- A member's track replaced by a new one before the old was removed, as when they move to another SFU, is reported as `StreamStopped` then `StreamStarted`, so hosts reopen their reader instead of freezing on the old track (034 R25).
 - A track declared unencrypted in an encrypted call is refused instead of played, and its member reads `NotEncrypted`: livekit gave it no frame cryptor, so a misconfigured client or the SFU could put clear media on their tile (034 C6).
 - A member arriving during a key switch is no longer handed the key still in use, which was minted before they joined and exposed its history; they decrypt once the new key is used, at most `delay_before_use_ms` later (034).
 - A member whose membership lapses and returns under the same member id gets their media back instead of reappearing silent (034 R19).

@@ -1216,7 +1216,8 @@ async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
 }
 
 /// 034 R25: a member moving focus is added on the new connection before the
-/// old one removes them; that late removal leaves the new track alone.
+/// old one removes them: the replaced track is reported removed and added,
+/// so readers reopen, and the late removal leaves the new track alone.
 #[tokio::test(start_paused = true)]
 async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
     let mut fx = Fixture::new();
@@ -1239,11 +1240,28 @@ async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
     })
     .unwrap();
     let events = fx.drain().await;
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event, PoolEvent::StreamRemoved { .. })),
-        "{events:?}"
+    let streams: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                PoolEvent::StreamRemoved { .. } | PoolEvent::StreamAdded { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        streams,
+        [
+            &PoolEvent::StreamRemoved {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Camera,
+            },
+            &PoolEvent::StreamAdded {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Camera,
+            },
+        ],
+        "one pair for the replacement, nothing for the late removal"
     );
     assert!(
         fx.pool

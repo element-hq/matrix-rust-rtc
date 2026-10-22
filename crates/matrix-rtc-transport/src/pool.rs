@@ -897,16 +897,24 @@ impl MediaPool {
     // ---- streams ------------------------------------------------------
 
     fn add_track(&mut self, member_id: &str, kind: MediaStreamKind, pooled: PooledTrack) {
-        let replaced = self
+        let track = pooled.track.clone();
+        let previous = self
             .tracks
             .lock()
             .expect("track map mutex poisoned")
-            .insert((member_id.to_owned(), kind), pooled)
-            .is_some();
-        if replaced {
-            // Same stream re-announced (e.g. events replayed on attach); the
-            // handle is refreshed, but it is not a new stream.
-            return;
+            .insert((member_id.to_owned(), kind), pooled);
+        match previous {
+            // The same track announced again: nothing new to read.
+            Some(previous) if Arc::ptr_eq(&previous.track, &track) => return,
+            // A new track in its place, as when a member moves focus (034
+            // R25) and the new connection adds them before the old removes
+            // them: a reader on the old track never yields again, so the host
+            // is told to open a new one.
+            Some(_) => self.out.push(PoolEvent::StreamRemoved {
+                member_id: member_id.to_owned(),
+                kind,
+            }),
+            None => {}
         }
         self.out.push(PoolEvent::StreamAdded {
             member_id: member_id.to_owned(),
