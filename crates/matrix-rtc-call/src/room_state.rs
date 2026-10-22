@@ -867,17 +867,11 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             CallKind::Group {
                 notify: Some(notify),
             } => {
-                self.notify_session_started(
-                    &notify.into(),
-                    &rtc,
-                    &joined.member_event_id,
-                    deadline,
-                )
-                .await;
+                self.notify_session_started(&notify.into(), &rtc, &joined.member_event_id)
+                    .await;
             }
             CallKind::Direct { ring } => {
-                self.join_direct(&rtc, &user_id, ring, &mut joined, deadline)
-                    .await;
+                self.join_direct(&rtc, &user_id, ring, &mut joined).await;
             }
         }
         Ok(joined)
@@ -890,19 +884,13 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         user_id: &str,
         ring: Option<crate::RingConfig>,
         joined: &mut CallJoined,
-        deadline: Option<executor::Instant>,
     ) {
         let tag = format!("{}/{}", self.room_id(), rtc.slot_id);
         let Some(callee) = callee_of(self.rtc.room_members(), user_id) else {
             log::info!("[{tag}] DM is not one-to-one: no ring, no direct-call lifecycle");
             if let Some(ring) = ring {
-                self.notify_session_started(
-                    &ring.demoted(),
-                    rtc,
-                    &joined.member_event_id,
-                    deadline,
-                )
-                .await;
+                self.notify_session_started(&ring.demoted(), rtc, &joined.member_event_id)
+                    .await;
             }
             return;
         };
@@ -965,14 +953,22 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         joined.direct = Some(direct);
     }
 
-    /// Sends the MSC4075 notification that summons the room to this session;
-    /// see [`notify_session_started`] for when it is suppressed.
+    /// Sends the MSC4075 notification that summons the room to this session,
+    /// detached; see [`notify_session_started`] for when it is suppressed.
+    ///
+    /// Not awaited by the join, which is over once our membership has landed:
+    /// nothing after it needs the notification, it never fails the join
+    /// (034 C10), and the core sends one only when nobody else is in the
+    /// session, so returning first hides us from no one. Waiting cost the
+    /// media connection instead: in an encrypted room the first send of a
+    /// session shares a room key with every device in the room, and on a
+    /// device that held the join 18 s. Retried for the notification's own
+    /// lifetime rather than the join's budget; the leave still cancels it.
     async fn notify_session_started(
         &self,
         notify: &NotifyConfig,
         params: &JoinSessionParams,
         member_event_id: &str,
-        deadline: Option<executor::Instant>,
     ) {
         let Ok(backend) = self.backend() else {
             return;
@@ -982,17 +978,29 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             .subscribe_membership_snapshots(&params.slot_id)
             .map(|snapshots| snapshots.borrow().clone())
             .unwrap_or_default();
-        notify_session_started(
-            backend.as_ref(),
-            self.rtc.outbox(),
-            self.rtc.room_id(),
-            notify,
-            params,
-            &members,
-            member_event_id,
-            deadline,
-        )
-        .await;
+        let outbox = self.rtc.outbox().clone();
+        let room_id = self.rtc.room_id().to_owned();
+        let notify = notify.clone();
+        let params = params.clone();
+        let member_event_id = member_event_id.to_owned();
+        let send = async move {
+            notify_session_started(
+                backend.as_ref(),
+                &outbox,
+                &room_id,
+                &notify,
+                &params,
+                &members,
+                &member_event_id,
+                None,
+            )
+            .await;
+        };
+        if executor::can_spawn() {
+            executor::spawn(send);
+        } else {
+            send.await;
+        }
     }
 }
 

@@ -458,10 +458,14 @@ async fn a_failed_key_rollout_or_notification_never_fails_the_join() {
         .await;
 
     assert!(call.is_ok(), "{:?}", call.err());
-    assert!(started.elapsed() <= JOIN_BUDGET);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the join waits for neither: it is over once the membership has landed"
+    );
+    tokio::time::sleep(JOIN_BUDGET).await;
     assert!(
         mock.calls_to(MockMethod::StickyEvent).len() > 2,
-        "the notification was retried"
+        "the notification was retried after the join returned"
     );
 }
 

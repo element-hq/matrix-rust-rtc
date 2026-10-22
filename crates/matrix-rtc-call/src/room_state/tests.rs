@@ -788,6 +788,15 @@ async fn join_and_notify(call: &mut Call, member_id: &str, notify: Option<GroupN
         ..rtc.into()
     };
     call.join(params).await.expect("join should succeed");
+    let_detached_sends_run().await;
+}
+
+/// The join returns before its notification is sent, which goes out on a
+/// task of its own; this lets it.
+async fn let_detached_sends_run() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Every sticky send of the notification, under its wire type, as
@@ -1031,6 +1040,7 @@ async fn dm(
         })
         .await
         .expect("join succeeds");
+    let_detached_sends_run().await;
     (call, sender, joined)
 }
 
