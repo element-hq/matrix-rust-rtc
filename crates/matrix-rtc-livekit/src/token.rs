@@ -76,7 +76,7 @@ async fn post_for_token(
         .json(body)
         .send()
         .await
-        .inspect_err(|error| log::warn!("SFU token request to {endpoint} failed: {error}"))?;
+        .inspect_err(|error| log::warn!("SFU token request to {endpoint} failed: {error:?}"))?;
 
     let status = response.status().as_u16();
     let body = response.text().await?;
