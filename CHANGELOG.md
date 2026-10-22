@@ -46,6 +46,7 @@ log only.
 - `raise_hand`/`lower_hand` show the hand at once and resolve once it has landed, retrying through an outage; a reversal or the call ending resolves them `Ok`, and only a permanent refusal fails them, the hand back where it was (034 R5).
 
 ### Fixed
+- The token exchange's HTTP client trusts the native root store and `SSL_CERT_FILE` as the signalling socket does, so a dev stack's own CA works for the whole media path.
 
 - A member is shown unable to decrypt only once their frames have failed for `StabilityConfig::key_grace` (FFI `key_grace_ms`, 4 s by default) without a break, so key rotations no longer flicker their tile or the interruptions record (034 C6).
 - A member's track replaced by a new one before the old was removed, as when they move to another SFU, is reported as `StreamStopped` then `StreamStarted`, so hosts reopen their reader instead of freezing on the old track (034 R25).

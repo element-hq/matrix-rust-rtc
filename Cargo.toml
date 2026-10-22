@@ -58,7 +58,10 @@ async-trait = "0.1"
 # the token exchange's `reqwest::Client`) and `matrix-rtc-call-sdk` uses the
 # same ones, so two version specs would build two copies whose types do not
 # match.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Both root stores, as for livekit below: the native ones honour `SSL_CERT_FILE`,
+# which is how a dev stack's CA (the QA lab's) reaches the token exchange, and
+# the webpki ones keep Android working where the native store is empty.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 
 # `livekit`: keep default features (notably `tokio`, which enables the signal client) and
 # select the rustls TLS backend for the SFU WebSocket/HTTP connections.
