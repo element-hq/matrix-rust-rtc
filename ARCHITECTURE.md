@@ -355,7 +355,8 @@ Membership is always applied as a complete set: a member whose event is absent f
   unconnected (`connect_own`), so a join never waits for the SFU.
 - `Interruptions` (034 R38): every cause interrupting the call in its own
   field — signalling, our membership's lapse, our own media, members
-  reconnecting or unreachable, undecryptable and unmappable identities —
+  reconnecting or unreachable, those we cannot decrypt (missing key, bad
+  key, or a track sent in clear and refused) and unmappable identities —
   published after the roster of the same change. Our publications are muted
   at the transport while our membership has lapsed (R17).
 - `attach_media` attaches media to a joined `RtcCall`: the one copy of the

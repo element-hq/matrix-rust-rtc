@@ -245,7 +245,7 @@ fn participant(id: &str) -> matrix_rtc_call_sdk::Participant {
         device_id: None,
         is_local: false,
         connection: matrix_rtc_call_sdk::ConnectionState::Connected,
-        decryptable: true,
+        unable_to_decrypt: None,
         streams: vec![],
         hand_raised_at_ms: None,
         hand_raised_position: None,
@@ -264,7 +264,7 @@ fn interruptions_cross_the_ffi_cause_by_cause() {
         own_media: ConnectionState::Reconnecting,
         members_reconnecting: vec!["bob".to_owned()],
         members_unreachable: vec!["carol".to_owned()],
-        undecryptable: vec!["dave".to_owned()],
+        unable_to_decrypt: vec!["dave".to_owned()],
         unmappable: vec!["id-erin".to_owned()],
     };
     assert_eq!(
@@ -275,7 +275,7 @@ fn interruptions_cross_the_ffi_cause_by_cause() {
             own_media: FfiConnectionState::Reconnecting,
             members_reconnecting: vec!["bob".to_owned()],
             members_unreachable: vec!["carol".to_owned()],
-            undecryptable: vec!["dave".to_owned()],
+            unable_to_decrypt: vec!["dave".to_owned()],
             unmappable: vec!["id-erin".to_owned()],
         }
     );

@@ -180,6 +180,10 @@ pub enum PoolEvent {
         member_id: String,
         state: FrameEncryptionState,
     },
+    /// A member published a track declared unencrypted, which the transport
+    /// refused (see [`ConnectionEvent::TrackNotEncrypted`]). Reported once
+    /// they map, for as long as they stay on the SFU.
+    SentInClear { member_id: String },
     /// A media key for a member was imported (reported through
     /// [`MediaPool::key_imported`], released once the membership is known),
     /// with the transport identity it was installed under.
@@ -387,6 +391,9 @@ pub struct MediaPool {
     constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
     /// Media that arrived before its membership, flushed when it lands.
     pending_tracks: PendingTracks,
+    /// Transport identities that published a track declared unencrypted,
+    /// until they leave the SFU; reported again whenever they map.
+    sent_in_clear: HashSet<String>,
     /// Imported key indices awaiting their membership, in arrival order.
     ///
     /// A `Vec`, not a single index: at join a member can be handed more than one
@@ -444,6 +451,7 @@ impl MediaPool {
             member_identities: HashMap::new(),
             constraints: HashMap::new(),
             pending_tracks: HashMap::new(),
+            sent_in_clear: HashSet::new(),
             pending_keys: HashMap::new(),
             pool: HashMap::new(),
             connection_generation: 0,
@@ -487,15 +495,23 @@ impl MediaPool {
     }
 
     /// The state of our own media's connection (034 R23): `Connected` with no
-    /// own focus to publish on, `Reconnecting` until it is adopted and while
-    /// it recovers, `Unreachable` once it is lost.
+    /// own focus to publish on, `Connecting` until it is first up,
+    /// `Reconnecting` while it recovers, `Unreachable` once it is lost.
     pub fn own_connection_state(&self) -> ConnectionState {
         let Some(key) = &self.own_connection_key else {
             return ConnectionState::Connected;
         };
         if self.own_lost {
-            ConnectionState::Unreachable
-        } else if !self.pool.contains_key(key) || self.degraded_keys.contains(key) {
+            return ConnectionState::Unreachable;
+        }
+        if !self.own.as_ref().is_some_and(|own| own.ever_up) {
+            return ConnectionState::Connecting;
+        }
+        let up = self
+            .pool
+            .get(key)
+            .is_some_and(|entry| matches!(entry.state, ConnState::Up { .. }));
+        if !up || self.degraded_keys.contains(key) {
             ConnectionState::Reconnecting
         } else {
             ConnectionState::Connected
@@ -812,6 +828,11 @@ impl MediaPool {
             for (kind, pooled) in pending {
                 self.add_track(&member.member_id, kind, pooled);
             }
+        }
+        if self.sent_in_clear.contains(&identity) {
+            self.out.push(PoolEvent::SentInClear {
+                member_id: member.member_id.clone(),
+            });
         }
         for key_index in self.pending_keys.remove(&identity).unwrap_or_default() {
             self.out.push(PoolEvent::KeyImported {
@@ -1281,6 +1302,16 @@ impl MediaPool {
                 // changes nothing for a member (tracks get their own events),
                 // only for a participant we could not map.
                 self.unmapped.remove(&identity);
+                self.sent_in_clear.remove(&identity);
+            }
+            ConnectionEvent::TrackNotEncrypted { identity, kind } => {
+                log::warn!(
+                    "refused a {kind:?} track declared unencrypted from {identity} on {connection_key}"
+                );
+                self.sent_in_clear.insert(identity.clone());
+                if let Some(member_id) = self.identity_map.get(&identity).cloned() {
+                    self.out.push(PoolEvent::SentInClear { member_id });
+                }
             }
             ConnectionEvent::TrackAdded {
                 identity,
@@ -1712,6 +1743,9 @@ impl MediaPool {
         }
         let connection = own.connection.clone();
         log::info!("our media goes out through {target} now, our own focus {own_key} being down");
+        if let Some(own) = self.own.as_mut() {
+            own.ever_up = true;
+        }
 
         self.pool.remove(own_key);
         self.unmapped.retain(|_, on| on != own_key);

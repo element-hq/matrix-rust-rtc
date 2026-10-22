@@ -271,8 +271,8 @@ async fn own_sfu_loss_to_the_budget() {
     assert_eq!(call.mock.calls().len(), sends, "nothing after the end");
 }
 
-/// Joining with our SFU down: the attach returns at once, our media is
-/// reconnecting and the call connecting; the SFU up at 25 s connects it with
+/// Joining with our SFU down: the attach returns at once, our media and the
+/// call are connecting; the SFU up at 25 s connects it with
 /// the member id unchanged. Never up: the call ends at 60 s from the request,
 /// as never connected.
 #[tokio::test(start_paused = true)]
@@ -281,7 +281,7 @@ async fn join_with_the_sfu_down() {
     assert_eq!(call.call.status(), CallStatus::Connecting);
     assert_eq!(
         call.media.engine.interruptions().own_media,
-        ConnectionState::Reconnecting
+        ConnectionState::Connecting
     );
     let member = call.sticky_sends().last().unwrap()["member"].clone();
 

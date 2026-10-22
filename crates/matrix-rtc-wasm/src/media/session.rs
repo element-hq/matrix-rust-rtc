@@ -18,7 +18,7 @@ use std::time::Duration;
 use js_sys::{Function, Reflect};
 use matrix_rtc_call_sdk::{
     AttachOptions, CallEngine, CallEvent, ConnectionState, FrameEncryptionDiagnostic,
-    Interruptions, MediaAttachment, Participant, StabilityConfig, attach_media,
+    Interruptions, MediaAttachment, Participant, StabilityConfig, UnableToDecrypt, attach_media,
 };
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_transport::keys::MediaKeyHandler;
@@ -77,6 +77,9 @@ struct WasmStabilityConfig {
     /// Reorders inside this window are delivered as one.
     #[serde(default = "default_coalesce_ms")]
     coalesce_ms: u64,
+    /// How long frames must fail to decrypt before `unable_to_decrypt` shows.
+    #[serde(default = "default_key_grace_ms")]
+    key_grace_ms: u64,
 }
 
 fn default_promote_ms() -> u64 {
@@ -91,12 +94,17 @@ fn default_coalesce_ms() -> u64 {
     StabilityConfig::default().coalesce.as_millis() as u64
 }
 
+fn default_key_grace_ms() -> u64 {
+    StabilityConfig::default().key_grace.as_millis() as u64
+}
+
 impl From<&WasmStabilityConfig> for StabilityConfig {
     fn from(c: &WasmStabilityConfig) -> Self {
         Self {
             promote: Duration::from_millis(c.promote_ms),
             demote: Duration::from_millis(c.demote_ms),
             coalesce: Duration::from_millis(c.coalesce_ms),
+            key_grace: Duration::from_millis(c.key_grace_ms),
         }
     }
 }
@@ -396,7 +404,7 @@ fn to_wasm_participant(
         device_id: participant.device_id.clone(),
         is_local: participant.is_local,
         connection: connection_str(participant.connection),
-        decryptable: participant.decryptable,
+        unable_to_decrypt: participant.unable_to_decrypt.map(unable_to_decrypt_str),
         rtc_identity,
         hand_raised_at_ms: participant.hand_raised_at_ms,
         hand_raised_position: participant.hand_raised_position,
@@ -415,8 +423,18 @@ fn to_wasm_participant(
 fn connection_str(state: ConnectionState) -> &'static str {
     match state {
         ConnectionState::Connected => "connected",
+        ConnectionState::Connecting => "connecting",
         ConnectionState::Reconnecting => "reconnecting",
         ConnectionState::Unreachable => "unreachable",
+    }
+}
+
+/// `RtcUnableToDecrypt` in `ts_types`.
+fn unable_to_decrypt_str(reason: UnableToDecrypt) -> &'static str {
+    match reason {
+        UnableToDecrypt::MissingKey => "missing_key",
+        UnableToDecrypt::BadKey => "bad_key",
+        UnableToDecrypt::NotEncrypted => "not_encrypted",
     }
 }
 
@@ -428,7 +446,7 @@ struct WasmInterruptions {
     own_media: &'static str,
     members_reconnecting: Vec<String>,
     members_unreachable: Vec<String>,
-    undecryptable: Vec<String>,
+    unable_to_decrypt: Vec<String>,
     unmappable: Vec<String>,
 }
 
@@ -440,7 +458,7 @@ impl From<Interruptions> for WasmInterruptions {
             own_media: connection_str(record.own_media),
             members_reconnecting: record.members_reconnecting,
             members_unreachable: record.members_unreachable,
-            undecryptable: record.undecryptable,
+            unable_to_decrypt: record.unable_to_decrypt,
             unmappable: record.unmappable,
         }
     }
@@ -461,7 +479,7 @@ struct WasmParticipant {
     device_id: Option<String>,
     is_local: bool,
     connection: &'static str,
-    decryptable: bool,
+    unable_to_decrypt: Option<&'static str>,
     /// The livekit-js participant identity, when derivable — the join key for
     /// `room.getParticipantByIdentity()`.
     rtc_identity: Option<String>,

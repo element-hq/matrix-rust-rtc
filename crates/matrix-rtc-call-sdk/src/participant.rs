@@ -13,6 +13,21 @@
 
 use matrix_rtc_transport::{ConnectionState, MediaStreamKind};
 
+/// Why a member's media is not shown although it may be arriving (034 R33,
+/// C6). Hosts draw the avatar for every case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnableToDecrypt {
+    /// Their frames carry a key index we hold no key for: their key has not
+    /// reached us. After [`crate::StabilityConfig::key_grace`] without a break.
+    MissingKey,
+    /// We hold a key for the index their frames carry, but it does not
+    /// decrypt them (or the cryptor failed). After [`crate::StabilityConfig::key_grace`].
+    BadKey,
+    /// They published a track declared unencrypted, which is refused and
+    /// never played; at once, for as long as they stay on the SFU.
+    NotEncrypted,
+}
+
 /// Live state of one media stream of a participant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StreamState {
@@ -37,10 +52,10 @@ pub struct Participant {
     /// transport can reach their media: such a member stays in the roster
     /// (signalling truth) but never gets streams.
     pub connection: ConnectionState,
-    /// Whether their media decrypts: false from a frame-encryption failure
-    /// until frames decrypt again (034 R33). Always true for our own entry,
-    /// which nothing decrypts. `streams` is untouched by it.
-    pub decryptable: bool,
+    /// Why their media cannot be shown, if it cannot (034 R33, C6); `None`
+    /// once frames decrypt again. Always `None` for our own entry, which
+    /// nothing decrypts. `streams` is untouched by it.
+    pub unable_to_decrypt: Option<UnableToDecrypt>,
     /// Streams currently published by this participant, in arrival order.
     pub streams: Vec<StreamState>,
     /// When this participant raised their hand (ms since the epoch, by the

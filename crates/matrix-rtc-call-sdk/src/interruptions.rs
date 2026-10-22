@@ -29,8 +29,10 @@ pub struct Interruptions {
     pub members_reconnecting: Vec<String>,
     /// Members no transport of ours can reach (R28).
     pub members_unreachable: Vec<String>,
-    /// Members whose media we cannot decrypt (R33).
-    pub undecryptable: Vec<String>,
+    /// Members whose media we cannot show: a missing or bad key past
+    /// [`crate::StabilityConfig::key_grace`], or sent in clear (R33). Each member's
+    /// [`crate::Participant::unable_to_decrypt`] says which.
+    pub unable_to_decrypt: Vec<String>,
     /// Participants on an SFU whose membership we have not seen (R16).
     pub unmappable: Vec<String>,
 }
@@ -43,7 +45,7 @@ impl Default for Interruptions {
             own_media: ConnectionState::Connected,
             members_reconnecting: Vec::new(),
             members_unreachable: Vec::new(),
-            undecryptable: Vec::new(),
+            unable_to_decrypt: Vec::new(),
             unmappable: Vec::new(),
         }
     }

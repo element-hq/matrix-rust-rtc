@@ -165,7 +165,7 @@ describe('web media roster over a fake transport delegate', () => {
     expect(me.rtc_identity).toBe(session.ownRtcIdentity());
     expect(peer.is_local).toBe(false);
     expect(peer.connection).toBe('connected');
-    expect(peer.decryptable).toBe(true);
+    expect(peer.unable_to_decrypt ?? null).toBe(null);
     // base64(SHA256(...)), unpadded: 43 chars.
     expect(peer.rtc_identity).toHaveLength(43);
 

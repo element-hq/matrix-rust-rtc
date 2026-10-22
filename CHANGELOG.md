@@ -10,6 +10,8 @@ log only.
 
 ### Breaking
 
+- `ConnectionState` (FFI `FfiConnectionState`, web `RtcConnectionState`) gains `Connecting`: our own media before our SFU is first up, so a call no longer opens with `own_media` reconnecting (034 C11).
+- `Participant`/`CallTile`'s `decryptable` is `unable_to_decrypt` (`MissingKey`, `BadKey`, `NotEncrypted`; FFI `FfiUnableToDecrypt`, web `RtcUnableToDecrypt`), and `Interruptions.undecryptable` is `unable_to_decrypt` (034 C6).
 - `AttachOptions`, `LiveKitAttachOptions`, `LiveKitCallOptions`, `EngineConfig` and `PoolConfig` take `sfu_fallback`, `PoolEvent` gains `OwnFocusMoved`, and the FFI `MediaSession` holds any transport's connection (034 R25, C16).
 - `CallEnd::ConnectionClosed` (FFI `FfiCallEnd`, web `loss_reason`) carries a `ConnectionLossReason` (`Budget`, `Refused`, `NeverConnected`), `MediaStatusReporter::lost` takes it, and `OwnFocusTransport` gains `prepare_own` and `TransportConnection` `reconnect` (034 R24, R27).
 - `attach_media` (FFI `connect_media_session`, web `connectMedia`) returns without waiting for our own SFU, which connects under the reconnect budget like a loss; `LiveKitTransportConnection::session` returns an `Option<Arc<_>>` (034 R24, C10).
@@ -45,6 +47,8 @@ log only.
 
 ### Fixed
 
+- A member is shown unable to decrypt only once their frames have failed for `StabilityConfig::key_grace` (FFI `key_grace_ms`, 4 s by default) without a break, so key rotations no longer flicker their tile or the interruptions record (034 C6).
+- A track declared unencrypted in an encrypted call is refused instead of played, and its member reads `NotEncrypted`: livekit gave it no frame cryptor, so a misconfigured client or the SFU could put clear media on their tile (034 C6).
 - A member arriving during a key switch is no longer handed the key still in use, which was minted before they joined and exposed its history; they decrypt once the new key is used, at most `delay_before_use_ms` later (034).
 - A member whose membership lapses and returns under the same member id gets their media back instead of reappearing silent (034 R19).
 - Our own SFU restarted under a call is reconnected with a fresh token instead of the call ending, the restarted SFU having forgotten the room (a 404) (034 R24).

@@ -44,7 +44,7 @@ use matrix_rtc_transport::{
 
 use crate::event::{CallEvent, FrameEncryptionDiagnostic, SpeakingMember};
 use crate::interruptions::Interruptions;
-use crate::participant::{Participant, StreamState};
+use crate::participant::{Participant, StreamState, UnableToDecrypt};
 use crate::tile::{
     CallTile, DetailWindow, LocalState, TileId, TileRoster, Tiles, derive_tiles, window,
 };
@@ -54,8 +54,41 @@ use crate::tile::{
 /// should resynchronise from [`CallEngine::participants`].
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
-/// How much the tile order is damped (spec 002 R10, R11). Configurable
-/// because the values are a product decision, not a protocol one.
+/// How long a member's frames must fail to decrypt, without a break, before
+/// they are shown unable to decrypt, unless [`StabilityConfig::key_grace`]
+/// says otherwise (034 C6). Senders switch to a new key 5 s
+/// after sending it, and on matrix.org keys took up to 8 s to arrive, so a
+/// rotation can drop frames for 3 s; that is not a fault to draw, and a grace
+/// barely past it would flash the state for a split second.
+pub const KEY_GRACE: Duration = Duration::from_secs(4);
+
+/// Why a remote member's media cannot be shown now: sent in clear at once, a
+/// key failure only once it has lasted `grace`.
+fn unable_to_decrypt(
+    member_id: &str,
+    grace: Duration,
+    sent_in_clear: &HashSet<String>,
+    undecryptable_since: &HashMap<String, rt::Instant>,
+    encryption_states: &HashMap<String, FrameEncryptionState>,
+) -> Option<UnableToDecrypt> {
+    if sent_in_clear.contains(member_id) {
+        return Some(UnableToDecrypt::NotEncrypted);
+    }
+    if undecryptable_since
+        .get(member_id)
+        .is_none_or(|since| since.elapsed() < grace)
+    {
+        return None;
+    }
+    match encryption_states.get(member_id) {
+        Some(FrameEncryptionState::MissingKey) => Some(UnableToDecrypt::MissingKey),
+        _ => Some(UnableToDecrypt::BadKey),
+    }
+}
+
+/// How much the tile order (spec 002 R10, R11) and a tile's key failures
+/// (034 C6) are damped. Configurable because the values are a product
+/// decision, not a protocol one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StabilityConfig {
     /// Sustained voice before a member ranks as speaking; the tile flag is not delayed.
@@ -64,6 +97,9 @@ pub struct StabilityConfig {
     pub demote: Duration,
     /// Reorders inside this window are delivered as one.
     pub coalesce: Duration,
+    /// How long a member's frames must fail to decrypt, without a break,
+    /// before they are shown unable to decrypt; [`KEY_GRACE`] by default.
+    pub key_grace: Duration,
 }
 
 impl Default for StabilityConfig {
@@ -75,6 +111,7 @@ impl Default for StabilityConfig {
             promote: Duration::from_millis(1500),
             demote: Duration::from_millis(1500),
             coalesce: Duration::from_millis(300),
+            key_grace: KEY_GRACE,
         }
     }
 }
@@ -194,6 +231,8 @@ enum ActorMessage {
         member_id: String,
         generation: u64,
     },
+    /// A member's key grace may have run out; the turn's sync reads it.
+    KeyGrace,
     /// The coalesce window closed; publish the new order if it is still the
     /// current window (R11).
     FlushReorder {
@@ -313,6 +352,8 @@ impl CallEngine {
             roster: Vec::new(),
             local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
+            undecryptable_since: HashMap::new(),
+            sent_in_clear: HashSet::new(),
             installed_keys: HashMap::new(),
             raised_hands: Vec::new(),
             arrived: false,
@@ -677,6 +718,12 @@ struct Actor {
     /// cannot be read: a momentary drop during a rotation and a permanent failure
     /// produce the same line, and only the previous state separates them.
     encryption_states: HashMap<String, FrameEncryptionState>,
+    /// Since when each member's frames have failed without a break; shown
+    /// unable to decrypt once that is `stability.key_grace` old.
+    undecryptable_since: HashMap<String, rt::Instant>,
+    /// Members who published a track declared unencrypted, which the
+    /// transport refused (034 C6); until they leave.
+    sent_in_clear: HashSet<String>,
     /// Our own live publications, so a mute can reach the transport and the
     /// roster can be corrected in one place, and so a membership landing after
     /// them can be seeded from them.
@@ -889,21 +936,27 @@ impl Actor {
         let own_media = self.pool.own_connection_state();
         let mut changed = false;
         for participant in &mut self.roster {
-            let (connection, decryptable) = if participant.is_local {
-                (own_media, true)
+            let (connection, unable_to_decrypt) = if participant.is_local {
+                (own_media, None)
             } else {
                 (
                     self.pool
                         .member_connection(&participant.member_id)
                         .unwrap_or_default(),
-                    self.encryption_states
-                        .get(&participant.member_id)
-                        .is_none_or(|state| !state.is_failure()),
+                    unable_to_decrypt(
+                        &participant.member_id,
+                        self.stability.key_grace,
+                        &self.sent_in_clear,
+                        &self.undecryptable_since,
+                        &self.encryption_states,
+                    ),
                 )
             };
-            if participant.connection != connection || participant.decryptable != decryptable {
+            if participant.connection != connection
+                || participant.unable_to_decrypt != unable_to_decrypt
+            {
                 participant.connection = connection;
-                participant.decryptable = decryptable;
+                participant.unable_to_decrypt = unable_to_decrypt;
                 changed = true;
             }
         }
@@ -925,15 +978,15 @@ impl Actor {
                 .filter(|p| p.connection == ConnectionState::Unreachable)
                 .map(|p| p.member_id.clone())
                 .collect(),
-            undecryptable: remote()
-                .filter(|p| !p.decryptable)
+            unable_to_decrypt: remote()
+                .filter(|p| p.unable_to_decrypt.is_some())
                 .map(|p| p.member_id.clone())
                 .collect(),
             unmappable: self.pool.unmappable(),
         };
         record.members_reconnecting.sort();
         record.members_unreachable.sort();
-        record.undecryptable.sort();
+        record.unable_to_decrypt.sort();
         self.interruptions_tx.send_if_modified(|current| {
             if *current == record {
                 return false;
@@ -1137,6 +1190,8 @@ impl Actor {
                     self.publish_tiles();
                 }
             }
+            // Nothing to do here: the sync after every message applies it.
+            ActorMessage::KeyGrace => {}
             ActorMessage::FlushReorder { generation } => {
                 if self.pending_reorder != Some(generation) {
                     return;
@@ -1260,6 +1315,10 @@ impl Actor {
                 PoolEvent::EncryptionStateChanged { member_id, state } => {
                     self.encryption_state_changed(member_id, state);
                 }
+                PoolEvent::SentInClear { member_id } => {
+                    log::warn!("{member_id} sent media in clear; it is not played");
+                    self.sent_in_clear.insert(member_id);
+                }
                 PoolEvent::KeyImported {
                     member_id,
                     identity,
@@ -1327,6 +1386,18 @@ impl Actor {
     fn encryption_state_changed(&mut self, member_id: String, state: FrameEncryptionState) {
         let diagnostic = self.encryption_diagnostic(&member_id, state);
         let previous = self.encryption_states.insert(member_id.clone(), state);
+        if !state.is_failure() {
+            self.undecryptable_since.remove(&member_id);
+        } else if !self.undecryptable_since.contains_key(&member_id) {
+            self.undecryptable_since
+                .insert(member_id.clone(), rt::Instant::now());
+            let messages = self.messages_tx.clone();
+            let grace = self.stability.key_grace;
+            rt::spawn(async move {
+                rt::sleep(grace).await;
+                let _ = messages.send(ActorMessage::KeyGrace);
+            });
+        }
         if state.is_failure() {
             log::warn!(
                 "frame encryption {state:?} for {member_id} (was {previous:?}), {diagnostic:?}"
@@ -1395,7 +1466,7 @@ impl Actor {
             } else {
                 ConnectionState::Unreachable
             },
-            decryptable: true,
+            unable_to_decrypt: None,
             streams: own_streams.clone(),
             hand_raised_at_ms,
             hand_raised_position: None,
@@ -1578,6 +1649,8 @@ impl Actor {
         // when it applies the same snapshot.
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
+        self.undecryptable_since.remove(member_id);
+        self.sent_in_clear.remove(member_id);
         self.speaking.remove(member_id);
         self.speakers.remove(member_id);
         if let Some(participant_count) = announce {
@@ -4862,7 +4935,7 @@ mod tests {
             let fx = fixture();
             assert_eq!(
                 record(&fx).own_media,
-                ConnectionState::Reconnecting,
+                ConnectionState::Connecting,
                 "not adopted"
             );
             let own = adopt(&fx);
@@ -4874,7 +4947,7 @@ mod tests {
 
         /// R33: an undecryptable member is flagged; `has_video` and the order
         /// do not move.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn an_undecryptable_member_is_flagged_and_has_video_is_untouched() {
             let fx = fixture();
             in_call(&fx).await;
@@ -4901,8 +4974,11 @@ mod tests {
                 state: FrameEncryptionState::MissingKey,
             })
             .unwrap();
-            wait_until(|| record(&fx).undecryptable == ["bob"]).await;
-            assert!(!tile(&fx, "bob").decryptable);
+            wait_until(|| record(&fx).unable_to_decrypt == ["bob"]).await;
+            assert_eq!(
+                tile(&fx, "bob").unable_to_decrypt,
+                Some(UnableToDecrypt::MissingKey)
+            );
             assert!(tile(&fx, "bob").has_video);
             assert_eq!(order_ids(&fx), order);
 
@@ -4911,8 +4987,146 @@ mod tests {
                 state: FrameEncryptionState::Ok,
             })
             .unwrap();
-            wait_until(|| record(&fx).undecryptable.is_empty()).await;
-            assert!(tile(&fx, "bob").decryptable);
+            wait_until(|| record(&fx).unable_to_decrypt.is_empty()).await;
+            assert_eq!(tile(&fx, "bob").unable_to_decrypt, None);
+        }
+
+        /// C6: frames failing for less than `KEY_GRACE` without a break, as
+        /// around a key rotation, never show the member undecryptable; each
+        /// spell counts from its own start.
+        #[tokio::test(start_paused = true)]
+        async fn a_key_rotation_blip_is_not_shown_undecryptable() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("bob", "@bob:example.org"),
+                ])
+                .unwrap();
+            rostered(&fx, &["own", "bob"]).await;
+            let state = |state| {
+                own.send(ConnectionEvent::EncryptionStateChanged {
+                    identity: "id-bob".to_owned(),
+                    state,
+                })
+                .unwrap();
+            };
+
+            state(FrameEncryptionState::MissingKey);
+            tokio::time::sleep(KEY_GRACE - Duration::from_millis(500)).await;
+            state(FrameEncryptionState::Ok);
+            state(FrameEncryptionState::MissingKey);
+            tokio::time::sleep(KEY_GRACE - Duration::from_millis(500)).await;
+            assert_eq!(
+                tile(&fx, "bob").unable_to_decrypt,
+                None,
+                "a new spell, not yet past"
+            );
+            assert!(record(&fx).unable_to_decrypt.is_empty());
+
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            assert_eq!(
+                tile(&fx, "bob").unable_to_decrypt,
+                Some(UnableToDecrypt::MissingKey)
+            );
+            assert_eq!(record(&fx).unable_to_decrypt, ["bob"]);
+        }
+
+        /// C6: a host can set the key grace.
+        #[tokio::test(start_paused = true)]
+        async fn the_key_grace_is_configurable() {
+            let fx = fixture_with(StabilityConfig {
+                key_grace: Duration::from_secs(10),
+                ..StabilityConfig::default()
+            });
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("bob", "@bob:example.org"),
+                ])
+                .unwrap();
+            rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            assert_eq!(tile(&fx, "bob").unable_to_decrypt, None);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                tile(&fx, "bob").unable_to_decrypt,
+                Some(UnableToDecrypt::MissingKey)
+            );
+        }
+
+        /// R33: a key that does not decrypt is told apart from a missing one.
+        #[tokio::test(start_paused = true)]
+        async fn a_bad_key_is_told_apart_from_a_missing_one() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("bob", "@bob:example.org"),
+                ])
+                .unwrap();
+            rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::DecryptionFailed,
+            })
+            .unwrap();
+            wait_until(|| record(&fx).unable_to_decrypt == ["bob"]).await;
+            assert_eq!(
+                tile(&fx, "bob").unable_to_decrypt,
+                Some(UnableToDecrypt::BadKey)
+            );
+        }
+
+        /// C6: a track declared unencrypted is never added, and its member
+        /// reads `NotEncrypted` at once, whatever their frame cryptor says,
+        /// until they leave.
+        #[tokio::test(start_paused = true)]
+        async fn a_track_sent_in_clear_is_refused_and_flagged_at_once() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("bob", "@bob:example.org"),
+                ])
+                .unwrap();
+            rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::TrackNotEncrypted {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+            })
+            .unwrap();
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::Ok,
+            })
+            .unwrap();
+            wait_until(|| record(&fx).unable_to_decrypt == ["bob"]).await;
+            settle(&fx.engine).await;
+            assert_eq!(
+                tile(&fx, "bob").unable_to_decrypt,
+                Some(UnableToDecrypt::NotEncrypted)
+            );
+            assert!(!tile(&fx, "bob").has_video, "never added");
+            assert_eq!(record(&fx).unable_to_decrypt, ["bob"]);
+
+            fx.memberships
+                .send(vec![member("own", "@alice:example.org")])
+                .unwrap();
+            wait_until(|| record(&fx).unable_to_decrypt.is_empty()).await;
         }
 
         /// R33: nothing of ours is decrypted, so our own tile always is.
@@ -4928,8 +5142,11 @@ mod tests {
             .unwrap();
             let _ = next_event(&mut fx.events).await; // FrameEncryptionState, logged
             settle(&fx.engine).await;
-            assert!(fx.engine.local_state().unwrap().tile.decryptable);
-            assert!(record(&fx).undecryptable.is_empty());
+            assert_eq!(
+                fx.engine.local_state().unwrap().tile.unable_to_decrypt,
+                None
+            );
+            assert!(record(&fx).unable_to_decrypt.is_empty());
         }
 
         async fn published(fx: &Fixture, options: PublishOptions) {
@@ -5043,7 +5260,7 @@ mod tests {
         }
 
         /// R38: each cause in its own field; clearing one clears only it.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn interruptions_list_every_cause_separately() {
             let fx = fixture();
             let peer = with_bob_on_a_peer_focus(&fx).await;
@@ -5069,7 +5286,7 @@ mod tests {
                 own_media: ConnectionState::Connected,
                 members_reconnecting: vec!["bob".to_owned()],
                 members_unreachable: vec!["carol".to_owned()],
-                undecryptable: vec!["bob".to_owned()],
+                unable_to_decrypt: vec!["bob".to_owned()],
                 unmappable: vec!["id-stranger".to_owned()],
             };
             wait_until(|| record(&fx) == all).await;
@@ -5152,7 +5369,7 @@ mod tests {
 
         /// R24, C10: our own focus is taken before it is up; a publication
         /// made meanwhile goes through its handle rather than failing, and
-        /// our media reads reconnecting until it connects.
+        /// our media reads connecting until it is first up.
         #[tokio::test]
         async fn publishing_before_our_own_focus_is_up_goes_through_its_handle() {
             let fx = fixture();
@@ -5163,7 +5380,7 @@ mod tests {
                 .await
                 .expect("the handle takes it");
             assert_eq!(fx.state.published.lock().unwrap().len(), 1);
-            assert_eq!(record(&fx).own_media, ConnectionState::Reconnecting);
+            assert_eq!(record(&fx).own_media, ConnectionState::Connecting);
         }
 
         /// R12: signalling unreachable for five minutes never touches our own

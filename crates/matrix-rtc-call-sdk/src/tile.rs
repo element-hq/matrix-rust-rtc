@@ -16,7 +16,7 @@ use std::collections::HashSet;
 
 use matrix_rtc_transport::{ConnectionState, MediaStreamKind};
 
-use crate::participant::{Participant, StreamState};
+use crate::participant::{Participant, StreamState, UnableToDecrypt};
 
 /// What a tile is: a person, or a screen they are sharing.
 ///
@@ -74,12 +74,12 @@ pub struct CallTile {
     /// See [`Participant::hand_raised_position`].
     pub hand_raised_position: Option<u32>,
     pub joined_at_ms: Option<u64>,
-    /// See [`Participant::connection`]. Neither it nor `decryptable` moves
-    /// `has_video` or the order: a host draws the avatar over a remote tile
-    /// that is not `Connected` or not `decryptable` (contract C6).
+    /// See [`Participant::connection`]. Neither it nor `unable_to_decrypt`
+    /// moves `has_video` or the order: a host draws the avatar over a remote
+    /// tile that is not `Connected` or is `unable_to_decrypt` (contract C6).
     pub connection: ConnectionState,
-    /// See [`Participant::decryptable`].
-    pub decryptable: bool,
+    /// See [`Participant::unable_to_decrypt`].
+    pub unable_to_decrypt: Option<UnableToDecrypt>,
 }
 
 impl CallTile {
@@ -235,7 +235,7 @@ fn tile(p: &Participant, kind: TileKind, speaking: &HashSet<String>) -> CallTile
         hand_raised_position: p.hand_raised_position,
         joined_at_ms: p.joined_at_ms,
         connection: p.connection,
-        decryptable: p.decryptable,
+        unable_to_decrypt: p.unable_to_decrypt,
     }
 }
 
@@ -298,7 +298,7 @@ mod tests {
             device_id: None,
             is_local: false,
             connection: ConnectionState::Connected,
-            decryptable: true,
+            unable_to_decrypt: None,
             streams: vec![],
             hand_raised_at_ms: None,
             hand_raised_position: None,

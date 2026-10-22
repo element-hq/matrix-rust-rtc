@@ -185,6 +185,18 @@ impl WasmConnectionEventSink {
         });
     }
 
+    /// livekit-js `TrackSubscribed` for a publication declared unencrypted
+    /// (`!publication.isEncrypted`) in an encrypted room: refuse it rather
+    /// than `trackAdded` (unsubscribe, never attach), and report it here. Its
+    /// frames would play as they come, and the SFU relays that declaration.
+    #[wasm_bindgen(js_name = trackNotEncrypted)]
+    pub fn track_not_encrypted(&self, identity: String, kind: String) {
+        let Some(kind) = parse_stream_kind(&kind) else {
+            return;
+        };
+        self.send(ConnectionEvent::TrackNotEncrypted { identity, kind });
+    }
+
     /// livekit-js `TrackUnsubscribed` / `LocalTrackUnpublished`.
     #[wasm_bindgen(js_name = trackRemoved)]
     pub fn track_removed(&self, identity: String, kind: String) {

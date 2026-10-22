@@ -116,7 +116,8 @@ this is the summary).
 - **What to show.** `client.signallingHealth()` (live before any call exists)
   is the server indicator; `media.interruptions()` / `nextInterruptions()` is
   every cause interrupting the call, one field each. Tiles carry `connection`
-  (`Connected`, `Reconnecting`, `Unreachable`) and `decryptable`.
+  (`Connected`, `Connecting`, `Reconnecting`, `Unreachable`) and
+  `unableToDecrypt` (`MissingKey`, `BadKey`, `NotEncrypted`, or nil).
 - **Our own SFU** is reconnected for 60 s (`ownReconnectBudgetMs`) before the
   call ends with `ConnectionClosed { Budget | Refused | NeverConnected }`,
   after its leave; `connectMediaSession` returns without waiting for it. With

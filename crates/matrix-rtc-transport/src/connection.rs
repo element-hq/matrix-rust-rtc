@@ -39,11 +39,15 @@ use crate::stream::MediaStreamKind;
 /// Whether the connection carrying someone's media is up (034 R23, R28).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ConnectionState {
-    /// Up, or being opened for the first time.
+    /// Up; a peer's connection also while it is opened for the first time.
     #[default]
     Connected,
-    /// Being re-established after a loss, or failing to connect, for as long
-    /// as that takes: a connection is never given up while a member is on it.
+    /// Our own media only: being opened for the first time, failing to or not,
+    /// until it is first up (034 R23). Not an interruption: the call is still
+    /// starting.
+    Connecting,
+    /// Being re-established after a loss, for as long as that takes: a
+    /// connection is never given up while a member is on it.
     Reconnecting,
     /// No transport can serve what the member advertises.
     Unreachable,
@@ -213,6 +217,14 @@ pub enum ConnectionEvent {
         identity: String,
         state: FrameEncryptionState,
     },
+    /// The participant published a track declared unencrypted in our
+    /// encrypted call. The transport refuses it, never as a `TrackAdded`: its
+    /// frames would be played as they come, and the SFU, which relays that
+    /// declaration, could inject its own under the participant's name.
+    TrackNotEncrypted {
+        identity: String,
+        kind: MediaStreamKind,
+    },
     /// The connection lost its transport link and is re-establishing it.
     Reconnecting,
     Reconnected,
@@ -261,6 +273,11 @@ impl fmt::Debug for ConnectionEvent {
                 .debug_struct("EncryptionStateChanged")
                 .field("identity", identity)
                 .field("state", state)
+                .finish(),
+            Self::TrackNotEncrypted { identity, kind } => f
+                .debug_struct("TrackNotEncrypted")
+                .field("identity", identity)
+                .field("kind", kind)
                 .finish(),
             Self::Reconnecting => f.write_str("Reconnecting"),
             Self::Reconnected => f.write_str("Reconnected"),

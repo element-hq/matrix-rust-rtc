@@ -713,7 +713,8 @@ async fn the_first_connect_runs_under_the_budget() {
     assert!(events.contains(&PoolEvent::Degraded(true)));
     assert_eq!(
         fx.pool.own_connection_state(),
-        ConnectionState::Reconnecting
+        ConnectionState::Connecting,
+        "starting, not interrupted"
     );
     assert!(
         fx.pool.own_handle().is_some(),
@@ -814,14 +815,11 @@ async fn a_peer_focus_is_retried_for_as_long_as_a_member_publishes_there() {
 
 /// 034 R16, R28: unmappable identities are listed until they map or leave;
 /// a member with no supported transport is unreachable; our own media is
-/// reconnecting until the own focus is adopted.
+/// connecting until the own focus is adopted, reconnecting once it was up.
 #[tokio::test(start_paused = true)]
 async fn unmappable_identities_and_unreachable_members_are_reported() {
     let mut fx = Fixture::new();
-    assert_eq!(
-        fx.pool.own_connection_state(),
-        ConnectionState::Reconnecting
-    );
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connecting);
     let own = fx.adopt();
     assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
     fx.pool.apply_snapshot(&[member_on("own", OWN_FOCUS)]);
@@ -1586,4 +1584,48 @@ mod identity {
                 .block_on(run(steps));
         }
     }
+}
+
+/// 034 C6: a track refused as unencrypted is reported for its member, also
+/// when it beat their membership, and forgotten once they leave the SFU.
+#[tokio::test(start_paused = true)]
+async fn a_track_sent_in_clear_is_reported_once_its_member_maps() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("own", OWN_FOCUS)]);
+    own.send(ConnectionEvent::TrackNotEncrypted {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+    })
+    .unwrap();
+    assert!(
+        !fx.drain()
+            .await
+            .iter()
+            .any(|event| matches!(event, PoolEvent::SentInClear { .. })),
+        "not a member yet"
+    );
+
+    let events = fx
+        .pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    assert!(events.contains(&PoolEvent::SentInClear {
+        member_id: "bob".into()
+    }));
+
+    own.send(ConnectionEvent::RemoteLeft {
+        identity: "id-bob".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[member_on("own", OWN_FOCUS)]);
+    let events = fx
+        .pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::SentInClear { .. })),
+        "left the SFU"
+    );
 }

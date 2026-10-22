@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use livekit::e2ee::EncryptionType;
 use livekit::id::ParticipantIdentity;
 use livekit::options::TrackPublishOptions;
 use livekit::prelude::{
@@ -1012,11 +1013,29 @@ async fn translate_room_events(
                 participant,
             } => {
                 let kind = stream_kind(publication.source(), publication.kind());
-                Some(ConnectionEvent::TrackAdded {
-                    identity: participant.identity().to_string(),
-                    kind,
-                    track: Arc::new(LiveKitRemoteTrack { kind, track }),
-                })
+                // Our rooms are always encrypted, and livekit attaches no frame
+                // cryptor to a track declared unencrypted: its frames would be
+                // played as they come. The SFU relays that declaration, so it
+                // could also inject frames of its own under this name.
+                if publication.encryption_type() == EncryptionType::None {
+                    publication.set_subscribed(false);
+                    Some(ConnectionEvent::TrackNotEncrypted {
+                        identity: participant.identity().to_string(),
+                        kind,
+                    })
+                } else {
+                    Some(ConnectionEvent::TrackAdded {
+                        identity: participant.identity().to_string(),
+                        kind,
+                        track: Arc::new(LiveKitRemoteTrack { kind, track }),
+                    })
+                }
+            }
+            // A track refused as unencrypted was never added.
+            RoomEvent::TrackUnsubscribed { publication, .. }
+                if publication.encryption_type() == EncryptionType::None =>
+            {
+                None
             }
             RoomEvent::TrackUnsubscribed {
                 publication,
