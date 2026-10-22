@@ -493,7 +493,11 @@ impl TransportConnection for LiveKitTransportConnection {
         // The receiver returned by the room connect carries events from the
         // very beginning (nothing can be missed); hand it to the translator.
         let (events_tx, events_rx) = unbounded_channel();
-        tokio::spawn(translate_room_events(connection.events, events_tx));
+        tokio::spawn(translate_room_events(
+            connection.events,
+            events_tx,
+            self.clone(),
+        ));
         self.republish_local_tracks(&session).await;
         self.reassert_local_key_index();
         Ok(events_rx)
@@ -992,6 +996,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 async fn translate_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
     tx: UnboundedSender<ConnectionEvent>,
+    owner: LiveKitTransportConnection,
 ) {
     while let Some(event) = events.recv().await {
         let translated = match event {
@@ -1043,7 +1048,17 @@ async fn translate_room_events(
                 })
             }
             RoomEvent::Reconnecting => Some(ConnectionEvent::Reconnecting),
-            RoomEvent::Reconnected => Some(ConnectionEvent::Reconnected),
+            RoomEvent::Reconnected => {
+                // When LiveKit gives up resuming it restarts the room itself and
+                // republishes our tracks on new peer connections, before this
+                // event, each with a new frame cryptor at index 0. Nothing of
+                // ours publishes them, so nothing else moves them onto the
+                // current index: after a rotation, peers that joined since held
+                // no key for index 0 and saw none of our media. After a resume,
+                // which keeps the cryptors, this changes nothing.
+                owner.reassert_local_key_index();
+                Some(ConnectionEvent::Reconnected)
+            }
             RoomEvent::Disconnected { reason } => Some(ConnectionEvent::Closed {
                 message: format!("{reason:?}"),
             }),
