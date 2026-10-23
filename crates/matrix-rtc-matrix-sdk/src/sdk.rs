@@ -43,7 +43,7 @@ use matrix_sdk::ruma::{
     DeviceId, EventId, OwnedEventId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
 };
 use matrix_sdk::{Client, Room, RoomMemberships};
-use matrix_sdk_base::crypto::CollectStrategy;
+use matrix_sdk_base::crypto::{CollectStrategy, OlmError};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
@@ -62,11 +62,24 @@ use tokio::task::JoinHandle;
 /// An SDK error that may carry the server's standard error body.
 trait ClientApiError: std::fmt::Display {
     fn client_api_error(&self) -> Option<&ruma::api::error::Error>;
+
+    /// Whether our own crypto refused the recipients before anything was sent.
+    fn refused_by_crypto(&self) -> bool {
+        false
+    }
 }
 
 impl ClientApiError for matrix_sdk::Error {
     fn client_api_error(&self) -> Option<&ruma::api::error::Error> {
         self.as_client_api_error()
+    }
+
+    /// MSC4153: our own device unsigned, or a verified peer's identity changed.
+    /// Hit by an encrypted to-device send and by a room event's key share alike
+    /// (the sticky membership included).
+    fn refused_by_crypto(&self) -> bool {
+        matches!(self, matrix_sdk::Error::OlmError(olm)
+            if matches!(**olm, OlmError::SessionRecipientCollectionError(_)))
     }
 }
 
@@ -102,8 +115,16 @@ fn sdk_backend_error(error: &impl ClientApiError) -> BackendError {
     .with_retry_after_ms(retry_after_ms)
 }
 
+/// A crypto refusal is decided here before anything is sent: final, and no
+/// word on the homeserver, so it must not read as signalling unreachable (R3).
+/// A refused membership fails the join rather than retrying to its deadline.
 fn command_error(error: impl ClientApiError) -> CommandError {
-    CommandError::Backend(sdk_backend_error(&error))
+    let backend = sdk_backend_error(&error);
+    CommandError::Backend(if error.refused_by_crypto() {
+        backend.permanent()
+    } else {
+        backend
+    })
 }
 
 /// A request this backend could not even build: final, nothing to retry.
@@ -1073,6 +1094,17 @@ mod tests {
 
     fn raw_event(json: &str) -> Raw<AnySyncTimelineEvent> {
         Raw::from_json_string(json.to_owned()).expect("valid json")
+    }
+
+    #[test]
+    fn a_refused_recipient_collection_is_permanent_and_other_failures_are_not() {
+        let refused =
+            matrix_sdk::Error::OlmError(Box::new(OlmError::SessionRecipientCollectionError(
+                matrix_sdk_base::crypto::SessionRecipientCollectionError::SendingFromUnverifiedDevice,
+            )));
+        assert!(command_error(refused).is_permanent());
+
+        assert!(!command_error(matrix_sdk::Error::InsufficientData).is_permanent());
     }
 
     #[test]
