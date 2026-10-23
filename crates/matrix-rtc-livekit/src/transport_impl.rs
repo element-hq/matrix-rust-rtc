@@ -498,6 +498,7 @@ impl TransportConnection for LiveKitTransportConnection {
             connection.events,
             events_tx,
             self.clone(),
+            Arc::downgrade(&session),
         ));
         self.republish_local_tracks(&session).await;
         self.reassert_local_key_index();
@@ -994,10 +995,13 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 /// Translate the LiveKit room event stream into the transport-neutral
 /// [`ConnectionEvent`] vocabulary. Runs until the room closes its channel;
 /// the outbound channel closing (engine gone) stops it early.
+///
+/// `session` is the room the events come from, read for the speaker list.
 async fn translate_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
     tx: UnboundedSender<ConnectionEvent>,
     owner: LiveKitTransportConnection,
+    session: std::sync::Weak<LiveKitSession>,
 ) {
     while let Some(event) = events.recv().await {
         let translated = match event {
@@ -1053,17 +1057,33 @@ async fn translate_room_events(
                 participant,
                 publication,
             } => remote_mute_event(&participant, &publication, false),
-            RoomEvent::ActiveSpeakersChanged { speakers } => {
-                Some(ConnectionEvent::ActiveSpeakers {
-                    // `audio_level` comes with the same event; without it a host
-                    // has to meter the PCM itself to answer "how loud".
-                    speakers: speakers
-                        .iter()
-                        .map(|speaker| SpeakingParticipant {
-                            identity: speaker.identity().to_string(),
-                            level: speaker.audio_level(),
+            RoomEvent::ActiveSpeakersChanged { .. } => {
+                // The SFU sends speaker *changes* (who started, whose level
+                // moved, who stopped) and the room re-emits each as if it were
+                // the whole list, so a speaker holding a steady level is
+                // missing from it. The engine reads the list as a snapshot, so
+                // it is rebuilt from every participant's flag, which the room
+                // keeps per change. `audio_level` rides along: without it a
+                // host has to meter the PCM itself to answer "how loud".
+                session.upgrade().map(|session| {
+                    let room = session.room();
+                    let local = room.local_participant();
+                    let mut speakers: Vec<SpeakingParticipant> = room
+                        .remote_participants()
+                        .values()
+                        .filter(|p| p.is_speaking())
+                        .map(|p| SpeakingParticipant {
+                            identity: p.identity().to_string(),
+                            level: p.audio_level(),
                         })
-                        .collect(),
+                        .collect();
+                    if local.is_speaking() {
+                        speakers.push(SpeakingParticipant {
+                            identity: local.identity().to_string(),
+                            level: local.audio_level(),
+                        });
+                    }
+                    ConnectionEvent::ActiveSpeakers { speakers }
                 })
             }
             RoomEvent::Reconnecting => Some(ConnectionEvent::Reconnecting),
