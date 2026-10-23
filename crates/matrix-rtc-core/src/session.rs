@@ -796,7 +796,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // itself to notice.
         let previous = std::mem::take(&mut self.candidates);
         let previously_held = std::mem::take(&mut self.held);
+        // Our own leave's reason, if the set carries one (the room-state format does not).
+        let mut own_leave_reason = None;
         for event in events {
+            if let RtcMembershipEvent::Left(left) = &event
+                && self.is_own(&left.sender, &left.sticky_key)
+            {
+                own_leave_reason = left.leave_reason.clone();
+            }
             // A delayed leave in the set keeps the candidate it replaces, on
             // the hold it already had or a new one (034 R21). Any other leave
             // finds nothing to remove: the set is being rebuilt.
@@ -840,6 +847,18 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 self.log_tag,
                 dropped.len(),
             );
+        }
+
+        // Ours was in the last set and is not in this one: a leave we did not send,
+        // unless the machine finds otherwise. Absent from both (we have only just
+        // published it) is not a departure.
+        let in_set = |set: &[_]| {
+            set.iter().any(|candidate: &JoinedMembership| {
+                self.is_own(&candidate.sender, &candidate.sticky_key)
+            })
+        };
+        if in_set(&previous) && !in_set(&self.candidates) {
+            self.own_departed(own_leave_reason.as_ref());
         }
 
         // A complete set is what a recovery waits for to see whether our own
@@ -954,6 +973,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                     }
                     return false;
                 }
+                if known && self.is_own(&left.sender, &left.sticky_key) {
+                    self.own_departed(left.leave_reason.as_ref());
+                }
                 self.held.remove(&key);
                 let before = self.candidates.len();
                 self.candidates.retain(|candidate| {
@@ -980,6 +1002,19 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         true
+    }
+
+    fn is_own(&self, sender: &str, sticky_key: &str) -> bool {
+        self.own_participation
+            .as_ref()
+            .is_some_and(|own| sender == own.user_id && sticky_key == own.member_id)
+    }
+
+    /// Our own membership left the room: the machine decides whether to put it back.
+    fn own_departed(&self, reason: Option<&LeaveReason>) {
+        if let Some(machine) = &self.own_membership_machine {
+            machine.on_own_departure(reason);
+        }
     }
 
     /// Whether `left` is held rather than applied (034 R21): a delayed leave

@@ -335,6 +335,71 @@ mod tests {
             );
         }
 
+        /// Our own leave, with `reason` (`None`: the empty set a room-state leave makes).
+        fn own_leave(reason: Option<LeaveCode>) -> Vec<RawStickyEvent> {
+            let Some(code) = reason else {
+                return Vec::new();
+            };
+            let left = left_event("@alice:example.org", "m.call#room", "alice-a");
+            vec![RawStickyEvent {
+                content: RawStickyEventContent {
+                    leave_reason: Some(LeaveReason::new(code)),
+                    ..left.content
+                },
+                origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+                ..left
+            }]
+        }
+
+        /// Joins, sees our membership in a set, then gets `leave`; returns the
+        /// memberships published and the delayed-leave restarts sent since.
+        async fn after_our_leave(leave: Vec<RawStickyEvent>) -> (usize, usize) {
+            let mock = alice_backend();
+            let (mut room, _outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let joined = room.own_membership_event_id("m.call#room").unwrap();
+            room.set_current_sticky_state(vec![own_event(&joined)])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let published = mock.sticky_events.lock().unwrap().len();
+            let restarts = mock.calls_to(MockMethod::RestartDelayedEvent).len();
+
+            room.set_current_sticky_state(leave).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            (
+                mock.sticky_events.lock().unwrap().len() - published,
+                mock.calls_to(MockMethod::RestartDelayedEvent).len() - restarts,
+            )
+        }
+
+        /// A leave we did not send while the homeserver is reachable — our
+        /// delayed leave firing on a stall or on restarts lost, or any leave in
+        /// a format that carries no reason — puts our membership back at once,
+        /// the delayed leave probed first, well inside the others' hold (C9).
+        #[tokio::test(start_paused = true)]
+        async fn our_membership_leaving_while_we_are_in_the_call_is_put_back_at_once() {
+            assert_eq!(
+                after_our_leave(own_leave(Some(LeaveCode::DelayedLeave))).await,
+                (1, 1),
+                "our delayed leave firing"
+            );
+            assert_eq!(
+                after_our_leave(own_leave(None)).await,
+                (1, 1),
+                "a leave with no reason"
+            );
+        }
+
+        /// A leave with any other reason was meant, and is not undone.
+        #[tokio::test(start_paused = true)]
+        async fn our_membership_leaving_for_another_reason_is_left_be() {
+            assert_eq!(
+                after_our_leave(own_leave(Some(LeaveCode::Leave))).await,
+                (0, 0)
+            );
+        }
+
         /// R17: the upkeep notices the lapse on its own, at the delayed leave's
         /// deadline, while every restart fails; and clears it when one lands.
         #[tokio::test(start_paused = true)]

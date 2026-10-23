@@ -51,6 +51,7 @@ log only.
 - `ActiveSpeakers` (and so a tile's `speaking`) lists everyone speaking, not only those whose state just changed, so a member talking steadily keeps the flag when someone else starts or stops.
 - The Rust reference backend reports a send its crypto refuses (our own device unsigned, MSC4153) as a final failure, not as signalling unreachable: a media key is not retried, and a sticky membership fails the join.
 - A member we cannot decrypt keeps their video flowing at the lowest layer even while the host hides it, so a key that arrives late is seen to work instead of leaving them on the key error until they unmute.
+- Our membership leaving the room while we are in the call (our delayed leave firing on a stall, or a leave with no reason) is put back at once, not at the next delayed-leave restart.
 
 - A member is shown unable to decrypt only once their frames have failed for `StabilityConfig::key_grace` (FFI `key_grace_ms`, 4 s by default) without a break, so key rotations no longer flicker their tile or the interruptions record (034 C6).
 - A member's track replaced by a new one before the old was removed, as when they move to another SFU, is reported as `StreamStopped` then `StreamStarted`, so hosts reopen their reader instead of freezing on the old track (034 R25).

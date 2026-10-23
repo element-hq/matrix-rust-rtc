@@ -73,6 +73,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
         let mut beat = pin!(executor::sleep(interval));
         let mut recoveries = machine.outbox().subscribe_recoveries();
         let mut republish_requests = machine.subscribe_republish_requests();
+        let mut departures = machine.subscribe_departures();
 
         // The membership's sends, each retried through the outbox for as long
         // as it takes, run side by side: a refresh retrying through an outage
@@ -81,6 +82,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
         let mut refresh = pin!(None);
         let mut recover = pin!(None);
         let mut republish = pin!(None);
+        let mut departure = pin!(None);
 
         // One retry per member a rollout did not reach, side by side, so a
         // member who stays unreachable holds back nobody else's key.
@@ -149,6 +151,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                 () = drive(refresh.as_mut()) => refresh.set(None),
                 () = drive(recover.as_mut()) => recover.set(None),
                 () = drive(republish.as_mut()) => republish.set(None),
+                () = drive(departure.as_mut()) => departure.set(None),
                 _ = executor::sleep(lapse_in.unwrap_or_default()), if lapse_in.is_some() => {
                     machine.update_lapsed();
                 }
@@ -156,6 +159,12 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                     recoveries.mark_unchanged();
                     if recover.is_none() {
                         recover.set(Some(machine.recover()));
+                    }
+                }
+                Ok(()) = departures.changed() => {
+                    departures.mark_unchanged();
+                    if departure.is_none() {
+                        departure.set(Some(machine.recover_departure()));
                     }
                 }
                 Ok(()) = republish_requests.changed() => {

@@ -304,6 +304,9 @@ pub struct OwnMembershipMachine<T: MatrixBackend> {
     /// Bumped to ask the session's upkeep for a republish, which it runs
     /// alongside its other sends.
     republish_requested: watch::Sender<u64>,
+    /// Bumped when our membership left the room while we are in the call
+    /// ([`Self::on_own_departure`]); the upkeep runs [`Self::recover_departure`].
+    departures: watch::Sender<u64>,
     /// A refresh is retrying; the beat does not start another.
     refreshing: AtomicBool,
     /// A delayed leave is being armed; the beat does not start another.
@@ -398,6 +401,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             lapsed: watch::Sender::new(false),
             awaiting_catch_up: AtomicBool::new(false),
             republish_requested: watch::Sender::new(0),
+            departures: watch::Sender::new(0),
             refreshing: AtomicBool::new(false),
             arming: AtomicBool::new(false),
             recovery_jitter: Arc::new(|| {
@@ -588,6 +592,57 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// session's upkeep.
     pub(crate) fn subscribe_republish_requests(&self) -> watch::Receiver<u64> {
         self.republish_requested.subscribe()
+    }
+
+    pub(crate) fn subscribe_departures(&self) -> watch::Receiver<u64> {
+        self.departures.subscribe()
+    }
+
+    /// Our membership left the room while we are in the call and not leaving:
+    /// a leave we did not send. One whose reason is `delayed_leave` is our
+    /// dead man's switch firing when it should not have (a stall, restarts
+    /// lost); one without a reason (the room-state and 2025 sticky formats
+    /// carry none) is just as unexpected. Either way we are put back at once,
+    /// inside the others' hold (C9), rather than at the next restart that
+    /// finds the delay gone. A leave with any other reason was meant: left be.
+    /// A recovery under way has its own catch-up for this.
+    pub fn on_own_departure(&self, reason: Option<&crate::session::LeaveReason>) {
+        if self.state() != OwnMembershipState::Joined
+            || self.awaiting_catch_up.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        if let Some(reason) = reason
+            && reason.code != crate::session::LeaveCode::DelayedLeave
+        {
+            log::info!(
+                "[{}] our membership left the room ({:?}); not ours to undo",
+                self.room_id,
+                reason.code
+            );
+            return;
+        }
+        log::warn!(
+            "[{}] our membership left the room while we are in the call ({}); putting it back",
+            self.room_id,
+            reason.map_or("no reason given", |_| "our delayed leave fired"),
+        );
+        self.departures.send_modify(|n| *n = n.wrapping_add(1));
+    }
+
+    /// Puts our membership back after [`Self::on_own_departure`]. The delayed
+    /// leave is probed first: a restart that finds it gone re-arms it and
+    /// republishes (as the beat would, later); one that lands means it is still
+    /// armed and only the membership is missing. Without delayed events, the
+    /// membership alone.
+    pub async fn recover_departure(&self) {
+        if self.state() != OwnMembershipState::Joined {
+            return;
+        }
+        let armed = self.keep_alive_info.lock().unwrap().is_some();
+        if !armed || self.restart(false).await {
+            self.republish().await;
+        }
     }
 
     fn request_republish(&self) {
