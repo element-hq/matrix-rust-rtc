@@ -62,6 +62,29 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// barely past it would flash the state for a split second.
 pub const KEY_GRACE: Duration = Duration::from_secs(4);
 
+/// What a member's video stream is asked for while we cannot decrypt it: kept
+/// flowing at the lowest layer even when the host says it is not visible. A
+/// host hides the video exactly when it shows the key error, and a paused
+/// stream sends no frames, so a key that arrives later could never be seen to
+/// work: the member would stay unable to decrypt until something else, such as
+/// their unmuting, sent frames. A stream the host released (`enabled: false`)
+/// or a bandwidth-saver choice is left as asked.
+fn probe_undecryptable(
+    kind: MediaStreamKind,
+    constraints: MediaConstraints,
+    undecryptable: bool,
+) -> MediaConstraints {
+    let video = matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare);
+    if !undecryptable || !video || !constraints.enabled || constraints.visible {
+        return constraints;
+    }
+    MediaConstraints {
+        visible: true,
+        detail: matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low),
+        ..constraints
+    }
+}
+
 /// Why a remote member's media cannot be shown now: sent in clear at once, a
 /// key failure only once it has lasted `grace`.
 fn unable_to_decrypt(
@@ -353,6 +376,7 @@ impl CallEngine {
             local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
             undecryptable_since: HashMap::new(),
+            host_constraints: HashMap::new(),
             sent_in_clear: HashSet::new(),
             installed_keys: HashMap::new(),
             raised_hands: Vec::new(),
@@ -721,6 +745,9 @@ struct Actor {
     /// Since when each member's frames have failed without a break; shown
     /// unable to decrypt once that is `stability.key_grace` old.
     undecryptable_since: HashMap<String, rt::Instant>,
+    /// The constraints the host last set per stream, before
+    /// [`probe_undecryptable`] adjusts them for a member we cannot decrypt.
+    host_constraints: HashMap<(String, MediaStreamKind), MediaConstraints>,
     /// Members who published a track declared unencrypted, which the
     /// transport refused (034 C6); until they leave.
     sent_in_clear: HashSet<String>,
@@ -1171,7 +1198,16 @@ impl Actor {
                 member_id,
                 kind,
                 constraints,
-            } => self.pool.set_constraints(member_id, kind, constraints),
+            } => {
+                self.host_constraints
+                    .insert((member_id.clone(), kind), constraints);
+                let undecryptable = self.is_undecryptable(&member_id);
+                self.pool.set_constraints(
+                    member_id,
+                    kind,
+                    probe_undecryptable(kind, constraints, undecryptable),
+                );
+            }
             ActorMessage::SpeakerTimer {
                 member_id,
                 generation,
@@ -1383,9 +1419,32 @@ impl Actor {
         }
     }
 
+    fn is_undecryptable(&self, member_id: &str) -> bool {
+        self.encryption_states
+            .get(member_id)
+            .is_some_and(FrameEncryptionState::is_failure)
+    }
+
     fn encryption_state_changed(&mut self, member_id: String, state: FrameEncryptionState) {
         let diagnostic = self.encryption_diagnostic(&member_id, state);
         let previous = self.encryption_states.insert(member_id.clone(), state);
+        // Crossing between decrypting and not changes what the member's video
+        // streams are asked for (see `probe_undecryptable`).
+        if previous.is_some_and(|p| p.is_failure()) != state.is_failure() {
+            let streams: Vec<_> = self
+                .host_constraints
+                .iter()
+                .filter(|((member, _), _)| *member == member_id)
+                .map(|((_, kind), constraints)| (*kind, *constraints))
+                .collect();
+            for (kind, constraints) in streams {
+                self.pool.set_constraints(
+                    member_id.clone(),
+                    kind,
+                    probe_undecryptable(kind, constraints, state.is_failure()),
+                );
+            }
+        }
         if !state.is_failure() {
             self.undecryptable_since.remove(&member_id);
         } else if !self.undecryptable_since.contains_key(&member_id) {
@@ -1650,6 +1709,8 @@ impl Actor {
         self.installed_keys.remove(member_id);
         self.encryption_states.remove(member_id);
         self.undecryptable_since.remove(member_id);
+        self.host_constraints
+            .retain(|(member, _), _| member != member_id);
         self.sent_in_clear.remove(member_id);
         self.speaking.remove(member_id);
         self.speakers.remove(member_id);
@@ -4356,6 +4417,56 @@ mod tests {
             .send(ConnectionEvent::Reconnected)
             .unwrap();
         wait_until(|| fx.state.applied.lock().unwrap().len() == 3).await;
+    }
+
+    /// A host hides the video of a member it shows unable to decrypt; the stream
+    /// keeps flowing at the lowest layer meanwhile, so a key that arrives later
+    /// can be seen to work, and the host's own constraints come back with it.
+    #[tokio::test(start_paused = true)]
+    async fn an_undecryptable_members_hidden_video_keeps_flowing_until_it_decrypts() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        rostered(&fx, &["bob"]).await;
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        let last = |fx: &Fixture| fx.state.applied.lock().unwrap().last().map(|(_, _, r)| *r);
+        let encryption = |state| ConnectionEvent::EncryptionStateChanged {
+            identity: "id-bob".to_owned(),
+            state,
+        };
+
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(encryption(FrameEncryptionState::MissingKey))
+            .unwrap();
+        fx.engine.set_constraints(
+            "bob",
+            MediaStreamKind::Camera,
+            MediaConstraints {
+                visible: false,
+                ..Default::default()
+            },
+        );
+        wait_until(|| !fx.state.applied.lock().unwrap().is_empty()).await;
+        let probing = last(&fx).unwrap();
+        assert_eq!(probing.demand, matrix_rtc_transport::StreamDemand::Active);
+        assert_eq!(
+            probing.detail,
+            matrix_rtc_transport::VideoDetail::Quality(matrix_rtc_transport::QualityLimit::Low)
+        );
+
+        let applied = fx.state.applied.lock().unwrap().len();
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(encryption(FrameEncryptionState::Ok))
+            .unwrap();
+        wait_until(|| fx.state.applied.lock().unwrap().len() > applied).await;
+        assert_eq!(
+            last(&fx).unwrap().demand,
+            matrix_rtc_transport::StreamDemand::Paused,
+            "decrypting again, the host's hidden stream pauses as it asked"
+        );
     }
 
     #[tokio::test(start_paused = true)]
