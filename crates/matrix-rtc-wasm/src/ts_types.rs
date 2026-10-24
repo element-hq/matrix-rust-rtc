@@ -74,6 +74,12 @@ export interface RoomOptionsIn {
  * sticky events, state events and joined members every call carries the
  * room's complete current set, the first one on subscribe; an empty set
  * means none.
+ *
+ * A send rejects with whatever its client threw; the library reads `errcode`,
+ * `httpStatus` and `data.retry_after_ms` off a matrix-js-sdk `MatrixError`,
+ * and `permanent: true` set by the host on a failure its client knows is final
+ * and has no Matrix code for (a room the user is not in). Attempt each send
+ * once and settle within 30 s: the library does the retrying.
  */
 export interface MatrixBackendHost {
     ownUserId(): string;
@@ -102,6 +108,29 @@ export interface MatrixBackendHost {
     rtcTransports(): Promise<unknown[]>;
 }
 
+/** Whether the homeserver is answering the library's sends; distinct from the media `degraded` flag. */
+export type RtcSignallingHealth =
+    | { type: "reachable" }
+    | { type: "unreachable"; since_ms: number };
+
+/** The connection carrying someone's media (034 R23, R28). `connecting` is our own SFU before it is first up: the call is starting, not interrupted. */
+export type RtcConnectionState = "connected" | "connecting" | "reconnecting" | "unreachable";
+
+/** Why a member's media is not shown (034 R33): `missing_key` and `bad_key` after `key_grace_ms` (4 s) of failing frames, `not_encrypted` (a track declared unencrypted, refused) at once. */
+export type RtcUnableToDecrypt = "missing_key" | "bad_key" | "not_encrypted";
+
+/** What is interrupting the call now, cause by cause (034 R38); empty when nothing is. Member lists hold `member_id`s, `unmappable` transport identities. */
+export interface RtcInterruptions {
+    signalling: RtcSignallingHealth;
+    own_membership_lapsed: boolean;
+    /** Our own SFU, from the first value, before our own entry is on the roster. */
+    own_media: RtcConnectionState;
+    members_reconnecting: string[];
+    members_unreachable: string[];
+    unable_to_decrypt: string[];
+    unmappable: string[];
+}
+
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
 export type MembershipFormatMode = "current" | "sticky_2025" | "room_state";
 
@@ -111,7 +140,10 @@ export interface RtcParticipant {
     user_id: string;
     device_id: string | null;
     is_local: boolean;
-    reachable: boolean;
+    /** The connection carrying their media; for our own entry, our own SFU's. */
+    connection: RtcConnectionState;
+    /** Why their media cannot be shown, or null; always null for our own entry. Draw the avatar when set or not connected. */
+    unable_to_decrypt: RtcUnableToDecrypt | null;
     /** The livekit-js participant identity — the join key for `room.getParticipantByIdentity()`. */
     rtc_identity: string | null;
     streams: { kind: RtcStreamKind; muted: boolean }[];
@@ -163,9 +195,10 @@ export type RtcCallStatus =
         media: RtcMediaPhase }
     /** Media up and somebody to talk to; `since_ms` holds through `degraded`. */
     | { type: "connected"; since_ms: number; degraded: boolean }
-    /** `message` is the transport's, for `connection_closed` only. */
+    /** `loss_reason` and `message` (the transport's, for logs) are for `connection_closed` only. */
     | { type: "ended";
         reason: "left" | "declined" | "unanswered" | "ring_not_sent" | "others_left" | "empty" | "slot_closed" | "connection_closed";
+        loss_reason: "budget" | "refused" | "never_connected" | null;
         message: string | null };
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
@@ -176,6 +209,8 @@ export interface MediaSessionConfigIn {
     format?: MembershipFormatMode;
     /** How much the tile order is damped; omitted fields take the defaults. */
     stability?: StabilityConfigIn;
+    /** How long our own SFU may stay unreachable before the call ends; 60 000 when omitted. */
+    own_reconnect_budget_ms?: number;
 }
 
 /**
@@ -190,6 +225,8 @@ export interface StabilityConfigIn {
     demote_ms?: number;
     /** Reorders inside this window are delivered as one. Default 300. */
     coalesce_ms?: number;
+    /** How long a member's frames must fail to decrypt before `unable_to_decrypt` shows `missing_key` or `bad_key`. Default 4000. */
+    key_grace_ms?: number;
 }
 
 /** The object driving livekit-js for `connectMedia`. */
@@ -208,6 +245,8 @@ export interface MediaDelegate {
     onEvent?(event: RtcCallEvent): void;
     /** The call's status: as it is first, then each change, last the end. */
     onStatus?(status: RtcCallStatus): void;
+    /** What is interrupting the call: as it is first, then each change, after the roster of the same change. */
+    onInterruptions?(record: RtcInterruptions): void;
 }
 
 /** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */

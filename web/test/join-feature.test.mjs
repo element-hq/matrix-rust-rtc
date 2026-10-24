@@ -116,6 +116,10 @@ describe('WASM bindings with a mock backend host', () => {
       await call.leave({
         leave_reason: { code: 'leave', reason: 'user hung up' },
       });
+      // leave() returns at once; the leave event and the delayed-leave cancel go out after it.
+      for (let i = 0; i < 100 && host._getCancelledEvents().length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
 
       const stickyEvents = host._getStickyEvents();
       expect(stickyEvents.length).toBe(1);

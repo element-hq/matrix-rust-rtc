@@ -31,19 +31,22 @@
 pub mod attach;
 pub mod engine;
 pub mod event;
+pub mod interruptions;
 #[cfg(feature = "livekit")]
 pub mod livekit;
 pub mod participant;
 pub mod tile;
 
 pub use attach::{AttachError, AttachOptions, MediaAttachment, attach_media};
-pub use engine::{CallEngine, EngineConfig, EngineHandle, StabilityConfig};
+pub use engine::{CallEngine, EngineConfig, EngineHandle, KEY_GRACE, StabilityConfig};
 pub use event::{CallEvent, FrameEncryptionDiagnostic};
+pub use interruptions::Interruptions;
 #[cfg(feature = "livekit")]
 pub use livekit::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 #[cfg(feature = "matrix-sdk")]
 pub use livekit::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, close_slot, open_slot};
-pub use participant::{Participant, StreamState};
+pub use matrix_rtc_transport::ConnectionState;
+pub use participant::{Participant, StreamState, UnableToDecrypt};
 pub use tile::{
     CallTile, DetailWindow, LocalState, TileId, TileKind, TileRef, TileRoster, Tiles, derive_tiles,
     window,

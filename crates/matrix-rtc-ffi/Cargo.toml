@@ -70,6 +70,13 @@ media = [
     "tokio/time",
 ]
 
+# Scripted fakes for hosts' own tests (034, contract C16):
+# `ScriptedMatrixBackend`, `ScriptedMediaTransport` and
+# `connect_scripted_media_session`. The build scripts turn it on for the
+# debug (dev-profile) AAR and XCFramework only; a release artifact never
+# carries it.
+testing = ["media", "matrix-rtc-core/testing", "matrix-rtc-transport/testing"]
+
 [build-dependencies]
 # Re-emits libwebrtc's `Java_*` JNI link args against our cdylib — see the
 # module docs in build.rs for why `webrtc-sys` cannot do this itself. Already

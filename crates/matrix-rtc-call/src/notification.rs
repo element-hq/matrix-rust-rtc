@@ -25,7 +25,12 @@
 //! [`CallJoinOptions::kind`]: crate::CallJoinOptions::kind
 
 use matrix_rtc_core::compat::DialectBackend;
-use matrix_rtc_core::{JoinSessionParams, JoinedMembership, MatrixBackend};
+use std::time::Duration;
+
+use matrix_rtc_core::{
+    JoinSessionParams, JoinedMembership, MatrixBackend, Outbox, SendKind, SendPolicy, SlotKey,
+    executor,
+};
 use serde_json::{Map, Value, json};
 
 /// Event type for MatrixRTC notifications (MSC4075).
@@ -258,13 +263,21 @@ pub(crate) fn is_own_participation(
 /// [`crate::RtcRoom::join_call`] calls it; a host driving a bare core room calls
 /// it itself. Never fails the join: the user is in the call
 /// whether or not anyone else was told about it.
+///
+/// Sent through `outbox` (034 R1): a transient failure is retried until
+/// `deadline` — the join's, so the notification never holds a join past its
+/// budget (R6) — or, without one, for as long as the notification lives.
+/// Keyed by the join's scope, so the join's leave cancels it.
+#[allow(clippy::too_many_arguments)]
 pub async fn notify_session_started<B: MatrixBackend + 'static>(
     backend: &DialectBackend<B>,
+    outbox: &Outbox,
     room_id: &str,
     notify: &NotifyConfig,
     params: &JoinSessionParams,
     members: &[JoinedMembership],
     member_event_id: &str,
+    deadline: Option<executor::Instant>,
 ) {
     let user_id = backend.own_user_id();
     let device_id = backend.own_device_id();
@@ -315,17 +328,26 @@ pub async fn notify_session_started<B: MatrixBackend + 'static>(
         notify.notification_type.as_str(),
     );
 
-    if let Err(error) = backend
-        .send_sticky_event(
-            room_id.to_owned(),
-            NOTIFICATION_EVENT_TYPE.to_owned(),
-            content,
-            notification_sticky_duration_ms(notify.lifetime_ms()),
-        )
-        .await
-    {
+    let budget = deadline.map_or(Duration::from_millis(notify.lifetime_ms()), |deadline| {
+        deadline.saturating_duration_since(executor::Instant::now())
+    });
+    let key = SlotKey::new(
+        format!("{room_id}/{}/{}", params.slot_id, params.membership_id()),
+        SendKind::Notification,
+    );
+    let sent = outbox
+        .send(key, SendPolicy::new().deadline(budget), || {
+            backend.send_sticky_event(
+                room_id.to_owned(),
+                NOTIFICATION_EVENT_TYPE.to_owned(),
+                content.clone(),
+                notification_sticky_duration_ms(notify.lifetime_ms()),
+            )
+        })
+        .await;
+    if let Err(error) = sent {
         log::warn!(
-            "[{tag}] the session-started notification was not sent ({error:?}); the call \
+            "[{tag}] the session-started notification was not sent ({error}); the call \
              itself is unaffected",
         );
     }

@@ -13,12 +13,18 @@
 //! [`crate::RtcRoom`] and [`crate::RtcCall`].
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use matrix_rtc_core::compat::DialectBackend;
+use matrix_rtc_core::outbox::{
+    BACKOFF_INITIAL, BACKOFF_MAX, Outbox, SendFailure, SendKind, SendPolicy, SlotKey,
+};
 use matrix_rtc_core::{
     ApplicationIntake, BaseRtcRoom, CommandError, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveError, LeaveSessionParams, MatrixBackend, RawTimelineEvent, RelationsRequest,
+    LeaveError, LeaveSessionParams, MatrixBackend, PendingLeave, RawTimelineEvent,
+    RelationsRequest, executor,
 };
 use tokio::sync::{broadcast, watch};
 
@@ -27,9 +33,10 @@ use crate::direct_call::{
 };
 use crate::notification::{NotifyConfig, is_own_participation, notify_session_started};
 use crate::reactions::{
-    ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, Clock, REACTION_EVENT_TYPE, RaisedHand,
-    ReactionError, ReactionsConfig, ReactionsState, ReceivedReaction, RelationLookup,
-    build_raised_hand_content, build_reaction_content, first_grapheme,
+    ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, Clock, HandRequests, HandSend,
+    REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionsConfig, ReactionsState,
+    ReceivedReaction, RelationLookup, build_raised_hand_content, build_reaction_content,
+    first_grapheme, wait_for_hand,
 };
 use crate::status::CallStatusCell;
 
@@ -70,6 +77,168 @@ impl From<JoinSessionParams> for CallJoinParams {
     fn from(rtc: JoinSessionParams) -> Self {
         Self::new(rtc)
     }
+}
+
+/// A leave whose participation has ended ([`CallRoomState::begin_leave`]) and
+/// whose sends have not: our raised hand lowered, then the core's leave, each
+/// one attempt (034 R8). Owns what it needs, so it runs without the room.
+pub struct CallPendingLeave<T: MatrixBackend + 'static> {
+    room_id: String,
+    slot_id: String,
+    /// The backend and the annotation to redact, when our hand was up.
+    lower_hand: Option<(Arc<T>, String)>,
+    core: PendingLeave<T>,
+}
+
+impl<T: MatrixBackend + 'static> CallPendingLeave<T> {
+    /// Sends the leave; a failure is the leave event's. The hand is best
+    /// effort: peers drop it with the membership anyway.
+    pub async fn send(self) -> Result<(), LeaveError> {
+        let Self {
+            room_id,
+            slot_id,
+            lower_hand,
+            core,
+        } = self;
+        if let Some((backend, event_id)) = lower_hand {
+            match backend
+                .redact_event(room_id.clone(), event_id.clone(), None)
+                .await
+            {
+                Ok(()) => log::info!("[{room_id}/{slot_id}] hand lowered ({event_id} redacted)"),
+                Err(error) => log::warn!(
+                    "[{room_id}/{slot_id}] the raised hand was not lowered before leaving \
+                     ({error}); peers drop it with the membership",
+                ),
+            }
+        }
+        core.send().await
+    }
+}
+
+/// How long a reaction may take to land before it is dropped (034 R4).
+pub const REACTION_BUDGET: Duration = Duration::from_secs(5);
+
+/// A reaction ready to go out without the room (see
+/// [`CallRoomState::prepare_reaction`]).
+pub(crate) struct ReactionSend<T> {
+    backend: Arc<T>,
+    outbox: Outbox,
+    key: SlotKey,
+    room_id: String,
+    log_tag: String,
+    content: serde_json::Value,
+    description: String,
+}
+
+impl<T: MatrixBackend + 'static> ReactionSend<T> {
+    /// Retried on a reported transient failure for at most
+    /// [`REACTION_BUDGET`], never after an attempt that timed out — it may
+    /// have landed — and dropped rather than shown late (034 R4).
+    pub(crate) async fn send(self) -> Result<String, ReactionError> {
+        let policy = SendPolicy::new()
+            .deadline(REACTION_BUDGET)
+            .never_retry_a_timed_out_attempt();
+        let outcome = self
+            .outbox
+            .send(self.key, policy, || {
+                self.backend.send_room_event(
+                    self.room_id.clone(),
+                    REACTION_EVENT_TYPE.to_owned(),
+                    self.content.clone(),
+                )
+            })
+            .await;
+        match outcome {
+            Ok(event_id) => {
+                log::debug!(
+                    "[{}] sent reaction {} as {event_id}",
+                    self.log_tag,
+                    self.description
+                );
+                Ok(event_id)
+            }
+            Err(SendFailure::Refused(error)) => Err(ReactionError::Command(error)),
+            Err(failure) => {
+                log::warn!(
+                    "[{}] reaction {} not sent: {failure}",
+                    self.log_tag,
+                    self.description
+                );
+                Err(ReactionError::NotSent)
+            }
+        }
+    }
+}
+
+/// One send our hand needs (see [`CallRoomState::hand_step`]).
+pub(crate) struct HandStep<T> {
+    backend: Arc<T>,
+    outbox: Outbox,
+    key: SlotKey,
+    room_id: String,
+    log_tag: String,
+    send: HandSend,
+}
+
+impl<T: MatrixBackend + 'static> HandStep<T> {
+    /// One attempt, through the hand's outbox slot: the sender re-reads what
+    /// is asked for between attempts. An annotation's event id on success.
+    pub(crate) async fn send(&self) -> Result<Option<String>, SendFailure> {
+        let outcome = self
+            .outbox
+            .send(self.key.clone(), SendPolicy::single_attempt(), || async {
+                match &self.send {
+                    HandSend::Annotate { on, .. } => self
+                        .backend
+                        .send_room_event(
+                            self.room_id.clone(),
+                            ANNOTATION_EVENT_TYPE.to_owned(),
+                            build_raised_hand_content(on),
+                        )
+                        .await
+                        .map(Some),
+                    HandSend::Redact { event_id } => self
+                        .backend
+                        .redact_event(self.room_id.clone(), event_id.clone(), None)
+                        .await
+                        .map(|()| None),
+                }
+            })
+            .await;
+        // The annotation of a membership event that has moved on: peers
+        // ignore it, so one attempt to tidy it is enough.
+        if let (
+            Ok(_),
+            HandSend::Annotate {
+                replacing: Some(old),
+                ..
+            },
+        ) = (&outcome, &self.send)
+            && let Err(error) = self
+                .backend
+                .redact_event(self.room_id.clone(), old.clone(), None)
+                .await
+        {
+            log::warn!(
+                "[{}] the previous raised-hand annotation {old} was not redacted ({error}); it \
+                 relates to a superseded membership event, so peers ignore it",
+                self.log_tag,
+            );
+        }
+        outcome
+    }
+}
+
+/// What the hand's sender does after a send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandNext {
+    /// Look again at once: it landed, or was refused.
+    Again,
+    /// A transient failure: wait, at least the server's retry-after.
+    Backoff(Option<Duration>),
+    /// Our participation is over.
+    Stop,
 }
 
 /// What a call join produced beyond the core's.
@@ -171,7 +340,9 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         Self { rtc, shared }
     }
 
-    /// A call over a fresh core room for `room_id`, sending through `backend`.
+    /// A call over a fresh core room for `room_id`, sending through `backend`
+    /// and retrying through an outbox of its own.
+    #[cfg(test)]
     pub fn with_backend(room_id: impl Into<String>, backend: Arc<T>) -> Self {
         Self::new(BaseRtcRoom::with_backend(room_id, backend))
     }
@@ -219,6 +390,41 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
             .backend()
             .cloned()
             .ok_or_else(|| CommandError::from_message("no backend configured"))
+    }
+
+    /// The part of [`Self::leave`] that needs the room: our participation
+    /// ends here, and what is returned sends the leave without the room
+    /// (034 R8) — our raised hand lowered first, while the membership it
+    /// annotates still stands, then the core's leave.
+    pub async fn begin_leave(
+        &mut self,
+        slot_id: &str,
+        params: LeaveSessionParams,
+    ) -> Result<CallPendingLeave<T>, LeaveError> {
+        let room_id = self.room_id();
+        let hand = self
+            .with_state(slot_id, |state| state.reactions.own_raised_hand().cloned())
+            .flatten()
+            .filter(|_| self.rtc.own_member_id(slot_id).is_some());
+        let lower_hand = hand
+            .zip(self.rtc.backend().cloned())
+            .map(|(hand, backend)| (backend, hand.reaction_event_id));
+
+        if let Some(Some(direct)) = self.with_state(slot_id, |state| state.direct.clone()) {
+            direct.finish_left();
+        }
+        let core = self.rtc.begin_leave(slot_id, params).await?;
+
+        self.with_state(slot_id, |state| {
+            state.own = None;
+            state.reactions.reset_own();
+        });
+        Ok(CallPendingLeave {
+            room_id,
+            slot_id: slot_id.to_owned(),
+            lower_hand,
+            core,
+        })
     }
 
     /// Lowers our hand first, while the membership it annotates still stands.
@@ -353,6 +559,7 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         Ok((own, member_id, membership_event_id))
     }
 
+    #[cfg(test)]
     /// Sends an emoji reaction from one slot, relating
     /// it to our current membership event.
     ///
@@ -368,7 +575,20 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         emoji: &str,
         name: &str,
     ) -> Result<String, ReactionError> {
-        let room_id = self.room_id();
+        let reaction = self.prepare_reaction(slot_id, emoji, name)?;
+        let event_id = reaction.send().await?;
+        self.reaction_sent(slot_id);
+        Ok(event_id)
+    }
+
+    /// [`Self::send_reaction`] up to the send, so the send can go out
+    /// without the room.
+    pub(crate) fn prepare_reaction(
+        &self,
+        slot_id: &str,
+        emoji: &str,
+        name: &str,
+    ) -> Result<ReactionSend<T>, ReactionError> {
         self.with_state(slot_id, |_| ())
             .ok_or(ReactionError::NoSession)?;
         let emoji = first_grapheme(emoji);
@@ -377,160 +597,183 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         }
         self.with_state(slot_id, |state| state.reactions.check_send_allowed())
             .ok_or(ReactionError::NoSession)??;
-        let (_, _, membership_event_id) = self.own_relation_target(slot_id)?;
-        let backend = self.backend()?;
-
-        let event_id = backend
-            .send_room_event(
-                self.room_id(),
-                REACTION_EVENT_TYPE.to_owned(),
-                build_reaction_content(&membership_event_id, emoji, name),
-            )
-            .await?;
-        self.with_state(slot_id, |state| state.reactions.record_sent());
-        log::debug!("[{room_id}/{slot_id}] sent reaction {emoji} ({name}) as {event_id}");
-        Ok(event_id)
+        let (_, member_id, membership_event_id) = self.own_relation_target(slot_id)?;
+        Ok(ReactionSend {
+            backend: self.backend()?,
+            outbox: self.rtc.outbox().clone(),
+            key: self.own_slot_key(slot_id, &member_id, SendKind::Reaction),
+            room_id: self.room_id(),
+            log_tag: format!("{}/{slot_id}", self.room_id()),
+            content: build_reaction_content(&membership_event_id, emoji, name),
+            description: format!("{emoji} ({name})"),
+        })
     }
 
-    /// Raises our hand in one slot: annotates our
-    /// current membership event with
-    /// [`RAISED_HAND_KEY`](crate::reactions::RAISED_HAND_KEY). Idempotent while
-    /// it is up. Shows in [`Self::raised_hands`] right away rather than waiting
-    /// for the echo.
+    /// Starts the cooldown: a reaction landed (034 R4).
+    pub(crate) fn reaction_sent(&self, slot_id: &str) {
+        self.with_state(slot_id, |state| state.reactions.record_sent());
+    }
+
+    /// The outbox slot of one of our own sends: in our participation's
+    /// scope, which the leave ends.
+    fn own_slot_key(&self, slot_id: &str, member_id: &str, kind: SendKind) -> SlotKey {
+        SlotKey::new(format!("{}/{slot_id}/{member_id}", self.room_id()), kind)
+    }
+
+    #[cfg(test)]
+    /// Raises our hand in one slot and returns once it has landed (034 R5);
+    /// see [`Self::request_hand`]. Idempotent while it is up.
     pub async fn raise_hand(&mut self, slot_id: &str) -> Result<(), ReactionError> {
-        let room_id = self.room_id();
-        let (enabled, already_up) = self
+        let wait = self.request_hand(slot_id, true)?;
+        self.drive_hand(slot_id).await;
+        wait.await
+    }
+
+    /// Lowers our hand in one slot by redacting the annotation, and returns
+    /// once that has landed. A no-op when it is not up.
+    pub async fn lower_hand(&mut self, slot_id: &str) -> Result<(), ReactionError> {
+        let wait = self.request_hand(slot_id, false)?;
+        self.drive_hand(slot_id).await;
+        wait.await
+    }
+
+    /// Asks for our hand up or down (034 R5): shown so in
+    /// [`Self::raised_hands`] at once, before anything is sent. Returns the
+    /// wait for the request's answer; the hand's sender does the sending.
+    pub(crate) fn request_hand(
+        &self,
+        slot_id: &str,
+        up: bool,
+    ) -> Result<impl Future<Output = Result<(), ReactionError>> + use<T>, ReactionError> {
+        let (enabled, wanted) = self
             .with_state(slot_id, |state| {
                 (
                     state.reactions.config().enabled,
-                    state.reactions.own_raised_hand().is_some(),
+                    state.reactions.hand_wanted(),
                 )
             })
             .ok_or(ReactionError::NoSession)?;
-        if !enabled {
+        if up && !enabled {
             return Err(ReactionError::Disabled);
         }
-        if already_up {
-            return Ok(());
-        }
-        let (own, member_id, membership_event_id) = self.own_relation_target(slot_id)?;
-        let backend = self.backend()?;
-
-        let event_id = backend
-            .send_room_event(
-                self.room_id(),
-                ANNOTATION_EVENT_TYPE.to_owned(),
-                build_raised_hand_content(&membership_event_id),
-            )
-            .await?;
-        log::info!("[{room_id}/{slot_id}] hand raised ({event_id})");
-        self.with_state(slot_id, |state| {
-            state.reactions.set_own_raised_hand(
-                &member_id,
-                &own.user_id,
-                event_id,
-                membership_event_id,
-            );
-        });
-        Ok(())
+        let own = if up || wanted {
+            let (own, member_id, _) = self.own_relation_target(slot_id)?;
+            Some((own, member_id))
+        } else {
+            None
+        };
+        let (request, requests) = self
+            .with_state(slot_id, |state| {
+                let request = match &own {
+                    Some((own, member_id)) => {
+                        state.reactions.request_hand(up, member_id, &own.user_id)
+                    }
+                    None => state.reactions.subscribe_hand_requests().borrow().latest,
+                };
+                (request, state.reactions.subscribe_hand_requests())
+            })
+            .ok_or(ReactionError::NoSession)?;
+        Ok(wait_for_hand(requests, request))
     }
 
-    /// Lowers our hand in one slot by redacting the
-    /// annotation. A no-op when it is not up.
-    pub async fn lower_hand(&mut self, slot_id: &str) -> Result<(), ReactionError> {
-        let room_id = self.room_id();
-        let Some(hand) = self
-            .with_state(slot_id, |state| state.reactions.own_raised_hand().cloned())
-            .ok_or(ReactionError::NoSession)?
-        else {
-            return Ok(());
-        };
-        let member_id = self
-            .rtc
-            .own_member_id(slot_id)
-            .ok_or(ReactionError::NotJoined)?;
-        let backend = self.backend()?;
-
-        backend
-            .redact_event(self.room_id(), hand.reaction_event_id.clone(), None)
-            .await?;
-        log::info!(
-            "[{room_id}/{slot_id}] hand lowered ({} redacted)",
-            hand.reaction_event_id
-        );
-        self.with_state(slot_id, |state| {
-            state.reactions.clear_own_raised_hand(&member_id);
-        });
-        Ok(())
+    /// Follows the requests for our hand in one slot (see
+    /// [`Self::request_hand`]).
+    pub(crate) fn subscribe_hand_requests(
+        &self,
+        slot_id: &str,
+    ) -> Option<watch::Receiver<HandRequests>> {
+        self.with_state(slot_id, |state| state.reactions.subscribe_hand_requests())
     }
 
-    /// Raises our hand again on our new membership event after a sticky
-    /// refresh, and redacts the annotation on the old one.
-    ///
-    /// Element Call drops a raised hand whose membership event has moved on
-    /// and looks for one on the new event instead, so a hand that stayed on
-    /// the join event would be lowered for us at the first refresh. Peers may
-    /// see the hand drop for one round trip in between; that is inherent to
-    /// the protocol. Returns `false` when the re-send failed, for the caller to
-    /// retry.
-    pub(crate) async fn reannotate_hand_if_moved(&mut self, slot_id: &str) -> bool {
-        let room_id = self.room_id();
-        let Some(Some(hand)) =
-            self.with_state(slot_id, |state| state.reactions.own_raised_hand().cloned())
-        else {
-            return true;
-        };
-        let Ok((own, member_id, current)) = self.own_relation_target(slot_id) else {
-            return true;
-        };
-        if current == hand.annotated_membership_event_id {
-            return true;
-        }
-        let Ok(backend) = self.backend() else {
-            return true;
-        };
-
-        log::debug!(
-            "[{room_id}/{slot_id}] our membership event moved ({} -> {current}); raising the \
-             hand on it again",
-            hand.annotated_membership_event_id,
-        );
-        match backend
-            .send_room_event(
-                self.room_id(),
-                ANNOTATION_EVENT_TYPE.to_owned(),
-                build_raised_hand_content(&current),
-            )
-            .await
-        {
-            Ok(event_id) => {
-                self.with_state(slot_id, |state| {
-                    state.reactions.set_own_raised_hand(
-                        &member_id,
-                        &own.user_id,
-                        event_id,
-                        current,
-                    );
-                });
-                if let Err(error) = backend
-                    .redact_event(self.room_id(), hand.reaction_event_id.clone(), None)
-                    .await
-                {
-                    log::warn!(
-                        "[{room_id}/{slot_id}] the previous raised-hand annotation {} was not \
-                         redacted ({error}); it relates to a superseded membership event, so \
-                         peers ignore it",
-                        hand.reaction_event_id,
-                    );
-                }
-                true
+    /// The next send our hand needs, or `None`, with every request
+    /// answered, when it stands where it was asked to — on our current
+    /// membership event, so a sticky refresh moving that event re-annotates it.
+    pub(crate) fn hand_step(&self, slot_id: &str) -> Option<HandStep<T>> {
+        let current = self.rtc.own_membership_event_id(slot_id);
+        let step = self.with_state(slot_id, |state| {
+            let step = state.reactions.hand_step(current.as_deref());
+            if step.is_none() {
+                state.reactions.settle_hand();
             }
-            Err(error) => {
+            step
+        })??;
+        let member_id = self.rtc.own_member_id(slot_id)?;
+        Some(HandStep {
+            backend: self.backend().ok()?,
+            outbox: self.rtc.outbox().clone(),
+            key: self.own_slot_key(slot_id, &member_id, SendKind::Hand),
+            room_id: self.room_id(),
+            log_tag: format!("{}/{slot_id}", self.room_id()),
+            send: step,
+        })
+    }
+
+    /// Applies one hand send's outcome and says what the sender does next.
+    pub(crate) fn hand_sent(
+        &self,
+        slot_id: &str,
+        step: &HandStep<T>,
+        outcome: Result<Option<String>, SendFailure>,
+    ) -> HandNext {
+        let Some((own, member_id, _)) = self.own_relation_target(slot_id).ok() else {
+            return HandNext::Stop;
+        };
+        let log_tag = &step.log_tag;
+        match (&step.send, outcome) {
+            (HandSend::Annotate { on, .. }, Ok(event_id)) => {
+                let event_id = event_id.unwrap_or_default();
+                log::info!("[{log_tag}] hand raised ({event_id})");
+                self.with_state(slot_id, |state| {
+                    state
+                        .reactions
+                        .hand_raised(&member_id, &own.user_id, event_id, on.clone());
+                });
+                HandNext::Again
+            }
+            (HandSend::Redact { event_id }, Ok(_)) => {
+                log::info!("[{log_tag}] hand lowered ({event_id} redacted)");
+                self.with_state(slot_id, |state| {
+                    state.reactions.hand_lowered(&member_id, &own.user_id);
+                });
+                HandNext::Again
+            }
+            (_, Err(SendFailure::Refused(error))) => {
                 log::warn!(
-                    "[{room_id}/{slot_id}] could not raise the hand again on the refreshed \
-                     membership ({error}); retrying",
+                    "[{log_tag}] the hand was refused for good ({error}); back where it was"
                 );
-                false
+                self.with_state(slot_id, |state| {
+                    state
+                        .reactions
+                        .refuse_hand(&member_id, &own.user_id, &error);
+                });
+                HandNext::Again
+            }
+            (_, Err(SendFailure::Failed(error))) => HandNext::Backoff(
+                error
+                    .backend_error()
+                    .and_then(|error| error.retry_after_ms)
+                    .map(Duration::from_millis),
+            ),
+            (_, Err(SendFailure::TimedOut)) => HandNext::Backoff(None),
+            // The leave ended our participation's sends.
+            (_, Err(_)) => HandNext::Stop,
+        }
+    }
+
+    /// Sends what our hand needs until it stands where it was asked to:
+    /// the sender for a caller holding the room, [`crate::RtcCall`]'s runs on
+    /// its own task.
+    async fn drive_hand(&mut self, slot_id: &str) {
+        let mut backoff = BACKOFF_INITIAL;
+        while let Some(step) = self.hand_step(slot_id) {
+            let outcome = step.send().await;
+            match self.hand_sent(slot_id, &step, outcome) {
+                HandNext::Again => backoff = BACKOFF_INITIAL,
+                HandNext::Stop => break,
+                HandNext::Backoff(retry_after) => {
+                    executor::sleep(retry_after.map_or(backoff, |after| after.max(backoff))).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                }
             }
         }
     }
@@ -583,12 +826,23 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
 impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
     /// The core join, then what the call's kind asks for: a group's
     /// notification, or a DM call's lifecycle and the ring to send.
+    #[cfg(test)]
     pub async fn join(&mut self, params: CallJoinParams) -> Result<CallJoined, JoinError> {
+        self.join_within(params, None).await
+    }
+
+    /// [`Self::join`] under the join's budget, which ends at `deadline`
+    /// (034 R6): the core join and a group's notification share it.
+    pub async fn join_within(
+        &mut self,
+        params: CallJoinParams,
+        deadline: Option<executor::Instant>,
+    ) -> Result<CallJoined, JoinError> {
         let reactions = params.reactions();
         let CallJoinParams { rtc, kind, .. } = params;
         let slot_id = rtc.slot_id.clone();
 
-        let member_event_id = self.rtc.join(rtc.clone()).await?;
+        let member_event_id = self.rtc.join_within(rtc.clone(), deadline).await?;
         // The join succeeded, so the room has a backend.
         let user_id = self.backend()?.own_user_id();
 
@@ -699,8 +953,17 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         joined.direct = Some(direct);
     }
 
-    /// Sends the MSC4075 notification that summons the room to this session;
-    /// see [`notify_session_started`] for when it is suppressed.
+    /// Sends the MSC4075 notification that summons the room to this session,
+    /// detached; see [`notify_session_started`] for when it is suppressed.
+    ///
+    /// Not awaited by the join, which is over once our membership has landed:
+    /// nothing after it needs the notification, it never fails the join
+    /// (034 C10), and the core sends one only when nobody else is in the
+    /// session, so returning first hides us from no one. Waiting cost the
+    /// media connection instead: in an encrypted room the first send of a
+    /// session shares a room key with every device in the room, and on a
+    /// device that held the join 18 s. Retried for the notification's own
+    /// lifetime rather than the join's budget; the leave still cancels it.
     async fn notify_session_started(
         &self,
         notify: &NotifyConfig,
@@ -715,15 +978,29 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             .subscribe_membership_snapshots(&params.slot_id)
             .map(|snapshots| snapshots.borrow().clone())
             .unwrap_or_default();
-        notify_session_started(
-            backend.as_ref(),
-            self.rtc.room_id(),
-            notify,
-            params,
-            &members,
-            member_event_id,
-        )
-        .await;
+        let outbox = self.rtc.outbox().clone();
+        let room_id = self.rtc.room_id().to_owned();
+        let notify = notify.clone();
+        let params = params.clone();
+        let member_event_id = member_event_id.to_owned();
+        let send = async move {
+            notify_session_started(
+                backend.as_ref(),
+                &outbox,
+                &room_id,
+                &notify,
+                &params,
+                &members,
+                &member_event_id,
+                None,
+            )
+            .await;
+        };
+        if executor::can_spawn() {
+            executor::spawn(send);
+        } else {
+            send.await;
+        }
     }
 }
 

@@ -21,12 +21,17 @@ mod feeder_tests;
 pub mod notification;
 pub mod reactions;
 mod status;
-pub use status::{CallEnd, CallStatus, MediaPhase, MediaStatusReporter, RingPhase};
+pub use status::{
+    CallEnd, CallStatus, ConnectionLossReason, MediaPhase, MediaStatusReporter, RingPhase,
+};
 mod room_state;
 pub mod transports;
 
-pub use client::{CallJoinOptions, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession};
+pub use client::{
+    CallJoinOptions, JOIN_BUDGET, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession,
+};
 pub use direct_call::{CallKind, DECLINE_EVENT_TYPES, GroupNotify, RING_SEND_DEADLINE, RingConfig};
+pub use matrix_rtc_core::SignallingHealth;
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
     NotificationType, NotifyConfig, build_notification_content, notification_sticky_duration_ms,

@@ -20,6 +20,7 @@ mod host;
 mod join;
 mod maybe_send;
 mod membership_listener;
+pub mod outbox;
 mod own_membership;
 mod session;
 mod slot;
@@ -52,18 +53,20 @@ pub use host::event::{
     RawTimelineEvent, RelationsRequest, StickyEventsUpdate,
 };
 pub use join::{
-    DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS, JoinSessionParams,
-    LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent, generate_member_id,
+    DEFAULT_JOIN_BUDGET_MS, DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
+    JoinSessionParams, LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent,
+    generate_member_id,
 };
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
+pub use outbox::{Outbox, SendFailure, SendKind, SendPolicy, SignallingHealth, SlotKey};
 pub use own_membership::{
     DelayedLeaveSupport, KeepAliveInfo, MembershipTimings, OwnMembershipMachine,
     OwnMembershipState, transport_to_json,
 };
 pub use session::{
-    ApplicationInfo, JoinedMembership, LeaveCode, LeaveReason, LeftMembership, MemberInfo,
-    Membership, RtcMembershipEvent, SlotSession,
+    ApplicationInfo, DELAYED_LEAVE_HOLD, JoinedMembership, LeaveCode, LeaveReason, LeftMembership,
+    MemberInfo, Membership, PendingLeave, RtcMembershipEvent, SlotSession,
 };
 pub use slot::{
     EncryptionMechanism, OpenSlot, RawSlotEvent, RawSlotEventContent, RoomEncryption,
@@ -77,7 +80,10 @@ pub use wire::wire_event_type;
 /// Test doubles for crates built on the core, behind the `testing` feature.
 #[cfg(feature = "testing")]
 pub mod testing {
-    pub use crate::host::backend::{MockBackend, MockRoomSubscription, MockToDeviceSubscription};
+    pub use crate::host::backend::{
+        MockBackend, MockCall, MockMethod, MockOutcome, MockRoomSubscription,
+        MockToDeviceSubscription,
+    };
 }
 
 #[cfg(test)]
@@ -233,6 +239,833 @@ mod tests {
         room.on_encryption_received(true).await;
         room.on_slots_received(vec![encrypted_call_slot()]).await;
         room
+    }
+
+    /// 034 through a room's upkeep, the path every host takes: recovery on
+    /// the health transition, the catch-up republish, the lapse.
+    mod resilience {
+        use super::*;
+        use crate::host::backend::{BackendError, MockBackend, MockMethod, MockOutcome};
+        use std::time::Duration;
+
+        const T0_MS: u64 = 1_000_000_000;
+
+        fn fail() -> MockOutcome {
+            MockOutcome::Fail(BackendError::new("offline"))
+        }
+
+        /// A room whose client outbox, and so whose machines, keep paused
+        /// tokio time.
+        async fn room(mock: &Arc<MockBackend>) -> (BaseRtcRoom<MockBackend>, Outbox) {
+            let origin = tokio::time::Instant::now();
+            let outbox = Outbox::with_clock(Arc::new(move || {
+                T0_MS + origin.elapsed().as_millis() as u64
+            }));
+            let mut room =
+                BaseRtcRoom::with_backend(ROOM_ID, mock.clone()).with_outbox(outbox.clone());
+            room.on_slots_received(vec![open_call_slot()]).await;
+            (room, outbox)
+        }
+
+        fn own_event(event_id: &str) -> RawStickyEvent {
+            RawStickyEvent {
+                event_id: Some(event_id.to_owned()),
+                origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+                ..joined_event("@alice:example.org", "m.call#room", "alice-a")
+            }
+        }
+
+        /// R10, R19, R22: the host's "online" starts a recovery: within the
+        /// random wait, a restart probes the delayed leave.
+        #[tokio::test(start_paused = true)]
+        async fn signalling_coming_back_starts_a_recovery() {
+            let mock = alice_backend();
+            let (mut room, outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            outbox.report_connectivity(false);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            let before = mock.calls_to(MockMethod::RestartDelayedEvent).len();
+            outbox.report_connectivity(true);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            let restarts = mock.calls_to(MockMethod::RestartDelayedEvent);
+            assert_eq!(restarts.len(), before + 1, "one probe: {restarts:?}");
+            let probe = *restarts.last().unwrap();
+            assert!(probe >= Duration::from_secs(5) && probe <= Duration::from_secs(8));
+        }
+
+        /// R19: after a recovery, a complete set without our membership makes
+        /// the upkeep republish it once; one with our current event id does
+        /// nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_catch_up_missing_our_membership_republishes_once() {
+            let mock = alice_backend();
+            let (mut room, outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let joined = room.own_membership_event_id("m.call#room").unwrap();
+
+            // Intact: our current event id is in the set.
+            outbox.report_connectivity(false);
+            outbox.report_connectivity(true);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            room.set_current_sticky_state(vec![own_event(&joined)])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                mock.sticky_events.lock().unwrap().len(),
+                1,
+                "intact: nothing"
+            );
+
+            // Gone: the set no longer holds us.
+            outbox.report_connectivity(false);
+            outbox.report_connectivity(true);
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            room.set_current_sticky_state(Vec::new()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let sticky = mock.sticky_events.lock().unwrap().clone();
+            assert_eq!(sticky.len(), 2, "one republish");
+            assert_eq!(sticky[0].2, sticky[1].2, "the same member id");
+            assert_eq!(
+                room.own_member_id("m.call#room").as_deref(),
+                Some("alice-a")
+            );
+        }
+
+        /// Our own leave, with `reason` (`None`: the empty set a room-state leave makes).
+        fn own_leave(reason: Option<LeaveCode>) -> Vec<RawStickyEvent> {
+            let Some(code) = reason else {
+                return Vec::new();
+            };
+            let left = left_event("@alice:example.org", "m.call#room", "alice-a");
+            vec![RawStickyEvent {
+                content: RawStickyEventContent {
+                    leave_reason: Some(LeaveReason::new(code)),
+                    ..left.content
+                },
+                origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+                ..left
+            }]
+        }
+
+        /// Joins, sees our membership in a set, then gets `leave`; returns the
+        /// memberships published and the delayed-leave restarts sent since.
+        async fn after_our_leave(leave: Vec<RawStickyEvent>) -> (usize, usize) {
+            let mock = alice_backend();
+            let (mut room, _outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let joined = room.own_membership_event_id("m.call#room").unwrap();
+            room.set_current_sticky_state(vec![own_event(&joined)])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let published = mock.sticky_events.lock().unwrap().len();
+            let restarts = mock.calls_to(MockMethod::RestartDelayedEvent).len();
+
+            room.set_current_sticky_state(leave).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            (
+                mock.sticky_events.lock().unwrap().len() - published,
+                mock.calls_to(MockMethod::RestartDelayedEvent).len() - restarts,
+            )
+        }
+
+        /// A leave we did not send while the homeserver is reachable — our
+        /// delayed leave firing on a stall or on restarts lost, or any leave in
+        /// a format that carries no reason — puts our membership back at once,
+        /// the delayed leave probed first, well inside the others' hold (C9).
+        #[tokio::test(start_paused = true)]
+        async fn our_membership_leaving_while_we_are_in_the_call_is_put_back_at_once() {
+            assert_eq!(
+                after_our_leave(own_leave(Some(LeaveCode::DelayedLeave))).await,
+                (1, 1),
+                "our delayed leave firing"
+            );
+            assert_eq!(
+                after_our_leave(own_leave(None)).await,
+                (1, 1),
+                "a leave with no reason"
+            );
+        }
+
+        /// A leave with any other reason was meant, and is not undone.
+        #[tokio::test(start_paused = true)]
+        async fn our_membership_leaving_for_another_reason_is_left_be() {
+            assert_eq!(
+                after_our_leave(own_leave(Some(LeaveCode::Leave))).await,
+                (0, 0)
+            );
+        }
+
+        /// R17: the upkeep notices the lapse on its own, at the delayed leave's
+        /// deadline, while every restart fails; and clears it when one lands.
+        #[tokio::test(start_paused = true)]
+        async fn the_upkeep_reports_our_membership_lapsing() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let mut lapsed = room.subscribe_own_membership_lapsed("m.call#room").unwrap();
+            mock.script(
+                MockMethod::RestartDelayedEvent,
+                std::iter::repeat_n(fail(), 7),
+            );
+
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            assert!(!*lapsed.borrow_and_update());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(*lapsed.borrow_and_update(), "lapsed at 30 s");
+        }
+
+        fn peer(user_id: &str, device_id: &str, member_id: &str) -> RawStickyEvent {
+            RawStickyEvent {
+                origin: EventOrigin::encrypted(Some(device_id.to_owned())),
+                ..joined_event(user_id, "m.call#room", member_id)
+            }
+        }
+
+        /// R20: the catch-up set's rollout serves, in one batch, every member
+        /// not yet served — the ones who arrived during the outage — and not
+        /// the ones who already hold the key.
+        #[tokio::test(start_paused = true)]
+        async fn the_catch_up_rollout_serves_every_member_not_yet_served_in_one_batch() {
+            let mock = alice_backend();
+            let mut room = encrypted_call_room(mock.clone()).await;
+            join_as(&mut room, "alice-a").await;
+            admit_peer(&mut room, "@bob:example.org", "BOBDEV", "bob-a").await;
+            assert!(
+                !mock
+                    .to_device_messages_for("@bob:example.org", "BOBDEV")
+                    .is_empty()
+            );
+            let batches = mock.calls_to(MockMethod::ToDevice).len();
+            let sent = mock.to_device_messages.lock().unwrap().len();
+
+            room.set_current_sticky_state(vec![
+                peer("@bob:example.org", "BOBDEV", "bob-a"),
+                peer("@carol:example.org", "CAROLDEV", "carol-a"),
+                peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            ])
+            .await
+            .unwrap();
+
+            assert_eq!(
+                mock.calls_to(MockMethod::ToDevice).len(),
+                batches + 1,
+                "one batch"
+            );
+            let mut recipients: Vec<String> = mock.to_device_messages.lock().unwrap()[sent..]
+                .iter()
+                .map(|(user, _, _, _)| user.clone())
+                .collect();
+            recipients.sort();
+            assert_eq!(recipients, ["@carol:example.org", "@dave:example.org"]);
+        }
+
+        /// [`room`], encrypted, so a join distributes keys.
+        async fn encrypted_room(mock: &Arc<MockBackend>) -> (BaseRtcRoom<MockBackend>, Outbox) {
+            let (mut room, outbox) = room(mock).await;
+            room.on_encryption_received(true).await;
+            room.on_slots_received(vec![encrypted_call_slot()]).await;
+            (room, outbox)
+        }
+
+        /// The key indices delivered to one device, in order.
+        fn indices_to(mock: &MockBackend, user_id: &str, device_id: &str) -> Vec<u64> {
+            mock.to_device_messages_for(user_id, device_id)
+                .iter()
+                .map(|(_, content)| content["media_key"]["index"].as_u64().unwrap())
+                .collect()
+        }
+
+        /// R32: a key the host failed to send is retried to that member alone
+        /// on backoff until it lands, at the same index.
+        #[tokio::test(start_paused = true)]
+        async fn an_undelivered_key_is_retried_on_backoff_until_delivered() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            mock.script(MockMethod::ToDevice, std::iter::repeat_n(fail(), 3));
+
+            room.set_current_sticky_state(vec![peer("@bob:example.org", "BOBDEV", "bob-a")])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(20)).await;
+
+            let sends: Vec<u64> = mock
+                .calls_to(MockMethod::ToDevice)
+                .iter()
+                .map(Duration::as_secs)
+                .collect();
+            assert_eq!(sends, [0, 1, 3, 7], "the rollout, then 1 s doubling");
+            assert_eq!(indices_to(&mock, "@bob:example.org", "BOBDEV"), [0]);
+            assert!(room_undelivered(&room).is_empty());
+        }
+
+        /// A rotation deferred by a departure inside the key's grace goes out
+        /// at its deadline, read on the same clock as the manager's, not at the
+        /// next keep-alive beat.
+        #[tokio::test(start_paused = true)]
+        async fn a_deferred_rotation_goes_out_at_its_deadline() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let bob = || peer("@bob:example.org", "BOBDEV", "bob-a");
+            let carol = || peer("@carol:example.org", "CAROLDEV", "carol-a");
+            let dave = peer("@dave:example.org", "DAVEDEV", "dave-a");
+            room.set_current_sticky_state(vec![bob(), carol(), dave])
+                .await
+                .unwrap();
+
+            // Dave leaves once the key is stale: a rotation at once, off the beat.
+            tokio::time::sleep(Duration::from_millis(13_500)).await;
+            room.set_current_sticky_state(vec![bob(), carol()])
+                .await
+                .unwrap();
+            // Carol leaves inside the new key's grace: deferred to 23.5 s.
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
+            room.set_current_sticky_state(vec![bob()]).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+
+            assert_eq!(indices_to(&mock, "@bob:example.org", "BOBDEV"), [0, 1, 2]);
+            let last = *mock.calls_to(MockMethod::ToDevice).last().unwrap();
+            assert!(
+                last >= Duration::from_millis(23_500) && last < Duration::from_secs(24),
+                "the deferred rotation went out at {last:?}, not at 23.5 s"
+            );
+        }
+
+        fn room_undelivered(room: &BaseRtcRoom<MockBackend>) -> Vec<String> {
+            room.undelivered_key_members("m.call#room")
+                .unwrap_or_default()
+        }
+
+        /// R32: a member the host answered for but did not deliver to is
+        /// retried too, without touching signalling health.
+        #[tokio::test(start_paused = true)]
+        async fn an_undelivered_recipient_is_retried_without_making_signalling_unreachable() {
+            let mock = alice_backend();
+            let (mut room, outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let bob = ("@bob:example.org".to_owned(), "BOBDEV".to_owned());
+            mock.undeliverable.lock().unwrap().insert(bob.clone());
+
+            room.set_current_sticky_state(vec![
+                peer("@bob:example.org", "BOBDEV", "bob-a"),
+                peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            ])
+            .await
+            .unwrap();
+            assert_eq!(room_undelivered(&room), ["bob-a"]);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            assert_eq!(outbox.health(), SignallingHealth::Reachable);
+
+            mock.undeliverable.lock().unwrap().clear();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            assert_eq!(indices_to(&mock, "@bob:example.org", "BOBDEV"), [0]);
+            assert_eq!(
+                indices_to(&mock, "@carol:example.org", "CAROLDEV"),
+                [0],
+                "carol once"
+            );
+            assert!(room_undelivered(&room).is_empty());
+        }
+
+        /// R32: a rotation addresses everyone, so the retry of the previous
+        /// key stops: the new index reaches bob, the old one never does.
+        #[tokio::test(start_paused = true)]
+        async fn a_rotation_supersedes_the_retry_of_the_previous_key() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            let carol = peer("@carol:example.org", "CAROLDEV", "carol-a");
+            let bob = peer("@bob:example.org", "BOBDEV", "bob-a");
+            room.set_current_sticky_state(vec![carol.clone()])
+                .await
+                .unwrap();
+            mock.undeliverable
+                .lock()
+                .unwrap()
+                .insert(("@bob:example.org".to_owned(), "BOBDEV".to_owned()));
+            room.set_current_sticky_state(vec![carol, bob.clone()])
+                .await
+                .unwrap();
+
+            // carol leaves at 4 s; the rotation it owes comes at the end of
+            // the key's freshness, 10 s, and addresses bob with index 1.
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            room.set_current_sticky_state(vec![bob]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(6_500)).await;
+            mock.undeliverable.lock().unwrap().clear();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+
+            assert_eq!(indices_to(&mock, "@bob:example.org", "BOBDEV"), [1]);
+            assert!(room_undelivered(&room).is_empty());
+        }
+
+        /// R32: a departure ends the member's retry.
+        #[tokio::test(start_paused = true)]
+        async fn an_undelivered_key_stops_being_retried_when_the_member_leaves() {
+            let mock = alice_backend();
+            let (mut room, _outbox) = encrypted_room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            mock.script(MockMethod::ToDevice, std::iter::repeat_n(fail(), 100));
+            room.set_current_sticky_state(vec![peer("@bob:example.org", "BOBDEV", "bob-a")])
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let before = mock.calls_to(MockMethod::ToDevice).len();
+
+            room.set_current_sticky_state(Vec::new()).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+
+            assert_eq!(mock.calls_to(MockMethod::ToDevice).len(), before);
+            assert!(room_undelivered(&room).is_empty());
+        }
+
+        /// R14: signalling unreachable for ten minutes ends nothing: the join
+        /// stays, and the session keeps trying.
+        #[tokio::test(start_paused = true)]
+        async fn signalling_unreachable_for_ten_minutes_never_ends_the_join() {
+            let mock = alice_backend();
+            let (mut room, outbox) = room(&mock).await;
+            join_as(&mut room, "alice-a").await;
+            for method in [
+                MockMethod::RestartDelayedEvent,
+                MockMethod::StickyEvent,
+                MockMethod::DelayedEvent,
+            ] {
+                mock.script(method, std::iter::repeat_n(fail(), 1_000));
+            }
+
+            tokio::time::sleep(Duration::from_secs(600)).await;
+
+            assert!(matches!(
+                outbox.health(),
+                SignallingHealth::Unreachable { .. }
+            ));
+            assert_eq!(
+                room.own_member_id("m.call#room").as_deref(),
+                Some("alice-a")
+            );
+            assert_eq!(room.joined_slots(), ["m.call#room"]);
+            let late = mock
+                .calls()
+                .into_iter()
+                .filter(|call| call.at > Duration::from_secs(570))
+                .count();
+            assert!(late > 0, "still trying at ten minutes");
+        }
+    }
+
+    /// 034 R21: the delayed-leave hold, at the room's entry point. Holds end
+    /// through `expire_holds`, which the feeder calls at `hold_expires_at`.
+    mod hold {
+        use super::*;
+        use std::time::Duration;
+
+        const SLOT: &str = "m.call#room";
+
+        fn member(sender: &str, key: &str, event_id: &str) -> RawStickyEvent {
+            RawStickyEvent {
+                event_id: Some(event_id.to_owned()),
+                origin: EventOrigin::encrypted(Some(format!("{key}-DEV"))),
+                ..joined_event(sender, SLOT, key)
+            }
+        }
+
+        fn leave(sender: &str, key: &str, code: LeaveCode) -> RawStickyEvent {
+            RawStickyEvent {
+                content: RawStickyEventContent {
+                    leave_reason: Some(LeaveReason::new(code)),
+                    ..left_event(sender, SLOT, key).content
+                },
+                origin: EventOrigin::encrypted(Some(format!("{key}-DEV"))),
+                ..left_event(sender, SLOT, key)
+            }
+        }
+
+        fn present(room: &BaseRtcRoom<NoopBackend>) -> Vec<String> {
+            let mut keys: Vec<String> = room
+                .subscribe_membership_snapshots(SLOT)
+                .expect("the session exists")
+                .borrow()
+                .iter()
+                .map(|member| member.sticky_key.clone())
+                .collect();
+            keys.sort();
+            keys
+        }
+
+        /// Advances paused time and expires what is due, as the feeder does.
+        async fn advance(room: &mut BaseRtcRoom<NoopBackend>, by: Duration) {
+            tokio::time::sleep(by).await;
+            room.expire_holds().await;
+        }
+
+        /// 034 R25: a peer republishing on another focus under the same
+        /// member id is an update, not a leave and a join: present throughout,
+        /// the snapshot naming the new focus.
+        #[tokio::test(start_paused = true)]
+        async fn a_republish_with_new_transports_is_a_move_not_a_leave() {
+            use crate::transport::{LiveKitTransport, RawRtcTransport, RtcTransport};
+
+            let on = |focus: &str, event_id: &str| {
+                let mut event = member("@bob:x", "bob", event_id);
+                event.content.transports = Some(MemberTransports::publishing(RawRtcTransport {
+                    transport_type: "livekit".to_owned(),
+                    extra_fields: [("livekit_service_url".to_owned(), focus.into())].into(),
+                }));
+                event
+            };
+            let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+            room.set_current_sticky_state(vec![on("https://a", "$b1")])
+                .await
+                .unwrap();
+            let mut snapshots = room.subscribe_membership_snapshots(SLOT).unwrap();
+            snapshots.mark_unchanged();
+
+            room.set_current_sticky_state(vec![on("https://b", "$b2")])
+                .await
+                .unwrap();
+            let snapshot = snapshots.borrow_and_update().clone();
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot[0].member_id, "bob");
+            assert_eq!(
+                snapshot[0].transports,
+                [RtcTransport::LiveKit(LiveKitTransport {
+                    livekit_service_url: "https://b".to_owned(),
+                })]
+            );
+            assert_eq!(room.hold_expires_at(), None, "nothing held");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_delayed_leave_is_held_ten_seconds_and_a_return_cancels_it() {
+            let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+            let mut snapshots = {
+                room.set_current_sticky_state(vec![member("@bob:x", "bob", "$b1")])
+                    .await
+                    .unwrap();
+                room.subscribe_membership_snapshots(SLOT).unwrap()
+            };
+            snapshots.mark_unchanged();
+
+            room.set_current_sticky_state(vec![leave("@bob:x", "bob", LeaveCode::DelayedLeave)])
+                .await
+                .unwrap();
+            assert!(!snapshots.has_changed().unwrap(), "held: nothing published");
+            assert!(room.hold_expires_at().is_some());
+
+            advance(&mut room, Duration::from_secs(6)).await;
+            room.set_current_sticky_state(vec![member("@bob:x", "bob", "$b2")])
+                .await
+                .unwrap();
+            assert_eq!(present(&room), ["bob"]);
+            assert_eq!(room.hold_expires_at(), None, "the return ends the hold");
+
+            advance(&mut room, Duration::from_secs(5)).await;
+            assert_eq!(present(&room), ["bob"], "still present after 10 s");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_delayed_leave_not_returned_in_ten_seconds_is_a_departure() {
+            let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+            room.set_current_sticky_state(vec![member("@bob:x", "bob", "$b1")])
+                .await
+                .unwrap();
+            let leave_set = vec![leave("@bob:x", "bob", LeaveCode::DelayedLeave)];
+            room.set_current_sticky_state(leave_set.clone())
+                .await
+                .unwrap();
+
+            advance(&mut room, Duration::from_millis(9_900)).await;
+            // The same set re-delivered inside the window keeps the first hold.
+            room.set_current_sticky_state(leave_set).await.unwrap();
+            assert_eq!(present(&room), ["bob"]);
+
+            advance(&mut room, Duration::from_millis(100)).await;
+            assert!(present(&room).is_empty(), "gone at 10 s");
+            assert_eq!(room.hold_expires_at(), None);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_plain_leave_an_expiry_and_a_join_apply_at_once_inside_the_window() {
+            let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+            room.set_current_sticky_state(vec![
+                member("@bob:x", "bob", "$b1"),
+                member("@carol:x", "carol", "$c1"),
+                member("@erin:x", "erin", "$e1"),
+            ])
+            .await
+            .unwrap();
+            room.set_current_sticky_state(vec![
+                leave("@bob:x", "bob", LeaveCode::DelayedLeave),
+                member("@carol:x", "carol", "$c1"),
+                member("@erin:x", "erin", "$e1"),
+            ])
+            .await
+            .unwrap();
+
+            advance(&mut room, Duration::from_secs(3)).await;
+            // carol hangs up, erin's entry expires (absent), dave joins.
+            room.set_current_sticky_state(vec![
+                leave("@bob:x", "bob", LeaveCode::DelayedLeave),
+                leave("@carol:x", "carol", LeaveCode::Leave),
+                member("@dave:x", "dave", "$d1"),
+            ])
+            .await
+            .unwrap();
+            assert_eq!(present(&room), ["bob", "dave"], "bob still held");
+
+            advance(&mut room, Duration::from_secs(7)).await;
+            assert_eq!(present(&room), ["dave"]);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_synapse_restart_burst_of_delayed_leaves_is_absorbed() {
+            let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+            let users: Vec<(String, String)> = (0..20)
+                .map(|n| (format!("@u{n}:x"), format!("u{n}")))
+                .collect();
+            room.set_current_sticky_state(
+                users
+                    .iter()
+                    .map(|(user, key)| member(user, key, &format!("${key}-1"))),
+            )
+            .await
+            .unwrap();
+            let mut snapshots = room.subscribe_membership_snapshots(SLOT).unwrap();
+            snapshots.mark_unchanged();
+
+            // The restart fires every delayed leave in one set.
+            room.set_current_sticky_state(
+                users
+                    .iter()
+                    .map(|(user, key)| leave(user, key, LeaveCode::DelayedLeave)),
+            )
+            .await
+            .unwrap();
+            // 19 come back by 8 s, one by one.
+            let mut set: Vec<RawStickyEvent> = users
+                .iter()
+                .map(|(user, key)| leave(user, key, LeaveCode::DelayedLeave))
+                .collect();
+            for (n, (user, key)) in users.iter().enumerate().skip(1) {
+                advance(&mut room, Duration::from_millis(400)).await;
+                set[n] = member(user, key, &format!("${key}-2"));
+                room.set_current_sticky_state(set.clone()).await.unwrap();
+            }
+            let members: Vec<_> = snapshots.borrow_and_update().clone();
+            assert_eq!(members.len(), 20, "nobody reported gone yet");
+
+            advance(&mut room, Duration::from_millis(2_400)).await;
+            assert_eq!(present(&room).len(), 19);
+            assert!(!present(&room).contains(&"u0".to_owned()));
+        }
+
+        mod properties {
+            use super::*;
+            use proptest::prelude::*;
+
+            #[derive(Clone, Copy, Debug)]
+            enum Step {
+                Join(usize),
+                Leave(usize),
+                DelayedLeave(usize),
+                Expire(usize),
+                Advance(u64),
+            }
+
+            #[derive(Clone, Copy, PartialEq)]
+            enum Entry {
+                Absent,
+                Joined(u32),
+                Left(bool),
+            }
+
+            const USERS: usize = 5;
+
+            fn step() -> impl Strategy<Value = Step> {
+                prop_oneof![
+                    (0..USERS).prop_map(Step::Join),
+                    (0..USERS).prop_map(Step::Leave),
+                    (0..USERS).prop_map(Step::DelayedLeave),
+                    (0..USERS).prop_map(Step::Expire),
+                    (0u64..6_000).prop_map(Step::Advance),
+                ]
+            }
+
+            fn set(entries: &[Entry]) -> Vec<RawStickyEvent> {
+                entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(n, entry)| {
+                        let (user, key) = (format!("@u{n}:x"), format!("u{n}"));
+                        match *entry {
+                            Entry::Absent => None,
+                            Entry::Joined(version) => {
+                                Some(member(&user, &key, &format!("${key}-{version}")))
+                            }
+                            Entry::Left(delayed) => Some(leave(
+                                &user,
+                                &key,
+                                if delayed {
+                                    LeaveCode::DelayedLeave
+                                } else {
+                                    LeaveCode::Leave
+                                },
+                            )),
+                        }
+                    })
+                    .collect()
+            }
+
+            /// Interleavings of joins, plain and delayed leaves and expiries
+            /// inside and across the window: the published members are the
+            /// model's at every step, so no member flickers out and back.
+            fn check(steps: Vec<Step>) {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .start_paused(true)
+                    .build()
+                    .unwrap();
+                runtime.block_on(async move {
+                    let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+                    let mut entries = [Entry::Absent; USERS];
+                    // Present members, and when a held one goes.
+                    let mut present: [bool; USERS] = [false; USERS];
+                    let mut held: [Option<tokio::time::Instant>; USERS] = [None; USERS];
+                    let mut version = 0u32;
+                    for step in steps {
+                        let now = tokio::time::Instant::now();
+                        match step {
+                            Step::Advance(ms) => {
+                                tokio::time::sleep(Duration::from_millis(ms)).await;
+                                room.expire_holds().await;
+                                let now = tokio::time::Instant::now();
+                                for n in 0..USERS {
+                                    if held[n].is_some_and(|until| until <= now) {
+                                        held[n] = None;
+                                        present[n] = false;
+                                    }
+                                }
+                            }
+                            Step::Join(n) => {
+                                version += 1;
+                                entries[n] = Entry::Joined(version);
+                                present[n] = true;
+                                held[n] = None;
+                            }
+                            Step::Leave(n) | Step::Expire(n) => {
+                                entries[n] = if matches!(step, Step::Leave(_)) {
+                                    Entry::Left(false)
+                                } else {
+                                    Entry::Absent
+                                };
+                                present[n] = false;
+                                held[n] = None;
+                            }
+                            Step::DelayedLeave(n) => {
+                                entries[n] = Entry::Left(true);
+                                if present[n] && held[n].is_none() {
+                                    held[n] = Some(now + DELAYED_LEAVE_HOLD);
+                                }
+                            }
+                        }
+                        if !matches!(step, Step::Advance(_)) {
+                            room.set_current_sticky_state(set(&entries)).await.unwrap();
+                        }
+                        let expected: Vec<String> = (0..USERS)
+                            .filter(|n| present[*n])
+                            .map(|n| format!("u{n}"))
+                            .collect();
+                        assert_eq!(present_keys(&room), expected, "after {step:?}");
+                    }
+                });
+            }
+
+            fn present_keys(room: &BaseRtcRoom<NoopBackend>) -> Vec<String> {
+                room.subscribe_membership_snapshots(SLOT)
+                    .map(|snapshots| {
+                        let mut keys: Vec<String> = snapshots
+                            .borrow()
+                            .iter()
+                            .map(|member| member.sticky_key.clone())
+                            .collect();
+                        keys.sort();
+                        keys
+                    })
+                    .unwrap_or_default()
+            }
+
+            proptest! {
+                #![proptest_config(ProptestConfig::with_cases(256))]
+                #[test]
+                fn hold_properties(steps in proptest::collection::vec(step(), 1..40)) {
+                    check(steps);
+                }
+            }
+        }
+
+        /// A departure confirmed at the end of the hold rotates the key; while
+        /// held, nothing is sent.
+        #[tokio::test(start_paused = true)]
+        async fn a_departure_confirmed_by_the_hold_rotates_the_key() {
+            let mock = alice_backend();
+            let origin = tokio::time::Instant::now();
+            let outbox = Outbox::with_clock(Arc::new(move || {
+                1_000_000_000 + origin.elapsed().as_millis() as u64
+            }));
+            let mut room = BaseRtcRoom::with_backend(ROOM_ID, mock.clone()).with_outbox(outbox);
+            room.on_encryption_received(true).await;
+            room.on_slots_received(vec![encrypted_call_slot()]).await;
+            join_as(&mut room, "alice-a").await;
+            let peers = |bob: RawStickyEvent| {
+                vec![
+                    bob,
+                    RawStickyEvent {
+                        origin: EventOrigin::encrypted(Some("CAROLDEV".to_owned())),
+                        ..joined_event("@carol:example.org", SLOT, "carol-a")
+                    },
+                ]
+            };
+            let bob = RawStickyEvent {
+                origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+                ..joined_event("@bob:example.org", SLOT, "bob-a")
+            };
+            room.set_current_sticky_state(peers(bob)).await.unwrap();
+            let to_carol = || {
+                mock.to_device_messages_for("@carol:example.org", "CAROLDEV")
+                    .len()
+            };
+            let served = to_carol();
+            assert_eq!(served, 1);
+
+            let bob_left = RawStickyEvent {
+                origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+                content: RawStickyEventContent {
+                    leave_reason: Some(LeaveReason::new(LeaveCode::DelayedLeave)),
+                    ..left_event("@bob:example.org", SLOT, "bob-a").content
+                },
+                ..left_event("@bob:example.org", SLOT, "bob-a")
+            };
+            room.set_current_sticky_state(peers(bob_left))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(9)).await;
+            room.expire_holds().await;
+            room.flush_due_key_rotation(SLOT).await;
+            assert_eq!(to_carol(), served, "no rotation while bob is held");
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            room.expire_holds().await;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            room.flush_due_key_rotation(SLOT).await;
+            assert!(to_carol() > served, "bob's departure rotated the key");
+        }
     }
 
     /// An MSC4354 sticky entry expires when its owner stops refreshing it — a

@@ -22,6 +22,7 @@ use crate::compat::ingest::{member_id, outbound_dialect};
 use crate::compat::{DialectBackend, LEGACY_KEY_EVENT_TYPE, MembershipFormat};
 use crate::executor::{self, AbortOnDrop, JoinHandleExt};
 use crate::feeder::{RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomRegistry, ToDeviceFeeder};
+use crate::outbox::{Outbox, SignallingHealth};
 use crate::{
     ApplicationIntake, BackendError, BaseRtcRoom, JoinError, JoinSessionParams, JoinedMembership,
     LeaveError, LeaveSessionParams, MatrixBackend, MaybeSend,
@@ -59,6 +60,9 @@ struct ClientShared<B: MatrixBackend + 'static, M> {
     to_device: StdMutex<Option<ToDeviceRunning>>,
     /// Serialises opening rooms, so two first rooms do not both subscribe.
     opening: Mutex<()>,
+    /// The retry layer every room's own sends go through, and the signalling
+    /// health they observe: one homeserver serves every room.
+    outbox: Outbox,
 }
 
 /// The client's to-device subscription and the task draining it.
@@ -110,14 +114,47 @@ where
     M: ApplicationIntake<DialectBackend<B>> + MaybeSend + 'static,
 {
     pub fn new(backend: Arc<B>) -> Self {
+        Self::with_outbox(backend, Outbox::new())
+    }
+
+    /// [`Self::new`] with the retry layer given: its clock is the one every
+    /// deadline of the client's joins is read from, which is how a test runs
+    /// a call on paused time.
+    pub fn with_outbox(backend: Arc<B>, outbox: Outbox) -> Self {
         Self {
             shared: Arc::new(ClientShared {
                 backend: Arc::new(DialectBackend::new(backend)),
                 registry: RoomRegistry::default(),
                 to_device: StdMutex::new(None),
                 opening: Mutex::new(()),
+                outbox,
             }),
         }
+    }
+
+    /// The retry layer the library's own sends go through (034 R1).
+    pub fn outbox(&self) -> &Outbox {
+        &self.shared.outbox
+    }
+
+    /// Whether the homeserver is answering the library's sends (R9).
+    pub fn signalling_health(&self) -> SignallingHealth {
+        self.shared.outbox.health()
+    }
+
+    /// Signalling health, current value first.
+    pub fn subscribe_signalling_health(&self) -> watch::Receiver<SignallingHealth> {
+        self.shared.outbox.subscribe_health()
+    }
+
+    /// The host reports its Matrix client offline or online (R11); see
+    /// [`Outbox::report_connectivity`].
+    pub fn report_connectivity(&self, online: bool) {
+        log::info!(
+            "client: host reports its Matrix client {}",
+            if online { "online" } else { "offline" }
+        );
+        self.shared.outbox.report_connectivity(online);
     }
 
     /// The host's backend behind the dialect wrapper, which every room state
@@ -202,10 +239,10 @@ impl<B: MatrixBackend + 'static> BaseRtcClient<B> {
         options: RoomOptions,
     ) -> Result<BaseRtcRoomHandle<B>, OpenError> {
         let room_id = room_id.into();
-        let room = Arc::new(Mutex::new(BaseRtcRoom::with_backend(
-            room_id.clone(),
-            self.shared.backend.clone(),
-        )));
+        let room = Arc::new(Mutex::new(
+            BaseRtcRoom::with_backend(room_id.clone(), self.shared.backend.clone())
+                .with_outbox(self.shared.outbox.clone()),
+        ));
         self.open_with(room_id, room, options).await
     }
 }

@@ -35,6 +35,10 @@ reqwest.workspace = true
 # webrtc-sys, so building this crate needs a C++ toolchain — CI jobs that lack
 # one must not build this crate.
 livekit.workspace = true
+# Only to name `SignalError`, whose HTTP status tells a rejected token or a
+# refusal from a transient failure (034 R24); livekit's own version and
+# features.
+livekit-api = { version = "0.5", default-features = false }
 # Stream combinators for draining the LiveKit audio stream in the media helpers.
 futures-util = "0.3"
 [target.'cfg(target_os = "android")'.dependencies]

@@ -245,6 +245,25 @@ Membership is always applied as a complete set: a member whose event is absent f
 - `BaseRtcClient` opens rooms (one live handle per room; a second is refused)
   and runs their feeds; `BaseRtcRoomHandle::seeded` resolves once the room's
   current state has been applied.
+- `outbox`: the one retry layer for every send the library makes on its own
+  initiative (034 R1). A send names its slot (scope + kind); a newer send of
+  the same slot supersedes it, never two attempts of one slot are in flight,
+  failures are classified on the host's error (`BackendError::is_permanent`:
+  a refusal is never retried), the rest retried on capped backoff (1 s to
+  30 s, or the server's retry-after), each attempt bounded at 30 s. One per
+  client, and with it the client's **health cell**: `SignallingHealth`
+  (reachable, or unreachable since a time), fed by those sends and the host's
+  `report_connectivity` (R9–R11). Its clock is every deadline's, so
+  `Outbox::with_clock` (through `RtcClient::with_outbox`) runs a call on
+  paused time.
+- Our membership through an outage (`own_membership`, `upkeep`): the lapse
+  predicted from our own deadlines while sends fail (R17), and on signalling's
+  return a probe of the delayed leave, a re-arm and one republish when it
+  fired, or the next complete membership set deciding when it did not (R19).
+  Receiving side: a member's `delayed_leave` is held 10 s before it counts
+  (R21), so a homeserver firing every delay at startup is not a mass
+  departure; a media key a member's device did not get is retried to that
+  member until it lands (R32).
 
 - A join names its slot, application and transport; who joins is the
   backend's account. Choosing the transport is the application's.
@@ -331,8 +350,15 @@ Membership is always applied as a complete set: a member whose event is absent f
   the frame-encryption diagnostic.
 - The engine's actor drives the pool rather than running beside it, so a
   member's join reaches the roster before their media does. Only the *own*
-  focus — established synchronously by the caller so join can fail fast,
-  then handed over via `adopt_own_connection` — ends the call when it dies.
+  focus ends the call, and only once its reconnect budget is spent or it
+  refuses us (034 R24): `attach_media` hands the pool the own handle
+  unconnected (`connect_own`), so a join never waits for the SFU.
+- `Interruptions` (034 R38): every cause interrupting the call in its own
+  field — signalling, our membership's lapse, our own media, members
+  reconnecting or unreachable, those we cannot decrypt (missing key, bad
+  key, or a track sent in clear and refused) and unmappable identities —
+  published after the roster of the same change. Our publications are muted
+  at the transport while our membership has lapsed (R17).
 - `attach_media` attaches media to a joined `RtcCall`: the one copy of the
   order-sensitive wiring (identity mapper before key handler, key listeners
   before the replay of held keys, replay before the own-focus connect, our
@@ -389,6 +415,17 @@ Membership is always applied as a complete set: a member whose event is absent f
   transport identities to `member_id`s, buffers media and keys that arrive
   before their membership, and debounces per-stream `MediaConstraints`
   (re-applied whenever a stream (re)appears or its connection resumes).
+  Our own focus is reconnected behind the same handle
+  (`TransportConnection::reconnect`) on backoff for 60 s from the loss or
+  the first connect request, the token reused until rejected and refetched
+  once (034 R24); with `PoolConfig::sfu_fallback`, our own focus down 10 s
+  while signalling works and a peer connection is up hands our handle the
+  busiest peer focus's connection (`hand_over`/`take_over`, R25) — a second
+  connect with our identity would evict the pool's own. Tracks remember the
+  connection they came over, so a moved member's late removal is ignored.
+- `testing` (feature): `ScriptedTransport`, a transport whose connections a
+  test interrupts, closes, restores, refuses or makes reject a token — the
+  call SDK's scenario tests and the FFI's debug artifacts use it.
 - `livekit`: the pure half of the MSC4195 control plane, shared by the native
   transport and the web binding — `identity` (the hash derivations), `token`
   (`/get_token` and legacy `/sfu/get` request builders and the response
@@ -461,6 +498,13 @@ Membership is always applied as a complete set: a member whose event is absent f
   runs on a dedicated multithreaded tokio runtime — the core's `?Send`
   futures never touch it. Android gets a `JNI_OnLoad` that initialises
   libwebrtc.
+- Behind the **`testing` feature** (debug artifacts only, 034 contract C16):
+  `ScriptedMatrixBackend` (a host trait implementation over the core's
+  `MockBackend`) and `ScriptedMediaTransport` with
+  `connect_scripted_media_session`, so a host's own tests can take the
+  homeserver or an SFU away, by hand or by fixture key. The behaviour hosts
+  build on is specified in feature-hq's
+  `plans/034.rust_rtc_transient_resilience/contract.md`, not restated here.
 
 ## `crates/matrix-rtc-livekit`
 

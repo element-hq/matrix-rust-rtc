@@ -10,7 +10,55 @@ log only.
 
 ### Breaking
 
+- `ConnectionState` (FFI `FfiConnectionState`, web `RtcConnectionState`) gains `Connecting`: our own media before our SFU is first up, so a call no longer opens with `own_media` reconnecting (034 C11).
+- `Participant`/`CallTile`'s `decryptable` is `unable_to_decrypt` (`MissingKey`, `BadKey`, `NotEncrypted`; FFI `FfiUnableToDecrypt`, web `RtcUnableToDecrypt`), and `Interruptions.undecryptable` is `unable_to_decrypt` (034 C6).
+- `AttachOptions`, `LiveKitAttachOptions`, `LiveKitCallOptions`, `EngineConfig` and `PoolConfig` take `sfu_fallback`, `PoolEvent` gains `OwnFocusMoved`, and the FFI `MediaSession` holds any transport's connection (034 R25, C16).
+- `CallEnd::ConnectionClosed` (FFI `FfiCallEnd`, web `loss_reason`) carries a `ConnectionLossReason` (`Budget`, `Refused`, `NeverConnected`), `MediaStatusReporter::lost` takes it, and `OwnFocusTransport` gains `prepare_own` and `TransportConnection` `reconnect` (034 R24, R27).
+- `attach_media` (FFI `connect_media_session`, web `connectMedia`) returns without waiting for our own SFU, which connects under the reconnect budget like a loss; `LiveKitTransportConnection::session` returns an `Option<Arc<_>>` (034 R24, C10).
+- `Participant`/`CallTile` (FFI `FfiParticipant`/`FfiCallTile`, web roster entries) replace `reachable` with `connection` (`Connected`, `Reconnecting`, `Unreachable`) and gain `decryptable`; `EngineConfig` takes the signalling health and our membership's lapse (034 R23, R28, R33).
 - `EventEncryption`'s `sender_cross_signed` is `sender_confirmed` (FFI `senderConfirmed`), the client's verdict on the sender under its own trust settings; `require_cross_signed_sender` is `require_confirmed_sender` and `KeyRejection::NotCrossSigned` is `SenderNotConfirmed` (web `sender_not_confirmed`).
+- `RtcCall::leave` (FFI `leave`, web `leave`) returns once the call has ended, without waiting for the one-attempt leave send, and fails only when the call was already over (034 R8).
+- `notify_session_started` takes the client's `Outbox` and the join's deadline, and `OwnMembershipMachine::join` a deadline (034 R1, R6).
+- `CommandError::SendError(String)` is `CommandError::Backend(BackendError)`, and `BackendError` (FFI `FfiBackendError.Failed`, web via `data.retry_after_ms` and `permanent`) gains `retry_after_ms` and `permanent`, so the library classifies a host's failure on its error code (034 R3).
+
+### Added
+
+- Debug builds of the media FFI (the `testing` feature) export `ScriptedMatrixBackend`, `ScriptedMediaTransport` and `connect_scripted_media_session`, scriptable by hand or by fixture key, for hosts' own tests (034 C16).
+- `MockBackend::set_outage`, `matrix_rtc_transport::testing::ScriptedTransport` and `RtcClient::with_outbox` let a test take the homeserver or an SFU away and run a call on paused time (034).
+- With `sfu_fallback` on (FFI `MediaSessionConfig.sfu_fallback`, off by default), our media moves to the busiest other member's SFU after our own has been down 10 s while signalling works and a peer connection is up, and our membership is republished naming it under the same member id (034 R25).
+- `RtcClient` reports signalling health (`signalling_health`/`subscribe_signalling_health`, web `signallingHealth`/`onSignallingHealth`) and takes the host's `report_connectivity` (web `reportConnectivity`) (034 R9–R11).
+- `BaseRtcRoom::subscribe_own_membership_lapsed` reports when our membership has lapsed for the other members while our sends fail (034 R17).
+- `CallEngine::interruptions`/`subscribe_interruptions` (FFI `MediaSession.interruptions`/`next_interruptions`, web `interruptions()` and `onInterruptions`) report every cause interrupting the call in its own field, after the roster of the same change (034 R16, R38).
+- While our membership has lapsed, our publications are muted at the transport and resume as the user left them, with nothing moving on our own tile (034 R17).
+- A media key a rollout could not deliver is retried to that member on backoff until it lands or they leave, and a rotation supersedes it (`undelivered_key_members`) (034 R32).
+
+### Changed
+
+- Our own SFU is retried at most 10 s apart with one last attempt when the reconnect budget runs out, so an SFU back late in the budget is reconnected rather than the call ending (034 R24).
+
+- Our own SFU is reconnected behind the same handle, local publications and their mute included, for 60 s from the loss (`own_reconnect_budget_ms`), fetching a new token once if the SFU rejects it; only then, or on a refusal, does the call end, after issuing its leave (034 R24, R26).
+- A join completes or fails within 30 s of the call: transient failures of the transports read, the publish and the notification are retried inside it, and it fails with `JoinError::TimedOut` or `JoinError::Refused` (FFI `JoinTimedOut`, `JoinRefused`) (034 R6, R27).
+
+- Our membership's refresh, delayed-leave restart and re-arm are retried until they land, the refresh falls due at a third of the lifetime instead of half, and when signalling returns the library re-arms and republishes only what the outage lost (034 R1, R18, R19).
+- A member whose delayed leave fires stays on the roster for 10 s and is not reported gone if they come back within it, so a homeserver restart no longer flickers everyone out (034 R21).
+- Joins and leaves are announced from our first roster on, through a lapse of our own membership, so a member who joined while our homeserver was unreachable is announced when it returns (034 R16).
+- A reaction is retried for at most 5 s and then fails with the new `ReactionError::NotSent` (FFI and web `Reaction("not sent")`) instead of landing late, and the cooldown starts only once it lands (034 R4).
+- `raise_hand`/`lower_hand` show the hand at once and resolve once it has landed, retrying through an outage; a reversal or the call ending resolves them `Ok`, and only a permanent refusal fails them, the hand back where it was (034 R5).
+
+### Fixed
+- The token exchange's HTTP client trusts the native root store and `SSL_CERT_FILE` as the signalling socket does, so a dev stack's own CA works for the whole media path.
+- A failed SFU token request is logged with its cause (an unknown certificate issuer, a refused connection), not just "error sending request".
+- `ActiveSpeakers` (and so a tile's `speaking`) lists everyone speaking, not only those whose state just changed, so a member talking steadily keeps the flag when someone else starts or stops.
+- The Rust reference backend reports a send its crypto refuses (our own device unsigned, MSC4153) as a final failure, not as signalling unreachable: a media key is not retried, and a sticky membership fails the join.
+- A member we cannot decrypt keeps their video flowing at the lowest layer even while the host hides it, so a key that arrives late is seen to work instead of leaving them on the key error until they unmute.
+- Our membership leaving the room while we are in the call (our delayed leave firing on a stall, or a leave with no reason) is put back at once, not at the next delayed-leave restart.
+
+- A member is shown unable to decrypt only once their frames have failed for `StabilityConfig::key_grace` (FFI `key_grace_ms`, 4 s by default) without a break, so key rotations no longer flicker their tile or the interruptions record (034 C6).
+- A member's track replaced by a new one before the old was removed, as when they move to another SFU, is reported as `StreamStopped` then `StreamStarted`, so hosts reopen their reader instead of freezing on the old track (034 R25).
+- A track declared unencrypted in an encrypted call is refused instead of played, and its member reads `NotEncrypted`: livekit gave it no frame cryptor, so a misconfigured client or the SFU could put clear media on their tile (034 C6).
+- A member arriving during a key switch is no longer handed the key still in use, which was minted before they joined and exposed its history; they decrypt once the new key is used, at most `delay_before_use_ms` later (034).
+- A member whose membership lapses and returns under the same member id gets their media back instead of reappearing silent (034 R19).
+- Our own SFU restarted under a call is reconnected with a fresh token instead of the call ending, the restarted SFU having forgotten the room (a 404) (034 R24).
 
 ## v0.5.0-rc.5 - 2026-10-15
 

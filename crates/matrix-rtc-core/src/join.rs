@@ -35,11 +35,16 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
 /// Distinct from [`DEFAULT_KEEP_ALIVE_TIMEOUT_MS`]: that one arms the delayed
 /// leave (the dead man's switch for a client that dies), while this one is how
 /// long the homeserver keeps our membership in the sticky map at all. Both are
-/// refreshed by [`keep_alive`], the sticky one only once it is halfway to
-/// expiry.
+/// refreshed by [`keep_alive`], the sticky one only once a third of it has
+/// passed.
 ///
 /// [`keep_alive`]: crate::OwnMembershipMachine::keep_alive
 pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
+
+/// How long a join may take from the moment the library receives it to our
+/// membership being published (034 R6): every step's transient failures are
+/// retried inside it, and a join still not through at its end fails.
+pub const DEFAULT_JOIN_BUDGET_MS: u64 = 30_000;
 
 /// The longest sticky lifetime that is actually honoured (1 hour).
 ///

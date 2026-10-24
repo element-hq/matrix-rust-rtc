@@ -22,6 +22,7 @@
 //! bounds vanish ([`MaybeSend`]): a browser transport wraps livekit-js through
 //! `JsValue`s, which are `!Send`, and the engine runs on the JS event loop.
 
+use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -34,6 +35,23 @@ use crate::frame::{AudioFrame, VideoFrame};
 use crate::local::{LocalTrackHandle, PublishOptions};
 use crate::stats::ReceiveStats;
 use crate::stream::MediaStreamKind;
+
+/// Whether the connection carrying someone's media is up (034 R23, R28).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ConnectionState {
+    /// Up; a peer's connection also while it is opened for the first time.
+    #[default]
+    Connected,
+    /// Our own media only: being opened for the first time, failing to or not,
+    /// until it is first up (034 R23). Not an interruption: the call is still
+    /// starting.
+    Connecting,
+    /// Being re-established after a loss, for as long as that takes: a
+    /// connection is never given up while a member is on it.
+    Reconnecting,
+    /// No transport can serve what the member advertises.
+    Unreachable,
+}
 
 /// Whether a participant's frames are encrypting and decrypting cleanly.
 ///
@@ -85,6 +103,14 @@ pub enum TransportError {
     /// The connection is gone.
     #[error("transport connection closed: {0}")]
     Closed(String),
+    /// The SFU rejected the token a connect presented; a fresh one may
+    /// succeed (034 R24).
+    #[error("the SFU rejected the token: {0}")]
+    TokenRejected(String),
+    /// The SFU or the token service refused us for good (a 4xx): retrying
+    /// cannot help (034 R24).
+    #[error("refused: {0}")]
+    Refused(String),
 }
 
 /// Our own membership identity, as transports need it for authentication and
@@ -191,6 +217,14 @@ pub enum ConnectionEvent {
         identity: String,
         state: FrameEncryptionState,
     },
+    /// The participant published a track declared unencrypted in our
+    /// encrypted call. The transport refuses it, never as a `TrackAdded`: its
+    /// frames would be played as they come, and the SFU, which relays that
+    /// declaration, could inject its own under the participant's name.
+    TrackNotEncrypted {
+        identity: String,
+        kind: MediaStreamKind,
+    },
     /// The connection lost its transport link and is re-establishing it.
     Reconnecting,
     Reconnected,
@@ -240,6 +274,11 @@ impl fmt::Debug for ConnectionEvent {
                 .field("identity", identity)
                 .field("state", state)
                 .finish(),
+            Self::TrackNotEncrypted { identity, kind } => f
+                .debug_struct("TrackNotEncrypted")
+                .field("identity", identity)
+                .field("kind", kind)
+                .finish(),
             Self::Reconnecting => f.write_str("Reconnecting"),
             Self::Reconnected => f.write_str("Reconnected"),
             Self::Closed { message } => f.debug_struct("Closed").field("message", message).finish(),
@@ -286,7 +325,9 @@ pub trait MediaTransport: MaybeSend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait TransportConnection: MaybeSend {
-    /// The grouping key this connection serves.
+    /// The grouping key this connection was opened for. A handle that took
+    /// another over ([`Self::take_over`]) serves that one's from then on,
+    /// which its owner keeps track of.
     fn connection_key(&self) -> &str;
 
     /// Publish a local track on this connection (only ever called on the own
@@ -319,6 +360,44 @@ pub trait TransportConnection: MaybeSend {
     /// without frame encryption.
     fn set_local_key_index(&self, _key_index: u8) {}
 
+    /// Establish this connection again behind the same handle, after a loss
+    /// or for a first connect (034 R24): the handle, and every local
+    /// publication made through it, stays valid and is carried onto the new
+    /// connection. `fresh_token` asks for a new token instead of the one the
+    /// last connect used. Resolves with the new connection's events.
+    ///
+    /// Only the own focus is reconnected this way; the default refuses, for
+    /// transports whose connections cannot be.
+    async fn reconnect(
+        &self,
+        _fresh_token: bool,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        Err(TransportError::Unsupported(
+            "this connection cannot be re-established".into(),
+        ))
+    }
+
+    /// This connection's established session, for another handle of the
+    /// same transport to [`take_over`](Self::take_over) (034 R25): opaque,
+    /// and only meaningful to that transport. Changes nothing by itself; once
+    /// taken over, this handle is no longer used. `None` while not connected,
+    /// and by default.
+    fn hand_over(&self) -> Option<Box<dyn Any>> {
+        None
+    }
+
+    /// Move this handle onto the session another connection
+    /// [handed over](Self::hand_over) (034 R25): its focus becomes this
+    /// handle's, every publication made through this handle goes out there,
+    /// and a later [`reconnect`](Self::reconnect) goes there too. A reconnect
+    /// still in flight is abandoned. Synchronous, so its owner decides
+    /// between it and such a reconnect in one step. The default refuses.
+    fn take_over(&self, _handover: Box<dyn Any>) -> Result<(), TransportError> {
+        Err(TransportError::Unsupported(
+            "this connection cannot take another over".into(),
+        ))
+    }
+
     /// Close the connection. Idempotent.
     async fn close(&self) -> Result<(), TransportError>;
 }
@@ -338,4 +417,10 @@ pub trait OwnFocusTransport: MediaTransport {
         connection_key: &str,
         ctx: &ConnectionContext,
     ) -> Result<(Self::Connection, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError>;
+
+    /// The own-focus handle, not connected yet: the pool establishes it
+    /// through [`TransportConnection::reconnect`], so a join does not wait
+    /// for the SFU (034 R24, contract C10). Publications made through it
+    /// before then go out once it connects.
+    fn prepare_own(&self, connection_key: &str, ctx: &ConnectionContext) -> Self::Connection;
 }

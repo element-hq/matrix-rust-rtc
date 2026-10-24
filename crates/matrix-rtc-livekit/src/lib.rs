@@ -71,7 +71,7 @@ pub mod android {
 ///
 /// The one place the token dialect is chosen, so the two `connect` entry points
 /// cannot drift apart.
-async fn acquire_token(
+pub(crate) async fn acquire_token(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,
     backend: &dyn MatrixBackend,
@@ -138,10 +138,22 @@ pub async fn connect_e2ee(
     key_provider: livekit::e2ee::key_provider::KeyProvider,
     auto_subscribe: bool,
 ) -> Result<LiveKitConnection, Error> {
+    let sfu_token = acquire_token(http, config, backend).await?;
+    LiveKitSession::connect_with_options(
+        &sfu_token,
+        e2ee_room_options(key_provider, auto_subscribe),
+    )
+    .await
+}
+
+/// The room options of an E2EE connection: GCM frame encryption through
+/// `key_provider`, dynacast, and `auto_subscribe` as given.
+pub(crate) fn e2ee_room_options(
+    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    auto_subscribe: bool,
+) -> livekit::RoomOptions {
     use livekit::RoomOptions;
     use livekit::e2ee::{E2eeOptions, EncryptionType};
-
-    let sfu_token = acquire_token(http, config, backend).await?;
 
     // RoomOptions is #[non_exhaustive]; mutate a default instance.
     let mut options = RoomOptions::default();
@@ -153,7 +165,7 @@ pub async fn connect_e2ee(
     // are actually subscribed and unneeded ones stop being encoded.
     options.dynacast = true;
     options.auto_subscribe = auto_subscribe;
-    LiveKitSession::connect_with_options(&sfu_token, options).await
+    options
 }
 
 /// Errors produced by the LiveKit transport.

@@ -32,6 +32,10 @@ set -e
 #            dead-stripped from the static archive otherwise, aborting at
 #            runtime with `+[NSString stringForAbslStringView:]: unrecognized
 #            selector`). See mobile/PACKAGING.md.
+#            The debug variant (`--profile dev`) also carries the `testing`
+#            feature: `ScriptedMatrixBackend`, `ScriptedMediaTransport` and
+#            `connect_scripted_media_session` for the host's own tests (034
+#            contract C16). Release profiles never do.
 #
 # Targets: aarch64-apple-ios (device) + aarch64-apple-ios-sim, plus
 # x86_64-apple-ios (Intel simulator) for the slim variant only.
@@ -83,6 +87,10 @@ SIM_TARGETS=(aarch64-apple-ios-sim)
 if [ "${MEDIA:-0}" = "1" ]; then
     FEATURE_ARGS=(--features media)
     echo "Building iOS XCFramework (MEDIA variant: frame streams + publishing)..."
+    if [ "$PROFILE" = "dev" ]; then
+        FEATURE_ARGS=(--features media,testing)
+        echo "Debug build: with the scripted test fakes (testing feature)."
+    fi
     # No x86_64 (Intel-Mac) simulator slice for the media variant: livekit
     # publishes no libwebrtc for it (their CI builds ios arm64 + arm64-sim
     # only), and webrtc-sys additionally mis-maps x86_64-apple-ios to a

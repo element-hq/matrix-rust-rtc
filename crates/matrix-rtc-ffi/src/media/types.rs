@@ -43,6 +43,91 @@ impl From<matrix_rtc_transport::MediaStreamKind> for FfiStreamKind {
     }
 }
 
+/// The connection carrying someone's media (034 R23, R28). Contract C6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConnectionState {
+    /// Up; a peer's connection also while it is opened for the first time.
+    Connected,
+    /// Our own media only: not yet up for the first time. The call is still
+    /// starting, so not an interruption.
+    Connecting,
+    /// Being re-established after a loss, for as long as that takes; never
+    /// given up while a member publishes there.
+    Reconnecting,
+    /// No transport can serve what the member advertises.
+    Unreachable,
+}
+
+impl From<matrix_rtc_call_sdk::ConnectionState> for FfiConnectionState {
+    fn from(state: matrix_rtc_call_sdk::ConnectionState) -> Self {
+        use matrix_rtc_call_sdk::ConnectionState as State;
+        match state {
+            State::Connected => Self::Connected,
+            State::Connecting => Self::Connecting,
+            State::Reconnecting => Self::Reconnecting,
+            State::Unreachable => Self::Unreachable,
+        }
+    }
+}
+
+/// Why a member's media is not shown although it may be arriving (034 R33).
+/// Draw the avatar for every case. Contract C6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiUnableToDecrypt {
+    /// Their key has not reached us; after `FfiStabilityConfig.key_grace_ms`
+    /// of failing frames.
+    MissingKey,
+    /// We hold a key for their frames but it does not decrypt them; after
+    /// `FfiStabilityConfig.key_grace_ms` of failing frames.
+    BadKey,
+    /// They published a track declared unencrypted, which is refused and
+    /// never played; at once.
+    NotEncrypted,
+}
+
+impl From<matrix_rtc_call_sdk::UnableToDecrypt> for FfiUnableToDecrypt {
+    fn from(reason: matrix_rtc_call_sdk::UnableToDecrypt) -> Self {
+        use matrix_rtc_call_sdk::UnableToDecrypt as Reason;
+        match reason {
+            Reason::MissingKey => Self::MissingKey,
+            Reason::BadKey => Self::BadKey,
+            Reason::NotEncrypted => Self::NotEncrypted,
+        }
+    }
+}
+
+/// What is interrupting the call now, cause by cause (034 R38). Contract C5.
+///
+/// Each cause changes on its own; the record is empty (reachable, not
+/// lapsed, connected, empty lists) when nothing is interrupted. Member lists
+/// hold `member_id`s on the roster; `unmappable` holds transport identities,
+/// which map to no member. `own_media` is authoritative for our own SFU from
+/// the first value, before our own tile exists.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct FfiInterruptions {
+    pub signalling: crate::FfiSignallingHealth,
+    pub own_membership_lapsed: bool,
+    pub own_media: FfiConnectionState,
+    pub members_reconnecting: Vec<String>,
+    pub members_unreachable: Vec<String>,
+    pub unable_to_decrypt: Vec<String>,
+    pub unmappable: Vec<String>,
+}
+
+impl From<matrix_rtc_call_sdk::Interruptions> for FfiInterruptions {
+    fn from(record: matrix_rtc_call_sdk::Interruptions) -> Self {
+        Self {
+            signalling: record.signalling.into(),
+            own_membership_lapsed: record.own_membership_lapsed,
+            own_media: record.own_media.into(),
+            members_reconnecting: record.members_reconnecting,
+            members_unreachable: record.members_unreachable,
+            unable_to_decrypt: record.unable_to_decrypt,
+            unmappable: record.unmappable,
+        }
+    }
+}
+
 /// Live state of one stream of a participant.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiStreamState {
@@ -58,8 +143,13 @@ pub struct FfiParticipant {
     pub user_id: String,
     pub device_id: Option<String>,
     pub is_local: bool,
-    /// Whether any transport can reach this member's media.
-    pub reachable: bool,
+    /// The connection carrying this member's media; for our own row, our
+    /// own SFU's. Contract C6.
+    pub connection: FfiConnectionState,
+    /// Why their media cannot be shown, if it cannot; a key failure only
+    /// after `FfiStabilityConfig.key_grace_ms` (4 s) without a break, so a key rotation does not flicker it.
+    /// Always `None` for our own row.
+    pub unable_to_decrypt: Option<FfiUnableToDecrypt>,
     pub streams: Vec<FfiStreamState>,
     /// When this participant raised their hand (ms since the epoch), or
     /// `None` while it is down.
@@ -77,7 +167,8 @@ impl From<matrix_rtc_call_sdk::Participant> for FfiParticipant {
             user_id: participant.user_id,
             device_id: participant.device_id,
             is_local: participant.is_local,
-            reachable: participant.reachable,
+            connection: participant.connection.into(),
+            unable_to_decrypt: participant.unable_to_decrypt.map(Into::into),
             hand_raised_at_ms: participant.hand_raised_at_ms,
             hand_raised_position: participant.hand_raised_position,
             streams: participant
@@ -187,7 +278,13 @@ pub struct FfiCallTile {
     pub hand_raised_at_ms: Option<u64>,
     /// See `FfiParticipant.hand_raised_position`.
     pub hand_raised_position: Option<u32>,
-    pub reachable: bool,
+    /// The connection carrying this member's media; on the own tile, our own
+    /// SFU's. Draw the avatar over a remote tile that is not `Connected` or
+    /// is `unable_to_decrypt`: `has_video` does not move for either.
+    /// Contract C6.
+    pub connection: FfiConnectionState,
+    /// See `FfiParticipant.unable_to_decrypt`. Always `None` on the own tile.
+    pub unable_to_decrypt: Option<FfiUnableToDecrypt>,
 }
 
 impl From<matrix_rtc_call_sdk::CallTile> for FfiCallTile {
@@ -205,7 +302,8 @@ impl From<matrix_rtc_call_sdk::CallTile> for FfiCallTile {
             speaking: t.speaking,
             hand_raised_at_ms: t.hand_raised_at_ms,
             hand_raised_position: t.hand_raised_position,
-            reachable: t.reachable,
+            connection: t.connection.into(),
+            unable_to_decrypt: t.unable_to_decrypt.map(Into::into),
         }
     }
 }
@@ -246,8 +344,8 @@ impl From<matrix_rtc_call_sdk::LocalState> for FfiLocalState {
     }
 }
 
-/// How much the tile order is damped (R10, R11). A product decision rather
-/// than a protocol one, so a host can tune it; the defaults are what
+/// How much the tile order (R10, R11) and a tile's key failures (034 C6) are
+/// damped. A product decision rather than a protocol one, so a host can tune it; the defaults are what
 /// `matrix_rtc_call_sdk::StabilityConfig` uses.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiStabilityConfig {
@@ -262,6 +360,11 @@ pub struct FfiStabilityConfig {
     /// Reorders inside this window are delivered as one.
     #[uniffi(default = 300)]
     pub coalesce_ms: u64,
+    /// How long a member's frames must fail to decrypt, without a break,
+    /// before `unable_to_decrypt` shows `MissingKey` or `BadKey`. Too short
+    /// and a key rotation flashes it.
+    #[uniffi(default = 4000)]
+    pub key_grace_ms: u64,
 }
 
 impl From<FfiStabilityConfig> for matrix_rtc_call_sdk::StabilityConfig {
@@ -270,6 +373,7 @@ impl From<FfiStabilityConfig> for matrix_rtc_call_sdk::StabilityConfig {
             promote: Duration::from_millis(c.promote_ms),
             demote: Duration::from_millis(c.demote_ms),
             coalesce: Duration::from_millis(c.coalesce_ms),
+            key_grace: Duration::from_millis(c.key_grace_ms),
         }
     }
 }

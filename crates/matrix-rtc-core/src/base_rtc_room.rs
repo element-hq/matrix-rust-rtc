@@ -23,10 +23,14 @@ use crate::host::backend::MatrixBackend;
 use crate::host::event::{EventConversionError, RawStickyEvent};
 use crate::join::{JoinSessionParams, LeaveSessionParams};
 use crate::membership_listener::{MembershipListener, MembershipListeners, MembershipScope};
-use crate::session::{JoinedMembership, LeaveReason, RtcMembershipEvent, SlotSession};
+use crate::outbox::Outbox;
+use crate::session::{
+    JoinedMembership, LeaveReason, PendingLeave, RtcMembershipEvent, SlotSession,
+};
 use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
+use crate::transport::RtcTransport;
 
 /// One room's RTC state and the slot sessions in it.
 pub struct BaseRtcRoom<T: MatrixBackend> {
@@ -46,6 +50,9 @@ pub struct BaseRtcRoom<T: MatrixBackend> {
     room_members: Option<HashSet<String>>,
     room_encryption: Option<RoomEncryption>,
     membership_listeners: MembershipListeners,
+    /// The retry layer this room's joins send through: its own, or the
+    /// client's once [`Self::with_outbox`] hands it over.
+    outbox: Outbox,
 }
 
 impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
@@ -60,7 +67,21 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             room_members: None,
             room_encryption: None,
             membership_listeners: MembershipListeners::default(),
+            outbox: Outbox::new(),
         }
+    }
+
+    /// Sends this room's joins through `outbox`, the client's, so one
+    /// homeserver's signalling health covers every room (034 R9). Set before
+    /// the first slot is used.
+    pub fn with_outbox(mut self, outbox: Outbox) -> Self {
+        self.outbox = outbox;
+        self
+    }
+
+    /// The retry layer this room's joins send through.
+    pub fn outbox(&self) -> &Outbox {
+        &self.outbox
     }
 
     /// Creates an empty room with a backend.
@@ -114,6 +135,16 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
     /// Returns the event id of the membership event this join sent; see
     /// [`SlotSession::join`].
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
+        self.join_within(params, None).await
+    }
+
+    /// [`Self::join`] under a budget that ends at `deadline` (034 R6); see
+    /// [`SlotSession::join_within`].
+    pub async fn join_within(
+        &mut self,
+        params: JoinSessionParams,
+        deadline: Option<crate::executor::Instant>,
+    ) -> Result<String, JoinError> {
         let backend = self
             .backend
             .as_ref()
@@ -157,7 +188,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             session.set_backend(backend);
         }
 
-        session.join(params).await
+        session.join_within(params, deadline).await
     }
 
     /// Leaves one slot.
@@ -181,6 +212,24 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         })?;
 
         session.leave(params).await
+    }
+
+    /// The part of [`Self::leave`] that needs the room; the returned leave
+    /// sends without it (034 R8). See [`SlotSession::begin_leave`].
+    pub async fn begin_leave(
+        &mut self,
+        slot_id: &str,
+        params: LeaveSessionParams,
+    ) -> Result<PendingLeave<T>, LeaveError> {
+        let session = self.sessions.get_mut(slot_id).ok_or_else(|| {
+            log::warn!(
+                "[{}/{slot_id}] leave rejected: no such session",
+                self.room_id
+            );
+            LeaveError::CommandError(CommandError::from_message("session not found"))
+        })?;
+
+        session.begin_leave(params).await
     }
 
     /// Applies the **complete** current sticky state of the room.
@@ -271,6 +320,31 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         Ok(())
     }
 
+    /// The members of one slot a key rollout has not reached yet, retried on
+    /// backoff (034 R32); `None` while the slot has no joined session.
+    pub fn undelivered_key_members(&self, slot_id: &str) -> Option<Vec<String>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(SlotSession::undelivered_key_members)
+    }
+
+    /// When the earliest delayed-leave hold of any slot ends (see
+    /// [`SlotSession::hold_expires_at`]).
+    pub fn hold_expires_at(&self) -> Option<crate::executor::Instant> {
+        self.sessions
+            .values()
+            .filter_map(SlotSession::hold_expires_at)
+            .min()
+    }
+
+    /// Applies every delayed leave whose hold has ended, in every slot (see
+    /// [`SlotSession::expire_holds`]).
+    pub async fn expire_holds(&mut self) {
+        for session in self.sessions.values_mut() {
+            session.expire_holds().await;
+        }
+    }
+
     /// One keep-alive tick for one slot (see [`SlotSession::keep_alive`]).
     /// Returns `false` if the slot is not joined.
     pub async fn keep_alive(&mut self, slot_id: &str) -> bool {
@@ -357,6 +431,14 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             .and_then(|session| session.own_membership_event_id())
     }
 
+    /// Follows whether our membership in one slot has lapsed for the other
+    /// members (034 R17), current value first; `None` if it is not joined.
+    pub fn subscribe_own_membership_lapsed(&self, slot_id: &str) -> Option<watch::Receiver<bool>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(|session| session.subscribe_own_membership_lapsed())
+    }
+
     /// Re-signals every key one slot already holds to its signal handler.
     ///
     /// Call after installing both the handler and the identity mapper: keys
@@ -378,6 +460,18 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         self.sessions
             .get(slot_id)
             .and_then(|session| session.key_rotation_due_at_ms())
+    }
+
+    /// Our membership in one slot republished naming `transport`
+    /// (see [`SlotSession::republish_transports`]).
+    pub fn republish_transports(
+        &self,
+        slot_id: &str,
+        transport: RtcTransport,
+    ) -> Option<impl Future<Output = ()> + use<T>> {
+        self.sessions
+            .get(slot_id)
+            .and_then(|session| session.republish_transports(transport))
     }
 
     /// Follows our membership event id in one slot, which moves on every
@@ -717,6 +811,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         let slot = self.slot_state(slot_id);
         let room_members = self.room_members.clone();
         let backend = self.backend.clone();
+        let outbox = self.outbox.clone();
         let room_id = self.room_id.clone();
         let membership_scope = MembershipScope {
             slot_id: slot_id.to_owned(),
@@ -735,7 +830,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             );
 
             let mut session =
-                SlotSession::new(room_id, slot_id.to_owned(), backend, membership_scope);
+                SlotSession::new(room_id, slot_id.to_owned(), backend, membership_scope, outbox);
             if let Some(slot) = slot {
                 session.seed_slot_state(slot);
             }

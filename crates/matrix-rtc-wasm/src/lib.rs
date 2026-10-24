@@ -73,6 +73,49 @@ impl WasmRtcClient {
         }
     }
 
+    /// Whether the homeserver is answering the library's sends (034 R9), as
+    /// `RtcSignallingHealth`.
+    #[wasm_bindgen(getter, js_name = signallingHealth, unchecked_return_type = "RtcSignallingHealth")]
+    pub fn signalling_health(&self) -> Result<JsValue, JsError> {
+        signalling_health_value(self.client.signalling_health())
+    }
+
+    /// Calls `callback` with the signalling health now, then on each change,
+    /// for as long as the client lives. Live before any call or media exists.
+    #[wasm_bindgen(js_name = onSignallingHealth)]
+    pub fn on_signalling_health(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "(health: RtcSignallingHealth) => void")]
+        callback: js_sys::Function,
+    ) {
+        let mut health = self.client.subscribe_signalling_health();
+        health.mark_changed();
+        matrix_rtc_core::executor::spawn(async move {
+            while health.changed().await.is_ok() {
+                let value = *health.borrow_and_update();
+                match signalling_health_value(value) {
+                    Ok(value) => {
+                        if let Err(error) = callback.call1(&JsValue::NULL, &value) {
+                            log::warn!("client: onSignallingHealth callback threw: {error:?}");
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("client: signalling health not serialisable: {error:?}")
+                    }
+                }
+            }
+        });
+    }
+
+    /// Reports the page's Matrix client offline, or online once a request to
+    /// the homeserver has succeeded since it was offline — never on sync
+    /// merely starting (034 R11). Online retries every pending send at once.
+    /// Optional: without it the library goes by its own sends.
+    #[wasm_bindgen(js_name = reportConnectivity)]
+    pub fn report_connectivity(&self, online: bool) {
+        self.client.report_connectivity(online);
+    }
+
     /// Opens a room: the library subscribes to what the room needs in the
     /// given mode and applies its current state. Resolves once that state is
     /// applied, so a `joinCall` issued afterwards sees it.
@@ -107,6 +150,10 @@ impl WasmRtcClient {
             room: RwLock::new(Some(room)),
         })
     }
+}
+
+fn signalling_health_value(health: matrix_rtc_call::SignallingHealth) -> Result<JsValue, JsError> {
+    serde_wasm_bindgen::to_value(&status::WasmSignallingHealth::from(health)).map_err(js_error)
 }
 
 #[wasm_bindgen]
@@ -344,7 +391,8 @@ impl WasmRtcCall {
 
     /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
     /// by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
-    /// sent. Resolves to the event id; rejects inside the send cooldown.
+    /// sent. Resolves to the event id; rejects inside the send cooldown, and
+    /// with "not sent" when it has not landed within 5 s (034 R4).
     #[wasm_bindgen(js_name = sendReaction)]
     pub async fn send_reaction(&self, emoji: String, name: String) -> Result<String, JsError> {
         self.call
@@ -353,13 +401,15 @@ impl WasmRtcCall {
             .map_err(js_error)
     }
 
-    /// Raises our hand. Idempotent while it is up.
+    /// Raises our hand: shown at once, resolving once it has landed, a lower
+    /// superseded it or the call ended; rejects only on a permanent refusal,
+    /// the hand back where it was (034 R5). Idempotent while it is up.
     #[wasm_bindgen(js_name = raiseHand)]
     pub async fn raise_hand(&self) -> Result<(), JsError> {
         self.call.raise_hand().await.map_err(js_error)
     }
 
-    /// Lowers our hand. A no-op when it is down.
+    /// Lowers our hand, as `raiseHand` raises it. A no-op when it is down.
     #[wasm_bindgen(js_name = lowerHand)]
     pub async fn lower_hand(&self) -> Result<(), JsError> {
         self.call.lower_hand().await.map_err(js_error)
@@ -379,8 +429,10 @@ impl WasmRtcCall {
         serde_wasm_bindgen::to_value(&self.call.raised_hands().await).map_err(js_error)
     }
 
-    /// Leaves the slot; the call is over and its media stopped at once, even
-    /// when the send fails — the delayed leave then removes the membership.
+    /// Leaves the slot; the call is over and its media stopped at once, and
+    /// this resolves without waiting for the leave to be sent (034 R8). The
+    /// send is one attempt; if it fails, the delayed leave removes the
+    /// membership. Rejects only when the call was already over.
     ///
     /// `params` is `{ leave_reason?: { code, reason? } }` — e.g.
     /// `{ code: "leave" }` for an intentional hang-up. Defaults to that.

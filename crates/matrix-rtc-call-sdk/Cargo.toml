@@ -88,6 +88,8 @@ required-features = ["matrix-sdk", "testing"]
 matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
 # `MediaStatusReporter::standalone`, to watch what the engine reports.
 matrix-rtc-call = { path = "../matrix-rtc-call", features = ["testing"] }
+# `ScriptedTransport`, for the scripted-outage scenarios (tests/resilience).
+matrix-rtc-transport = { path = "../matrix-rtc-transport", features = ["testing"] }
 serde = { workspace = true }
 serde_json.workspace = true
 # `signal` for the join_and_record example's Ctrl-C hang-up; `io-std` for the

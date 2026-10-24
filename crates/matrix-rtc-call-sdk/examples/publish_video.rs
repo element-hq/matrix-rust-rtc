@@ -67,6 +67,8 @@ async fn run_call(
             http: None,
             auto_subscribe: true,
             stability: Default::default(),
+            own_reconnect_budget: None,
+            sfu_fallback: false,
         },
     )
     .await?
