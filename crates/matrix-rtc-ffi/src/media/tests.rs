@@ -108,8 +108,8 @@ fn connect_requires_a_live_call() {
 }
 
 /// 034 C10: the session returns at once whatever the SFU does; a dead one
-/// shows as our own media reconnecting, and is given up at the end of the
-/// budget, the call ending `NeverConnected`.
+/// shows as our own media connecting (never up, so not reconnecting), and is
+/// given up at the end of the budget, the call ending `NeverConnected`.
 fn a_dead_own_focus_is_given_up_at_the_end_of_the_budget(
     transport: FfiJoinTransport,
     mock: Arc<MockHost>,
@@ -127,7 +127,7 @@ fn a_dead_own_focus_is_given_up_at_the_end_of_the_budget(
         .expect("returns without waiting for the SFU");
     assert_eq!(
         session.interruptions().own_media,
-        FfiConnectionState::Reconnecting
+        FfiConnectionState::Connecting
     );
     assert!(matches!(call.status(), crate::FfiCallStatus::Connecting));
 
