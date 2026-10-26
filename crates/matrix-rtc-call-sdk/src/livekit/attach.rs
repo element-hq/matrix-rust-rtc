@@ -31,6 +31,13 @@ pub struct LiveKitAttachOptions {
     /// [`LiveKitMediaTransport::with_auto_subscribe`].
     pub auto_subscribe: bool,
     pub stability: StabilityConfig,
+    /// How long our own focus may stay unreachable before the call ends
+    /// (034 R24); `None` takes
+    /// [`OWN_RECONNECT_BUDGET`](matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET).
+    pub own_reconnect_budget: Option<std::time::Duration>,
+    /// Whether our media may move to a peer's SFU while ours is down
+    /// (034 R25); see [`AttachOptions::sfu_fallback`].
+    pub sfu_fallback: bool,
 }
 
 /// A call with native LiveKit media attached.
@@ -72,6 +79,10 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
             identity_mapper: mapper,
             format: options.format,
             stability: options.stability,
+            own_reconnect_budget: options
+                .own_reconnect_budget
+                .unwrap_or(matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET),
+            sfu_fallback: options.sfu_fallback,
         },
     )
     .await?;

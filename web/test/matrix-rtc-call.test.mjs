@@ -149,7 +149,8 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     await call.connect();
 
     // One focus in play, so one Room, connected with what the token fetch
-    // returned.
+    // returned. The own focus connects after `connect` returns (034 R24).
+    await waitFor(() => instances.length === 1 || null, 'the own focus connected');
     expect(instances).toHaveLength(1);
     const room = instances[0];
     expect(room.url).toBe('wss://sfu.example.org');

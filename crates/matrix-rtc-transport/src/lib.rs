@@ -35,10 +35,12 @@ pub mod local;
 pub mod pool;
 pub mod stats;
 pub mod stream;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 pub use connection::{
-    ConnectionContext, ConnectionEvent, FrameEncryptionState, FrameStream, MediaTransport,
-    OwnFocusTransport, OwnMemberClaims, RemoteTrackHandle, SpeakingParticipant,
+    ConnectionContext, ConnectionEvent, ConnectionState, FrameEncryptionState, FrameStream,
+    MediaTransport, OwnFocusTransport, OwnMemberClaims, RemoteTrackHandle, SpeakingParticipant,
     TransportConnection, TransportError,
 };
 pub use constraints::{

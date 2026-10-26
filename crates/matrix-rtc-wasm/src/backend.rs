@@ -43,33 +43,41 @@ fn js_error_message(error: &JsValue) -> String {
     }
 }
 
-/// A matrix-js-sdk `MatrixError` carries `errcode` and `httpStatus`; read
-/// them when present so the library can classify the failure.
-fn js_error_parts(error: &JsValue) -> (Option<String>, Option<u16>, String) {
-    let field = |name: &str| Reflect::get(error, &JsValue::from_str(name)).ok();
-    let errcode = field("errcode").and_then(|v| v.as_string());
-    let status = field("httpStatus")
+/// A matrix-js-sdk `MatrixError` carries `errcode`, `httpStatus` and, on a
+/// rate limit, `data.retry_after_ms`; read them when present so the library
+/// can classify the failure (034 R3, R7). A host marks a failure its client
+/// knows is final, with no Matrix code, by setting `permanent: true` on it.
+fn js_backend_error(error: &JsValue) -> BackendError {
+    let field = |target: &JsValue, name: &str| Reflect::get(target, &JsValue::from_str(name)).ok();
+    let errcode = field(error, "errcode").and_then(|v| v.as_string());
+    let status = field(error, "httpStatus")
         .and_then(|v| v.as_f64())
         .map(|status| status as u16);
-    (errcode, status, js_error_message(error))
+    let retry_after_ms = field(error, "data")
+        .filter(|data| data.is_object())
+        .and_then(|data| field(&data, "retry_after_ms"))
+        .and_then(|v| v.as_f64())
+        .map(|ms| ms as u64);
+    let permanent = field(error, "permanent").is_some_and(|v| v.as_bool() == Some(true));
+    let error = BackendError::with_matrix_error(errcode, status, js_error_message(error))
+        .with_retry_after_ms(retry_after_ms);
+    if permanent { error.permanent() } else { error }
 }
 
 fn send_error(error: JsValue) -> CommandError {
-    let converted = CommandError::SendError(js_error_message(&error));
+    let converted = CommandError::Backend(js_backend_error(&error));
     log::warn!("command failed: {converted}");
     converted
 }
 
 fn delayed_error(error: JsValue) -> CommandError {
-    let (errcode, status, message) = js_error_parts(&error);
-    let converted = CommandError::delayed_event_failure(errcode.as_deref(), status, message);
+    let converted = CommandError::delayed_event_failure(js_backend_error(&error));
     log::warn!("command failed: {converted}");
     converted
 }
 
 fn backend_error(error: JsValue) -> BackendError {
-    let (errcode, status, message) = js_error_parts(&error);
-    BackendError::with_matrix_error(errcode, status, message)
+    js_backend_error(&error)
 }
 
 /// Reads the event id out of whatever a send method resolved to: matrix-js-sdk's
@@ -86,7 +94,7 @@ fn js_event_id(resolved: &JsValue, method: &str) -> Result<String, CommandError>
             return Ok(event_id);
         }
     }
-    Err(CommandError::SendError(format!(
+    Err(CommandError::ClientRejected(format!(
         "{method} must resolve to the event id (matrix-js-sdk's `{{event_id}}`); got {resolved:?}"
     )))
 }
@@ -326,7 +334,9 @@ impl MatrixBackend for JsBackend {
             .await
             .map_err(delayed_error)?;
         resolved.as_string().ok_or_else(|| {
-            CommandError::SendError("sendDelayedEvent did not return a string delay id".to_owned())
+            CommandError::ClientRejected(
+                "sendDelayedEvent did not return a string delay id".to_owned(),
+            )
         })
     }
 

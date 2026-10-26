@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use matrix_rtc_call::{CallEnd, CallJoinOptions, CallStatus, JoinTransport, RtcClient, RtcRoom};
+use matrix_rtc_call::{
+    CallEnd, CallJoinOptions, CallStatus, ConnectionLossReason, JoinTransport, RtcClient, RtcRoom,
+};
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     EventEncryption, EventIn, JoinedMembership, KEY_MESSAGE_TYPE, LeaveSessionParams, RoomOptions,
@@ -23,6 +25,7 @@ const ROOM: &str = "!room:example.org";
 const SLOT: &str = "m.call#room";
 const BOB: &str = "@bob:example.org";
 const FOCUS: &str = "https://sfu.example.org";
+const PEER_FOCUS: &str = "https://sfu-b.example.org";
 
 /// Not the default derivation, so a key imported under the raw `member_id`
 /// fallback (the mapper installed too late) shows.
@@ -50,21 +53,71 @@ impl FrameKeyRing for RecordingRing {
     }
 }
 
-#[derive(Clone, Default)]
+/// How the own focus answers each connect, in order; `Ok` once they run out.
+#[derive(Clone, Copy, Debug)]
+enum Answer {
+    Fail,
+    Refuse,
+}
+
+/// The SFUs, shared by the transport and its handles. `answers` are our own
+/// focus's; a peer's focus always connects.
+#[derive(Default)]
+struct OwnFocus {
+    connects: Mutex<Vec<String>>,
+    answers: Mutex<std::collections::VecDeque<Answer>>,
+    /// Each focus's live connection events, for a test to play the SFU.
+    events: Mutex<std::collections::HashMap<String, mpsc::UnboundedSender<ConnectionEvent>>>,
+    /// The foci our own handle took over.
+    takeovers: Mutex<Vec<String>>,
+}
+
+#[derive(Clone)]
 struct FakeConnection {
+    key: String,
     local_key_indexes: Arc<Mutex<Vec<u8>>>,
-    /// Held so the engine sees the connection alive.
-    _events: Option<mpsc::UnboundedSender<ConnectionEvent>>,
+    own: Arc<OwnFocus>,
 }
 
 #[async_trait]
 impl TransportConnection for FakeConnection {
     fn connection_key(&self) -> &str {
-        FOCUS
+        &self.key
     }
 
     fn set_local_key_index(&self, key_index: u8) {
         self.local_key_indexes.lock().unwrap().push(key_index);
+    }
+
+    async fn reconnect(
+        &self,
+        _fresh_token: bool,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        self.own.connects.lock().unwrap().push(self.key.clone());
+        let answer = if self.key == FOCUS {
+            self.own.answers.lock().unwrap().pop_front()
+        } else {
+            None
+        };
+        match answer {
+            Some(Answer::Fail) => Err(TransportError::Connect("unreachable".into())),
+            Some(Answer::Refuse) => Err(TransportError::Refused("403".into())),
+            None => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.own.events.lock().unwrap().insert(self.key.clone(), tx);
+                Ok(rx)
+            }
+        }
+    }
+
+    fn hand_over(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.key.clone()))
+    }
+
+    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<(), TransportError> {
+        let key = handover.downcast::<String>().expect("a fake's handover");
+        self.own.takeovers.lock().unwrap().push(*key);
+        Ok(())
     }
 
     async fn close(&self) -> Result<(), TransportError> {
@@ -74,10 +127,30 @@ impl TransportConnection for FakeConnection {
 
 #[derive(Default)]
 struct FakeTransport {
-    own_connects: Mutex<Vec<String>>,
-    refuse: bool,
-    /// The own connection's events, for a test to play the SFU.
-    own_events: Mutex<Option<mpsc::UnboundedSender<ConnectionEvent>>>,
+    own: Arc<OwnFocus>,
+}
+
+impl FakeTransport {
+    fn answering(answers: impl IntoIterator<Item = Answer>) -> Self {
+        let transport = Self::default();
+        transport.own.answers.lock().unwrap().extend(answers);
+        transport
+    }
+
+    /// Our own focus's connects.
+    fn connects(&self) -> Vec<String> {
+        let connects = self.own.connects.lock().unwrap();
+        connects
+            .iter()
+            .filter(|key| *key == FOCUS)
+            .cloned()
+            .collect()
+    }
+
+    /// Our own focus's live connection.
+    fn events(&self) -> mpsc::UnboundedSender<ConnectionEvent> {
+        self.own.events.lock().unwrap()[FOCUS].clone()
+    }
 }
 
 #[async_trait]
@@ -121,29 +194,33 @@ impl OwnFocusTransport for FakeTransport {
     async fn connect_own(
         &self,
         connection_key: &str,
-        _ctx: &ConnectionContext,
+        ctx: &ConnectionContext,
     ) -> Result<(FakeConnection, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError> {
-        self.own_connects
-            .lock()
-            .unwrap()
-            .push(connection_key.to_owned());
-        if self.refuse {
-            return Err(TransportError::Connect("refused".into()));
+        let connection = self.prepare_own(connection_key, ctx);
+        let events = connection.reconnect(false).await?;
+        Ok((connection, events))
+    }
+
+    fn prepare_own(&self, connection_key: &str, _ctx: &ConnectionContext) -> FakeConnection {
+        FakeConnection {
+            key: connection_key.to_owned(),
+            local_key_indexes: Arc::default(),
+            own: self.own.clone(),
         }
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.own_events.lock().unwrap() = Some(tx.clone());
-        Ok((
-            FakeConnection {
-                _events: Some(tx),
-                ..FakeConnection::default()
-            },
-            rx,
-        ))
     }
 }
 
 /// An encrypted room with an open per-member-encrypted slot and Bob in it, the way a homeserver would feed it.
 async fn open(client: &RtcClient<MockBackend>, mock: &MockBackend) -> RtcRoom<MockBackend> {
+    open_with_bob_on(client, mock, FOCUS).await
+}
+
+/// [`open`], with Bob publishing on `bob_focus`.
+async fn open_with_bob_on(
+    client: &RtcClient<MockBackend>,
+    mock: &MockBackend,
+    bob_focus: &str,
+) -> RtcRoom<MockBackend> {
     let room = client
         .room(ROOM, RoomOptions::default())
         .await
@@ -182,7 +259,7 @@ async fn open(client: &RtcClient<MockBackend>, mock: &MockBackend) -> RtcRoom<Mo
             "msc4354_sticky_key": "bob-1",
             "member": { "id": "bob-1", "membership": "join" },
             "application": { "type": "m.call" },
-            "transports": { "published": [{ "type": "livekit", "livekit_service_url": FOCUS }] },
+            "transports": { "published": [{ "type": "livekit", "livekit_service_url": bob_focus }] },
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
     }]);
@@ -217,6 +294,8 @@ fn options(mock: &MockBackend) -> AttachOptions {
         identity_mapper: mapper(),
         format: matrix_rtc_core::compat::MembershipFormat::Current,
         stability: StabilityConfig::default(),
+        own_reconnect_budget: matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
+        sfu_fallback: false,
     }
 }
 
@@ -258,7 +337,7 @@ async fn a_key_held_before_attaching_is_imported_under_the_mapped_identity_and_r
     }
     assert!(imported, "the replayed key reaches the event stream");
 
-    assert_eq!(*transport.own_connects.lock().unwrap(), [FOCUS]);
+    assert_eq!(transport.connects(), [FOCUS]);
     assert!(attached.own_connection.is_some());
     assert_eq!(
         attached.own_identity,
@@ -316,7 +395,7 @@ async fn a_receive_only_call_connects_no_own_focus() {
     .expect("attaches");
 
     assert!(attached.own_connection.is_none());
-    assert!(transport.own_connects.lock().unwrap().is_empty());
+    assert!(transport.connects().is_empty());
 }
 
 #[tokio::test]
@@ -337,29 +416,53 @@ async fn a_call_that_is_over_does_not_attach() {
     assert!(matches!(result, Err(AttachError::NotJoined(_))));
 }
 
+/// 034 R24, C10: the attach never waits for our own focus; a refusal ends
+/// the call, after its leave, with the reason.
 #[tokio::test]
-async fn a_refusing_own_focus_fails_the_attach() {
+async fn a_refusing_own_focus_ends_the_call_after_its_leave() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock).await;
     let call = room.join_call(CallJoinOptions::new()).await.expect("join");
-    let transport = Arc::new(FakeTransport {
-        refuse: true,
-        ..FakeTransport::default()
-    });
+    let leaves_before = sticky_leaves(&mock);
+    let transport = Arc::new(FakeTransport::answering([Answer::Refuse]));
 
-    let result = attach_media(
+    let _attached = attach_media(
         &call,
         transport,
         Arc::new(MediaKeyHandler::new()),
         options(&mock),
     )
-    .await;
-    assert!(matches!(result, Err(AttachError::Transport(_))));
+    .await
+    .expect("attaches without waiting for the SFU");
+    settle().await;
+
+    assert!(matches!(
+        call.status(),
+        CallStatus::Ended {
+            reason: CallEnd::ConnectionClosed {
+                reason: ConnectionLossReason::Refused,
+                ..
+            }
+        }
+    ));
+    assert!(!call.is_live());
+    assert_eq!(sticky_leaves(&mock), leaves_before + 1, "one leave issued");
 }
 
-/// The status follows our own focus: up once attached, degraded while it
-/// reconnects, over when it closes for good.
+/// Our sticky leaves sent so far.
+fn sticky_leaves(mock: &MockBackend) -> usize {
+    mock.sticky_events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, _, content, _)| content["member"]["membership"] == "leave")
+        .count()
+}
+
+/// The status follows our own focus: connecting until it is first up,
+/// degraded while it reconnects, and a loss the transport gives up on is
+/// reconnected rather than ended.
 #[tokio::test]
 async fn our_own_focus_drives_the_call_status() {
     let mock = mock();
@@ -377,16 +480,19 @@ async fn our_own_focus_drives_the_call_status() {
     )
     .await
     .expect("attaches");
+    settle().await;
     let CallStatus::Connected {
         since_ms,
         degraded: false,
     } = call.status()
     else {
-        panic!("connected once attached, not {:?}", call.status());
+        panic!("connected once our focus is up, not {:?}", call.status());
     };
 
-    let events = transport.own_events.lock().unwrap().clone().unwrap();
-    events.send(ConnectionEvent::Reconnecting).unwrap();
+    transport
+        .events()
+        .send(ConnectionEvent::Reconnecting)
+        .unwrap();
     settle().await;
     assert_eq!(
         call.status(),
@@ -396,7 +502,8 @@ async fn our_own_focus_drives_the_call_status() {
         }
     );
 
-    events
+    transport
+        .events()
         .send(ConnectionEvent::Closed {
             message: "gone".to_owned(),
         })
@@ -404,31 +511,139 @@ async fn our_own_focus_drives_the_call_status() {
     settle().await;
     assert_eq!(
         call.status(),
-        CallStatus::Ended {
-            reason: CallEnd::ConnectionClosed {
-                message: "gone".to_owned()
-            }
-        }
+        CallStatus::Connected {
+            since_ms,
+            degraded: false
+        },
+        "reconnected behind the same handle"
     );
+    assert_eq!(transport.connects().len(), 2);
 }
 
-#[tokio::test]
-async fn a_refused_own_focus_leaves_the_call_connecting() {
+/// 034 R26: when our own focus is given up, publishing stops, the leave is
+/// issued, and only then is the end reported, without waiting for the
+/// leave's outcome.
+#[tokio::test(start_paused = true)]
+async fn a_lost_connection_stops_publishing_and_issues_the_leave_before_ended() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock).await;
     let call = room.join_call(CallJoinOptions::new()).await.expect("join");
-    let transport = Arc::new(FakeTransport {
-        refuse: true,
-        ..FakeTransport::default()
-    });
-
-    let _ = attach_media(
+    let transport = Arc::new(FakeTransport::default());
+    let _attached = attach_media(
         &call,
-        transport,
+        transport.clone(),
         Arc::new(MediaKeyHandler::new()),
         options(&mock),
     )
-    .await;
-    assert_eq!(call.status(), CallStatus::Connecting);
+    .await
+    .expect("attaches");
+    settle().await;
+    transport
+        .own
+        .answers
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(Answer::Fail, 100));
+    mock.script(
+        matrix_rtc_core::testing::MockMethod::StickyEvent,
+        [matrix_rtc_core::testing::MockOutcome::Hang],
+    );
+    let calls_before = mock
+        .calls_to(matrix_rtc_core::testing::MockMethod::StickyEvent)
+        .len();
+    let mut ended = call.subscribe_ended();
+    let mut status = call.subscribe_status();
+
+    transport
+        .events()
+        .send(ConnectionEvent::Closed {
+            message: "gone".to_owned(),
+        })
+        .unwrap();
+    // Nothing ends before the budget.
+    tokio::time::sleep(Duration::from_secs(59)).await;
+    assert!(call.is_live());
+    status
+        .wait_for(|status| matches!(status, CallStatus::Ended { .. }))
+        .await
+        .unwrap();
+
+    assert!(
+        ended.borrow_and_update().is_some(),
+        "publishing stopped first"
+    );
+    assert_eq!(
+        mock.calls_to(matrix_rtc_core::testing::MockMethod::StickyEvent)
+            .len(),
+        calls_before + 1,
+        "the leave was issued before the end, and the end did not wait for it"
+    );
+    assert!(matches!(
+        call.status(),
+        CallStatus::Ended {
+            reason: CallEnd::ConnectionClosed {
+                reason: ConnectionLossReason::Budget,
+                ..
+            }
+        }
+    ));
+}
+
+/// 034 R25: our own focus down for ten seconds while Bob's is up moves our
+/// media onto Bob's, and our membership is republished naming it under the
+/// same member id; the call outlives the budget.
+#[tokio::test(start_paused = true)]
+async fn own_sfu_loss_with_fallback_republishes_our_membership_on_the_peer_focus() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_with_bob_on(&client, &mock, PEER_FOCUS).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let transport = Arc::new(FakeTransport::default());
+    let _attached = attach_media(
+        &call,
+        transport.clone(),
+        Arc::new(MediaKeyHandler::new()),
+        AttachOptions {
+            sfu_fallback: true,
+            ..options(&mock)
+        },
+    )
+    .await
+    .expect("attaches");
+    settle().await;
+    transport
+        .own
+        .answers
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(Answer::Fail, 100));
+    let member_id = call.member_id().to_owned();
+
+    transport
+        .events()
+        .send(ConnectionEvent::Closed {
+            message: "gone".to_owned(),
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    assert!(transport.own.takeovers.lock().unwrap().is_empty());
+    tokio::time::sleep(Duration::from_secs(61)).await;
+
+    assert_eq!(*transport.own.takeovers.lock().unwrap(), [PEER_FOCUS]);
+    let (_, _, content, _) = mock.last_sticky_event().expect("republished");
+    assert_eq!(
+        content["transports"]["published"],
+        json!([{ "type": "livekit", "livekit_service_url": PEER_FOCUS }])
+    );
+    assert_eq!(content["member"]["id"], json!(member_id));
+    assert_eq!(content["member"]["membership"], "join");
+    assert!(call.is_live(), "no end at the budget");
+    assert!(matches!(
+        call.status(),
+        CallStatus::Connected {
+            degraded: false,
+            ..
+        }
+    ));
 }

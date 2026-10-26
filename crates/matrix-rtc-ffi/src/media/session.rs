@@ -16,14 +16,13 @@ use tokio::sync::watch;
 use matrix_rtc_call_sdk::{AttachError, CallEngine, CallEvent, MediaAttachment};
 use matrix_rtc_call_sdk::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_livekit::{LiveKitTransportConnection, MediaKeyBridge};
-use matrix_rtc_transport::{MediaStreamKind, TransportConnection as _};
+use matrix_rtc_transport::{MediaKeyHandler, MediaStreamKind, TransportConnection};
 
 use super::frames::{AudioFrameStream, FfiLocalTrack, VideoFrameStream};
 use super::types::{
-    FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiParticipant, FfiPublishOptions,
-    FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef, FfiStreamStats, FfiTileId,
-    FfiTileRoster, zip_stream_stats,
+    FfiCallEvent, FfiInterruptions, FfiLocalState, FfiMediaConstraints, FfiParticipant,
+    FfiPublishOptions, FfiReceiveStats, FfiStabilityConfig, FfiStreamKind, FfiStreamRef,
+    FfiStreamStats, FfiTileId, FfiTileRoster, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 use crate::RtcCall;
@@ -36,6 +35,17 @@ pub struct MediaSessionConfig {
     /// How much the tile order is damped. `None` takes the defaults.
     #[uniffi(default = None)]
     pub stability: Option<FfiStabilityConfig>,
+    /// How long our own SFU may stay unreachable, from the loss or the
+    /// connect request, before the call ends with `ConnectionClosed`
+    /// (034 R24, contract C11). `None` takes 60 000; the spec's 60 s is not
+    /// a licence to shorten it.
+    #[uniffi(default = None)]
+    pub own_reconnect_budget_ms: Option<u64>,
+    /// Whether our media may move to another member's SFU while ours is
+    /// down (034 R25, contract C11): only where that SFU accepts a token for
+    /// an account of our homeserver. Off by default.
+    #[uniffi(default = false)]
+    pub sfu_fallback: bool,
 }
 
 /// Attach media to a joined call: wire frame-key signalling into the core,
@@ -74,16 +84,7 @@ async fn build_media_session(
             call.slot_id(),
         );
     }
-    let LiveKitAttachment {
-        media:
-            MediaAttachment {
-                engine,
-                own_connection,
-                own_identity,
-                events,
-            },
-        key_bridge,
-    } = attach_livekit(
+    let LiveKitAttachment { media, key_bridge } = attach_livekit(
         call.inner(),
         call.backend(),
         LiveKitAttachOptions {
@@ -91,25 +92,22 @@ async fn build_media_session(
             http: None,
             auto_subscribe: true,
             stability: config.stability.map(Into::into).unwrap_or_default(),
+            own_reconnect_budget: config
+                .own_reconnect_budget_ms
+                .map(std::time::Duration::from_millis),
+            sfu_fallback: config.sfu_fallback,
         },
     )
     .await
-    .map_err(|error| match error {
+    .map_err(attach_error)?;
+    Ok(MediaSession::new(media, key_bridge))
+}
+
+pub(crate) fn attach_error(error: AttachError) -> MediaFfiError {
+    match error {
         AttachError::NotJoined(message) => MediaFfiError::NotJoined(message),
         error => MediaFfiError::Transport(error.to_string()),
-    })?;
-
-    let tiles = engine.subscribe_tiles();
-    let local = engine.subscribe_local_state();
-    Ok(Arc::new(MediaSession {
-        engine,
-        connection: own_connection,
-        _bridge: key_bridge,
-        events: TokioMutex::new(events),
-        tiles: TokioMutex::new(tiles),
-        local: TokioMutex::new(local),
-        own_identity,
-    }))
+    }
 }
 
 /// A live media session on a joined slot: the participant roster, the
@@ -121,14 +119,44 @@ async fn build_media_session(
 pub struct MediaSession {
     engine: CallEngine,
     /// The own-focus connection; `None` for a receive-only call.
-    connection: Option<LiveKitTransportConnection>,
-    /// Keeps the key bridge alive alongside the session for clarity; the
+    connection: Option<Arc<dyn TransportConnection>>,
+    /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
-    _bridge: Arc<MediaKeyBridge>,
+    _bridge: Arc<MediaKeyHandler>,
     events: TokioMutex<broadcast::Receiver<CallEvent>>,
     tiles: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::TileRoster>>,
     local: TokioMutex<watch::Receiver<Option<matrix_rtc_call_sdk::LocalState>>>,
+    interruptions: TokioMutex<watch::Receiver<matrix_rtc_call_sdk::Interruptions>>,
     own_identity: String,
+}
+
+impl MediaSession {
+    /// The session over an attachment, whatever its transport.
+    pub(crate) fn new<C: TransportConnection + 'static>(
+        media: MediaAttachment<C>,
+        key_handler: Arc<MediaKeyHandler>,
+    ) -> Arc<Self> {
+        let MediaAttachment {
+            engine,
+            own_connection,
+            own_identity,
+            events,
+        } = media;
+        let tiles = engine.subscribe_tiles();
+        let local = engine.subscribe_local_state();
+        let interruptions = engine.subscribe_interruptions();
+        Arc::new(MediaSession {
+            engine,
+            connection: own_connection
+                .map(|connection| Arc::new(connection) as Arc<dyn TransportConnection>),
+            _bridge: key_handler,
+            events: TokioMutex::new(events),
+            tiles: TokioMutex::new(tiles),
+            local: TokioMutex::new(local),
+            interruptions: TokioMutex::new(interruptions),
+            own_identity,
+        })
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -209,6 +237,22 @@ impl MediaSession {
     /// is on the roster.
     pub fn local_state(&self) -> Option<FfiLocalState> {
         self.engine.local_state().map(Into::into)
+    }
+
+    /// What is interrupting the call now, cause by cause (034 R38).
+    /// Contract C5.
+    pub fn interruptions(&self) -> FfiInterruptions {
+        self.engine.interruptions().into()
+    }
+
+    /// The next interruptions record. Suspends until it changes; `None`
+    /// means the session is over. Latest-value-wins, as
+    /// [`Self::next_roster`]; for any one change it comes after the roster
+    /// and local state, so the tiles read on waking already agree with it.
+    pub async fn next_interruptions(&self) -> Option<FfiInterruptions> {
+        let mut interruptions = self.interruptions.lock().await;
+        interruptions.changed().await.ok()?;
+        Some(interruptions.borrow_and_update().clone().into())
     }
 
     /// Declare which tiles get full records in [`FfiTileRoster::detail`]:

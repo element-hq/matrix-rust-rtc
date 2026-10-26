@@ -290,6 +290,45 @@ async fn dropping_the_room_forgets_its_dialect() {
     ));
 }
 
+/// A leave goes out detached (034 R8), and a host may shut the room down the
+/// moment it has asked for it (C10): the leave is still written in the room's
+/// format, and the format is forgotten once it has gone.
+#[tokio::test]
+async fn a_leave_sent_after_the_room_is_dropped_keeps_its_format() {
+    let mock = mock();
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
+    room.join(join_params()).await.expect("join");
+    let joins = mock.state_events.lock().unwrap().len();
+
+    let hold = client.backend().hold_dialect(ROOM);
+    let pending = room
+        .state()
+        .lock()
+        .await
+        .begin_leave(SLOT, LeaveSessionParams::new())
+        .await
+        .expect("joined");
+    drop(room);
+    pending.send().await.expect("the leave is sent");
+
+    let state = mock.state_events.lock().unwrap();
+    assert_eq!(state.len(), joins + 1, "the leave went out as room state");
+    let (room_id, event_type, _, _) = state.last().unwrap();
+    assert_eq!(
+        (room_id.as_str(), event_type.as_str()),
+        (ROOM, STATE_MEMBER_EVENT_TYPE)
+    );
+    assert!(mock.sticky_events.lock().unwrap().is_empty());
+    drop(state);
+
+    drop(hold);
+    assert!(matches!(
+        client.backend().dialect(ROOM),
+        OutboundDialect::None
+    ));
+}
+
 #[tokio::test]
 async fn a_join_without_a_transport_is_refused_and_publishes_nothing() {
     let mock = mock();

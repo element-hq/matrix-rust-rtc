@@ -250,6 +250,34 @@ async fn an_empty_sticky_set_clears_the_session() {
         .await;
 }
 
+/// 034 R21: a held delayed leave ends on the feeder's own timer, with no
+/// further delivery.
+#[tokio::test(start_paused = true)]
+async fn a_delayed_leave_hold_ends_on_the_feeders_timer() {
+    let harness = Harness::attach().await;
+    harness.seed_room_state();
+    harness
+        .sink()
+        .on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
+    harness.attachment.seeded().await;
+    harness
+        .wait_until(|| async { harness.member_count().await == Some(1) })
+        .await;
+
+    let mut fired = member_event(BOB, "bob-1", "$m2");
+    fired.content = json!({
+        "slot_id": SLOT,
+        "msc4354_sticky_key": "bob-1",
+        "member": { "id": "bob-1", "membership": "leave" },
+        "leave_reason": { "code": "delayed_leave" },
+    });
+    harness.sink().on_sticky_events(vec![fired]);
+    tokio::time::sleep(Duration::from_millis(9_900)).await;
+    assert_eq!(harness.member_count().await, Some(1), "held");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(harness.member_count().await, Some(0), "gone at 10 s");
+}
+
 #[tokio::test]
 async fn a_closed_slot_projects_the_member_out() {
     let harness = Harness::attach().await;

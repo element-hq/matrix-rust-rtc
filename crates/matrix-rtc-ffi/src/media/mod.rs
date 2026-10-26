@@ -49,12 +49,15 @@ pub use frames::{
     AudioFrameStream, FfiAudioFrame, FfiLocalTrack, FfiVideoFrameData, FfiVideoPlane,
     FfiVideoRotation, VideoFrameRef, VideoFrameStream,
 };
+#[cfg(feature = "testing")]
+pub(crate) use session::attach_error as session_attach_error;
 pub use session::{MediaSession, MediaSessionConfig, connect_media_session};
 pub use types::{
-    FfiAudioSourceConfig, FfiCallEvent, FfiFrameEncryptionDiagnostic, FfiFrameEncryptionState,
-    FfiKeyRejection, FfiMediaConstraints, FfiParticipant, FfiPublishOptions, FfiQualityLimit,
-    FfiQualityLimitation, FfiReceiveStats, FfiSendLayerStats, FfiSendStats, FfiStreamKind,
-    FfiStreamState, FfiVideoDetail, FfiVideoSourceConfig,
+    FfiAudioSourceConfig, FfiCallEvent, FfiConnectionState, FfiFrameEncryptionDiagnostic,
+    FfiFrameEncryptionState, FfiInterruptions, FfiKeyRejection, FfiMediaConstraints,
+    FfiParticipant, FfiPublishOptions, FfiQualityLimit, FfiQualityLimitation, FfiReceiveStats,
+    FfiSendLayerStats, FfiSendStats, FfiStreamKind, FfiStreamState, FfiVideoDetail,
+    FfiVideoSourceConfig,
 };
 
 /// Errors produced by the media layer of the FFI.

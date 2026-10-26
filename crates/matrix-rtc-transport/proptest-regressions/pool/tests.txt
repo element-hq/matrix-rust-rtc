@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 62837d487f62c7b53ffb9dae9ae10a5ee6cc0ddc79e7a1e2a1e87eeb938b56cb # shrinks to sfu_fallback = true, fails = [true, true, true, true], steps = [OwnClosed, Wait(10), PeerReconnecting, Wait(6), Wait(4)]
+cc 019f4abf6f50c297d58c8fe0adaff06e7d1a73002a8699944d486b0ed5bd2236 # shrinks to steps = [Snapshot([(1, 0), (2, 1)]), RemoteJoined(0, Member(1)), Snapshot([])]

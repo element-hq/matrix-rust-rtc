@@ -133,8 +133,8 @@ pub struct LiveKitCallOptions {
     /// until this elapses. A tool that expects to be killed — a load generator,
     /// a test — wants it short.
     ///
-    /// Not free: the keep-alive re-sends the membership once it is halfway to
-    /// expiring, so halving this doubles that signalling rate. Keep it well
+    /// Not free: the keep-alive re-sends the membership once a third of it has
+    /// passed, so halving this doubles that signalling rate. Keep it well
     /// above twice [`keep_alive_interval_ms`](Self::keep_alive_interval_ms), or the
     /// entry can lapse between ticks.
     pub sticky_duration_ms: Option<u64>,
@@ -196,6 +196,11 @@ pub struct LiveKitCallOptions {
     /// window reorders are coalesced into. A product decision rather than a
     /// protocol one; see [`StabilityConfig`].
     pub stability: StabilityConfig,
+    /// Whether our media may move to another member's SFU while ours is
+    /// down (034 R25); see
+    /// [`AttachOptions::sfu_fallback`](crate::AttachOptions::sfu_fallback).
+    /// Off by default.
+    pub sfu_fallback: bool,
 }
 
 impl Default for LiveKitCallOptions {
@@ -214,6 +219,7 @@ impl Default for LiveKitCallOptions {
             kind: CallKind::default(),
             reactions: None,
             stability: StabilityConfig::default(),
+            sfu_fallback: false,
         }
     }
 }
@@ -342,6 +348,8 @@ impl LiveKitCall {
                 http: options.http.clone(),
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),
+                own_reconnect_budget: None,
+                sfu_fallback: options.sfu_fallback,
             },
         )
         .await;
@@ -383,9 +391,23 @@ impl LiveKitCall {
             options.slot_id
         );
 
+        // This facade hands out the connected room, so it waits for our own
+        // focus, which the attach no longer does (034 R24); a focus given up
+        // has ended the call, and its leave is already issued.
+        let mut status = call.subscribe_status();
+        let session = tokio::select! {
+            session = connection.wait_connected() => session,
+            _ = status.wait_for(|status| matches!(status, CallStatus::Ended { .. })) => {
+                return Err(LiveKitCallError::Signalling(format!(
+                    "our own focus was given up: {:?}",
+                    call.status(),
+                )));
+            }
+        };
+
         // Transition-period raw stream; subscribed immediately after connect,
         // so only events racing the connect itself can be missed here.
-        let raw_events = connection.session().room().subscribe();
+        let raw_events = session.room().subscribe();
 
         Ok(LiveKitCall {
             call,
@@ -532,8 +554,10 @@ impl LiveKitCall {
     ///
     /// Transition API: media access moves behind [`LiveKitCall::remote_track`] and
     /// the upcoming publish surface.
-    pub fn session(&self) -> &LiveKitSession {
-        self.connection.session()
+    pub fn session(&self) -> Arc<LiveKitSession> {
+        self.connection
+            .session()
+            .expect("connected before the join returned")
     }
 
     /// Our MSC4195 pseudonymous LiveKit identity (the JWT `sub`). Peers see

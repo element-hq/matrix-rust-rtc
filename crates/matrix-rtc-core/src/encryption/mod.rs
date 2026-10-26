@@ -212,7 +212,7 @@
 
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
@@ -438,6 +438,30 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+
+    /// The members a rollout could not reach, by member id, with the key
+    /// index each is owed (034 R32). Retried on backoff by the session's
+    /// upkeep until delivered; a rotation replaces every entry, a departure
+    /// drops its own.
+    undelivered: Arc<watch::Sender<BTreeMap<String, Undelivered>>>,
+}
+
+/// A key a rollout could not hand to one member.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Undelivered {
+    target: ParticipantDeviceInfo,
+    key_index: u8,
+}
+
+/// What one retry of an undelivered key came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyRetry {
+    /// The member now holds the key.
+    Delivered,
+    /// Nothing is owed any more: the member left, or a rotation addressed them.
+    Moot,
+    /// The host answered but did not deliver to this member.
+    Undelivered,
 }
 
 /// A key that has been replaced but is still what we encrypt with, because its
@@ -512,6 +536,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             superseded_key: Arc::new(RwLock::new(None)),
             rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
+            undelivered: Arc::new(watch::Sender::new(BTreeMap::new())),
         }
     }
 
@@ -745,6 +770,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         *self.signalled_key.lock().unwrap() = None;
         *self.superseded_key.write().unwrap() = None;
         self.set_rotation_due_at(None);
+        self.undelivered.send_replace(BTreeMap::new());
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -935,6 +961,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 membership_ts: m.membership_ts,
             })
             .collect();
+
+        // A member who left is owed nothing (034 R32).
+        self.undelivered.send_if_modified(|undelivered| {
+            let before = undelivered.len();
+            undelivered.retain(|_, owed| {
+                current_participants
+                    .iter()
+                    .any(|participant| participant.same_join(&owed.target))
+            });
+            undelivered.len() != before
+        });
 
         let current_key = {
             let guard = self.outbound_key.read().unwrap();
@@ -1135,7 +1172,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // What will be on the wire once this rollout settles, when that is not what
         // the rollout is about to hand out — during a switch window, the key we are
         // still encrypting with rather than the one in `outbound_key`. `None` when
-        // the two coincide and an arrival needs nothing extra.
+        // the two coincide.
         let key_still_in_use = match (rotating, use_after_ms) {
             // Switching at once: what we distribute is what we will use.
             (true, 0) => None,
@@ -1187,6 +1224,33 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             })
             .collect();
 
+        // Whoever this rollout missed is retried on backoff, independently of
+        // the next rollout; a rotation addresses everyone, so what was owed of
+        // the previous key is dropped (034 R32).
+        self.undelivered.send_if_modified(|undelivered| {
+            let before = undelivered.clone();
+            if use_new_key {
+                undelivered.clear();
+            }
+            for participant in &to_distribute_to {
+                if served
+                    .iter()
+                    .any(|recipient| recipient.same_join(participant))
+                {
+                    undelivered.remove(&participant.member_id);
+                } else {
+                    undelivered.insert(
+                        participant.member_id.clone(),
+                        Undelivered {
+                            target: participant.clone(),
+                            key_index: outbound_key_to_use.key_index,
+                        },
+                    );
+                }
+            }
+            *undelivered != before
+        });
+
         // One line per rollout saying how it went as a whole: per-recipient
         // errors are easy to miss in a busy log, and "distributed to 1 of 3" is
         // the shape of the problem.
@@ -1201,7 +1265,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         } else {
             log::warn!(
                 "[{}/{}] distributed key index {} to {} of {} member(s); not delivered to {:?}, \
-                 who cannot decrypt our media until the next rollout retries them",
+                 who cannot decrypt our media until a retry reaches them",
                 self.room_id,
                 self.slot_id,
                 outbound_key_to_use.key_index,
@@ -1211,54 +1275,11 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             );
         }
 
-        // Whoever has just arrived holds only what this rollout sent them, and what
-        // we encrypt with is not necessarily that: a rotation waits out its
-        // `delayBeforeUse` first, and during that wait the key on the wire is the
-        // one it replaced. Unless the arrival is given *that* key too, they decrypt
-        // nothing until the window closes — a media blackout of
-        // `delay_before_use_ms` on every join into an established call, landing on
-        // the member least able to explain it.
-        //
-        // Handing it over widens what an arrival can read by the length of the
-        // window. The grace period already makes the same concession and for
-        // longer, by giving an arrival a key the call has been using for up to
-        // `key_rotation_grace_period_ms`.
-        //
-        // Restricted to the arrivals this rollout actually reached: a member the
-        // send could not be delivered to holds neither key, and a second
-        // undeliverable message buys them nothing. It also keeps a member we can
-        // never reach — who stays in `joined` for good, never being recorded as
-        // holding anything — from adding a send to every rollout for the rest of
-        // the call.
-        if let Some((in_use_index, in_use_key)) = &key_still_in_use
-            && *in_use_index != outbound_key_to_use.key_index
-        {
-            let arrivals_served: Vec<ParticipantDeviceInfo> = joined_participants
-                .iter()
-                .filter(|arrival| {
-                    served
-                        .iter()
-                        .any(|recipient| recipient.member_id == arrival.member_id)
-                })
-                .cloned()
-                .collect();
-            if !arrivals_served.is_empty() {
-                log::debug!(
-                    "[{}/{}] also handing key index {in_use_index} to {} arrival(s): it is what \
-                     we are encrypting with until index {} takes over",
-                    self.room_id,
-                    self.slot_id,
-                    arrivals_served.len(),
-                    outbound_key_to_use.key_index,
-                );
-                self.send_key_to_participants(
-                    &general_purpose::STANDARD.encode(in_use_key),
-                    *in_use_index,
-                    &arrivals_served,
-                )
-                .await;
-            }
-        }
+        // An arrival is never handed the key still in use during a switch
+        // window: it was minted before they joined, possibly long before, and
+        // would let them read back over everything it encrypted, which is what
+        // rotating on their arrival exists to prevent. They decrypt us once the
+        // window closes, at most `delay_before_use_ms` after joining.
 
         // Update or store the outbound key
         if use_new_key {
@@ -1341,6 +1362,82 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         Ok(())
     }
 
+    /// The members a rollout could not reach, by member id (034 R32).
+    pub fn undelivered_members(&self) -> Vec<String> {
+        self.undelivered.borrow().keys().cloned().collect()
+    }
+
+    /// Follows the undelivered members; the upkeep runs one retry per member.
+    pub(crate) fn subscribe_undelivered(&self) -> watch::Receiver<BTreeMap<String, Undelivered>> {
+        self.undelivered.subscribe()
+    }
+
+    /// Stops retrying `member_id`: the host refused the send for good.
+    pub(crate) fn forget_undelivered(&self, member_id: &str) {
+        self.undelivered
+            .send_if_modified(|undelivered| undelivered.remove(member_id).is_some());
+    }
+
+    /// One retry of the key owed to `member_id`, to that member alone. `Err`
+    /// is the host's failure of the whole send, which the outbox classifies.
+    pub(crate) async fn retry_undelivered_key(
+        &self,
+        member_id: &str,
+    ) -> Result<KeyRetry, CommandError> {
+        let Some(owed) = self.undelivered.borrow().get(member_id).cloned() else {
+            return Ok(KeyRetry::Moot);
+        };
+        let key = self
+            .outbound_key
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|key| key.key_index == owed.key_index)
+            .map(|key| key.key.clone());
+        let Some(key) = key else {
+            // Rotated since: the rotation's rollout addressed them.
+            self.drop_owed(&owed);
+            return Ok(KeyRetry::Moot);
+        };
+
+        let served = self
+            .deliver_key(
+                &general_purpose::STANDARD.encode(&key),
+                owed.key_index,
+                std::slice::from_ref(&owed.target),
+            )
+            .await?;
+        if served.is_empty() {
+            return Ok(KeyRetry::Undelivered);
+        }
+        log::info!(
+            "[{}/{}] key index {} delivered to member {} on retry",
+            self.room_id,
+            self.slot_id,
+            owed.key_index,
+            member_id,
+        );
+        if let Some(key) = self.outbound_key.write().unwrap().as_mut()
+            && key.key_index == owed.key_index
+            && !key.shared_with.iter().any(|x| x.same_join(&owed.target))
+        {
+            key.shared_with.push(owed.target.clone());
+        }
+        self.drop_owed(&owed);
+        Ok(KeyRetry::Delivered)
+    }
+
+    /// Removes `owed`, unless a newer rollout has replaced it meanwhile.
+    fn drop_owed(&self, owed: &Undelivered) {
+        self.undelivered.send_if_modified(|undelivered| {
+            let current = undelivered.get(&owed.target.member_id) == Some(owed);
+            if current {
+                undelivered.remove(&owed.target.member_id);
+            }
+            current
+        });
+    }
+
     /// The key we are encrypting with at `now`, and its index.
     ///
     /// Not always the one in `outbound_key`: a rotation is stored there as soon as
@@ -1364,6 +1461,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     ///
     /// The session's scheduler drives [`Self::flush_due_rotation`] at the
     /// instant it comes up; see [`Self::subscribe_rotation_due`].
+    /// [`Self::retry_undelivered_key`], for tests standing in for the upkeep
+    /// that drives it: `true` when the member now holds the key.
+    #[cfg(feature = "testing")]
+    pub async fn retry_undelivered_key_now(&self, member_id: &str) -> Result<bool, CommandError> {
+        Ok(matches!(
+            self.retry_undelivered_key(member_id).await?,
+            KeyRetry::Delivered
+        ))
+    }
+
     pub fn rotation_due_at_ms(&self) -> Option<u64> {
         *self.rotation_due_at.borrow()
     }
@@ -1434,8 +1541,32 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         index: u8,
         targets: &[ParticipantDeviceInfo],
     ) -> Vec<ParticipantDeviceInfo> {
+        self.deliver_key(key_b64, index, targets)
+            .await
+            .unwrap_or_else(|error| {
+                // The batch never left; nobody was served, so nobody is recorded
+                // as holding the key and every one of them is retried.
+                log::error!(
+                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
+                    self.room_id,
+                    self.slot_id,
+                    targets.len(),
+                );
+                Vec::new()
+            })
+    }
+
+    /// [`Self::send_key_to_participants`], with the host's error when the
+    /// batch itself failed: a retry tells a signalling failure from a member
+    /// the host could not deliver to.
+    async fn deliver_key(
+        &self,
+        key_b64: &str,
+        index: u8,
+        targets: &[ParticipantDeviceInfo],
+    ) -> Result<Vec<ParticipantDeviceInfo>, CommandError> {
         if targets.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // The same content for every recipient: it names *our* member id and key,
@@ -1500,33 +1631,19 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
 
         if recipients.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let deliveries = match self
+        let deliveries = self
             .backend
             .send_to_device_message(recipients, KEY_MESSAGE_TYPE.to_string(), content)
-            .await
-        {
-            Ok(deliveries) => deliveries,
-            Err(error) => {
-                // The batch never left; nobody was served, so nobody is recorded
-                // as holding the key and the next rollout retries all of them.
-                log::error!(
-                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
-                    self.room_id,
-                    self.slot_id,
-                    addressed.len(),
-                );
-                return Vec::new();
-            }
-        };
+            .await?;
 
         // Match results back by recipient rather than by position: an
         // implementation is free to reorder or to answer for only some of them,
         // and treating an unanswered recipient as served is the failure this
         // whole shape exists to prevent.
-        addressed
+        Ok(addressed
             .into_iter()
             .filter(|target| {
                 let delivered = deliveries.iter().find(|delivery| {
@@ -1561,7 +1678,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     }
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Signals a key to the application layer.
@@ -1744,7 +1861,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         let key_bytes = general_purpose::STANDARD
             .decode(&received.key_b64)
-            .map_err(|e| CommandError::SendError(format!("Failed to decode key: {}", e)))?;
+            .map_err(|e| {
+                CommandError::SerializationError(format!("Failed to decode key: {}", e))
+            })?;
 
         if key_bytes.len() != 32 {
             log::warn!(
@@ -1986,6 +2105,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             superseded_key: self.superseded_key.clone(),
             rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
+            undelivered: self.undelivered.clone(),
         }
     }
 }
@@ -2709,14 +2829,15 @@ mod tests {
         );
     }
 
-    /// An arrival that rotates must still leave the newcomer able to decrypt.
+    /// An arrival that rotates hands the newcomer the new key only.
     ///
     /// The rotation is delayed to keep the members already present decrypting, so
-    /// for the length of the delay we go on encrypting with a key the newcomer was
-    /// never sent — which is a media blackout on every join into an established
-    /// call unless they are handed that key too.
+    /// for the length of the delay we go on encrypting with a key minted before
+    /// the newcomer joined. Handing it over would let them read back over
+    /// everything it encrypted, which is what rotating on their arrival prevents;
+    /// they decrypt us once the new key comes into use.
     #[tokio::test]
-    async fn an_arrival_is_handed_the_key_we_keep_encrypting_with() {
+    async fn an_arrival_is_not_handed_the_key_it_arrived_after() {
         let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
@@ -2780,9 +2901,9 @@ mod tests {
             "carol needs the key we are rotating to, got {sent_to_carol:?}"
         );
         assert!(
-            sent_to_carol.contains(&(index_in_use as u64)),
-            "carol also needs the key we go on encrypting with for the next {}ms, or she \
-             decrypts nothing until it elapses; got {sent_to_carol:?}",
+            !sent_to_carol.contains(&(index_in_use as u64)),
+            "carol must not get the key minted before she joined, which we go on \
+             encrypting with for {}ms; got {sent_to_carol:?}",
             signal.use_after_ms,
         );
     }

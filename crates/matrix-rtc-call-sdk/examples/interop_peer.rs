@@ -598,7 +598,7 @@ async fn join_call(
     // Publish both: Element Call sits on "Waiting for media..." until it has
     // something it can decode, and video is the half that has historically
     // broken silently (see the simulcast note on PATTERN_WIDTH).
-    let tone = media::publish_tone(call.session(), 440.0).await?;
+    let tone = media::publish_tone(&call.session(), 440.0).await?;
     let video = publish_pattern_video(&call).await?;
 
     emit(serde_json::json!({

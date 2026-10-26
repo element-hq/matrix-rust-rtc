@@ -32,11 +32,20 @@
 //!
 //! - Our own raised hand is re-annotated onto the new membership event after
 //!   every refresh (and the old annotation redacted), or Element Call peers
-//!   would lower it for us. See `CallRoomState::keep_alive`.
+//!   would lower it for us. The hand's sender does it, see below.
 //! - As a receiver we are more lenient than Element Call: a hand stays raised
 //!   for as long as the member is in the call, whichever of their membership
 //!   events it was annotated on. A member's reaction is validated against every
 //!   membership event id the session has seen for them, not only the latest.
+//!
+//! # Our hand is a desired state (034 R5)
+//!
+//! A raise or lower records what the user asked for and shows it at once; a
+//! sender then annotates or redacts until where the hand landed matches it,
+//! one attempt at a time so a reversal never abandons an attempt whose outcome
+//! it needs. Each request is answered through [`HandRequests`]: landed,
+//! superseded by a later one, or refused for good, which returns the hand to
+//! where it last landed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -47,7 +56,7 @@ use thiserror::Error;
 use tokio::sync::{broadcast, watch};
 use unicode_segmentation::UnicodeSegmentation;
 
-use matrix_rtc_core::{CommandError, JoinedMembership, RawTimelineEvent};
+use matrix_rtc_core::{BackendError, CommandError, JoinedMembership, RawTimelineEvent};
 
 /// Event type of an Element Call emoji reaction.
 pub const REACTION_EVENT_TYPE: &str = "io.element.call.reaction";
@@ -73,8 +82,8 @@ pub const DEFAULT_REACTION_ACTIVE_MS: u64 = 3_000;
 pub const DEFAULT_REACTION_MAX_AGE_MS: u64 = 10_000;
 
 /// How many membership event ids are remembered per member for validating a
-/// reaction against an older one of their events. Refreshes are half an hour
-/// apart by default, so this covers hours of a call; the bound only exists so
+/// reaction against an older one of their events. Refreshes are twenty
+/// minutes apart by default, so this covers hours of a call; the bound only exists so
 /// a member cannot grow the set without limit.
 const KNOWN_MEMBERSHIP_EVENTS_PER_MEMBER: usize = 8;
 
@@ -435,9 +444,86 @@ pub enum ReactionError {
     /// The emoji was empty once trimmed to its first grapheme.
     #[error("the reaction has no emoji")]
     EmptyEmoji,
+    /// The reaction did not land within its 5 s, and is dropped rather than
+    /// shown late (034 R4). The message is the contract's (C12): hosts read
+    /// it through the bindings' `Reaction` error.
+    #[error("not sent")]
+    NotSent,
     /// The host failed to send or redact.
     #[error("command failed: {0}")]
     Command(#[from] CommandError),
+}
+
+/// How the requests for our hand stand (034 R5): a request is a raise or a
+/// lower, numbered in order, and each one supersedes those before it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HandRequests {
+    /// The latest request.
+    pub(crate) latest: u64,
+    /// Every request up to this one is answered.
+    pub(crate) settled: u64,
+    /// The request a permanent refusal failed, and the refusal.
+    pub(crate) refused: Option<(u64, HandRefusal)>,
+}
+
+/// A refusal, kept so each waiting call can be handed its own copy.
+#[derive(Clone, Debug)]
+pub(crate) struct HandRefusal {
+    backend: Option<BackendError>,
+    message: String,
+}
+
+impl HandRefusal {
+    pub(crate) fn new(error: &CommandError) -> Self {
+        Self {
+            backend: error.backend_error().cloned(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_error(&self) -> ReactionError {
+        ReactionError::Command(match &self.backend {
+            Some(error) => CommandError::Backend(error.clone()),
+            None => CommandError::from_message(self.message.clone()),
+        })
+    }
+}
+
+/// What it takes for our hand to stand where it was asked to be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HandSend {
+    /// Annotate the membership event `on`, then redact `replacing`, the
+    /// annotation of a membership event that has moved on.
+    Annotate {
+        on: String,
+        replacing: Option<String>,
+    },
+    /// Redact the annotation that raised it.
+    Redact { event_id: String },
+}
+
+/// Waits until `request` is answered: `Ok` once it landed or a later request
+/// superseded it, or once the session is gone; the refusal otherwise.
+pub(crate) async fn wait_for_hand(
+    mut requests: watch::Receiver<HandRequests>,
+    request: u64,
+) -> Result<(), ReactionError> {
+    loop {
+        {
+            let requests = requests.borrow_and_update();
+            if let Some((refused, refusal)) = &requests.refused
+                && *refused == request
+            {
+                return Err(refusal.to_error());
+            }
+            if requests.latest > request || requests.settled >= request {
+                return Ok(());
+            }
+        }
+        if requests.changed().await.is_err() {
+            return Ok(());
+        }
+    }
 }
 
 /// Milliseconds since the Unix epoch, injectable for tests.
@@ -477,7 +563,11 @@ pub(crate) struct ReactionsState {
     relations_fetched: HashSet<String>,
     /// When we last sent a reaction.
     last_sent_ms: Option<u64>,
+    /// Where our hand last landed: the truth peers see.
     own_raised_hand: Option<OwnRaisedHand>,
+    /// Whether the user last asked for our hand up (034 R5).
+    hand_wanted: bool,
+    hand_requests: watch::Sender<HandRequests>,
 }
 
 /// How many reactions a slow subscriber may fall behind before it starts
@@ -500,6 +590,8 @@ impl ReactionsState {
             relations_fetched: HashSet::new(),
             last_sent_ms: None,
             own_raised_hand: None,
+            hand_wanted: false,
+            hand_requests: watch::Sender::new(HandRequests::default()),
         }
     }
 
@@ -827,55 +919,145 @@ impl ReactionsState {
         self.last_sent_ms = Some(self.now());
     }
 
+    pub(crate) fn hand_wanted(&self) -> bool {
+        self.hand_wanted
+    }
+
     pub(crate) fn own_raised_hand(&self) -> Option<&OwnRaisedHand> {
         self.own_raised_hand.as_ref()
     }
 
-    /// Records that we raised our hand with `reaction_event_id` on
-    /// `membership_event_id`, and shows it locally right away rather than
-    /// waiting for the echo.
-    pub(crate) fn set_own_raised_hand(
+    /// Asks for our hand `up` or down, showing it so at once, and returns
+    /// the request to wait on. Asking for what is already asked for is no new
+    /// request: the caller waits on the pending one.
+    pub(crate) fn request_hand(&mut self, up: bool, own_member_id: &str, own_user_id: &str) -> u64 {
+        if up == self.hand_wanted {
+            return self.hand_requests.borrow().latest;
+        }
+        self.hand_wanted = up;
+        self.show_own_hand(own_member_id, own_user_id);
+        let mut latest = 0;
+        self.hand_requests.send_modify(|requests| {
+            requests.latest += 1;
+            latest = requests.latest;
+        });
+        latest
+    }
+
+    pub(crate) fn subscribe_hand_requests(&self) -> watch::Receiver<HandRequests> {
+        self.hand_requests.subscribe()
+    }
+
+    /// What our hand needs next to stand where it was asked to be on
+    /// `membership_event_id`, our current membership event; `None`, and every
+    /// request answered, when it already does.
+    pub(crate) fn hand_step(&self, membership_event_id: Option<&str>) -> Option<HandSend> {
+        let current = membership_event_id?;
+        match (&self.own_raised_hand, self.hand_wanted) {
+            (None, true) => Some(HandSend::Annotate {
+                on: current.to_owned(),
+                replacing: None,
+            }),
+            (Some(hand), true) if hand.annotated_membership_event_id != current => {
+                Some(HandSend::Annotate {
+                    on: current.to_owned(),
+                    replacing: Some(hand.reaction_event_id.clone()),
+                })
+            }
+            (Some(hand), false) => Some(HandSend::Redact {
+                event_id: hand.reaction_event_id.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Answers every request so far: the hand stands where it was asked to.
+    pub(crate) fn settle_hand(&self) {
+        self.hand_requests.send_if_modified(|requests| {
+            let moved = requests.settled != requests.latest;
+            requests.settled = requests.latest;
+            moved
+        });
+    }
+
+    /// Records that our annotation `reaction_event_id` on
+    /// `membership_event_id` landed.
+    pub(crate) fn hand_raised(
         &mut self,
         own_member_id: &str,
         own_user_id: &str,
         reaction_event_id: String,
         membership_event_id: String,
     ) {
-        let raised_at_ms = self
-            .raised_hands
-            .get(own_member_id)
-            .map(|hand| hand.raised_at_ms)
-            .unwrap_or_else(|| self.now());
-        self.raised_hands.insert(
-            own_member_id.to_owned(),
-            RaisedHand {
-                member_id: own_member_id.to_owned(),
-                sender: own_user_id.to_owned(),
-                reaction_event_id: reaction_event_id.clone(),
-                raised_at_ms,
-                from_backfill: false,
-            },
-        );
         self.own_raised_hand = Some(OwnRaisedHand {
             reaction_event_id,
             annotated_membership_event_id: membership_event_id,
         });
-        self.publish_raised_hands();
+        self.show_own_hand(own_member_id, own_user_id);
     }
 
-    /// Forgets our hand, locally lowering it.
-    pub(crate) fn clear_own_raised_hand(&mut self, own_member_id: &str) {
+    /// Records that the redaction of our annotation landed.
+    pub(crate) fn hand_lowered(&mut self, own_member_id: &str, own_user_id: &str) {
         self.own_raised_hand = None;
-        if self.raised_hands.remove(own_member_id).is_some() {
-            self.publish_raised_hands();
+        self.show_own_hand(own_member_id, own_user_id);
+    }
+
+    /// A permanent refusal: the request is dropped, the hand goes back to
+    /// where it last landed, and the latest request fails with `error`.
+    pub(crate) fn refuse_hand(
+        &mut self,
+        own_member_id: &str,
+        own_user_id: &str,
+        error: &CommandError,
+    ) {
+        self.hand_wanted = self.own_raised_hand.is_some();
+        self.show_own_hand(own_member_id, own_user_id);
+        let refusal = HandRefusal::new(error);
+        self.hand_requests.send_modify(|requests| {
+            requests.refused = Some((requests.latest, refusal));
+            requests.settled = requests.latest;
+        });
+    }
+
+    /// Shows our hand where it was asked to be: up from the first attempt,
+    /// under the event id it landed with once it has.
+    fn show_own_hand(&mut self, own_member_id: &str, own_user_id: &str) {
+        let shown = self.raised_hands.get(own_member_id).cloned();
+        let wanted = self.hand_wanted.then(|| RaisedHand {
+            member_id: own_member_id.to_owned(),
+            sender: own_user_id.to_owned(),
+            reaction_event_id: self
+                .own_raised_hand
+                .as_ref()
+                .map(|hand| hand.reaction_event_id.clone())
+                .unwrap_or_default(),
+            raised_at_ms: shown
+                .as_ref()
+                .map_or_else(|| self.now(), |hand| hand.raised_at_ms),
+            from_backfill: false,
+        });
+        if shown == wanted {
+            return;
         }
+        match wanted {
+            Some(hand) => {
+                self.raised_hands.insert(own_member_id.to_owned(), hand);
+            }
+            None => {
+                self.raised_hands.remove(own_member_id);
+            }
+        }
+        self.publish_raised_hands();
     }
 
     /// Forgets everything about our own participation. Peers' hands stay: the
     /// session outlives a leave and its roster does too.
+    /// Every request for our hand is answered: it went with the membership.
     pub(crate) fn reset_own(&mut self) {
         self.own_raised_hand = None;
+        self.hand_wanted = false;
         self.last_sent_ms = None;
+        self.settle_hand();
     }
 }
 

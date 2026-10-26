@@ -11,7 +11,22 @@
 //! of truth for who is in the call; transports only attach media to entries
 //! that already exist.
 
-use matrix_rtc_transport::MediaStreamKind;
+use matrix_rtc_transport::{ConnectionState, MediaStreamKind};
+
+/// Why a member's media is not shown although it may be arriving (034 R33,
+/// C6). Hosts draw the avatar for every case.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnableToDecrypt {
+    /// Their frames carry a key index we hold no key for: their key has not
+    /// reached us. After [`crate::StabilityConfig::key_grace`] without a break.
+    MissingKey,
+    /// We hold a key for the index their frames carry, but it does not
+    /// decrypt them (or the cryptor failed). After [`crate::StabilityConfig::key_grace`].
+    BadKey,
+    /// They published a track declared unencrypted, which is refused and
+    /// never played; at once, for as long as they stay on the SFU.
+    NotEncrypted,
+}
 
 /// Live state of one media stream of a participant.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,10 +47,15 @@ pub struct Participant {
     pub device_id: Option<String>,
     /// Whether this is our own membership.
     pub is_local: bool,
-    /// Whether any registered transport can reach this member's media. A
-    /// member publishing only unsupported transports stays in the roster
+    /// The connection carrying this member's media (034 R28); for our own
+    /// entry, our own SFU's (R23). `Unreachable` when no registered
+    /// transport can reach their media: such a member stays in the roster
     /// (signalling truth) but never gets streams.
-    pub reachable: bool,
+    pub connection: ConnectionState,
+    /// Why their media cannot be shown, if it cannot (034 R33, C6); `None`
+    /// once frames decrypt again. Always `None` for our own entry, which
+    /// nothing decrypts. `streams` is untouched by it.
+    pub unable_to_decrypt: Option<UnableToDecrypt>,
     /// Streams currently published by this participant, in arrival order.
     pub streams: Vec<StreamState>,
     /// When this participant raised their hand (ms since the epoch, by the

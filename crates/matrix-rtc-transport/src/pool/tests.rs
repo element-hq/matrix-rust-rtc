@@ -27,6 +27,23 @@ struct TransportState {
     /// Connect attempts that fail before one succeeds.
     fail_attempts: AtomicU32,
     applied: StdMutex<Vec<(String, MediaStreamKind, ResolvedConstraints)>>,
+    /// Outcomes of the own connection's `reconnect` calls, in order; `Ok`
+    /// once they run out.
+    reconnect_outcomes: StdMutex<std::collections::VecDeque<Reconnect>>,
+    /// `(when, fresh_token)` of every `reconnect` call.
+    reconnects: StdMutex<Vec<(tokio::time::Instant, bool)>>,
+    /// Every connection key the own handle took over.
+    takeovers: StdMutex<Vec<String>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Reconnect {
+    Ok,
+    Fail,
+    TokenRejected,
+    Refused,
+    /// Never answers.
+    Hang,
 }
 
 struct FakeTransport(Arc<TransportState>);
@@ -94,6 +111,49 @@ impl TransportConnection for FakeConnection {
         Ok(())
     }
 
+    async fn reconnect(
+        &self,
+        fresh_token: bool,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        self.state
+            .reconnects
+            .lock()
+            .unwrap()
+            .push((tokio::time::Instant::now(), fresh_token));
+        let outcome = self
+            .state
+            .reconnect_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Reconnect::Ok);
+        match outcome {
+            Reconnect::Ok => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                self.state
+                    .senders
+                    .lock()
+                    .unwrap()
+                    .insert(self.key.clone(), tx);
+                Ok(rx)
+            }
+            Reconnect::Fail => Err(TransportError::Connect("unreachable".into())),
+            Reconnect::TokenRejected => Err(TransportError::TokenRejected("401".into())),
+            Reconnect::Refused => Err(TransportError::Refused("403".into())),
+            Reconnect::Hang => std::future::pending().await,
+        }
+    }
+
+    fn hand_over(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(self.key.clone()))
+    }
+
+    fn take_over(&self, handover: Box<dyn std::any::Any>) -> Result<(), TransportError> {
+        let key = handover.downcast::<String>().expect("a fake's handover");
+        self.state.takeovers.lock().unwrap().push(*key);
+        Ok(())
+    }
+
     async fn close(&self) -> Result<(), TransportError> {
         self.state.closes.lock().unwrap().push(self.key.clone());
         Ok(())
@@ -154,6 +214,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_fallback(false)
+    }
+
+    fn with_fallback(sfu_fallback: bool) -> Self {
         let state = Arc::new(TransportState::default());
         let (pool, inbox) = MediaPool::new(PoolConfig {
             transports: vec![Arc::new(FakeTransport(state.clone()))],
@@ -167,6 +231,8 @@ impl Fixture {
                 },
             },
             own_connection_key: Some(OWN_FOCUS.to_owned()),
+            own_reconnect_budget: OWN_RECONNECT_BUDGET,
+            sfu_fallback,
         });
         Self { pool, inbox, state }
     }
@@ -361,10 +427,26 @@ async fn a_peer_focus_is_connected_and_reconnected_when_it_drops() {
                 kind: MediaStreamKind::Camera,
             },
             PoolEvent::Degraded(true),
+            reconnecting(PEER_FOCUS),
         ]
     );
+    assert_eq!(
+        fx.pool.member_connection("carol"),
+        Some(ConnectionState::Reconnecting)
+    );
+    assert_eq!(
+        fx.pool.member_connection("own"),
+        Some(ConnectionState::Connected)
+    );
     tokio::time::sleep(BACKOFF_BASE * 2).await;
-    assert_eq!(fx.drain().await, vec![PoolEvent::Degraded(false)]);
+    assert_eq!(
+        fx.drain().await,
+        vec![PoolEvent::Degraded(false), connected(PEER_FOCUS)]
+    );
+    assert_eq!(
+        fx.pool.member_connection("carol"),
+        Some(ConnectionState::Connected)
+    );
     assert_eq!(fx.connects(PEER_FOCUS), 2);
 }
 
@@ -373,14 +455,20 @@ async fn a_failed_connect_backs_off_and_retries() {
     let mut fx = Fixture::new();
     fx.state.fail_attempts.store(2, Ordering::SeqCst);
     fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
-    assert_eq!(fx.drain().await, vec![PoolEvent::Degraded(true)]);
+    assert_eq!(
+        fx.drain().await,
+        vec![PoolEvent::Degraded(true), reconnecting(PEER_FOCUS)]
+    );
 
     tokio::time::sleep(backoff_delay(1)).await;
     fx.drain().await;
     assert_eq!(fx.connects(PEER_FOCUS), 2);
 
     tokio::time::sleep(backoff_delay(2)).await;
-    assert_eq!(fx.drain().await, vec![PoolEvent::Degraded(false)]);
+    assert_eq!(
+        fx.drain().await,
+        vec![PoolEvent::Degraded(false), connected(PEER_FOCUS)]
+    );
     assert_eq!(fx.connects(PEER_FOCUS), 3);
 }
 
@@ -405,27 +493,246 @@ async fn an_idle_peer_focus_closes_after_the_grace_unless_a_member_returns() {
     assert_eq!(fx.connects(PEER_FOCUS), 1);
 }
 
-#[tokio::test]
-async fn losing_the_own_focus_is_reported_and_close_spares_it() {
+/// 034 R24: the transport giving up is not the end: the own focus is
+/// reconnected behind the same handle, at once and then on backoff, reusing
+/// the token; `close` still spares it.
+#[tokio::test(start_paused = true)]
+async fn the_own_focus_is_reconnected_after_the_transport_gives_up() {
     let mut fx = Fixture::new();
     let own = fx.adopt();
-    assert!(fx.pool.own_connection().is_some());
-
+    let start = tokio::time::Instant::now();
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_secs(50)).await;
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Reconnect::Fail);
     own.send(ConnectionEvent::Closed {
-        message: "kicked".into(),
+        message: "ten attempts spent".into(),
     })
     .unwrap();
-    assert_eq!(
-        fx.drain().await,
-        vec![PoolEvent::OwnConnectionLost {
-            message: "kicked".into(),
-        }]
+    let mut events = fx.drain().await;
+    for _ in 0..2 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        events.extend(fx.drain().await);
+    }
+
+    let attempts: Vec<(u64, bool)> = fx
+        .state
+        .reconnects
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(at, fresh)| ((*at - start).as_secs(), *fresh))
+        .collect();
+    assert_eq!(attempts, [(50, false), (51, false)], "token reused");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::OwnConnectionLost { .. }))
     );
-    assert!(fx.pool.own_connection().is_none());
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    assert!(fx.pool.own_connection().is_some());
 
     fx.pool.close();
     fx.drain().await;
     assert!(fx.state.closes.lock().unwrap().is_empty());
+}
+
+/// 034 R24 as sharpened: from a loss the transport gave up on, attempts at
+/// most 10 s apart and one at the budget's end, so an SFU back at 35 s is
+/// reconnected, and one back at 60 s still counts.
+#[tokio::test(start_paused = true)]
+async fn the_own_focus_is_tried_every_ten_seconds_and_at_the_budget_end() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend([Reconnect::Fail; 9]);
+    let start = tokio::time::Instant::now();
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    let mut events = Vec::new();
+    for _ in 0..70 {
+        events.extend(fx.drain().await);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let attempts: Vec<u64> = fx
+        .state
+        .reconnects
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(at, _)| (*at - start).as_secs())
+        .collect();
+    assert_eq!(attempts, [0, 1, 3, 7, 15, 25, 35, 45, 55, 60]);
+    assert_eq!(lost(&events), None, "the attempt at 60 s landed");
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+}
+
+/// The last attempt gets ten seconds to answer before the focus is given up.
+#[tokio::test(start_paused = true)]
+async fn a_last_attempt_that_never_answers_ends_ten_seconds_later() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend([Reconnect::Fail; 9].into_iter().chain([Reconnect::Hang]));
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    let mut lost_at = None;
+    let start = tokio::time::Instant::now();
+    for _ in 0..80 {
+        if lost(&fx.drain().await).is_some() && lost_at.is_none() {
+            lost_at = Some((tokio::time::Instant::now() - start).as_secs());
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    assert_eq!(lost_at, Some(70));
+}
+
+fn lost(events: &[PoolEvent]) -> Option<OwnConnectionLoss> {
+    events.iter().find_map(|event| match event {
+        PoolEvent::OwnConnectionLost { reason, .. } => Some(*reason),
+        _ => None,
+    })
+}
+
+/// 034 R24: a token the SFU rejects is fetched again, once.
+#[tokio::test(start_paused = true)]
+async fn a_rejected_token_is_fetched_again_once() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .push_back(Reconnect::TokenRejected);
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    fx.drain().await;
+    let fresh: Vec<bool> = fx
+        .state
+        .reconnects
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, fresh)| *fresh)
+        .collect();
+    assert_eq!(fresh, [false, true]);
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+}
+
+/// 034 R24: rejected again after the refetch, or any stated refusal, ends
+/// the budget at once.
+#[tokio::test(start_paused = true)]
+async fn a_token_rejected_again_after_one_refetch_ends_the_budget_at_once() {
+    for outcomes in [
+        vec![Reconnect::TokenRejected, Reconnect::TokenRejected],
+        vec![Reconnect::Refused],
+    ] {
+        let mut fx = Fixture::new();
+        let own = fx.adopt();
+        let start = tokio::time::Instant::now();
+        fx.state.reconnect_outcomes.lock().unwrap().extend(outcomes);
+        own.send(ConnectionEvent::Closed {
+            message: "gone".into(),
+        })
+        .unwrap();
+        let mut events = fx.drain().await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        events.extend(fx.drain().await);
+        assert_eq!(lost(&events), Some(OwnConnectionLoss::Refused));
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "at once, not at 60 s"
+        );
+        let attempts = fx.state.reconnects.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        fx.drain().await;
+        assert_eq!(
+            fx.state.reconnects.lock().unwrap().len(),
+            attempts,
+            "never retried"
+        );
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Unreachable);
+    }
+}
+
+/// 034 R24: the budget runs from the first sign of the loss, and ends the
+/// own focus at 60 s, not before.
+#[tokio::test(start_paused = true)]
+async fn the_reconnect_budget_ends_the_own_focus_after_sixty_seconds() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(Reconnect::Fail, 100));
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    own.send(ConnectionEvent::Closed {
+        message: "gone".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    tokio::time::sleep(Duration::from_millis(49_900)).await;
+    assert_eq!(lost(&fx.drain().await), None, "not before 60 s");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(lost(&fx.drain().await), Some(OwnConnectionLoss::Budget));
+}
+
+/// 034 R24, C10: the first connect runs under the budget from the request;
+/// never established, it is `NeverConnected`; established, it is up.
+#[tokio::test(start_paused = true)]
+async fn the_first_connect_runs_under_the_budget() {
+    let mut fx = Fixture::new();
+    fx.state
+        .reconnect_outcomes
+        .lock()
+        .unwrap()
+        .extend(std::iter::repeat_n(Reconnect::Fail, 100));
+    let (connection, _) = fake_connection(&fx.state, OWN_FOCUS);
+    let events = fx.pool.connect_own(connection);
+    assert!(events.contains(&PoolEvent::Degraded(true)));
+    assert_eq!(
+        fx.pool.own_connection_state(),
+        ConnectionState::Connecting,
+        "starting, not interrupted"
+    );
+    assert!(
+        fx.pool.own_handle().is_some(),
+        "publishable before it is up"
+    );
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(
+        lost(&fx.drain().await),
+        Some(OwnConnectionLoss::NeverConnected)
+    );
+
+    let mut fx = Fixture::new();
+    let (connection, _) = fake_connection(&fx.state, OWN_FOCUS);
+    fx.pool.connect_own(connection);
+    let events = fx.drain().await;
+    assert!(events.contains(&connected(OWN_FOCUS)));
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    assert!(fx.pool.own_connection().is_some());
 }
 
 #[tokio::test(start_paused = true)]
@@ -462,5 +769,881 @@ async fn constraints_are_debounced_and_follow_the_stream() {
     assert_eq!(
         *fx.state.applied.lock().unwrap(),
         vec![expected.clone(), expected]
+    );
+}
+
+fn reconnecting(key: &str) -> PoolEvent {
+    PoolEvent::ConnectionState {
+        connection_key: key.into(),
+        state: ConnectionState::Reconnecting,
+    }
+}
+
+fn connected(key: &str) -> PoolEvent {
+    PoolEvent::ConnectionState {
+        connection_key: key.into(),
+        state: ConnectionState::Connected,
+    }
+}
+
+/// 034 R30: a member's focus is retried on capped backoff for as long as
+/// they publish there, and only their departure stops it.
+#[tokio::test(start_paused = true)]
+async fn a_peer_focus_is_retried_for_as_long_as_a_member_publishes_there() {
+    let mut fx = Fixture::new();
+    fx.state.fail_attempts.store(u32::MAX, Ordering::SeqCst);
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    for _ in 0..100 {
+        tokio::time::sleep(BACKOFF_MAX).await;
+        fx.drain().await;
+    }
+    let attempts = fx.connects(PEER_FOCUS);
+    assert!(attempts >= 95, "still trying at 50 min: {attempts}");
+    assert_eq!(
+        fx.pool.member_connection("carol"),
+        Some(ConnectionState::Reconnecting)
+    );
+
+    fx.pool.apply_snapshot(&[]);
+    tokio::time::sleep(BACKOFF_MAX * 4).await;
+    fx.drain().await;
+    assert!(
+        fx.connects(PEER_FOCUS) <= attempts + 1,
+        "stopped with the member"
+    );
+}
+
+/// 034 R16, R28: unmappable identities are listed until they map or leave;
+/// a member with no supported transport is unreachable; our own media is
+/// connecting until the own focus is adopted, reconnecting once it was up.
+#[tokio::test(start_paused = true)]
+async fn unmappable_identities_and_unreachable_members_are_reported() {
+    let mut fx = Fixture::new();
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connecting);
+    let own = fx.adopt();
+    assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    fx.pool.apply_snapshot(&[member_on("own", OWN_FOCUS)]);
+
+    own.send(ConnectionEvent::RemoteJoined {
+        identity: "id-bob".into(),
+    })
+    .unwrap();
+    own.send(ConnectionEvent::RemoteJoined {
+        identity: "id-stranger".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    assert_eq!(fx.pool.unmappable(), ["id-bob", "id-stranger"]);
+
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    assert_eq!(fx.pool.unmappable(), ["id-stranger"], "bob mapped");
+    own.send(ConnectionEvent::RemoteLeft {
+        identity: "id-stranger".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    assert!(fx.pool.unmappable().is_empty(), "the stranger left");
+
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    fx.drain().await;
+    assert_eq!(
+        fx.pool.own_connection_state(),
+        ConnectionState::Reconnecting
+    );
+    assert_eq!(
+        fx.pool.member_connection("bob"),
+        Some(ConnectionState::Reconnecting)
+    );
+}
+
+mod fallback {
+    //! 034 R25: our own focus down past the grace, with signalling working
+    //! and a peer connection up, moves our media onto the busiest peer focus.
+
+    use super::*;
+
+    const THIRD_FOCUS: &str = "https://sfu-c.example.org";
+
+    /// Own focus adopted; bob and carol on the peer focus, dave on a third.
+    async fn call(sfu_fallback: bool) -> (Fixture, UnboundedSender<ConnectionEvent>) {
+        let mut fx = Fixture::with_fallback(sfu_fallback);
+        let own = fx.adopt();
+        fx.pool.apply_snapshot(&[
+            member_on("own", OWN_FOCUS),
+            member_on("bob", PEER_FOCUS),
+            member_on("carol", PEER_FOCUS),
+            member_on("dave", THIRD_FOCUS),
+        ]);
+        fx.drain().await;
+        (fx, own)
+    }
+
+    /// The transport gives our own focus up, and every reconnect fails.
+    fn lose_own(fx: &Fixture, own: &UnboundedSender<ConnectionEvent>) {
+        fx.state
+            .reconnect_outcomes
+            .lock()
+            .unwrap()
+            .extend([Reconnect::Fail; 40]);
+        own.send(ConnectionEvent::Closed {
+            message: "gone".into(),
+        })
+        .unwrap();
+    }
+
+    /// Runs `secs` seconds a second at a time; every event with the second
+    /// it came at, counted from `start`.
+    async fn run(
+        fx: &mut Fixture,
+        start: tokio::time::Instant,
+        secs: u64,
+    ) -> Vec<(u64, PoolEvent)> {
+        let mut events = Vec::new();
+        for _ in 0..secs {
+            let at = (tokio::time::Instant::now() - start).as_secs();
+            events.extend(fx.drain().await.into_iter().map(|event| (at, event)));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        events
+    }
+
+    fn moved(events: &[(u64, PoolEvent)]) -> Option<(u64, String)> {
+        events.iter().find_map(|(at, event)| match event {
+            PoolEvent::OwnFocusMoved {
+                connection_key,
+                transport,
+            } => {
+                assert_eq!(
+                    *transport,
+                    RtcTransport::LiveKit(LiveKitTransport {
+                        livekit_service_url: connection_key.clone(),
+                    })
+                );
+                Some((*at, connection_key.clone()))
+            }
+            _ => None,
+        })
+    }
+
+    fn lost_at(events: &[(u64, PoolEvent)]) -> Option<(u64, OwnConnectionLoss)> {
+        events.iter().find_map(|(at, event)| match event {
+            PoolEvent::OwnConnectionLost { reason, .. } => Some((*at, *reason)),
+            _ => None,
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_busiest_peer_connection_is_taken_over_at_ten_seconds() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+
+        assert_eq!(moved(&events), Some((10, PEER_FOCUS.to_owned())));
+        assert_eq!(*fx.state.takeovers.lock().unwrap(), [PEER_FOCUS]);
+        assert_eq!(lost_at(&events), None);
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+        let after: Vec<u64> = fx
+            .state
+            .reconnects
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(at, _)| (*at - start).as_secs())
+            .filter(|at| *at >= 10)
+            .collect();
+        assert!(after.is_empty(), "the own attempt dropped: {after:?}");
+        // The old focus has nobody else on it: nothing to reconnect.
+        assert_eq!(fx.connects(OWN_FOCUS), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_the_host_flag_the_budget_runs_out() {
+        let (mut fx, own) = call(false).await;
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+        assert_eq!(moved(&events), None);
+        assert_eq!(lost_at(&events), Some((60, OwnConnectionLoss::Budget)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_fallback_while_every_connection_is_down() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        fx.sender(PEER_FOCUS)
+            .send(ConnectionEvent::Reconnecting)
+            .unwrap();
+        fx.sender(THIRD_FOCUS)
+            .send(ConnectionEvent::Reconnecting)
+            .unwrap();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+        assert_eq!(moved(&events), None);
+        assert!(fx.state.takeovers.lock().unwrap().is_empty());
+        assert_eq!(lost_at(&events), Some((60, OwnConnectionLoss::Budget)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_fallback_in_a_single_sfu_call() {
+        let mut fx = Fixture::with_fallback(true);
+        let own = fx.adopt();
+        fx.pool
+            .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+        fx.drain().await;
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 70).await;
+        assert_eq!(moved(&events), None);
+        assert_eq!(lost_at(&events), Some((60, OwnConnectionLoss::Budget)));
+    }
+
+    /// The busiest focus is down while another peer's is up: the move waits
+    /// for it, and happens as it comes back.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_connection_coming_back_mid_outage_enables_the_fallback() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        let peer = fx.sender(PEER_FOCUS);
+        peer.send(ConnectionEvent::Reconnecting).unwrap();
+        lose_own(&fx, &own);
+        let mut events = run(&mut fx, start, 25).await;
+        assert_eq!(moved(&events), None);
+        peer.send(ConnectionEvent::Reconnected).unwrap();
+        events.extend(run(&mut fx, start, 5).await);
+        assert_eq!(moved(&events), Some((25, PEER_FOCUS.to_owned())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_fallback_needs_signalling() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        fx.pool.set_signalling_reachable(false);
+        lose_own(&fx, &own);
+        let mut events = run(&mut fx, start, 20).await;
+        assert_eq!(moved(&events), None);
+        events.extend(
+            fx.pool
+                .set_signalling_reachable(true)
+                .into_iter()
+                .map(|event| (20, event)),
+        );
+        assert_eq!(moved(&events), Some((20, PEER_FOCUS.to_owned())));
+    }
+
+    /// Our own focus back first: the pending fallback is dropped.
+    #[tokio::test(start_paused = true)]
+    async fn our_own_focus_back_first_wins() {
+        let (mut fx, own) = call(true).await;
+        let start = tokio::time::Instant::now();
+        let peer = fx.sender(PEER_FOCUS);
+        peer.send(ConnectionEvent::Reconnecting).unwrap();
+        fx.state
+            .reconnect_outcomes
+            .lock()
+            .unwrap()
+            .extend([Reconnect::Fail; 4]);
+        own.send(ConnectionEvent::Closed {
+            message: "gone".into(),
+        })
+        .unwrap();
+        // Attempts at 0, 1, 3, 7 fail; the one at 15 lands.
+        let mut events = run(&mut fx, start, 18).await;
+        peer.send(ConnectionEvent::Reconnected).unwrap();
+        events.extend(run(&mut fx, start, 5).await);
+        assert_eq!(moved(&events), None);
+        assert!(fx.state.takeovers.lock().unwrap().is_empty());
+        assert_eq!(fx.pool.own_connection_state(), ConnectionState::Connected);
+    }
+
+    /// Whoever else publishes on the old focus is subscribed to as a peer's.
+    #[tokio::test(start_paused = true)]
+    async fn the_old_focus_is_connected_as_a_peer_when_others_remain_there() {
+        let (mut fx, own) = call(true).await;
+        fx.pool.apply_snapshot(&[
+            member_on("own", OWN_FOCUS),
+            member_on("erin", OWN_FOCUS),
+            member_on("bob", PEER_FOCUS),
+            member_on("carol", PEER_FOCUS),
+        ]);
+        let start = tokio::time::Instant::now();
+        lose_own(&fx, &own);
+        let events = run(&mut fx, start, 12).await;
+        assert_eq!(moved(&events), Some((10, PEER_FOCUS.to_owned())));
+        assert_eq!(fx.connects(OWN_FOCUS), 1);
+        assert_eq!(
+            fx.pool.member_connection("erin"),
+            Some(ConnectionState::Connected)
+        );
+    }
+    #[derive(Clone, Debug)]
+    enum Step {
+        OwnClosed,
+        PeerReconnecting,
+        PeerReconnected,
+        Signalling(bool),
+        Wait(u64),
+    }
+
+    fn step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        prop_oneof![
+            Just(Step::OwnClosed),
+            Just(Step::PeerReconnecting),
+            Just(Step::PeerReconnected),
+            any::<bool>().prop_map(Step::Signalling),
+            (1u64..20).prop_map(Step::Wait),
+        ]
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// Whatever the order of losses, reconnect outcomes, peer outages and
+        /// signalling: our media moves only with the host flag, only while
+        /// signalling is reachable, first to the busiest focus, never back to
+        /// our own, and again (or given up) only once the focus it moved to
+        /// was lost in turn.
+        #[test]
+        fn a_fallback_is_taken_only_on_its_terms(
+            sfu_fallback: bool,
+            fails in proptest::collection::vec(proptest::bool::ANY, 0..40),
+            steps in proptest::collection::vec(step(), 1..30),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (mut fx, own) = call(sfu_fallback).await;
+                fx.state.reconnect_outcomes.lock().unwrap().extend(
+                    fails
+                        .iter()
+                        .map(|fail| if *fail { Reconnect::Fail } else { Reconnect::Ok }),
+                );
+                let peer = fx.sender(PEER_FOCUS);
+                let mut reachable = true;
+                let mut moves = 0;
+                let mut new_focus_lost = false;
+                for step in steps {
+                    new_focus_lost |= moves > 0 && matches!(step, Step::PeerReconnecting);
+                    let events = match step {
+                        Step::OwnClosed => {
+                            let _ = own.send(ConnectionEvent::Closed {
+                                message: "gone".into(),
+                            });
+                            fx.drain().await
+                        }
+                        Step::PeerReconnecting => {
+                            let _ = peer.send(ConnectionEvent::Reconnecting);
+                            fx.drain().await
+                        }
+                        Step::PeerReconnected => {
+                            let _ = peer.send(ConnectionEvent::Reconnected);
+                            fx.drain().await
+                        }
+                        Step::Signalling(now) => {
+                            reachable = now;
+                            let mut events = fx.pool.set_signalling_reachable(now);
+                            events.extend(fx.drain().await);
+                            events
+                        }
+                        Step::Wait(secs) => {
+                            let mut events = Vec::new();
+                            for _ in 0..secs {
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                                events.extend(fx.drain().await);
+                            }
+                            events
+                        }
+                    };
+                    for event in &events {
+                        if let PoolEvent::OwnFocusMoved { connection_key, .. } = event {
+                            assert!(sfu_fallback, "moved without the host flag");
+                            assert!(reachable, "moved while signalling was down");
+                            assert_ne!(connection_key, OWN_FOCUS, "never back");
+                            if moves == 0 {
+                                assert_eq!(connection_key, PEER_FOCUS, "the busiest focus");
+                            } else {
+                                assert!(new_focus_lost, "moved again with no new loss");
+                            }
+                            moves += 1;
+                        }
+                        if matches!(event, PoolEvent::OwnConnectionLost { .. }) {
+                            assert!(moves == 0 || new_focus_lost, "given up after moving away");
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Found by the identity property: a membership that lapses and returns
+/// under the same member id (a republish after an outage, 034 R17/R19) gets
+/// its media back. The SFU kept carrying it and will not announce it again.
+#[tokio::test(start_paused = true)]
+async fn a_member_returning_under_the_same_member_id_gets_their_media_back() {
+    let mut fx = Fixture::new();
+    fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    fx.sender(PEER_FOCUS)
+        .send(track_added("id-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+
+    fx.pool.apply_snapshot(&[]);
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_none()
+    );
+    let events = fx.pool.apply_snapshot(&[member_on("bob", PEER_FOCUS)]);
+
+    assert!(events.contains(&PoolEvent::StreamAdded {
+        member_id: "bob".into(),
+        kind: MediaStreamKind::Microphone,
+    }));
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Microphone)
+            .is_some()
+    );
+}
+
+/// 034 R25: a member moving focus is added on the new connection before the
+/// old one removes them: the replaced track is reported removed and added,
+/// so readers reopen, and the late removal leaves the new track alone.
+#[tokio::test(start_paused = true)]
+async fn a_late_removal_from_the_old_connection_keeps_the_moved_track() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    own.send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    fx.drain().await;
+
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", PEER_FOCUS)]);
+    fx.drain().await;
+    fx.sender(PEER_FOCUS)
+        .send(track_added("id-bob", MediaStreamKind::Camera))
+        .unwrap();
+    own.send(ConnectionEvent::TrackRemoved {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+    })
+    .unwrap();
+    let events = fx.drain().await;
+    let streams: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                PoolEvent::StreamRemoved { .. } | PoolEvent::StreamAdded { .. }
+            )
+        })
+        .collect();
+    assert_eq!(
+        streams,
+        [
+            &PoolEvent::StreamRemoved {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Camera,
+            },
+            &PoolEvent::StreamAdded {
+                member_id: "bob".into(),
+                kind: MediaStreamKind::Camera,
+            },
+        ],
+        "one pair for the replacement, nothing for the late removal"
+    );
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("bob", MediaStreamKind::Camera)
+            .is_some()
+    );
+}
+
+mod identity {
+    //! The identity mapping under arbitrary interleavings of membership
+    //! snapshots, SFU events (members' and strangers'), key imports,
+    //! connections dropping and time, checked after every step against a
+    //! model of what is published where:
+    //!
+    //! 1. a stream is reported added only when absent and removed only when
+    //!    present, and the reported streams are exactly the subscribed tracks;
+    //! 2. every subscribed track is a current member's, and every track a
+    //!    current member has live on a connection is subscribed (media that
+    //!    beat its membership included);
+    //! 3. a key is reported only for a current member, under their identity,
+    //!    and one imported before the membership is reported when it lands;
+    //! 4. `unmappable()` is exactly the identities that joined a live
+    //!    connection while mapping to no member and have not left it or been
+    //!    mapped since (034 R16: a participant whose membership we have not
+    //!    seen; a member whose membership ends is not re-listed, or every
+    //!    hang-up would flash an unknown participant until the SFU drops them).
+
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use proptest::prelude::*;
+
+    use super::*;
+
+    const FOCI: [&str; 2] = ["https://sfu-a.example.org", "https://sfu-b.example.org"];
+    const MEMBERS: [&str; 3] = ["m0", "m1", "m2"];
+    const STRANGERS: [&str; 2] = ["s0", "s1"];
+    const KINDS: [MediaStreamKind; 2] = [MediaStreamKind::Microphone, MediaStreamKind::Camera];
+
+    /// Who an SFU event is about: a member (by index) or a stranger.
+    #[derive(Clone, Copy, Debug)]
+    enum Who {
+        Member(usize),
+        Stranger(usize),
+    }
+
+    impl Who {
+        fn identity(self) -> String {
+            match self {
+                Who::Member(n) => format!("id-{}", MEMBERS[n]),
+                Who::Stranger(n) => format!("id-{}", STRANGERS[n]),
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// The members in the snapshot, each on one focus.
+        Snapshot(Vec<(usize, usize)>),
+        TrackAdded(usize, Who, usize),
+        TrackRemoved(usize, Who, usize),
+        RemoteJoined(usize, Who),
+        RemoteLeft(usize, Who),
+        KeyImported(Who, u8),
+        ConnectionDown(usize),
+        Advance(u64),
+    }
+
+    fn who() -> impl Strategy<Value = Who> {
+        prop_oneof![
+            3 => (0..MEMBERS.len()).prop_map(Who::Member),
+            1 => (0..STRANGERS.len()).prop_map(Who::Stranger),
+        ]
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        let focus = 0..FOCI.len();
+        let kind = 0..KINDS.len();
+        prop_oneof![
+            3 => proptest::collection::btree_map(0..MEMBERS.len(), 0..FOCI.len(), 0..=MEMBERS.len())
+                .prop_map(|members| Step::Snapshot(members.into_iter().collect())),
+            4 => (focus.clone(), who(), kind.clone())
+                .prop_map(|(f, w, k)| Step::TrackAdded(f, w, k)),
+            2 => (focus.clone(), who(), kind).prop_map(|(f, w, k)| Step::TrackRemoved(f, w, k)),
+            2 => (focus.clone(), who()).prop_map(|(f, w)| Step::RemoteJoined(f, w)),
+            1 => (focus.clone(), who()).prop_map(|(f, w)| Step::RemoteLeft(f, w)),
+            2 => (who(), 0u8..3).prop_map(|(w, i)| Step::KeyImported(w, i)),
+            1 => focus.prop_map(Step::ConnectionDown),
+            2 => (0u64..12_000).prop_map(Step::Advance),
+        ]
+    }
+
+    /// What the SFUs and the host have done, as far as the pool can know.
+    #[derive(Default)]
+    struct Model {
+        /// The latest snapshot: member id → focus.
+        snapshot: BTreeMap<String, String>,
+        /// Tracks live on a connection: (identity, kind) → focus.
+        published: BTreeMap<(String, MediaStreamKind), String>,
+        /// Identities that joined a connection unmapped: identity → focus.
+        unmapped: BTreeMap<String, String>,
+        /// Keys imported for an identity no member had: identity → indexes.
+        pending_keys: BTreeMap<String, BTreeSet<u8>>,
+        /// Streams as the pool reported them.
+        streams: BTreeSet<(String, MediaStreamKind)>,
+    }
+
+    fn member_of(identity: &str) -> Option<&'static str> {
+        MEMBERS
+            .iter()
+            .find(|member| format!("id-{member}") == identity)
+            .copied()
+    }
+
+    fn live(fx: &Fixture, focus: &str) -> Option<UnboundedSender<ConnectionEvent>> {
+        let up = fx
+            .pool
+            .pool
+            .get(focus)
+            .is_some_and(|entry| matches!(entry.state, ConnState::Up { .. }));
+        up.then(|| fx.state.senders.lock().unwrap().get(focus).cloned())
+            .flatten()
+    }
+
+    /// The connection to `focus` is gone, as the pool will see it: what was
+    /// on it is not any more.
+    fn connection_gone(model: &mut Model, focus: &str) {
+        model.published.retain(|_, on| on != focus);
+        model.unmapped.retain(|_, on| on != focus);
+    }
+
+    fn apply(model: &mut Model, events: &[PoolEvent], step: &Step) {
+        for event in events {
+            match event {
+                PoolEvent::StreamAdded { member_id, kind } => {
+                    assert!(
+                        model.streams.insert((member_id.clone(), *kind)),
+                        "after {step:?}: {member_id} {kind:?} added twice"
+                    );
+                }
+                PoolEvent::StreamRemoved { member_id, kind } => {
+                    assert!(
+                        model.streams.remove(&(member_id.clone(), *kind)),
+                        "after {step:?}: {member_id} {kind:?} removed while absent"
+                    );
+                }
+                PoolEvent::KeyImported {
+                    member_id,
+                    identity,
+                    key_index,
+                } => {
+                    assert!(
+                        model.snapshot.contains_key(member_id),
+                        "after {step:?}: a key reported for {member_id}, not a member"
+                    );
+                    assert_eq!(*identity, format!("id-{member_id}"), "after {step:?}");
+                    if let Some(pending) = model.pending_keys.get_mut(identity) {
+                        pending.remove(key_index);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn check(fx: &Fixture, model: &Model, step: &Step) {
+        let tracks: BTreeSet<(String, MediaStreamKind)> =
+            fx.pool.tracks.lock().unwrap().keys().cloned().collect();
+        // 1.
+        assert_eq!(
+            tracks, model.streams,
+            "after {step:?}: the subscribed tracks are not the reported streams"
+        );
+        // 2.
+        for (member_id, _) in &tracks {
+            assert!(
+                model.snapshot.contains_key(member_id),
+                "after {step:?}: a track of {member_id}, not a member"
+            );
+        }
+        for (identity, kind) in model.published.keys() {
+            if let Some(member) = member_of(identity)
+                && model.snapshot.contains_key(member)
+            {
+                assert!(
+                    tracks.contains(&(member.to_owned(), *kind)),
+                    "after {step:?}: {member}'s live {kind:?} is not subscribed"
+                );
+            }
+        }
+        // 3.
+        for (identity, pending) in &model.pending_keys {
+            if member_of(identity).is_some_and(|member| model.snapshot.contains_key(member)) {
+                assert!(
+                    pending.is_empty(),
+                    "after {step:?}: keys {pending:?} of {identity} never reported"
+                );
+            }
+        }
+        // 4.
+        let expected: BTreeSet<String> = model.unmapped.keys().cloned().collect();
+        let unmappable: BTreeSet<String> = fx.pool.unmappable().into_iter().collect();
+        assert_eq!(
+            unmappable, expected,
+            "after {step:?}: unmappable identities"
+        );
+    }
+
+    async fn run(steps: Vec<Step>) {
+        let mut fx = Fixture::new();
+        let mut model = Model::default();
+        for step in steps {
+            let mut events = Vec::new();
+            match &step {
+                Step::Snapshot(members) => {
+                    let snapshot: Vec<JoinedMembership> = members
+                        .iter()
+                        .map(|(member, focus)| member_on(MEMBERS[*member], FOCI[*focus]))
+                        .collect();
+                    let departed: Vec<String> = model
+                        .snapshot
+                        .keys()
+                        .filter(|member| {
+                            !members.iter().any(|(m, _)| MEMBERS[*m] == member.as_str())
+                        })
+                        .cloned()
+                        .collect();
+                    // A departure takes its streams without events; the owner
+                    // drops the member as a whole.
+                    for member in &departed {
+                        model.streams.retain(|(m, _)| m != member);
+                    }
+                    model.snapshot = members
+                        .iter()
+                        .map(|(member, focus)| {
+                            (MEMBERS[*member].to_owned(), FOCI[*focus].to_owned())
+                        })
+                        .collect();
+                    model.unmapped.retain(|identity, _| {
+                        member_of(identity).is_none_or(|m| !model.snapshot.contains_key(m))
+                    });
+                    events.extend(fx.pool.apply_snapshot(&snapshot));
+                }
+                Step::TrackAdded(focus, who, kind) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(track_added(&who.identity(), KINDS[*kind]))
+                            .unwrap();
+                        model
+                            .published
+                            .insert((who.identity(), KINDS[*kind]), FOCI[*focus].to_owned());
+                    }
+                }
+                Step::TrackRemoved(focus, who, kind) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(ConnectionEvent::TrackRemoved {
+                                identity: who.identity(),
+                                kind: KINDS[*kind],
+                            })
+                            .unwrap();
+                        let key = (who.identity(), KINDS[*kind]);
+                        if model.published.get(&key).map(String::as_str) == Some(FOCI[*focus]) {
+                            model.published.remove(&key);
+                        }
+                    }
+                }
+                Step::RemoteJoined(focus, who) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(ConnectionEvent::RemoteJoined {
+                                identity: who.identity(),
+                            })
+                            .unwrap();
+                        let mapped = member_of(&who.identity())
+                            .is_some_and(|m| model.snapshot.contains_key(m));
+                        if !mapped {
+                            model
+                                .unmapped
+                                .insert(who.identity(), FOCI[*focus].to_owned());
+                        }
+                    }
+                }
+                Step::RemoteLeft(focus, who) => {
+                    if let Some(sender) = live(&fx, FOCI[*focus]) {
+                        sender
+                            .send(ConnectionEvent::RemoteLeft {
+                                identity: who.identity(),
+                            })
+                            .unwrap();
+                        model.unmapped.remove(&who.identity());
+                    }
+                }
+                Step::KeyImported(who, index) => {
+                    let mapped =
+                        member_of(&who.identity()).is_some_and(|m| model.snapshot.contains_key(m));
+                    if !mapped {
+                        model
+                            .pending_keys
+                            .entry(who.identity())
+                            .or_default()
+                            .insert(*index);
+                    }
+                    events.extend(fx.pool.key_imported(who.identity(), *index));
+                }
+                Step::ConnectionDown(focus) => {
+                    if live(&fx, FOCI[*focus]).is_some() {
+                        fx.state.senders.lock().unwrap().remove(FOCI[*focus]);
+                        connection_gone(&mut model, FOCI[*focus]);
+                    }
+                }
+                Step::Advance(ms) => tokio::time::sleep(Duration::from_millis(*ms)).await,
+            }
+            events.extend(fx.drain().await);
+            // A connection closed for being idle took what was on it.
+            for focus in FOCI {
+                if !fx.pool.pool.contains_key(focus) {
+                    connection_gone(&mut model, focus);
+                }
+            }
+            apply(&mut model, &events, &step);
+            check(&fx, &model, &step);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        #[test]
+        fn the_identity_mapping_holds_whatever_arrives_first(
+            steps in proptest::collection::vec(step(), 1..40),
+        ) {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .unwrap()
+                .block_on(run(steps));
+        }
+    }
+}
+
+/// 034 C6: a track refused as unencrypted is reported for its member, also
+/// when it beat their membership, and forgotten once they leave the SFU.
+#[tokio::test(start_paused = true)]
+async fn a_track_sent_in_clear_is_reported_once_its_member_maps() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("own", OWN_FOCUS)]);
+    own.send(ConnectionEvent::TrackNotEncrypted {
+        identity: "id-bob".into(),
+        kind: MediaStreamKind::Camera,
+    })
+    .unwrap();
+    assert!(
+        !fx.drain()
+            .await
+            .iter()
+            .any(|event| matches!(event, PoolEvent::SentInClear { .. })),
+        "not a member yet"
+    );
+
+    let events = fx
+        .pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    assert!(events.contains(&PoolEvent::SentInClear {
+        member_id: "bob".into()
+    }));
+
+    own.send(ConnectionEvent::RemoteLeft {
+        identity: "id-bob".into(),
+    })
+    .unwrap();
+    fx.drain().await;
+    fx.pool.apply_snapshot(&[member_on("own", OWN_FOCUS)]);
+    let events = fx
+        .pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("bob", OWN_FOCUS)]);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, PoolEvent::SentInClear { .. })),
+        "left the SFU"
     );
 }

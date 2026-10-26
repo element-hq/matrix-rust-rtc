@@ -192,13 +192,25 @@ export class MatrixRtcCall {
     room.on(RoomEvent.ParticipantDisconnected, (participant) =>
       sink.remoteLeft(participant.identity),
     );
+    // In an encrypted room a track declared unencrypted is refused: its
+    // frames would play as they come, and the SFU relays that declaration.
+    const refused = (publication) =>
+      Boolean(this.roomOptions.e2ee) && publication?.isEncrypted === false;
     room.on(RoomEvent.TrackSubscribed, (_track, publication, participant) => {
       const kind = kindOf(publication);
-      if (kind) sink.trackAdded(participant.identity, kind);
+      if (!kind) return;
+      if (refused(publication)) {
+        publication.setSubscribed(false);
+        sink.trackNotEncrypted(participant.identity, kind);
+        return;
+      }
+      sink.trackAdded(participant.identity, kind);
     });
     room.on(RoomEvent.TrackUnsubscribed, (_track, publication, participant) => {
       const kind = kindOf(publication);
-      if (kind) sink.trackRemoved(participant.identity, kind);
+      if (kind && !refused(publication)) {
+        sink.trackRemoved(participant.identity, kind);
+      }
     });
     // Local publications too, so our own roster entry carries our streams.
     room.on(RoomEvent.LocalTrackPublished, (publication) => {

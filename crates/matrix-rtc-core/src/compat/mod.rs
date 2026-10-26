@@ -105,7 +105,7 @@ pub mod ingest;
 pub mod room_state;
 pub mod sticky_2025;
 
-pub use dialect_backend::DialectBackend;
+pub use dialect_backend::{DialectBackend, DialectHold};
 pub use room_state::{
     RoomStateDialect, STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
 };

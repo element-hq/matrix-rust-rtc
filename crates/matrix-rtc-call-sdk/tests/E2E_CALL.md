@@ -29,6 +29,22 @@ registration).
 | **Multi-SFU** (`e2e_call_two_foci_*`) | The same flow with `alice` publishing on SFU 1 and `bob` on SFU 2 (the backend stack runs two SFU + lk-jwt pairs). Each client's `CallEngine` reads the peer's `transports` from their membership and opens a second connection to the peer's focus (MSC4195 multi-SFU). Tones flow in **both directions** (alice 440 Hz, bob 660 Hz) and are received through the transport-agnostic media API (`LiveKitCall::participants` → `LiveKitCall::remote_track` → frame streams) instead of raw LiveKit events. |
 | **Video + constraints** (same scenario) | `alice` publishes a synthetic half-bright/half-dark I420 pattern through `LiveKitCall::publish` (camera track, simulcast + dynacast); `bob` receives it via `video_frames()` across the SFUs and verifies the luma split (robust to VP8 compression). Then `bob` exercises both constraint demand states: `visible = false` **pauses** the stream (frames stop, subscription kept — `set_enabled(false)`) and `visible = true` resumes it instantly; `enabled = false` turns it **off** (released as fully as the transport supports — LiveKit currently pauses here too, because its client-side resubscribe is unreliable at 0.7.48) and `enabled = true` brings frames back. |
 
+## Resilience scenarios (`e2e_resilience_*`)
+
+`e2e_call/resilience.rs` stops and starts the stack's containers under a call
+(feature 034): Synapse restarted (media keeps flowing, both clients report
+signalling unreachable then reachable, nobody is reported gone, no call ends),
+our SFU stopped and started inside the 60 s budget (reconnected, same member
+id), our SFU stopped for good with bob's up and `sfu_fallback` on (our media
+moves to bob's SFU and bob hears it again), and both SFUs stopped (no fallback;
+the call ends with `Budget`). They put the stack back however they end, and must
+run one at a time:
+
+```sh
+cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing \
+    --test e2e_call -- --ignored --nocapture --test-threads=1 e2e_resilience
+```
+
 ## How it's wired
 
 Each participant is a `matrix_rtc_call_sdk::LiveKitCall` (`src/livekit/call.rs`) — the crate's

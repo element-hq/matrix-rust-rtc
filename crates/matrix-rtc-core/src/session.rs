@@ -10,7 +10,7 @@
 //! by its [`BaseRtcRoom`](crate::BaseRtcRoom), the only thing that creates one.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
@@ -18,18 +18,25 @@ use tokio::sync::{broadcast, watch};
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::executor::{AbortHandle, AbortOnDrop};
+use crate::executor::{self, AbortHandle, AbortOnDrop};
 use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
 use crate::membership_listener::MembershipScope;
-use crate::own_membership::{MembershipTimings, OwnMembershipMachine, transport_to_json};
+use crate::outbox::Outbox;
+use crate::own_membership::{MembershipTimings, OwnEntry, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{MemberTransports, RtcTransport};
 use crate::upkeep::{self, SessionUpkeep};
 
 #[allow(unused_imports)]
 use log::*;
+
+/// How long a member whose delayed leave fired stays on the roster, waiting
+/// for them to come back (034 R21). A homeserver restart fires every overdue
+/// delayed leave on it at once, and each live client restarts or republishes
+/// well inside this.
+pub const DELAYED_LEAVE_HOLD: Duration = Duration::from_secs(10);
 
 /// What a session knows about the room state governing its slot.
 ///
@@ -117,12 +124,42 @@ struct OwnParticipation {
 /// join, so a subscriber only falls behind across several rejoins.
 const AUTO_LEAVES_CAPACITY: usize = 4;
 
+/// A leave whose participation has ended ([`SlotSession::begin_leave`]) and
+/// whose sends have not: our leave membership, then the delayed leave
+/// cancelled, each one attempt (034 R8). Owns everything it needs, so it runs
+/// without the session or its room.
+pub struct PendingLeave<T: MatrixBackend + 'static> {
+    machine: Arc<OwnMembershipMachine<T>>,
+    upkeep: Option<AbortOnDrop<()>>,
+    leave_reason: Option<LeaveReason>,
+    log_tag: String,
+}
+
+impl<T: MatrixBackend + 'static> PendingLeave<T> {
+    /// Sends the leave. A failure is the leave event's; the delayed leave
+    /// removes the membership then.
+    pub async fn send(self) -> Result<(), LeaveError> {
+        let sent = self
+            .machine
+            .leave(self.leave_reason)
+            .await
+            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
+        drop(self.upkeep);
+        sent?;
+        log::info!("[{}] left", self.log_tag);
+        Ok(())
+    }
+}
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct SlotSession<T: MatrixBackend> {
     /// Member events that are join-shaped and still sticky. These are
     /// candidates only: the remaining MSC4143 join conditions depend on room
     /// state, which can change under them at any time.
     candidates: Vec<JoinedMembership>,
+    /// Candidates whose delayed leave fired, kept until the instant here
+    /// unless they come back first (034 R21), by `(sender, sticky_key)`.
+    held: HashMap<(String, String), executor::Instant>,
     /// The candidates that currently satisfy every join condition. This is what
     /// gets published and what the encryption manager distributes keys to.
     members: Vec<JoinedMembership>,
@@ -157,12 +194,15 @@ pub struct SlotSession<T: MatrixBackend> {
     /// from a multi-call client is attributable. Pre-formatted because it is
     /// used on paths that run per event.
     log_tag: String,
+    /// The client's retry layer, handed to each join's membership machine.
+    outbox: Outbox,
 }
 
 impl<T: MatrixBackend> Clone for SlotSession<T> {
     fn clone(&self) -> Self {
         Self {
             candidates: self.candidates.clone(),
+            held: self.held.clone(),
             members: self.members.clone(),
             slot: self.slot.clone(),
             room_members: self.room_members.clone(),
@@ -178,6 +218,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             slot_id: self.slot_id.clone(),
             membership_scope: self.membership_scope.clone(), // Shares the watch, so shares its listeners
             log_tag: self.log_tag.clone(),
+            outbox: self.outbox.clone(),
         }
     }
 }
@@ -190,12 +231,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         slot_id: String,
         backend: Option<Arc<T>>,
         membership_scope: MembershipScope,
+        outbox: Outbox,
     ) -> Self {
         let (membership_snapshots_tx, _membership_snapshots_rx) = watch::channel(Vec::new());
         let log_tag = format!("{room_id}/{slot_id}");
 
         Self {
             candidates: Vec::new(),
+            held: HashMap::new(),
             members: Vec::new(),
             slot: SlotKnowledge::default(),
             room_members: None,
@@ -211,6 +254,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             slot_id,
             membership_scope,
             log_tag,
+            outbox,
         }
     }
 
@@ -352,6 +396,17 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// application relates its own events to (a call's MSC4075 notification).
     /// Returns `Err(JoinError)` if validation fails, backend not configured, or commands fail.
     pub async fn join(&mut self, params: JoinSessionParams) -> Result<String, JoinError> {
+        self.join_within(params, None).await
+    }
+
+    /// [`Self::join`] under a budget that ends at `deadline` (034 R6), counted
+    /// from when the caller received the join; `None` is
+    /// [`DEFAULT_JOIN_BUDGET_MS`](crate::DEFAULT_JOIN_BUDGET_MS) from now.
+    pub async fn join_within(
+        &mut self,
+        params: JoinSessionParams,
+        deadline: Option<executor::Instant>,
+    ) -> Result<String, JoinError> {
         params.validate().map_err(|missing| {
             log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
             JoinError::MissingParameter(missing)
@@ -400,7 +455,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             },
         };
         let keep_alive_interval = Duration::from_millis(params.effective_keep_alive_interval_ms());
-        let machine = OwnMembershipMachine::new(
+        let mut machine = OwnMembershipMachine::new(
             backend.clone(),
             self.room_id.clone(),
             self.slot_id.clone(),
@@ -413,8 +468,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             },
         );
 
+        machine.set_outbox(self.outbox.clone());
+
         // Use the machine to join (async, awaits both delayed leave scheduling and join event)
-        let membership_event_id = machine.join(transports).await?;
+        let membership_event_id = machine.join(transports, deadline).await?;
 
         // Store the machine
         self.own_membership_machine = Some(Arc::new(machine));
@@ -460,6 +517,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         );
         let manage_media_keys = encryption_config.manage_media_keys;
         encryption_manager.set_config(encryption_config);
+        // One clock per client: key timings and the membership's share it.
+        encryption_manager.set_clock(self.outbox.clock());
 
         // Start the encryption manager (creates first key)
         encryption_manager.join().await.map_err(|e| {
@@ -559,34 +618,37 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// A failed send still ends the join here, since the machine is gone and
     /// cannot retry; the delayed leave removes the membership.
     pub async fn leave(&mut self, params: LeaveSessionParams) -> Result<(), LeaveError> {
+        self.begin_leave(params).await?.send().await
+    }
+
+    /// The part of [`Self::leave`] that needs the session: our participation
+    /// ends here — the machine stops sending, keys stop going out, and the
+    /// joined memberships are republished without us — and what remains is the
+    /// leave's own sends, returned to run without holding the session (034 R8).
+    pub async fn begin_leave(
+        &mut self,
+        params: LeaveSessionParams,
+    ) -> Result<PendingLeave<T>, LeaveError> {
         // Check if we have a membership machine (i.e., we've joined)
         let machine = self.own_membership_machine.take().ok_or_else(|| {
             log::warn!("[{}] leave rejected: not joined", self.log_tag);
             LeaveError::NotJoined
         })?;
-        // A tick in flight finishes first (the machine serialises the two),
-        // and finds nothing joined afterwards.
-        let upkeep = self.upkeep.take();
-
         log::info!(
             "[{}] leaving as {} (reason {:?})",
             self.log_tag,
             machine.sticky_key(),
             params.leave_reason,
         );
-
-        // Use the machine to leave (async, awaits both leave event and delayed event cancellation)
-        let sent = machine
-            .leave(params.leave_reason.clone())
-            .await
-            .inspect_err(|error| log::warn!("[{}] leave failed: {error}", self.log_tag));
+        // Nothing this join retries is sent from here on; a send already at
+        // the host finishes first, and the leave waits for it.
+        machine.begin_leave();
 
         // Clean up the encryption manager
         if let Some(encryption_manager) = self.encryption_manager.take() {
             encryption_manager.leave();
         }
         self.own_participation = None;
-        drop(upkeep);
 
         // Republish the joined memberships now that we are no longer among them, rather than
         // waiting for the host's next sticky delta. Room state and peer
@@ -595,9 +657,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // want to see who is left in the call.
         self.refresh().await;
 
-        sent?;
-        log::info!("[{}] left", self.log_tag);
-        Ok(())
+        Ok(PendingLeave {
+            machine,
+            // Kept until the leave is sent: its sends in flight must finish
+            // rather than be dropped mid-attempt under the leave.
+            upkeep: self.upkeep.take(),
+            leave_reason: params.leave_reason,
+            log_tag: self.log_tag.clone(),
+        })
     }
 
     /// One keep-alive tick: restarts the delayed leave, refreshes the sticky
@@ -646,12 +713,40 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             .and_then(|machine| machine.membership_event_id())
     }
 
+    /// Our membership republished naming `transport` as the focus we publish
+    /// on, after our media moved there (034 R25): the send, to await outside
+    /// the room's lock. `None` while not joined.
+    pub fn republish_transports(
+        &self,
+        transport: RtcTransport,
+    ) -> Option<impl Future<Output = ()> + use<T>> {
+        let machine = self.own_membership_machine.clone()?;
+        Some(async move { machine.republish_transports(&transport).await })
+    }
+
     /// Follows [`Self::own_membership_event_id`] for this join, which moves on
     /// every sticky refresh; `None` while not joined.
     pub fn subscribe_own_membership_event_id(&self) -> Option<watch::Receiver<Option<String>>> {
         self.own_membership_machine
             .as_ref()
             .map(|machine| machine.subscribe_membership_event_id())
+    }
+
+    /// Whether our membership has lapsed for the other members (034 R17):
+    /// predicted from our own deadlines while our sends fail, until a send
+    /// lands. `None` while not joined.
+    pub fn own_membership_lapsed(&self) -> Option<bool> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.is_lapsed())
+    }
+
+    /// Follows [`Self::own_membership_lapsed`] for this join; `None` while not
+    /// joined.
+    pub fn subscribe_own_membership_lapsed(&self) -> Option<watch::Receiver<bool>> {
+        self.own_membership_machine
+            .as_ref()
+            .map(|machine| machine.subscribe_lapsed())
     }
 
     /// Stops this join's upkeep when aborted, for an owner that lets go of
@@ -700,7 +795,33 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // member in the call for good, and force every host to diff snapshots
         // itself to notice.
         let previous = std::mem::take(&mut self.candidates);
+        let previously_held = std::mem::take(&mut self.held);
+        // Our own leave's reason, if the set carries one (the room-state format does not).
+        let mut own_leave_reason = None;
         for event in events {
+            if let RtcMembershipEvent::Left(left) = &event
+                && self.is_own(&left.sender, &left.sticky_key)
+            {
+                own_leave_reason = left.leave_reason.clone();
+            }
+            // A delayed leave in the set keeps the candidate it replaces, on
+            // the hold it already had or a new one (034 R21). Any other leave
+            // finds nothing to remove: the set is being rebuilt.
+            if let RtcMembershipEvent::Left(left) = &event
+                && let Some(candidate) = previous.iter().find(|candidate| {
+                    candidate.sender == left.sender && candidate.sticky_key == left.sticky_key
+                })
+                && self.holds(left)
+            {
+                let key = (left.sender.clone(), left.sticky_key.clone());
+                let until = previously_held
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_else(|| self.hold_from_now(left));
+                self.candidates.push(candidate.clone());
+                self.held.insert(key, until);
+                continue;
+            }
             // Deliberately *not* `apply_membership_event`: this loop rebuilds
             // the whole candidate set, and publishing after each event would
             // announce every partial set of joined memberships on the way — starting with a
@@ -726,6 +847,34 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 self.log_tag,
                 dropped.len(),
             );
+        }
+
+        // Ours was in the last set and is not in this one: a leave we did not send,
+        // unless the machine finds otherwise. Absent from both (we have only just
+        // published it) is not a departure.
+        let in_set = |set: &[_]| {
+            set.iter().any(|candidate: &JoinedMembership| {
+                self.is_own(&candidate.sender, &candidate.sticky_key)
+            })
+        };
+        if in_set(&previous) && !in_set(&self.candidates) {
+            self.own_departed(own_leave_reason.as_ref());
+        }
+
+        // A complete set is what a recovery waits for to see whether our own
+        // membership survived the outage (034 R19).
+        if let (Some(machine), Some(own)) = (&self.own_membership_machine, &self.own_participation)
+        {
+            let entry = self
+                .candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.sender == own.user_id && candidate.sticky_key == own.member_id
+                })
+                .map_or(OwnEntry::Absent, |candidate| {
+                    OwnEntry::Present(candidate.membership_event_id.clone())
+                });
+            machine.on_catch_up(entry);
         }
 
         // `apply_membership_event` refreshes only when it changed something, so
@@ -768,6 +917,20 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                     candidate.sender == joined.sender && candidate.sticky_key == joined.sticky_key
                 });
 
+                // A return inside the hold is no change of membership (034 R21).
+                if self
+                    .held
+                    .remove(&(joined.sender.clone(), joined.sticky_key.clone()))
+                    .is_some()
+                {
+                    log::info!(
+                        "[{}] {}/{} came back inside the delayed-leave hold",
+                        self.log_tag,
+                        joined.sender,
+                        joined.sticky_key,
+                    );
+                }
+
                 match existing {
                     Some(index) if self.candidates[index] == joined => {
                         log::trace!(
@@ -799,6 +962,21 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 }
             }
             RtcMembershipEvent::Left(left) => {
+                let key = (left.sender.clone(), left.sticky_key.clone());
+                let known = self.candidates.iter().any(|candidate| {
+                    candidate.sender == left.sender && candidate.sticky_key == left.sticky_key
+                });
+                if known && self.holds(&left) {
+                    if !self.held.contains_key(&key) {
+                        let until = self.hold_from_now(&left);
+                        self.held.insert(key, until);
+                    }
+                    return false;
+                }
+                if known && self.is_own(&left.sender, &left.sticky_key) {
+                    self.own_departed(left.leave_reason.as_ref());
+                }
+                self.held.remove(&key);
                 let before = self.candidates.len();
                 self.candidates.retain(|candidate| {
                     !(candidate.sender == left.sender && candidate.sticky_key == left.sticky_key)
@@ -824,6 +1002,89 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         true
+    }
+
+    fn is_own(&self, sender: &str, sticky_key: &str) -> bool {
+        self.own_participation
+            .as_ref()
+            .is_some_and(|own| sender == own.user_id && sticky_key == own.member_id)
+    }
+
+    /// Our own membership left the room: the machine decides whether to put it back.
+    fn own_departed(&self, reason: Option<&LeaveReason>) {
+        if let Some(machine) = &self.own_membership_machine {
+            machine.on_own_departure(reason);
+        }
+    }
+
+    /// Whether `left` is held rather than applied (034 R21): a delayed leave
+    /// firing, for anyone but our own current participation, whose lapse the
+    /// recovery has to see.
+    fn holds(&self, left: &LeftMembership) -> bool {
+        let delayed = left
+            .leave_reason
+            .as_ref()
+            .is_some_and(|reason| reason.code == LeaveCode::DelayedLeave);
+        let ours = self
+            .own_participation
+            .as_ref()
+            .is_some_and(|own| left.sender == own.user_id && left.sticky_key == own.member_id);
+        delayed && !ours
+    }
+
+    fn hold_from_now(&self, left: &LeftMembership) -> executor::Instant {
+        log::info!(
+            "[{}] {}/{}'s delayed leave fired; holding them {}s for a return",
+            self.log_tag,
+            left.sender,
+            left.sticky_key,
+            DELAYED_LEAVE_HOLD.as_secs(),
+        );
+        executor::Instant::now() + DELAYED_LEAVE_HOLD
+    }
+
+    /// The members a key rollout has not reached yet (034 R32), or `None`
+    /// while not joined.
+    pub fn undelivered_key_members(&self) -> Option<Vec<String>> {
+        self.encryption_manager
+            .as_ref()
+            .map(EncryptionManager::undelivered_members)
+    }
+
+    /// When the earliest delayed-leave hold ends, if one is running; the room's
+    /// feeder calls [`Self::expire_holds`] then.
+    pub fn hold_expires_at(&self) -> Option<executor::Instant> {
+        self.held.values().min().copied()
+    }
+
+    /// Applies every delayed leave whose hold has ended: the member is gone,
+    /// with the key rotation any departure brings (034 R21).
+    pub async fn expire_holds(&mut self) {
+        let now = executor::Instant::now();
+        let expired: Vec<(String, String)> = self
+            .held
+            .iter()
+            .filter(|(_, until)| **until <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for key in &expired {
+            self.held.remove(key);
+            log::info!(
+                "[{}] {}/{} did not come back within the hold; gone",
+                self.log_tag,
+                key.0,
+                key.1,
+            );
+        }
+        self.candidates.retain(|candidate| {
+            !expired.iter().any(|(sender, sticky_key)| {
+                candidate.sender == *sender && candidate.sticky_key == *sticky_key
+            })
+        });
+        self.refresh().await;
     }
 
     /// Whether `candidate` satisfies the MSC4143 join conditions that depend on

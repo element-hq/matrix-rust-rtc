@@ -23,6 +23,8 @@ async-trait.workspace = true
 rand = "0.8"
 rand_core = "0.6"
 base64 = "0.21"
+# `FuturesUnordered`: the upkeep runs one key retry per undelivered member.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # `rand` reaches getrandom 0.2, which has no wasm entropy source unless its
 # `js` feature is on and refuses to compile for wasm32-unknown-unknown without
@@ -53,4 +55,5 @@ testing = []
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
 futures = "0.3"
+proptest = "1"
 

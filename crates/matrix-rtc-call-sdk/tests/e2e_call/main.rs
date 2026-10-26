@@ -46,6 +46,7 @@
 //! ```
 
 mod provision;
+mod resilience;
 mod simulcast;
 
 use std::env;
@@ -590,7 +591,7 @@ async fn run(
     //    through the transport-agnostic media API — bob receiving alice's
     //    tone proves bob's engine connected to alice's focus, and vice versa.
     println!("[alice] publishing 440 Hz tone");
-    let _alice_tone = media::publish_tone(alice.call.session(), 440.0).await?;
+    let _alice_tone = media::publish_tone(&alice.call.session(), 440.0).await?;
 
     // Bound to the outer scope so the capture tasks are not aborted mid-call:
     // publishers stay alive through teardown, exactly like the single-focus
@@ -606,7 +607,7 @@ async fn run(
         ),
         Scenario::TwoFoci => {
             println!("[bob] publishing 660 Hz tone");
-            _bob_tone = Some(media::publish_tone(bob.call.session(), 660.0).await?);
+            _bob_tone = Some(media::publish_tone(&bob.call.session(), 660.0).await?);
             let bob_hears = record_peer_tone(&bob.call, "bob", 440.0).await?;
             let alice_hears = record_peer_tone(&alice.call, "alice", 660.0).await?;
 
@@ -1167,44 +1168,53 @@ async fn record_peer_tone(
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
 
-    let track = loop {
-        if let Some(track) = call.remote_track(&peer.member_id, MediaStreamKind::Microphone) {
-            break track;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            println!(
-                "[{label}] WARNING: no microphone stream from {} within 60s",
-                peer.member_id
-            );
-            return Ok(false);
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
-    println!(
-        "[{label}] receiving microphone stream of {} ({})",
-        peer.member_id, peer.user_id
-    );
-
-    let mut frames = track
-        .audio_frames()
-        .ok_or("microphone track has no audio frame stream")?;
     let target_samples = media::SAMPLE_RATE as usize * 2;
     let mut pcm: Vec<i16> = Vec::with_capacity(target_samples);
+    // A stream that stalls or ends is fetched again, as a host does on the
+    // next `StreamAdded`: when the peer's media moves to another SFU, the
+    // stream held from the old one goes quiet before the new one lands.
     while pcm.len() < target_samples {
-        match tokio::time::timeout_at(deadline, frames.next()).await {
-            Ok(Some(frame)) => pcm.extend_from_slice(&frame.data),
-            Ok(None) => {
-                println!("[{label}] frame stream ended after {} samples", pcm.len());
-                break;
+        let track = loop {
+            if let Some(track) = call.remote_track(&peer.member_id, MediaStreamKind::Microphone) {
+                break track;
             }
-            Err(_) => {
+            if tokio::time::Instant::now() >= deadline {
                 println!(
-                    "[{label}] WARNING: frame stream stalled at {} samples",
-                    pcm.len()
+                    "[{label}] WARNING: no microphone stream from {} within 60s",
+                    peer.member_id
                 );
-                break;
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        println!(
+            "[{label}] receiving microphone stream of {} ({})",
+            peer.member_id, peer.user_id
+        );
+        let mut frames = track
+            .audio_frames()
+            .ok_or("microphone track has no audio frame stream")?;
+        while pcm.len() < target_samples {
+            let stall = (tokio::time::Instant::now() + Duration::from_secs(3)).min(deadline);
+            match tokio::time::timeout_at(stall, frames.next()).await {
+                Ok(Some(frame)) => pcm.extend_from_slice(&frame.data),
+                Ok(None) => {
+                    println!("[{label}] frame stream ended after {} samples", pcm.len());
+                    break;
+                }
+                Err(_) => {
+                    println!(
+                        "[{label}] WARNING: frame stream stalled at {} samples",
+                        pcm.len()
+                    );
+                    break;
+                }
             }
         }
+        if pcm.len() >= target_samples || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
     let energy = media::detect_tone(&pcm, media::SAMPLE_RATE, freq);

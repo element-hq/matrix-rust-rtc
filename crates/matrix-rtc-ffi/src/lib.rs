@@ -47,6 +47,8 @@ pub use params::{
 /// see the module docs. Pulls the LiveKit client (libwebrtc): default off.
 #[cfg(feature = "media")]
 pub mod media;
+#[cfg(feature = "testing")]
+pub mod testing;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum MatrixRtcFfiError {
@@ -72,6 +74,17 @@ pub enum MatrixRtcFfiError {
     /// refused; somebody with the power level has to open it first.
     #[error("slot '{0}' is not open in this room")]
     SlotClosed(String),
+    /// The join did not complete within its 30 s budget: the homeserver kept
+    /// failing, or did not answer (034 R6, R27).
+    #[error("the join timed out")]
+    JoinTimedOut,
+    /// The homeserver refused the join for good (034 R6, R27); `errcode` is
+    /// its Matrix error code when it gave one.
+    #[error("the join was refused: {reason}")]
+    JoinRefused {
+        errcode: Option<String>,
+        reason: String,
+    },
 }
 
 impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
@@ -89,6 +102,13 @@ impl From<RtcError> for MatrixRtcFfiError {
             error @ RtcError::SessionOver => Self::CallOver(error.to_string()),
             RtcError::Join(matrix_rtc_core::JoinError::SlotClosed { slot_id }) => {
                 Self::SlotClosed(slot_id)
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::TimedOut) => Self::JoinTimedOut,
+            RtcError::Join(matrix_rtc_core::JoinError::Refused { errcode, message }) => {
+                Self::JoinRefused {
+                    errcode,
+                    reason: message,
+                }
             }
             error => Self::InvalidInput(error.to_string()),
         }
@@ -296,6 +316,25 @@ impl RtcClient {
         Arc::new(Self {
             client: call::RtcClient::new(Arc::new(FfiBackend::new(backend))),
         })
+    }
+
+    /// Whether the homeserver is answering the library's sends (034 R9).
+    pub fn signalling_health(&self) -> FfiSignallingHealth {
+        self.client.signalling_health().into()
+    }
+
+    /// Signalling health, current value first, then each change. Live from
+    /// the client, before any call or media exists.
+    pub fn subscribe_signalling_health(&self) -> Arc<SignallingHealthSubscription> {
+        SignallingHealthSubscription::new(self.client.subscribe_signalling_health())
+    }
+
+    /// Reports the host's Matrix client offline, or online once a request to
+    /// the homeserver has succeeded since it was offline — never on sync merely
+    /// starting (034 R11). Online retries every pending send at once. Optional:
+    /// a host that never reports leaves the library to its own sends.
+    pub fn report_connectivity(&self, online: bool) {
+        self.client.report_connectivity(online);
     }
 
     /// Opens a room: the library subscribes to what the room needs in the
@@ -613,7 +652,9 @@ impl RtcCall {
     /// sent. Returns the event id.
     ///
     /// Fails inside the send cooldown (Element Call's three seconds by
-    /// default), since peers would drop the reaction anyway.
+    /// default), since peers would drop the reaction anyway, and with
+    /// `Reaction("not sent")` when it has not landed within 5 s: it is dropped,
+    /// never delivered late, and the cooldown does not start (034 R4).
     pub async fn send_reaction(
         &self,
         emoji: String,
@@ -622,13 +663,18 @@ impl RtcCall {
         Ok(self.call.send_reaction(&emoji, &name).await?)
     }
 
-    /// Raises our hand. Idempotent while it is up; the hand follows our
-    /// membership across sticky refreshes on its own.
+    /// Raises our hand. Shown on our tile at once; suspends until the hand
+    /// has landed, however long signalling is away, and resolves `Ok` early
+    /// when a lower supersedes it or the call ends. Fails only on a permanent
+    /// refusal, the hand back where it was. Cancelling the call leaves the
+    /// request standing: only a lower withdraws it (034 R5). Idempotent while
+    /// it is up; the hand follows our membership across sticky refreshes.
     pub async fn raise_hand(&self) -> Result<(), MatrixRtcFfiError> {
         Ok(self.call.raise_hand().await?)
     }
 
-    /// Lowers our hand by redacting the annotation. A no-op when it is down.
+    /// Lowers our hand by redacting the annotation, as [`Self::raise_hand`]
+    /// raises it. A no-op when it is down.
     pub async fn lower_hand(&self) -> Result<(), MatrixRtcFfiError> {
         Ok(self.call.lower_hand().await?)
     }
@@ -659,8 +705,11 @@ impl RtcCall {
         CallStatusSubscription::new(self.call.subscribe_status())
     }
 
-    /// Leaves the slot; the call is over and its media stopped at once, even
-    /// when the send fails — the delayed leave then removes the membership.
+    /// Leaves the slot; the call is over and its media stopped at once, and
+    /// this returns without waiting for the leave to be sent (034 R8). The
+    /// send is one attempt; if it fails, the delayed leave — or the
+    /// membership's lifetime — removes us. Fails only with `CallOver`, when the
+    /// call was already over.
     pub async fn leave(&self, params: FfiLeaveSessionParams) -> Result<(), MatrixRtcFfiError> {
         log::info!(
             "call: [{}/{}] leave requested reason={:?}",
@@ -694,8 +743,34 @@ pub enum FfiCallEnd {
     Empty,
     /// The slot was closed, which ended our participation without us asking.
     SlotClosed,
-    /// The connection to our own focus closed and will not come back.
-    ConnectionClosed { message: String },
+    /// Our own SFU connection was given up (034 R24): `reason` is for the
+    /// screen, `message` for logs only. Publishing has stopped and our leave
+    /// has been issued (contract C10).
+    ConnectionClosed {
+        reason: FfiConnectionLossReason,
+        message: String,
+    },
+}
+
+/// Why our own SFU connection was given up. Contract C10.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiConnectionLossReason {
+    /// Lost, and not back within the reconnect budget.
+    Budget,
+    /// The SFU or its token service refused us.
+    Refused,
+    /// Never established within the budget from the connect request.
+    NeverConnected,
+}
+
+impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
+    fn from(value: call::ConnectionLossReason) -> Self {
+        match value {
+            call::ConnectionLossReason::Budget => Self::Budget,
+            call::ConnectionLossReason::Refused => Self::Refused,
+            call::ConnectionLossReason::NeverConnected => Self::NeverConnected,
+        }
+    }
 }
 
 impl From<call::CallEnd> for FfiCallEnd {
@@ -708,7 +783,10 @@ impl From<call::CallEnd> for FfiCallEnd {
             call::CallEnd::OthersLeft => Self::OthersLeft,
             call::CallEnd::Empty => Self::Empty,
             call::CallEnd::SlotClosed => Self::SlotClosed,
-            call::CallEnd::ConnectionClosed { message } => Self::ConnectionClosed { message },
+            call::CallEnd::ConnectionClosed { reason, message } => Self::ConnectionClosed {
+                reason: reason.into(),
+                message,
+            },
         }
     }
 }
@@ -800,6 +878,55 @@ impl From<call::CallStatus> for FfiCallStatus {
                 reason: reason.into(),
             },
         }
+    }
+}
+
+/// Whether the homeserver is answering the library's sends (034 R9). Distinct
+/// from the media `degraded` flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiSignallingHealth {
+    Reachable,
+    /// Since the first transient failure of a library send, or the host's
+    /// offline report, in epoch milliseconds; stable until reachable again.
+    Unreachable {
+        since_ms: u64,
+    },
+}
+
+impl From<call::SignallingHealth> for FfiSignallingHealth {
+    fn from(value: call::SignallingHealth) -> Self {
+        match value {
+            call::SignallingHealth::Reachable => Self::Reachable,
+            call::SignallingHealth::Unreachable { since_ms } => Self::Unreachable { since_ms },
+        }
+    }
+}
+
+/// Signalling health, pulled with an async [`Self::next`] like the call status.
+#[derive(uniffi::Object)]
+pub struct SignallingHealthSubscription {
+    receiver: tokio::sync::Mutex<watch::Receiver<call::SignallingHealth>>,
+}
+
+impl SignallingHealthSubscription {
+    fn new(mut receiver: watch::Receiver<call::SignallingHealth>) -> Arc<Self> {
+        // The first `next` yields the health as it is now.
+        receiver.mark_changed();
+        Arc::new(Self {
+            receiver: tokio::sync::Mutex::new(receiver),
+        })
+    }
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl SignallingHealthSubscription {
+    /// The current health on the first call, then each change. `None` once
+    /// the client is gone.
+    pub async fn next(&self) -> Option<FfiSignallingHealth> {
+        let mut receiver = self.receiver.lock().await;
+        receiver.changed().await.ok()?;
+        let health = *receiver.borrow_and_update();
+        Some(health.into())
     }
 }
 
@@ -1035,6 +1162,59 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+    }
+
+    /// 034 R27: a refused join names the code; a timed-out one says so, as
+    /// its own error.
+    #[tokio::test]
+    async fn join_failures_are_distinguishable() {
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open_call_room(&client, &mock).await;
+        *mock.refuse_sticky.lock().unwrap() = Some(FfiBackendError::Failed {
+            errcode: Some("M_FORBIDDEN".to_owned()),
+            status: Some(403),
+            retry_after_ms: None,
+            permanent: false,
+            reason: "not allowed".to_owned(),
+        });
+
+        let refused = room.clone().join_call(join_params()).await;
+        assert!(
+            matches!(
+                refused,
+                Err(MatrixRtcFfiError::JoinRefused { errcode: Some(ref code), .. }) if code == "M_FORBIDDEN"
+            ),
+            "{:?}",
+            refused.err()
+        );
+
+        assert!(matches!(
+            MatrixRtcFfiError::from(RtcError::Join(matrix_rtc_core::JoinError::TimedOut)),
+            MatrixRtcFfiError::JoinTimedOut
+        ));
+    }
+
+    /// 034 C3, C4: health is live from the client, current value first, and
+    /// follows the host's connectivity report.
+    #[tokio::test]
+    async fn signalling_health_follows_the_connectivity_report() {
+        let client = RtcClient::new(MockHost::new());
+        let health = client.subscribe_signalling_health();
+        assert_eq!(health.next().await, Some(FfiSignallingHealth::Reachable));
+
+        client.report_connectivity(false);
+        let Some(FfiSignallingHealth::Unreachable { since_ms }) = health.next().await else {
+            panic!("offline is unreachable at once");
+        };
+        assert!(since_ms > 0);
+        assert_eq!(
+            client.signalling_health(),
+            FfiSignallingHealth::Unreachable { since_ms }
+        );
+
+        client.report_connectivity(true);
+        assert_eq!(health.next().await, Some(FfiSignallingHealth::Reachable));
     }
 
     #[tokio::test]

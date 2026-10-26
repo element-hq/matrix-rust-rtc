@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use matrix_rtc_core::testing::MockBackend;
+use matrix_rtc_core::testing::{MockBackend, MockMethod, MockOutcome};
 use matrix_rtc_core::{
     DiscardedKey, EncryptionKeySignalHandler, EventEncryption, EventIn, KEY_MESSAGE_TYPE,
     KeyMaterialSignal, LeaveCode, LeaveSessionParams, SLOT_EVENT_TYPE, ToDeviceMessageIn,
@@ -21,6 +21,10 @@ const ROOM: &str = "!room:example.org";
 const OTHER_ROOM: &str = "!other:example.org";
 const SLOT: &str = "m.call#room";
 const BOB: &str = "@bob:example.org";
+
+fn offline() -> MockOutcome {
+    MockOutcome::Fail(BackendError::new("offline"))
+}
 
 fn mock() -> Arc<MockBackend> {
     let mock = Arc::new(MockBackend::new());
@@ -297,10 +301,11 @@ async fn a_closed_slot_ends_the_session_even_when_the_leave_fails() {
     );
 }
 
-/// A leave that fails to send is reported, but the session has ended before
-/// the send, so media stops publishing either way.
+/// R8: a leave that fails to send still ends the session, so media stops
+/// publishing; `leave()` never reports the send, and fails only when the call
+/// was already over.
 #[tokio::test]
-async fn a_leave_that_fails_to_send_still_ends_the_session() {
+async fn leave_fails_only_when_the_call_is_already_over() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());
     let room = open(&client, &mock, ROOM).await;
@@ -308,7 +313,7 @@ async fn a_leave_that_fails_to_send_still_ends_the_session() {
     let ended = call.subscribe_ended();
     *mock.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
 
-    assert!(call.leave(LeaveSessionParams::new()).await.is_err());
+    assert!(call.leave(LeaveSessionParams::new()).await.is_ok());
 
     assert!(!call.is_live());
     assert_eq!(
@@ -319,6 +324,149 @@ async fn a_leave_that_fails_to_send_still_ends_the_session() {
         call.leave(LeaveSessionParams::new()).await,
         Err(RtcError::SessionOver)
     ));
+}
+
+/// R8: hanging up returns at once, whatever the send does, and the leave is
+/// attempted exactly once.
+#[tokio::test(start_paused = true)]
+async fn leave_returns_at_once_and_sends_once() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+    let sent_before = mock.calls_to(MockMethod::StickyEvent).len();
+    let started = tokio::time::Instant::now();
+
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+
+    assert_eq!(
+        started.elapsed(),
+        Duration::ZERO,
+        "nothing awaited the send"
+    );
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(
+        mock.calls_to(MockMethod::StickyEvent).len(),
+        sent_before + 1,
+        "one attempt, never retried"
+    );
+}
+
+/// R8: shutting the room down right after a leave neither waits for the
+/// leave's send nor sends a second one.
+#[tokio::test(start_paused = true)]
+async fn closing_the_room_after_a_leave_neither_waits_nor_recalls_it() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+    let sent_before = mock.calls_to(MockMethod::StickyEvent).len();
+    let started = tokio::time::Instant::now();
+
+    call.leave(LeaveSessionParams::new()).await.expect("leave");
+    room.close().await;
+
+    assert_eq!(started.elapsed(), Duration::ZERO);
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert_eq!(
+        mock.calls_to(MockMethod::StickyEvent).len(),
+        sent_before + 1,
+        "the one leave, not a second from the close"
+    );
+}
+
+/// R6: the join retries the transports read and the publish inside its
+/// budget.
+#[tokio::test(start_paused = true)]
+async fn a_join_retries_transient_failures_inside_its_budget() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    mock.script(MockMethod::RtcTransports, [offline()]);
+    mock.script(MockMethod::StickyEvent, [offline()]);
+
+    room.join_call(CallJoinOptions::new()).await.expect("join");
+
+    assert_eq!(mock.calls_to(MockMethod::RtcTransports).len(), 2);
+    assert_eq!(mock.calls_to(MockMethod::StickyEvent).len(), 2);
+}
+
+/// R6, R27: a refused publish fails the join at once, naming the code; one
+/// that never answers fails it at the budget.
+#[tokio::test(start_paused = true)]
+async fn join_failures_say_whether_they_timed_out_or_were_refused() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+
+    mock.script(
+        MockMethod::StickyEvent,
+        [MockOutcome::Fail(BackendError::with_matrix_error(
+            Some("M_FORBIDDEN".to_owned()),
+            Some(403),
+            "no",
+        ))],
+    );
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        room.join_call(CallJoinOptions::new()).await,
+        Err(RtcError::Join(JoinError::Refused { errcode: Some(ref code), .. })) if code == "M_FORBIDDEN"
+    ));
+    assert_eq!(started.elapsed(), Duration::ZERO);
+
+    mock.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+    let started = tokio::time::Instant::now();
+    assert!(matches!(
+        room.join_call(CallJoinOptions::new()).await,
+        Err(RtcError::Join(JoinError::TimedOut))
+    ));
+    assert_eq!(started.elapsed(), JOIN_BUDGET);
+}
+
+/// R6: neither the first key rollout nor the notification fails a join, and
+/// the notification, retried, never holds it past its budget.
+#[tokio::test(start_paused = true)]
+async fn a_failed_key_rollout_or_notification_never_fails_the_join() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    // Bob leaves, so the join starts the session and notifies the room.
+    let sink = mock
+        .room_subscription(ROOM)
+        .expect("subscribed")
+        .sink
+        .clone();
+    sink.on_sticky_events(Vec::new());
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    mock.script(MockMethod::ToDevice, std::iter::repeat_n(offline(), 100));
+    mock.script(
+        MockMethod::StickyEvent,
+        std::iter::once(MockOutcome::Ok).chain(std::iter::repeat_n(offline(), 100)),
+    );
+    let started = tokio::time::Instant::now();
+
+    let call = room
+        .join_call(CallJoinOptions::new().kind(CallKind::Group {
+            notify: Some(crate::GroupNotify {
+                intent: None,
+                lifetime_ms: None,
+                mentions: Default::default(),
+            }),
+        }))
+        .await;
+
+    assert!(call.is_ok(), "{:?}", call.err());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the join waits for neither: it is over once the membership has landed"
+    );
+    tokio::time::sleep(JOIN_BUDGET).await;
+    assert!(
+        mock.calls_to(MockMethod::StickyEvent).len() > 2,
+        "the notification was retried after the join returned"
+    );
 }
 
 #[tokio::test]
@@ -847,4 +995,270 @@ async fn a_group_call_is_connected_by_its_media_and_ended_by_the_leave() {
             reason: CallEnd::Left
         }
     );
+}
+
+/// 034 R4, R5: reactions and our hand through failing sends, on paused time.
+mod reactions_and_hands {
+    use super::*;
+
+    fn forbidden() -> MockOutcome {
+        MockOutcome::Fail(BackendError::with_matrix_error(
+            Some("M_FORBIDDEN".to_owned()),
+            Some(403),
+            "not allowed",
+        ))
+    }
+
+    async fn joined() -> (Arc<MockBackend>, RtcRoom<MockBackend>, RtcCall<MockBackend>) {
+        let mock = mock();
+        let client = RtcClient::new(mock.clone());
+        let room = open(&client, &mock, ROOM).await;
+        let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+        (mock, room, call)
+    }
+
+    /// Room-event attempts from `from` on, as offsets from it.
+    fn room_event_attempts(mock: &MockBackend, from: Duration) -> Vec<Duration> {
+        mock.calls_to(MockMethod::RoomEvent)
+            .into_iter()
+            .filter(|at| *at >= from)
+            .map(|at| at - from)
+            .collect()
+    }
+
+    fn since(mock: &MockBackend) -> Duration {
+        mock.created_at.elapsed()
+    }
+
+    async fn our_hand(call: &RtcCall<MockBackend>, mock: &MockBackend) -> Option<RaisedHand> {
+        call.raised_hands()
+            .await
+            .into_iter()
+            .find(|hand| hand.sender == mock.user_id)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reaction_is_retried_for_five_seconds_then_dropped() {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, std::iter::repeat_n(offline(), 10));
+        let from = since(&mock);
+
+        let sent = call.send_reaction("👏", "clapping").await;
+
+        assert!(matches!(
+            sent,
+            Err(RtcError::Reaction(ReactionError::NotSent))
+        ));
+        assert_eq!(since(&mock) - from, Duration::from_secs(5));
+        assert_eq!(
+            room_event_attempts(&mock, from),
+            [0, 1, 3].map(Duration::from_secs),
+            "nothing after"
+        );
+        // No cooldown was recorded: the next one goes out at once.
+        mock.scripted.lock().unwrap().clear();
+        call.send_reaction("👏", "clapping")
+            .await
+            .expect("no cooldown");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reaction_whose_attempt_timed_out_is_never_retried() {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, [MockOutcome::Hang]);
+        let from = since(&mock);
+
+        let sent = call.send_reaction("👏", "clapping").await;
+
+        assert!(matches!(
+            sent,
+            Err(RtcError::Reaction(ReactionError::NotSent))
+        ));
+        assert_eq!(since(&mock) - from, Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert_eq!(room_event_attempts(&mock, from).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raised_hand_shows_locally_from_the_first_attempt_and_the_call_suspends_until_it_lands()
+     {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, [offline(), offline()]);
+        let from = since(&mock);
+
+        let (raised, ()) = tokio::join!(call.raise_hand(), async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert!(our_hand(&call, &mock).await.is_some(), "shown at once");
+        });
+
+        raised.expect("raised");
+        assert_eq!(
+            since(&mock) - from,
+            Duration::from_secs(3),
+            "the third send"
+        );
+        let hand = our_hand(&call, &mock).await.expect("up");
+        let annotations = mock.room_events.lock().unwrap().len();
+        assert_eq!(hand.reaction_event_id, format!("$room-{annotations}"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_suspended_raise_outlives_an_outage() {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, std::iter::repeat_n(offline(), 1_000));
+
+        let (raised, ()) = tokio::join!(call.raise_hand(), async {
+            for _ in 0..9 {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                assert!(our_hand(&call, &mock).await.is_some(), "up throughout");
+            }
+            mock.scripted.lock().unwrap().clear();
+        });
+
+        raised.expect("raised at the first success");
+        assert!(
+            !our_hand(&call, &mock)
+                .await
+                .unwrap()
+                .reaction_event_id
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raise_and_a_lower_that_both_failed_publish_nothing() {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, std::iter::repeat_n(offline(), 1_000));
+        mock.script(MockMethod::Redaction, std::iter::repeat_n(offline(), 1_000));
+        let landed = mock.room_events.lock().unwrap().len();
+
+        let (raised, lowered) = tokio::join!(call.raise_hand(), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let started = tokio::time::Instant::now();
+            let lowered = call.lower_hand().await;
+            assert_eq!(started.elapsed(), Duration::ZERO, "nothing to send");
+            lowered
+        });
+
+        raised.expect("the reversal answers the raise quietly");
+        lowered.expect("lowered");
+        assert!(our_hand(&call, &mock).await.is_none());
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert_eq!(mock.room_events.lock().unwrap().len(), landed);
+        assert!(mock.redactions.lock().unwrap().is_empty());
+        assert!(mock.calls_to(MockMethod::Redaction).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_permanent_refusal_fails_the_call_and_reverts_the_hand() {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, [forbidden()]);
+        let from = since(&mock);
+
+        let raised = call.raise_hand().await;
+
+        assert!(matches!(
+            raised,
+            Err(RtcError::Reaction(ReactionError::Command(_)))
+        ));
+        assert!(our_hand(&call, &mock).await.is_none(), "back down");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(room_event_attempts(&mock, from).len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lower_waits_for_a_pending_raise_then_redacts() {
+        let (mock, _room, call) = joined().await;
+        mock.script(
+            MockMethod::RoomEvent,
+            [MockOutcome::After(
+                Duration::from_secs(2),
+                Box::new(MockOutcome::Ok),
+            )],
+        );
+        let from = since(&mock);
+
+        let (raised, lowered) = tokio::join!(call.raise_hand(), async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            call.lower_hand().await
+        });
+
+        raised.expect("raise");
+        lowered.expect("lower");
+        let annotation = format!("$room-{}", mock.room_events.lock().unwrap().len());
+        let redactions = mock.redactions.lock().unwrap().clone();
+        assert_eq!(redactions.len(), 1);
+        assert_eq!(redactions[0].1, annotation, "the raise's own event");
+        let redacted_at = mock.calls_to(MockMethod::Redaction)[0] - from;
+        assert!(redacted_at >= Duration::from_secs(2));
+        assert!(our_hand(&call, &mock).await.is_none());
+    }
+
+    /// The end of the call answers a suspended hand call: a leave, or the
+    /// slot closing.
+    #[tokio::test(start_paused = true)]
+    async fn a_suspended_hand_call_resolves_ok_when_the_call_ends() {
+        for close_slot in [false, true] {
+            let (mock, _room, call) = joined().await;
+            mock.script(MockMethod::RoomEvent, std::iter::repeat_n(offline(), 1_000));
+            let from = since(&mock);
+
+            let (raised, ()) = tokio::join!(call.raise_hand(), async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if close_slot {
+                    mock.room_subscription(ROOM)
+                        .expect("subscribed")
+                        .sink
+                        .on_state_events(
+                            SLOT_EVENT_TYPE.to_owned(),
+                            vec![EventIn {
+                                event_id: "$closed".to_owned(),
+                                sender: BOB.to_owned(),
+                                event_type: SLOT_EVENT_TYPE.to_owned(),
+                                state_key: Some(SLOT.to_owned()),
+                                origin_server_ts: 3,
+                                content: json!({ "status": "closed" }),
+                                encryption: EventEncryption::Cleartext,
+                            }],
+                        );
+                } else {
+                    call.leave(LeaveSessionParams::new()).await.expect("leave");
+                }
+            });
+
+            raised.expect("answered by the end");
+            assert_eq!(since(&mock) - from, Duration::from_secs(5));
+            let attempts = room_event_attempts(&mock, from).len();
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            assert_eq!(
+                room_event_attempts(&mock, from).len(),
+                attempts,
+                "no annotation after the end"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_suspended_hand_call_keeps_the_desired_state() {
+        let (mock, _room, call) = joined().await;
+        mock.script(MockMethod::RoomEvent, std::iter::repeat_n(offline(), 3));
+        let from = since(&mock);
+
+        let dropped = tokio::time::timeout(Duration::from_secs(1), call.raise_hand()).await;
+        assert!(dropped.is_err(), "still suspended at 1 s");
+        assert!(our_hand(&call, &mock).await.is_some());
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            room_event_attempts(&mock, from),
+            [0, 1, 3, 7].map(Duration::from_secs)
+        );
+        assert!(
+            !our_hand(&call, &mock)
+                .await
+                .unwrap()
+                .reaction_event_id
+                .is_empty()
+        );
+    }
 }

@@ -211,7 +211,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // `call.session().room().local_participant().publish_track(...)`.
     let _tone = if env::var("PUBLISH_TONE").is_ok() {
         println!("publishing a 440 Hz tone; Ctrl-C to hang up");
-        Some(media::publish_tone(call.session(), 440.0).await?)
+        Some(media::publish_tone(&call.session(), 440.0).await?)
     } else {
         None
     };
