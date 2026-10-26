@@ -46,6 +46,7 @@ log only.
 - `raise_hand`/`lower_hand` show the hand at once and resolve once it has landed, retrying through an outage; a reversal or the call ending resolves them `Ok`, and only a permanent refusal fails them, the hand back where it was (034 R5).
 
 ### Fixed
+- The release workflow drafts the GitHub Release with its assets before publishing it, as immutable releases require; `v0.5.0-rc.6` went out without them, so its Swift package is broken.
 - The token exchange's HTTP client trusts the native root store and `SSL_CERT_FILE` as the signalling socket does, so a dev stack's own CA works for the whole media path.
 - A failed SFU token request is logged with its cause (an unknown certificate issuer, a refused connection), not just "error sending request".
 - `ActiveSpeakers` (and so a tile's `speaking`) lists everyone speaking, not only those whose state just changed, so a member talking steadily keeps the flag when someone else starts or stops.
