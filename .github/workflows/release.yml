@@ -322,6 +322,26 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+      # Releases are immutable: assets can only be added to a draft, so the
+      # release is drafted with them here, before anything irreversible, and
+      # published once the tag is pushed.
+      - name: Draft GitHub Release
+        if: ${{ !inputs.dry_run }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          draft: true
+          # A semver pre-release (0.2.0-rc.1) must not become "latest".
+          prerelease: ${{ contains(inputs.version, '-') }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/matrix-rtc-android-${{ inputs.version }}.aar
+            dist/matrix-rtc-android-${{ inputs.version }}-debuginfo.zip
+            dist/MatrixRtcFFI.xcframework.zip
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+
       - name: Publish to GitHub Packages
         if: ${{ !inputs.dry_run }}
         working-directory: mobile/android
@@ -354,18 +374,8 @@ jobs:
           git tag -a "v$VERSION" -m "v$VERSION"
           git push origin "HEAD:${GITHUB_REF_NAME}" "refs/tags/v$VERSION"
 
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         if: ${{ !inputs.dry_run }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ inputs.version }}
-          name: v${{ inputs.version }}
-          # A semver pre-release (0.2.0-rc.1) must not become "latest".
-          prerelease: ${{ contains(inputs.version, '-') }}
-          body_path: dist/release-notes.md
-          files: |
-            dist/matrix-rtc-android-${{ inputs.version }}.aar
-            dist/matrix-rtc-android-${{ inputs.version }}-debuginfo.zip
-            dist/MatrixRtcFFI.xcframework.zip
-            dist/SHA256SUMS
-          fail_on_unmatched_files: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "v$VERSION" --draft=false
