@@ -314,8 +314,11 @@ val room = client.room(roomId, FfiRoomOptions(
   messages through the same to-device subscription. Do set `originServerTs` on
   every event: it is the deadline base for a membership that states no
   `created_ts`, and `0` reads as long expired.
-- **In `ROOM_STATE` only:** honour the `stateKey` of `sendDelayedEvent` — the
-  dead man's switch has to be a state event too.
+- **Delayed leaves:** `sendDelayedStateEvent` is the `ROOM_STATE` dead man's
+  switch, `sendDelayedStickyEvent` the sticky formats'. The Rust SDK bindings
+  cannot send a delayed sticky event yet (matrix-rust-sdk#6973): answer
+  `M_UNRECOGNIZED`, never a plain delayed event, and the call joins on a
+  shorter membership lifetime.
 
 Slots need nothing from you. Both generations of Element Call publish no
 `m.rtc.slot`, so the truthful "no slots" your backend reports would resolve the

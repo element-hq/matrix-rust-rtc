@@ -29,19 +29,17 @@ use matrix_sdk::room::{IncludeRelations, RelationsOptions};
 use matrix_sdk::ruma;
 use matrix_sdk::ruma::api::client::delayed_events::update_delayed_event::UpdateAction;
 use matrix_sdk::ruma::api::client::delayed_events::{
-    DelayParameters, delayed_message_event, delayed_state_event, update_delayed_event,
+    DelayParameters, delayed_state_event, update_delayed_event,
 };
 use matrix_sdk::ruma::api::client::state::{get_state_events, send_state_event};
 use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
 use matrix_sdk::ruma::events::relation::RelationType;
 use matrix_sdk::ruma::events::{
-    AnyMessageLikeEventContent, AnyStateEventContent, AnySyncMessageLikeEvent, AnyToDeviceEvent,
-    AnyToDeviceEventContent, MessageLikeEventType, StateEventType, TimelineEventType,
+    AnyStateEventContent, AnySyncMessageLikeEvent, AnyToDeviceEvent, AnyToDeviceEventContent,
+    MessageLikeEventType, StateEventType, TimelineEventType,
 };
 use matrix_sdk::ruma::serde::Raw;
-use matrix_sdk::ruma::{
-    DeviceId, EventId, OwnedEventId, OwnedUserId, RoomId, TransactionId, UInt, UserId,
-};
+use matrix_sdk::ruma::{DeviceId, EventId, OwnedEventId, OwnedUserId, RoomId, UInt, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships};
 use matrix_sdk_base::crypto::{CollectStrategy, OlmError};
 use serde_json::Value;
@@ -347,11 +345,11 @@ impl MatrixBackend for SdkMatrixBackend {
         Ok(response.response.event_id.to_string())
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
@@ -360,43 +358,40 @@ impl MatrixBackend for SdkMatrixBackend {
             timeout: Duration::from_millis(delay_ms),
         };
         let raw = serde_json::value::to_raw_value(&content).map_err(local_error)?;
-
+        // NOTE the argument order: `state_key` comes *before* `event_type`
+        // here, unlike every other ruma send.
+        let request = delayed_state_event::unstable::Request::new_raw(
+            room_id,
+            state_key,
+            StateEventType::from(event_type),
+            delay,
+            Raw::<AnyStateEventContent>::from_json(raw),
+        );
         // Returns the MSC4140 delay id, which is what restart/cancel take.
-        let delay_id = match state_key {
-            // NOTE the argument order: `state_key` comes *before* `event_type`
-            // here, unlike every other ruma send.
-            Some(state_key) => {
-                let request = delayed_state_event::unstable::Request::new_raw(
-                    room_id,
-                    state_key,
-                    StateEventType::from(event_type),
-                    delay,
-                    Raw::<AnyStateEventContent>::from_json(raw),
-                );
-                self.client
-                    .send(request)
-                    .with_request_config(rtc_request_config())
-                    .await
-                    .map_err(delayed_command_error)?
-                    .delay_id
-            }
-            None => {
-                let request = delayed_message_event::unstable::Request::new_raw(
-                    room_id,
-                    TransactionId::new(),
-                    wire_event_type(event_type),
-                    delay,
-                    Raw::<AnyMessageLikeEventContent>::from_json(raw),
-                );
-                self.client
-                    .send(request)
-                    .with_request_config(rtc_request_config())
-                    .await
-                    .map_err(delayed_command_error)?
-                    .delay_id
-            }
-        };
-        Ok(delay_id)
+        Ok(self
+            .client
+            .send(request)
+            .with_request_config(rtc_request_config())
+            .await
+            .map_err(delayed_command_error)?
+            .delay_id)
+    }
+
+    /// Not yet: the SDK cannot attach a sticky duration to a delayed send
+    /// (matrix-org/matrix-rust-sdk#6973), and a plain delayed event would fire
+    /// without replacing the sticky membership. The core then joins without a
+    /// dead man's switch, on a shorter membership lifetime.
+    async fn send_delayed_sticky_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _content: Value,
+        _sticky_duration_ms: u64,
+        _delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        Err(CommandError::DelayedEventsNotSupported(
+            "the SDK cannot send a delayed sticky event yet (matrix-rust-sdk#6973)".to_owned(),
+        ))
     }
 
     async fn restart_delayed_event(

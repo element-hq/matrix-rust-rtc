@@ -396,20 +396,40 @@ impl MatrixBackend for ScriptedMatrixBackend {
             .map_err(ffi_error)
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content_json: String,
         delay_ms: u64,
     ) -> Result<String, FfiBackendError> {
         self.mock
-            .send_delayed_event(
+            .send_delayed_state_event(
                 room_id,
                 event_type,
                 state_key,
                 json(&content_json)?,
+                delay_ms,
+            )
+            .await
+            .map_err(ffi_error)
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content_json: String,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, FfiBackendError> {
+        self.mock
+            .send_delayed_sticky_event(
+                room_id,
+                event_type,
+                json(&content_json)?,
+                sticky_duration_ms,
                 delay_ms,
             )
             .await

@@ -772,8 +772,15 @@ mod tests {
             ),
         );
         set(
-            "sendDelayedEvent",
+            "sendDelayedStateEvent",
             "roomId,eventType,stateKey,content,delayMs",
+            "if (JSON.stringify(content) === '{}') \
+                 return Promise.reject(new Error('content is not a plain object')); \
+             return Promise.resolve('delay-id');",
+        );
+        set(
+            "sendDelayedStickyEvent",
+            "roomId,eventType,content,stickyDurationMs,delayMs",
             "if (JSON.stringify(content) === '{}') \
                  return Promise.reject(new Error('content is not a plain object')); \
              return Promise.resolve('delay-id');",

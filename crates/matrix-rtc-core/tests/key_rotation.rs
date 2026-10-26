@@ -269,12 +269,24 @@ impl MatrixBackend for PeerSender {
         Ok("$sticky".to_owned())
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        _state_key: String,
+        content: Value,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        self.send_delayed_sticky_event(room_id, event_type, content, 0, delay_ms)
+            .await
+    }
+
+    async fn send_delayed_sticky_event(
         &self,
         _room_id: String,
         _event_type: String,
-        _state_key: Option<String>,
         _content: Value,
+        _sticky_duration_ms: u64,
         _delay_ms: u64,
     ) -> Result<String, CommandError> {
         Ok("delay-id".to_owned())
