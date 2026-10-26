@@ -1188,6 +1188,44 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         self.republish().await;
     }
 
+    /// Ends a previous participation of this device that never left, by
+    /// putting a leave in the sticky map under its `sticky_key`.
+    ///
+    /// An app killed without a delayed leave to fire stays in everyone's call
+    /// until its membership expires. The room-state format overwrites it on the
+    /// next join by reusing its state key; MSC4143 mints a fresh `member.id` per
+    /// join, so here it is ended explicitly. One attempt, while we are joined:
+    /// best effort.
+    pub async fn clear_superseded(&self, sticky_key: String) {
+        let content = serde_json::to_value(RawStickyEventContent::for_leave(
+            self.slot_id.clone(),
+            sticky_key.clone(),
+            Some(LeaveReason::new(LeaveCode::Leave)),
+        ))
+        .expect("m.rtc.member content is always serializable");
+        let Some(pending) = self.begin_if_joined(SendKind::SupersededLeave {
+            sticky_key: sticky_key.clone(),
+        }) else {
+            return;
+        };
+        log::info!(
+            "[{}] ending {sticky_key}, a previous participation of this device that never left",
+            self.room_id
+        );
+        match pending
+            .run(SendPolicy::single_attempt(), || {
+                self.publish_once(content.clone())
+            })
+            .await
+        {
+            Ok(_) | Err(SendFailure::Superseded | SendFailure::Cancelled) => {}
+            Err(failure) => log::warn!(
+                "[{}] could not end the previous participation {sticky_key}: {failure}",
+                self.room_id
+            ),
+        }
+    }
+
     /// Re-sends our join content, retried until it lands, is superseded or the
     /// join leaves. Same content, so the same member id.
     pub async fn republish(&self) {

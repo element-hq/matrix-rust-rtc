@@ -196,6 +196,10 @@ pub struct SlotSession<T: MatrixBackend> {
     log_tag: String,
     /// The client's retry layer, handed to each join's membership machine.
     outbox: Outbox,
+    /// Previous participations of this device we sent a leave for, so each
+    /// gets one.
+    /// Behind a lock because the joined set is recomputed through `&self`.
+    superseded_ended: std::sync::Mutex<HashSet<String>>,
 }
 
 impl<T: MatrixBackend> Clone for SlotSession<T> {
@@ -219,6 +223,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             membership_scope: self.membership_scope.clone(), // Shares the watch, so shares its listeners
             log_tag: self.log_tag.clone(),
             outbox: self.outbox.clone(),
+            superseded_ended: Default::default(),
         }
     }
 }
@@ -255,6 +260,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             membership_scope,
             log_tag,
             outbox,
+            superseded_ended: Default::default(),
         }
     }
 
@@ -1138,6 +1144,31 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
     }
 
+    /// Sends a leave for each previous participation of this device that is
+    /// still in the sticky map, once each; see
+    /// [`OwnMembershipMachine::clear_superseded`].
+    fn end_superseded(&self, excluded: &[(&str, JoinCondition)]) {
+        let Some(machine) = self.own_membership_machine.as_ref() else {
+            return;
+        };
+        if !crate::executor::can_spawn() {
+            return;
+        }
+        for (sticky_key, condition) in excluded {
+            if *condition != JoinCondition::SupersededOwnParticipation
+                || !self
+                    .superseded_ended
+                    .lock()
+                    .unwrap()
+                    .insert((*sticky_key).to_owned())
+            {
+                continue;
+            }
+            let (machine, sticky_key) = (Arc::clone(machine), (*sticky_key).to_owned());
+            crate::executor::spawn(async move { machine.clear_superseded(sticky_key).await });
+        }
+    }
+
     /// Recomputes the joined set and publishes it if it changed.
     ///
     /// Every input to the join conditions routes through here, so a slot
@@ -1156,6 +1187,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 excluded.push((candidate.sticky_key.as_str(), condition));
             }
         }
+        self.end_superseded(&excluded);
 
         if members == self.members {
             if !excluded.is_empty() {
