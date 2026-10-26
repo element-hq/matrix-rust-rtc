@@ -2732,7 +2732,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-call"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "log",
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-call-sdk"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "clap",
@@ -2773,7 +2773,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-core"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -2795,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-ffi"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "android_logger",
  "async-trait",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-livekit"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2837,7 +2837,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-matrix-sdk"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "log",
@@ -2851,7 +2851,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-transport"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2868,7 +2868,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-wasm"
-version = "0.5.0-rc.5"
+version = "0.5.0-rc.7"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",
