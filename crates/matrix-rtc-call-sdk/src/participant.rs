@@ -54,7 +54,8 @@ pub struct Participant {
     pub connection: ConnectionState,
     /// Why their media cannot be shown, if it cannot (034 R33, C6); `None`
     /// once frames decrypt again. Always `None` for our own entry, which
-    /// nothing decrypts. `streams` is untouched by it.
+    /// nothing decrypts, and while `streams` is empty: no media, nothing to
+    /// fail to decrypt. `streams` is untouched by it.
     pub unable_to_decrypt: Option<UnableToDecrypt>,
     /// Streams currently published by this participant, in arrival order.
     pub streams: Vec<StreamState>,
