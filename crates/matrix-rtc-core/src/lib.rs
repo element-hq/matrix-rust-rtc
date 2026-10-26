@@ -1236,6 +1236,7 @@ mod tests {
             "one leave for the stale participation: {leaves:?}"
         );
         assert_eq!(leaves[0]["member"]["membership"], "leave");
+        assert_eq!(leaves[0]["leave_reason"]["code"], "superseded");
     }
 
     /// A join hands back the event id of the membership it sent, so an
