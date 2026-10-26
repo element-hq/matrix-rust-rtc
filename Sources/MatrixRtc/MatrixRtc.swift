@@ -2420,6 +2420,12 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
     func disconnect() async throws 
     
     /**
+     * What is interrupting the call now, cause by cause (034 R38).
+     * Contract C5.
+     */
+    func interruptions()  -> FfiInterruptions
+    
+    /**
      * Our participant identity on the media plane (the JWT `sub`; peers import
      * our media key under it).
      *
@@ -2451,6 +2457,14 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
      * is [`FfiCallTile::speaking`].
      */
     func nextEvent() async  -> FfiCallEvent?
+    
+    /**
+     * The next interruptions record. Suspends until it changes; `None`
+     * means the session is over. Latest-value-wins, as
+     * [`Self::next_roster`]; for any one change it comes after the roster
+     * and local state, so the tiles read on waking already agree with it.
+     */
+    func nextInterruptions() async  -> FfiInterruptions?
     
     /**
      * The next change to our own tile or screen-sharing flag. Suspends until
@@ -2672,6 +2686,17 @@ open func disconnect()async throws   {
 }
     
     /**
+     * What is interrupting the call now, cause by cause (034 R38).
+     * Contract C5.
+     */
+open func interruptions() -> FfiInterruptions  {
+    return try!  FfiConverterTypeFfiInterruptions_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_mediasession_interruptions(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Our participant identity on the media plane (the JWT `sub`; peers import
      * our media key under it).
      *
@@ -2725,6 +2750,30 @@ open func nextEvent()async  -> FfiCallEvent?  {
             completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterOptionTypeFfiCallEvent.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * The next interruptions record. Suspends until it changes; `None`
+     * means the session is over. Latest-value-wins, as
+     * [`Self::next_roster`]; for any one change it comes after the roster
+     * and local state, so the tiles read on waking already agree with it.
+     */
+open func nextInterruptions()async  -> FfiInterruptions?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_mediasession_next_interruptions(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeFfiInterruptions.lift,
             errorHandler: nil
             
         )
@@ -3396,13 +3445,17 @@ public protocol RtcCallProtocol: AnyObject, Sendable {
     func isLive()  -> Bool
     
     /**
-     * Leaves the slot; the call is over and its media stopped at once, even
-     * when the send fails — the delayed leave then removes the membership.
+     * Leaves the slot; the call is over and its media stopped at once, and
+     * this returns without waiting for the leave to be sent (034 R8). The
+     * send is one attempt; if it fails, the delayed leave — or the
+     * membership's lifetime — removes us. Fails only with `CallOver`, when the
+     * call was already over.
      */
     func leave(params: FfiLeaveSessionParams) async throws 
     
     /**
-     * Lowers our hand by redacting the annotation. A no-op when it is down.
+     * Lowers our hand by redacting the annotation, as [`Self::raise_hand`]
+     * raises it. A no-op when it is down.
      */
     func lowerHand() async throws 
     
@@ -3420,8 +3473,12 @@ public protocol RtcCallProtocol: AnyObject, Sendable {
     func membershipEventId() async  -> String?
     
     /**
-     * Raises our hand. Idempotent while it is up; the hand follows our
-     * membership across sticky refreshes on its own.
+     * Raises our hand. Shown on our tile at once; suspends until the hand
+     * has landed, however long signalling is away, and resolves `Ok` early
+     * when a lower supersedes it or the call ends. Fails only on a permanent
+     * refusal, the hand back where it was. Cancelling the call leaves the
+     * request standing: only a lower withdraws it (034 R5). Idempotent while
+     * it is up; the hand follows our membership across sticky refreshes.
      */
     func raiseHand() async throws 
     
@@ -3438,7 +3495,9 @@ public protocol RtcCallProtocol: AnyObject, Sendable {
      * sent. Returns the event id.
      *
      * Fails inside the send cooldown (Element Call's three seconds by
-     * default), since peers would drop the reaction anyway.
+     * default), since peers would drop the reaction anyway, and with
+     * `Reaction("not sent")` when it has not landed within 5 s: it is dropped,
+     * never delivered late, and the cooldown does not start (034 R4).
      */
     func sendReaction(emoji: String, name: String) async throws  -> String
     
@@ -3535,8 +3594,11 @@ open func isLive() -> Bool  {
 }
     
     /**
-     * Leaves the slot; the call is over and its media stopped at once, even
-     * when the send fails — the delayed leave then removes the membership.
+     * Leaves the slot; the call is over and its media stopped at once, and
+     * this returns without waiting for the leave to be sent (034 R8). The
+     * send is one attempt; if it fails, the delayed leave — or the
+     * membership's lifetime — removes us. Fails only with `CallOver`, when the
+     * call was already over.
      */
 open func leave(params: FfiLeaveSessionParams)async throws   {
     return
@@ -3556,7 +3618,8 @@ open func leave(params: FfiLeaveSessionParams)async throws   {
 }
     
     /**
-     * Lowers our hand by redacting the annotation. A no-op when it is down.
+     * Lowers our hand by redacting the annotation, as [`Self::raise_hand`]
+     * raises it. A no-op when it is down.
      */
 open func lowerHand()async throws   {
     return
@@ -3626,8 +3689,12 @@ open func membershipEventId()async  -> String?  {
 }
     
     /**
-     * Raises our hand. Idempotent while it is up; the hand follows our
-     * membership across sticky refreshes on its own.
+     * Raises our hand. Shown on our tile at once; suspends until the hand
+     * has landed, however long signalling is away, and resolves `Ok` early
+     * when a lower supersedes it or the call ends. Fails only on a permanent
+     * refusal, the hand back where it was. Cancelling the call leaves the
+     * request standing: only a lower withdraws it (034 R5). Idempotent while
+     * it is up; the hand follows our membership across sticky refreshes.
      */
 open func raiseHand()async throws   {
     return
@@ -3680,7 +3747,9 @@ open func roomId() -> String  {
      * sent. Returns the event id.
      *
      * Fails inside the send cooldown (Element Call's three seconds by
-     * default), since peers would drop the reaction anyway.
+     * default), since peers would drop the reaction anyway, and with
+     * `Reaction("not sent")` when it has not landed within 5 s: it is dropped,
+     * never delivered late, and the cooldown does not start (034 R4).
      */
 open func sendReaction(emoji: String, name: String)async throws  -> String  {
     return
@@ -3837,6 +3906,14 @@ public func FfiConverterTypeRtcCall_lower(_ value: RtcCall) -> UnsafeMutableRawP
 public protocol RtcClientProtocol: AnyObject, Sendable {
     
     /**
+     * Reports the host's Matrix client offline, or online once a request to
+     * the homeserver has succeeded since it was offline — never on sync merely
+     * starting (034 R11). Online retries every pending send at once. Optional:
+     * a host that never reports leaves the library to its own sends.
+     */
+    func reportConnectivity(online: Bool) 
+    
+    /**
      * Opens a room: the library subscribes to what the room needs in the
      * given mode and applies its current state. Resolves once that state is
      * applied, so a `join_call` issued afterwards sees it.
@@ -3846,6 +3923,17 @@ public protocol RtcClientProtocol: AnyObject, Sendable {
      * ends its subscriptions without leaving; `shutdown` leaves first.
      */
     func room(roomId: String, options: FfiRoomOptions) async throws  -> RtcRoom
+    
+    /**
+     * Whether the homeserver is answering the library's sends (034 R9).
+     */
+    func signallingHealth()  -> FfiSignallingHealth
+    
+    /**
+     * Signalling health, current value first, then each change. Live from
+     * the client, before any call or media exists.
+     */
+    func subscribeSignallingHealth()  -> SignallingHealthSubscription
     
 }
 /**
@@ -3913,6 +4001,19 @@ public convenience init(backend: MatrixBackend) {
 
     
     /**
+     * Reports the host's Matrix client offline, or online once a request to
+     * the homeserver has succeeded since it was offline — never on sync merely
+     * starting (034 R11). Online retries every pending send at once. Optional:
+     * a host that never reports leaves the library to its own sends.
+     */
+open func reportConnectivity(online: Bool)  {try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtcclient_report_connectivity(self.uniffiClonePointer(),
+        FfiConverterBool.lower(online),$0
+    )
+}
+}
+    
+    /**
      * Opens a room: the library subscribes to what the room needs in the
      * given mode and applies its current state. Resolves once that state is
      * applied, so a `join_call` issued afterwards sees it.
@@ -3936,6 +4037,27 @@ open func room(roomId: String, options: FfiRoomOptions)async throws  -> RtcRoom 
             liftFunc: FfiConverterTypeRtcRoom_lift,
             errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
         )
+}
+    
+    /**
+     * Whether the homeserver is answering the library's sends (034 R9).
+     */
+open func signallingHealth() -> FfiSignallingHealth  {
+    return try!  FfiConverterTypeFfiSignallingHealth_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtcclient_signalling_health(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Signalling health, current value first, then each change. Live from
+     * the client, before any call or media exists.
+     */
+open func subscribeSignallingHealth() -> SignallingHealthSubscription  {
+    return try!  FfiConverterTypeSignallingHealthSubscription_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtcclient_subscribe_signalling_health(self.uniffiClonePointer(),$0
+    )
+})
 }
     
 
@@ -4572,6 +4694,153 @@ public func FfiConverterTypeRtcRoom_lift(_ pointer: UnsafeMutableRawPointer) thr
 #endif
 public func FfiConverterTypeRtcRoom_lower(_ value: RtcRoom) -> UnsafeMutableRawPointer {
     return FfiConverterTypeRtcRoom.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Signalling health, pulled with an async [`Self::next`] like the call status.
+ */
+public protocol SignallingHealthSubscriptionProtocol: AnyObject, Sendable {
+    
+    /**
+     * The current health on the first call, then each change. `None` once
+     * the client is gone.
+     */
+    func next() async  -> FfiSignallingHealth?
+    
+}
+/**
+ * Signalling health, pulled with an async [`Self::next`] like the call status.
+ */
+open class SignallingHealthSubscription: SignallingHealthSubscriptionProtocol, @unchecked Sendable {
+    fileprivate let pointer: UnsafeMutableRawPointer!
+
+    /// Used to instantiate a [FFIObject] without an actual pointer, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoPointer {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromRawPointer pointer: UnsafeMutableRawPointer) {
+        self.pointer = pointer
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noPointer: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing [Pointer] the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noPointer: NoPointer) {
+        self.pointer = nil
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiClonePointer() -> UnsafeMutableRawPointer {
+        return try! rustCall { uniffi_matrix_rtc_ffi_fn_clone_signallinghealthsubscription(self.pointer, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        guard let pointer = pointer else {
+            return
+        }
+
+        try! rustCall { uniffi_matrix_rtc_ffi_fn_free_signallinghealthsubscription(pointer, $0) }
+    }
+
+    
+
+    
+    /**
+     * The current health on the first call, then each change. `None` once
+     * the client is gone.
+     */
+open func next()async  -> FfiSignallingHealth?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_signallinghealthsubscription_next(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionTypeFfiSignallingHealth.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSignallingHealthSubscription: FfiConverter {
+
+    typealias FfiType = UnsafeMutableRawPointer
+    typealias SwiftType = SignallingHealthSubscription
+
+    public static func lift(_ pointer: UnsafeMutableRawPointer) throws -> SignallingHealthSubscription {
+        return SignallingHealthSubscription(unsafeFromRawPointer: pointer)
+    }
+
+    public static func lower(_ value: SignallingHealthSubscription) -> UnsafeMutableRawPointer {
+        return value.uniffiClonePointer()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SignallingHealthSubscription {
+        let v: UInt64 = try readInt(&buf)
+        // The Rust code won't compile if a pointer won't fit in a UInt64.
+        // We have to go via `UInt` because that's the thing that's the size of a pointer.
+        let ptr = UnsafeMutableRawPointer(bitPattern: UInt(truncatingIfNeeded: v))
+        if (ptr == nil) {
+            throw UniffiInternalError.unexpectedNullPointer
+        }
+        return try lift(ptr!)
+    }
+
+    public static func write(_ value: SignallingHealthSubscription, into buf: inout [UInt8]) {
+        // This fiddling is because `Int` is the thing that's the same size as a pointer.
+        // The Rust code won't compile if a pointer won't fit in a `UInt64`.
+        writeInt(&buf, UInt64(bitPattern: Int64(Int(bitPattern: lower(value)))))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignallingHealthSubscription_lift(_ pointer: UnsafeMutableRawPointer) throws -> SignallingHealthSubscription {
+    return try FfiConverterTypeSignallingHealthSubscription.lift(pointer)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSignallingHealthSubscription_lower(_ value: SignallingHealthSubscription) -> UnsafeMutableRawPointer {
+    return FfiConverterTypeSignallingHealthSubscription.lower(value)
 }
 
 
@@ -5389,7 +5658,17 @@ public struct FfiCallTile {
      * See `FfiParticipant.hand_raised_position`.
      */
     public var handRaisedPosition: UInt32?
-    public var reachable: Bool
+    /**
+     * The connection carrying this member's media; on the own tile, our own
+     * SFU's. Draw the avatar over a remote tile that is not `Connected` or
+     * is `unable_to_decrypt`: `has_video` does not move for either.
+     * Contract C6.
+     */
+    public var connection: FfiConnectionState
+    /**
+     * See `FfiParticipant.unable_to_decrypt`. Always `None` on the own tile.
+     */
+    public var unableToDecrypt: FfiUnableToDecrypt?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5400,7 +5679,16 @@ public struct FfiCallTile {
          */speaking: Bool, handRaisedAtMs: UInt64?, 
         /**
          * See `FfiParticipant.hand_raised_position`.
-         */handRaisedPosition: UInt32?, reachable: Bool) {
+         */handRaisedPosition: UInt32?, 
+        /**
+         * The connection carrying this member's media; on the own tile, our own
+         * SFU's. Draw the avatar over a remote tile that is not `Connected` or
+         * is `unable_to_decrypt`: `has_video` does not move for either.
+         * Contract C6.
+         */connection: FfiConnectionState, 
+        /**
+         * See `FfiParticipant.unable_to_decrypt`. Always `None` on the own tile.
+         */unableToDecrypt: FfiUnableToDecrypt?) {
         self.memberId = memberId
         self.kind = kind
         self.userId = userId
@@ -5411,7 +5699,8 @@ public struct FfiCallTile {
         self.speaking = speaking
         self.handRaisedAtMs = handRaisedAtMs
         self.handRaisedPosition = handRaisedPosition
-        self.reachable = reachable
+        self.connection = connection
+        self.unableToDecrypt = unableToDecrypt
     }
 }
 
@@ -5452,7 +5741,10 @@ extension FfiCallTile: Equatable, Hashable {
         if lhs.handRaisedPosition != rhs.handRaisedPosition {
             return false
         }
-        if lhs.reachable != rhs.reachable {
+        if lhs.connection != rhs.connection {
+            return false
+        }
+        if lhs.unableToDecrypt != rhs.unableToDecrypt {
             return false
         }
         return true
@@ -5469,7 +5761,8 @@ extension FfiCallTile: Equatable, Hashable {
         hasher.combine(speaking)
         hasher.combine(handRaisedAtMs)
         hasher.combine(handRaisedPosition)
-        hasher.combine(reachable)
+        hasher.combine(connection)
+        hasher.combine(unableToDecrypt)
     }
 }
 
@@ -5492,7 +5785,8 @@ public struct FfiConverterTypeFfiCallTile: FfiConverterRustBuffer {
                 speaking: FfiConverterBool.read(from: &buf), 
                 handRaisedAtMs: FfiConverterOptionUInt64.read(from: &buf), 
                 handRaisedPosition: FfiConverterOptionUInt32.read(from: &buf), 
-                reachable: FfiConverterBool.read(from: &buf)
+                connection: FfiConverterTypeFfiConnectionState.read(from: &buf), 
+                unableToDecrypt: FfiConverterOptionTypeFfiUnableToDecrypt.read(from: &buf)
         )
     }
 
@@ -5507,7 +5801,8 @@ public struct FfiConverterTypeFfiCallTile: FfiConverterRustBuffer {
         FfiConverterBool.write(value.speaking, into: &buf)
         FfiConverterOptionUInt64.write(value.handRaisedAtMs, into: &buf)
         FfiConverterOptionUInt32.write(value.handRaisedPosition, into: &buf)
-        FfiConverterBool.write(value.reachable, into: &buf)
+        FfiConverterTypeFfiConnectionState.write(value.connection, into: &buf)
+        FfiConverterOptionTypeFfiUnableToDecrypt.write(value.unableToDecrypt, into: &buf)
     }
 }
 
@@ -5550,10 +5845,10 @@ public struct FfiEncryptionConfig {
      */
     public var manageMediaKeys: Bool?
     /**
-     * Whether to discard keys from devices that are not cross-signed
+     * Whether to discard keys from senders the client does not confirm
      * (default: true, per MSC4153).
      */
-    public var requireCrossSignedSender: Bool?
+    public var requireConfirmedSender: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -5573,14 +5868,14 @@ public struct FfiEncryptionConfig {
          * Whether to manage media keys (default: true).
          */manageMediaKeys: Bool?, 
         /**
-         * Whether to discard keys from devices that are not cross-signed
+         * Whether to discard keys from senders the client does not confirm
          * (default: true, per MSC4153).
-         */requireCrossSignedSender: Bool?) {
+         */requireConfirmedSender: Bool?) {
         self.delayBeforeUseMs = delayBeforeUseMs
         self.keyRotationGracePeriodMs = keyRotationGracePeriodMs
         self.maxKeyLifetimeMs = maxKeyLifetimeMs
         self.manageMediaKeys = manageMediaKeys
-        self.requireCrossSignedSender = requireCrossSignedSender
+        self.requireConfirmedSender = requireConfirmedSender
     }
 }
 
@@ -5603,7 +5898,7 @@ extension FfiEncryptionConfig: Equatable, Hashable {
         if lhs.manageMediaKeys != rhs.manageMediaKeys {
             return false
         }
-        if lhs.requireCrossSignedSender != rhs.requireCrossSignedSender {
+        if lhs.requireConfirmedSender != rhs.requireConfirmedSender {
             return false
         }
         return true
@@ -5614,7 +5909,7 @@ extension FfiEncryptionConfig: Equatable, Hashable {
         hasher.combine(keyRotationGracePeriodMs)
         hasher.combine(maxKeyLifetimeMs)
         hasher.combine(manageMediaKeys)
-        hasher.combine(requireCrossSignedSender)
+        hasher.combine(requireConfirmedSender)
     }
 }
 
@@ -5631,7 +5926,7 @@ public struct FfiConverterTypeFfiEncryptionConfig: FfiConverterRustBuffer {
                 keyRotationGracePeriodMs: FfiConverterOptionUInt64.read(from: &buf), 
                 maxKeyLifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
                 manageMediaKeys: FfiConverterOptionBool.read(from: &buf), 
-                requireCrossSignedSender: FfiConverterOptionBool.read(from: &buf)
+                requireConfirmedSender: FfiConverterOptionBool.read(from: &buf)
         )
     }
 
@@ -5640,7 +5935,7 @@ public struct FfiConverterTypeFfiEncryptionConfig: FfiConverterRustBuffer {
         FfiConverterOptionUInt64.write(value.keyRotationGracePeriodMs, into: &buf)
         FfiConverterOptionUInt64.write(value.maxKeyLifetimeMs, into: &buf)
         FfiConverterOptionBool.write(value.manageMediaKeys, into: &buf)
-        FfiConverterOptionBool.write(value.requireCrossSignedSender, into: &buf)
+        FfiConverterOptionBool.write(value.requireConfirmedSender, into: &buf)
     }
 }
 
@@ -5663,19 +5958,25 @@ public func FfiConverterTypeFfiEncryptionConfig_lower(_ value: FfiEncryptionConf
 /**
  * What the client reports about how an event arrived. `encrypted: false`
  * means cleartext; the other two fields then mean nothing. Report only what
- * the client says — a cross-signing status it cannot give stays `null`.
+ * the client says — a confirmation it cannot give stays `null`.
  */
 public struct FfiEventEncryption {
     public var encrypted: Bool
     public var senderDeviceId: String?
-    public var senderCrossSigned: Bool?
+    /**
+     * Whether the client confirms the sender under its own trust settings.
+     */
+    public var senderConfirmed: Bool?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(encrypted: Bool, senderDeviceId: String? = nil, senderCrossSigned: Bool? = nil) {
+    public init(encrypted: Bool, senderDeviceId: String? = nil, 
+        /**
+         * Whether the client confirms the sender under its own trust settings.
+         */senderConfirmed: Bool? = nil) {
         self.encrypted = encrypted
         self.senderDeviceId = senderDeviceId
-        self.senderCrossSigned = senderCrossSigned
+        self.senderConfirmed = senderConfirmed
     }
 }
 
@@ -5692,7 +5993,7 @@ extension FfiEventEncryption: Equatable, Hashable {
         if lhs.senderDeviceId != rhs.senderDeviceId {
             return false
         }
-        if lhs.senderCrossSigned != rhs.senderCrossSigned {
+        if lhs.senderConfirmed != rhs.senderConfirmed {
             return false
         }
         return true
@@ -5701,7 +6002,7 @@ extension FfiEventEncryption: Equatable, Hashable {
     public func hash(into hasher: inout Hasher) {
         hasher.combine(encrypted)
         hasher.combine(senderDeviceId)
-        hasher.combine(senderCrossSigned)
+        hasher.combine(senderConfirmed)
     }
 }
 
@@ -5716,14 +6017,14 @@ public struct FfiConverterTypeFfiEventEncryption: FfiConverterRustBuffer {
             try FfiEventEncryption(
                 encrypted: FfiConverterBool.read(from: &buf), 
                 senderDeviceId: FfiConverterOptionString.read(from: &buf), 
-                senderCrossSigned: FfiConverterOptionBool.read(from: &buf)
+                senderConfirmed: FfiConverterOptionBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: FfiEventEncryption, into buf: inout [UInt8]) {
         FfiConverterBool.write(value.encrypted, into: &buf)
         FfiConverterOptionString.write(value.senderDeviceId, into: &buf)
-        FfiConverterOptionBool.write(value.senderCrossSigned, into: &buf)
+        FfiConverterOptionBool.write(value.senderConfirmed, into: &buf)
     }
 }
 
@@ -5988,6 +6289,125 @@ public func FfiConverterTypeFfiGroupNotify_lower(_ value: FfiGroupNotify) -> Rus
 
 
 /**
+ * What is interrupting the call now, cause by cause (034 R38). Contract C5.
+ *
+ * Each cause changes on its own; the record is empty (reachable, not
+ * lapsed, connected, empty lists) when nothing is interrupted. Member lists
+ * hold `member_id`s on the roster; `unmappable` holds transport identities,
+ * which map to no member. `own_media` is authoritative for our own SFU from
+ * the first value, before our own tile exists.
+ */
+public struct FfiInterruptions {
+    public var signalling: FfiSignallingHealth
+    public var ownMembershipLapsed: Bool
+    public var ownMedia: FfiConnectionState
+    public var membersReconnecting: [String]
+    public var membersUnreachable: [String]
+    public var unableToDecrypt: [String]
+    public var unmappable: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(signalling: FfiSignallingHealth, ownMembershipLapsed: Bool, ownMedia: FfiConnectionState, membersReconnecting: [String], membersUnreachable: [String], unableToDecrypt: [String], unmappable: [String]) {
+        self.signalling = signalling
+        self.ownMembershipLapsed = ownMembershipLapsed
+        self.ownMedia = ownMedia
+        self.membersReconnecting = membersReconnecting
+        self.membersUnreachable = membersUnreachable
+        self.unableToDecrypt = unableToDecrypt
+        self.unmappable = unmappable
+    }
+}
+
+#if compiler(>=6)
+extension FfiInterruptions: Sendable {}
+#endif
+
+
+extension FfiInterruptions: Equatable, Hashable {
+    public static func ==(lhs: FfiInterruptions, rhs: FfiInterruptions) -> Bool {
+        if lhs.signalling != rhs.signalling {
+            return false
+        }
+        if lhs.ownMembershipLapsed != rhs.ownMembershipLapsed {
+            return false
+        }
+        if lhs.ownMedia != rhs.ownMedia {
+            return false
+        }
+        if lhs.membersReconnecting != rhs.membersReconnecting {
+            return false
+        }
+        if lhs.membersUnreachable != rhs.membersUnreachable {
+            return false
+        }
+        if lhs.unableToDecrypt != rhs.unableToDecrypt {
+            return false
+        }
+        if lhs.unmappable != rhs.unmappable {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(signalling)
+        hasher.combine(ownMembershipLapsed)
+        hasher.combine(ownMedia)
+        hasher.combine(membersReconnecting)
+        hasher.combine(membersUnreachable)
+        hasher.combine(unableToDecrypt)
+        hasher.combine(unmappable)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiInterruptions: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiInterruptions {
+        return
+            try FfiInterruptions(
+                signalling: FfiConverterTypeFfiSignallingHealth.read(from: &buf), 
+                ownMembershipLapsed: FfiConverterBool.read(from: &buf), 
+                ownMedia: FfiConverterTypeFfiConnectionState.read(from: &buf), 
+                membersReconnecting: FfiConverterSequenceString.read(from: &buf), 
+                membersUnreachable: FfiConverterSequenceString.read(from: &buf), 
+                unableToDecrypt: FfiConverterSequenceString.read(from: &buf), 
+                unmappable: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiInterruptions, into buf: inout [UInt8]) {
+        FfiConverterTypeFfiSignallingHealth.write(value.signalling, into: &buf)
+        FfiConverterBool.write(value.ownMembershipLapsed, into: &buf)
+        FfiConverterTypeFfiConnectionState.write(value.ownMedia, into: &buf)
+        FfiConverterSequenceString.write(value.membersReconnecting, into: &buf)
+        FfiConverterSequenceString.write(value.membersUnreachable, into: &buf)
+        FfiConverterSequenceString.write(value.unableToDecrypt, into: &buf)
+        FfiConverterSequenceString.write(value.unmappable, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInterruptions_lift(_ buf: RustBuffer) throws -> FfiInterruptions {
+    return try FfiConverterTypeFfiInterruptions.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiInterruptions_lower(_ value: FfiInterruptions) -> RustBuffer {
+    return FfiConverterTypeFfiInterruptions.lower(value)
+}
+
+
+/**
  * FFI-friendly join session parameters.
  */
 public struct FfiJoinSessionParams {
@@ -6019,7 +6439,7 @@ public struct FfiJoinSessionParams {
      *
      * A different clock from `keep_alive_timeout_ms`: this is how long the
      * homeserver keeps the membership at all. The SDK re-sends the membership
-     * at half this interval, so shortening it buys nothing but traffic.
+     * once a third of it has passed, so shortening it buys nothing but traffic.
      */
     public var stickyDurationMs: UInt64?
     /**
@@ -6028,8 +6448,9 @@ public struct FfiJoinSessionParams {
      *
      * Only ever used on such a homeserver, where nothing clears a crashed
      * client's membership except this lifetime running out. Raising it trades a
-     * slower cleanup for less signalling; the SDK re-sends the membership at
-     * half this interval, so 300000 means a membership event every 2½ minutes.
+     * slower cleanup for less signalling; the SDK re-sends the membership once
+     * a third of it has passed, so 300000 means a membership event every 100 s,
+     * and an outage of up to about 3 min 20 s never lapses it.
      * Do not lower it below 300000 — MSC4354 says a sticky duration "SHOULD NOT
      * be set to below 5 minutes", because a server whose clock runs behind
      * expires sticky events early and a shorter duration cannot absorb that.
@@ -6072,7 +6493,7 @@ public struct FfiJoinSessionParams {
          *
          * A different clock from `keep_alive_timeout_ms`: this is how long the
          * homeserver keeps the membership at all. The SDK re-sends the membership
-         * at half this interval, so shortening it buys nothing but traffic.
+         * once a third of it has passed, so shortening it buys nothing but traffic.
          */stickyDurationMs: UInt64?, 
         /**
          * Optional membership lifetime to fall back to on a homeserver that
@@ -6080,8 +6501,9 @@ public struct FfiJoinSessionParams {
          *
          * Only ever used on such a homeserver, where nothing clears a crashed
          * client's membership except this lifetime running out. Raising it trades a
-         * slower cleanup for less signalling; the SDK re-sends the membership at
-         * half this interval, so 300000 means a membership event every 2½ minutes.
+         * slower cleanup for less signalling; the SDK re-sends the membership once
+         * a third of it has passed, so 300000 means a membership event every 100 s,
+         * and an outage of up to about 3 min 20 s never lapses it.
          * Do not lower it below 300000 — MSC4354 says a sticky duration "SHOULD NOT
          * be set to below 5 minutes", because a server whose clock runs behind
          * expires sticky events early and a shorter duration cannot absorb that.
@@ -6630,9 +7052,16 @@ public struct FfiParticipant {
     public var deviceId: String?
     public var isLocal: Bool
     /**
-     * Whether any transport can reach this member's media.
+     * The connection carrying this member's media; for our own row, our
+     * own SFU's. Contract C6.
      */
-    public var reachable: Bool
+    public var connection: FfiConnectionState
+    /**
+     * Why their media cannot be shown, if it cannot; a key failure only
+     * after `FfiStabilityConfig.key_grace_ms` (4 s) without a break, so a key rotation does not flicker it.
+     * Always `None` for our own row.
+     */
+    public var unableToDecrypt: FfiUnableToDecrypt?
     public var streams: [FfiStreamState]
     /**
      * When this participant raised their hand (ms since the epoch), or
@@ -6653,8 +7082,14 @@ public struct FfiParticipant {
          * `member.id` of the membership — unique per join, the roster key.
          */memberId: String, userId: String, deviceId: String?, isLocal: Bool, 
         /**
-         * Whether any transport can reach this member's media.
-         */reachable: Bool, streams: [FfiStreamState], 
+         * The connection carrying this member's media; for our own row, our
+         * own SFU's. Contract C6.
+         */connection: FfiConnectionState, 
+        /**
+         * Why their media cannot be shown, if it cannot; a key failure only
+         * after `FfiStabilityConfig.key_grace_ms` (4 s) without a break, so a key rotation does not flicker it.
+         * Always `None` for our own row.
+         */unableToDecrypt: FfiUnableToDecrypt?, streams: [FfiStreamState], 
         /**
          * When this participant raised their hand (ms since the epoch), or
          * `None` while it is down.
@@ -6668,7 +7103,8 @@ public struct FfiParticipant {
         self.userId = userId
         self.deviceId = deviceId
         self.isLocal = isLocal
-        self.reachable = reachable
+        self.connection = connection
+        self.unableToDecrypt = unableToDecrypt
         self.streams = streams
         self.handRaisedAtMs = handRaisedAtMs
         self.handRaisedPosition = handRaisedPosition
@@ -6694,7 +7130,10 @@ extension FfiParticipant: Equatable, Hashable {
         if lhs.isLocal != rhs.isLocal {
             return false
         }
-        if lhs.reachable != rhs.reachable {
+        if lhs.connection != rhs.connection {
+            return false
+        }
+        if lhs.unableToDecrypt != rhs.unableToDecrypt {
             return false
         }
         if lhs.streams != rhs.streams {
@@ -6714,7 +7153,8 @@ extension FfiParticipant: Equatable, Hashable {
         hasher.combine(userId)
         hasher.combine(deviceId)
         hasher.combine(isLocal)
-        hasher.combine(reachable)
+        hasher.combine(connection)
+        hasher.combine(unableToDecrypt)
         hasher.combine(streams)
         hasher.combine(handRaisedAtMs)
         hasher.combine(handRaisedPosition)
@@ -6734,7 +7174,8 @@ public struct FfiConverterTypeFfiParticipant: FfiConverterRustBuffer {
                 userId: FfiConverterString.read(from: &buf), 
                 deviceId: FfiConverterOptionString.read(from: &buf), 
                 isLocal: FfiConverterBool.read(from: &buf), 
-                reachable: FfiConverterBool.read(from: &buf), 
+                connection: FfiConverterTypeFfiConnectionState.read(from: &buf), 
+                unableToDecrypt: FfiConverterOptionTypeFfiUnableToDecrypt.read(from: &buf), 
                 streams: FfiConverterSequenceTypeFfiStreamState.read(from: &buf), 
                 handRaisedAtMs: FfiConverterOptionUInt64.read(from: &buf), 
                 handRaisedPosition: FfiConverterOptionUInt32.read(from: &buf)
@@ -6746,7 +7187,8 @@ public struct FfiConverterTypeFfiParticipant: FfiConverterRustBuffer {
         FfiConverterString.write(value.userId, into: &buf)
         FfiConverterOptionString.write(value.deviceId, into: &buf)
         FfiConverterBool.write(value.isLocal, into: &buf)
-        FfiConverterBool.write(value.reachable, into: &buf)
+        FfiConverterTypeFfiConnectionState.write(value.connection, into: &buf)
+        FfiConverterOptionTypeFfiUnableToDecrypt.write(value.unableToDecrypt, into: &buf)
         FfiConverterSequenceTypeFfiStreamState.write(value.streams, into: &buf)
         FfiConverterOptionUInt64.write(value.handRaisedAtMs, into: &buf)
         FfiConverterOptionUInt32.write(value.handRaisedPosition, into: &buf)
@@ -7917,8 +8359,8 @@ public func FfiConverterTypeFfiSendStats_lower(_ value: FfiSendStats) -> RustBuf
 
 
 /**
- * How much the tile order is damped (R10, R11). A product decision rather
- * than a protocol one, so a host can tune it; the defaults are what
+ * How much the tile order (R10, R11) and a tile's key failures (034 C6) are
+ * damped. A product decision rather than a protocol one, so a host can tune it; the defaults are what
  * `matrix_rtc_call_sdk::StabilityConfig` uses.
  */
 public struct FfiStabilityConfig {
@@ -7936,6 +8378,12 @@ public struct FfiStabilityConfig {
      * Reorders inside this window are delivered as one.
      */
     public var coalesceMs: UInt64
+    /**
+     * How long a member's frames must fail to decrypt, without a break,
+     * before `unable_to_decrypt` shows `MissingKey` or `BadKey`. Too short
+     * and a key rotation flashes it.
+     */
+    public var keyGraceMs: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7950,10 +8398,16 @@ public struct FfiStabilityConfig {
          */demoteMs: UInt64 = UInt64(1500), 
         /**
          * Reorders inside this window are delivered as one.
-         */coalesceMs: UInt64 = UInt64(300)) {
+         */coalesceMs: UInt64 = UInt64(300), 
+        /**
+         * How long a member's frames must fail to decrypt, without a break,
+         * before `unable_to_decrypt` shows `MissingKey` or `BadKey`. Too short
+         * and a key rotation flashes it.
+         */keyGraceMs: UInt64 = UInt64(4000)) {
         self.promoteMs = promoteMs
         self.demoteMs = demoteMs
         self.coalesceMs = coalesceMs
+        self.keyGraceMs = keyGraceMs
     }
 }
 
@@ -7973,6 +8427,9 @@ extension FfiStabilityConfig: Equatable, Hashable {
         if lhs.coalesceMs != rhs.coalesceMs {
             return false
         }
+        if lhs.keyGraceMs != rhs.keyGraceMs {
+            return false
+        }
         return true
     }
 
@@ -7980,6 +8437,7 @@ extension FfiStabilityConfig: Equatable, Hashable {
         hasher.combine(promoteMs)
         hasher.combine(demoteMs)
         hasher.combine(coalesceMs)
+        hasher.combine(keyGraceMs)
     }
 }
 
@@ -7994,7 +8452,8 @@ public struct FfiConverterTypeFfiStabilityConfig: FfiConverterRustBuffer {
             try FfiStabilityConfig(
                 promoteMs: FfiConverterUInt64.read(from: &buf), 
                 demoteMs: FfiConverterUInt64.read(from: &buf), 
-                coalesceMs: FfiConverterUInt64.read(from: &buf)
+                coalesceMs: FfiConverterUInt64.read(from: &buf), 
+                keyGraceMs: FfiConverterUInt64.read(from: &buf)
         )
     }
 
@@ -8002,6 +8461,7 @@ public struct FfiConverterTypeFfiStabilityConfig: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.promoteMs, into: &buf)
         FfiConverterUInt64.write(value.demoteMs, into: &buf)
         FfiConverterUInt64.write(value.coalesceMs, into: &buf)
+        FfiConverterUInt64.write(value.keyGraceMs, into: &buf)
     }
 }
 
@@ -9122,14 +9582,40 @@ public struct MediaSessionConfig {
      * How much the tile order is damped. `None` takes the defaults.
      */
     public var stability: FfiStabilityConfig?
+    /**
+     * How long our own SFU may stay unreachable, from the loss or the
+     * connect request, before the call ends with `ConnectionClosed`
+     * (034 R24, contract C11). `None` takes 60 000; the spec's 60 s is not
+     * a licence to shorten it.
+     */
+    public var ownReconnectBudgetMs: UInt64?
+    /**
+     * Whether our media may move to another member's SFU while ours is
+     * down (034 R25, contract C11): only where that SFU accepts a token for
+     * an account of our homeserver. Off by default.
+     */
+    public var sfuFallback: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(
         /**
          * How much the tile order is damped. `None` takes the defaults.
-         */stability: FfiStabilityConfig? = nil) {
+         */stability: FfiStabilityConfig? = nil, 
+        /**
+         * How long our own SFU may stay unreachable, from the loss or the
+         * connect request, before the call ends with `ConnectionClosed`
+         * (034 R24, contract C11). `None` takes 60 000; the spec's 60 s is not
+         * a licence to shorten it.
+         */ownReconnectBudgetMs: UInt64? = nil, 
+        /**
+         * Whether our media may move to another member's SFU while ours is
+         * down (034 R25, contract C11): only where that SFU accepts a token for
+         * an account of our homeserver. Off by default.
+         */sfuFallback: Bool = false) {
         self.stability = stability
+        self.ownReconnectBudgetMs = ownReconnectBudgetMs
+        self.sfuFallback = sfuFallback
     }
 }
 
@@ -9143,11 +9629,19 @@ extension MediaSessionConfig: Equatable, Hashable {
         if lhs.stability != rhs.stability {
             return false
         }
+        if lhs.ownReconnectBudgetMs != rhs.ownReconnectBudgetMs {
+            return false
+        }
+        if lhs.sfuFallback != rhs.sfuFallback {
+            return false
+        }
         return true
     }
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(stability)
+        hasher.combine(ownReconnectBudgetMs)
+        hasher.combine(sfuFallback)
     }
 }
 
@@ -9160,12 +9654,16 @@ public struct FfiConverterTypeMediaSessionConfig: FfiConverterRustBuffer {
     public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> MediaSessionConfig {
         return
             try MediaSessionConfig(
-                stability: FfiConverterOptionTypeFfiStabilityConfig.read(from: &buf)
+                stability: FfiConverterOptionTypeFfiStabilityConfig.read(from: &buf), 
+                ownReconnectBudgetMs: FfiConverterOptionUInt64.read(from: &buf), 
+                sfuFallback: FfiConverterBool.read(from: &buf)
         )
     }
 
     public static func write(_ value: MediaSessionConfig, into buf: inout [UInt8]) {
         FfiConverterOptionTypeFfiStabilityConfig.write(value.stability, into: &buf)
+        FfiConverterOptionUInt64.write(value.ownReconnectBudgetMs, into: &buf)
+        FfiConverterBool.write(value.sfuFallback, into: &buf)
     }
 }
 
@@ -9430,15 +9928,17 @@ public func FfiConverterTypeRtcLogRecord_lower(_ value: RtcLogRecord) -> RustBuf
 
 
 /**
- * A failure reported by the host's Matrix client. Carry the Matrix `errcode`
- * and HTTP status when the client has them: the library classifies them (a
- * delayed-event refusal, for one); the host does not.
+ * A failure reported by the host's Matrix client. Carry the Matrix `errcode`,
+ * HTTP status and rate-limit `retry_after_ms` when the client has them: the
+ * library classifies them (034 R3, R7); the host does not. Set `permanent`
+ * only for a condition the client knows is final and has no Matrix code for,
+ * such as a room the user is not in: a permanent failure is never retried.
  */
 public enum FfiBackendError: Swift.Error {
 
     
     
-    case Failed(errcode: String?, status: UInt16?, reason: String
+    case Failed(errcode: String?, status: UInt16?, retryAfterMs: UInt64?, permanent: Bool, reason: String
     )
 }
 
@@ -9459,6 +9959,8 @@ public struct FfiConverterTypeFfiBackendError: FfiConverterRustBuffer {
         case 1: return .Failed(
             errcode: try FfiConverterOptionString.read(from: &buf), 
             status: try FfiConverterOptionUInt16.read(from: &buf), 
+            retryAfterMs: try FfiConverterOptionUInt64.read(from: &buf), 
+            permanent: try FfiConverterBool.read(from: &buf), 
             reason: try FfiConverterString.read(from: &buf)
             )
 
@@ -9473,10 +9975,12 @@ public struct FfiConverterTypeFfiBackendError: FfiConverterRustBuffer {
 
         
         
-        case let .Failed(errcode,status,reason):
+        case let .Failed(errcode,status,retryAfterMs,permanent,reason):
             writeInt(&buf, Int32(1))
             FfiConverterOptionString.write(errcode, into: &buf)
             FfiConverterOptionUInt16.write(status, into: &buf)
+            FfiConverterOptionUInt64.write(retryAfterMs, into: &buf)
+            FfiConverterBool.write(permanent, into: &buf)
             FfiConverterString.write(reason, into: &buf)
             
         }
@@ -9550,9 +10054,11 @@ public enum FfiCallEnd {
      */
     case slotClosed
     /**
-     * The connection to our own focus closed and will not come back.
+     * Our own SFU connection was given up (034 R24): `reason` is for the
+     * screen, `message` for logs only. Publishing has stopped and our leave
+     * has been issued (contract C10).
      */
-    case connectionClosed(message: String
+    case connectionClosed(reason: FfiConnectionLossReason, message: String
     )
 }
 
@@ -9585,7 +10091,7 @@ public struct FfiConverterTypeFfiCallEnd: FfiConverterRustBuffer {
         
         case 7: return .slotClosed
         
-        case 8: return .connectionClosed(message: try FfiConverterString.read(from: &buf)
+        case 8: return .connectionClosed(reason: try FfiConverterTypeFfiConnectionLossReason.read(from: &buf), message: try FfiConverterString.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9624,8 +10130,9 @@ public struct FfiConverterTypeFfiCallEnd: FfiConverterRustBuffer {
             writeInt(&buf, Int32(7))
         
         
-        case let .connectionClosed(message):
+        case let .connectionClosed(reason,message):
             writeInt(&buf, Int32(8))
+            FfiConverterTypeFfiConnectionLossReason.write(reason, into: &buf)
             FfiConverterString.write(message, into: &buf)
             
         }
@@ -10136,6 +10643,196 @@ extension FfiCallStatus: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Why our own SFU connection was given up. Contract C10.
+ */
+
+public enum FfiConnectionLossReason {
+    
+    /**
+     * Lost, and not back within the reconnect budget.
+     */
+    case budget
+    /**
+     * The SFU or its token service refused us.
+     */
+    case refused
+    /**
+     * Never established within the budget from the connect request.
+     */
+    case neverConnected
+}
+
+
+#if compiler(>=6)
+extension FfiConnectionLossReason: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiConnectionLossReason: FfiConverterRustBuffer {
+    typealias SwiftType = FfiConnectionLossReason
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiConnectionLossReason {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .budget
+        
+        case 2: return .refused
+        
+        case 3: return .neverConnected
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiConnectionLossReason, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .budget:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .refused:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .neverConnected:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiConnectionLossReason_lift(_ buf: RustBuffer) throws -> FfiConnectionLossReason {
+    return try FfiConverterTypeFfiConnectionLossReason.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiConnectionLossReason_lower(_ value: FfiConnectionLossReason) -> RustBuffer {
+    return FfiConverterTypeFfiConnectionLossReason.lower(value)
+}
+
+
+extension FfiConnectionLossReason: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * The connection carrying someone's media (034 R23, R28). Contract C6.
+ */
+
+public enum FfiConnectionState {
+    
+    /**
+     * Up; a peer's connection also while it is opened for the first time.
+     */
+    case connected
+    /**
+     * Our own media only: not yet up for the first time. The call is still
+     * starting, so not an interruption.
+     */
+    case connecting
+    /**
+     * Being re-established after a loss, for as long as that takes; never
+     * given up while a member publishes there.
+     */
+    case reconnecting
+    /**
+     * No transport can serve what the member advertises.
+     */
+    case unreachable
+}
+
+
+#if compiler(>=6)
+extension FfiConnectionState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiConnectionState: FfiConverterRustBuffer {
+    typealias SwiftType = FfiConnectionState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiConnectionState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .connected
+        
+        case 2: return .connecting
+        
+        case 3: return .reconnecting
+        
+        case 4: return .unreachable
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiConnectionState, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .connected:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .connecting:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .reconnecting:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unreachable:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiConnectionState_lift(_ buf: RustBuffer) throws -> FfiConnectionState {
+    return try FfiConverterTypeFfiConnectionState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiConnectionState_lower(_ value: FfiConnectionState) -> RustBuffer {
+    return FfiConverterTypeFfiConnectionState.lower(value)
+}
+
+
+extension FfiConnectionState: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What the media layer knows about a frame-encryption failure (mirrors
  * `matrix_rtc_call_sdk::FrameEncryptionDiagnostic`).
  *
@@ -10453,7 +11150,7 @@ extension FfiJoinTransport: Equatable, Hashable {}
 /**
  * Why a media key was refused (mirrors `matrix_rtc_core::KeyRejection`).
  *
- * Typed rather than a message so a host can act on it: `NotCrossSigned` is a
+ * Typed rather than a message so a host can act on it: `SenderNotConfirmed` is a
  * "verify this device" prompt, not just something to log.
  */
 
@@ -10464,9 +11161,9 @@ public enum FfiKeyRejection {
      */
     case cleartext
     /**
-     * The sending device is not cross-signed (MSC4153).
+     * The client does not confirm the sender (MSC4153).
      */
-    case notCrossSigned
+    case senderNotConfirmed
     /**
      * The message named a different room than this session's.
      */
@@ -10506,7 +11203,7 @@ public struct FfiConverterTypeFfiKeyRejection: FfiConverterRustBuffer {
         
         case 1: return .cleartext
         
-        case 2: return .notCrossSigned
+        case 2: return .senderNotConfirmed
         
         case 3: return .roomMismatch(claimed: try FfiConverterString.read(from: &buf)
         )
@@ -10531,7 +11228,7 @@ public struct FfiConverterTypeFfiKeyRejection: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case .notCrossSigned:
+        case .senderNotConfirmed:
             writeInt(&buf, Int32(2))
         
         
@@ -11119,6 +11816,87 @@ extension FfiRtcTransport: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Whether the homeserver is answering the library's sends (034 R9). Distinct
+ * from the media `degraded` flag.
+ */
+
+public enum FfiSignallingHealth {
+    
+    case reachable
+    /**
+     * Since the first transient failure of a library send, or the host's
+     * offline report, in epoch milliseconds; stable until reachable again.
+     */
+    case unreachable(sinceMs: UInt64
+    )
+}
+
+
+#if compiler(>=6)
+extension FfiSignallingHealth: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiSignallingHealth: FfiConverterRustBuffer {
+    typealias SwiftType = FfiSignallingHealth
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiSignallingHealth {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .reachable
+        
+        case 2: return .unreachable(sinceMs: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiSignallingHealth, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .reachable:
+            writeInt(&buf, Int32(1))
+        
+        
+        case let .unreachable(sinceMs):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt64.write(sinceMs, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSignallingHealth_lift(_ buf: RustBuffer) throws -> FfiSignallingHealth {
+    return try FfiConverterTypeFfiSignallingHealth.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiSignallingHealth_lower(_ value: FfiSignallingHealth) -> RustBuffer {
+    return FfiConverterTypeFfiSignallingHealth.lower(value)
+}
+
+
+extension FfiSignallingHealth: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * The RTC encryption mechanism an `m.rtc.slot` prescribes for its members.
  *
  * Its presence is what turns RTC encryption on for the slot; its absence turns
@@ -11370,6 +12148,99 @@ public func FfiConverterTypeFfiTileKind_lower(_ value: FfiTileKind) -> RustBuffe
 
 
 extension FfiTileKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Why a member's media is not shown although it may be arriving (034 R33).
+ * Draw the avatar for every case. Contract C6.
+ */
+
+public enum FfiUnableToDecrypt {
+    
+    /**
+     * Their key has not reached us; after `FfiStabilityConfig.key_grace_ms`
+     * of failing frames.
+     */
+    case missingKey
+    /**
+     * We hold a key for their frames but it does not decrypt them; after
+     * `FfiStabilityConfig.key_grace_ms` of failing frames.
+     */
+    case badKey
+    /**
+     * They published a track declared unencrypted, which is refused and
+     * never played; at once.
+     */
+    case notEncrypted
+}
+
+
+#if compiler(>=6)
+extension FfiUnableToDecrypt: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiUnableToDecrypt: FfiConverterRustBuffer {
+    typealias SwiftType = FfiUnableToDecrypt
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiUnableToDecrypt {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .missingKey
+        
+        case 2: return .badKey
+        
+        case 3: return .notEncrypted
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiUnableToDecrypt, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .missingKey:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .badKey:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .notEncrypted:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiUnableToDecrypt_lift(_ buf: RustBuffer) throws -> FfiUnableToDecrypt {
+    return try FfiConverterTypeFfiUnableToDecrypt.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiUnableToDecrypt_lower(_ value: FfiUnableToDecrypt) -> RustBuffer {
+    return FfiConverterTypeFfiUnableToDecrypt.lower(value)
+}
+
+
+extension FfiUnableToDecrypt: Equatable, Hashable {}
 
 
 
@@ -11668,6 +12539,17 @@ public enum MatrixRtcFfiError: Swift.Error {
      */
     case SlotClosed(String
     )
+    /**
+     * The join did not complete within its 30 s budget: the homeserver kept
+     * failing, or did not answer (034 R6, R27).
+     */
+    case JoinTimedOut
+    /**
+     * The homeserver refused the join for good (034 R6, R27); `errcode` is
+     * its Matrix error code when it gave one.
+     */
+    case JoinRefused(errcode: String?, reason: String
+    )
 }
 
 
@@ -11702,6 +12584,11 @@ public struct FfiConverterTypeMatrixRtcFfiError: FfiConverterRustBuffer {
             )
         case 7: return .SlotClosed(
             try FfiConverterString.read(from: &buf)
+            )
+        case 8: return .JoinTimedOut
+        case 9: return .JoinRefused(
+            errcode: try FfiConverterOptionString.read(from: &buf), 
+            reason: try FfiConverterString.read(from: &buf)
             )
 
          default: throw UniffiInternalError.unexpectedEnumCase
@@ -11747,6 +12634,16 @@ public struct FfiConverterTypeMatrixRtcFfiError: FfiConverterRustBuffer {
         case let .SlotClosed(v1):
             writeInt(&buf, Int32(7))
             FfiConverterString.write(v1, into: &buf)
+            
+        
+        case .JoinTimedOut:
+            writeInt(&buf, Int32(8))
+        
+        
+        case let .JoinRefused(errcode,reason):
+            writeInt(&buf, Int32(9))
+            FfiConverterOptionString.write(errcode, into: &buf)
+            FfiConverterString.write(reason, into: &buf)
             
         }
     }
@@ -12340,6 +13237,30 @@ fileprivate struct FfiConverterOptionTypeFfiGroupNotify: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiInterruptions: FfiConverterRustBuffer {
+    typealias SwiftType = FfiInterruptions?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiInterruptions.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiInterruptions.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiLeaveReason: FfiConverterRustBuffer {
     typealias SwiftType = FfiLeaveReason?
 
@@ -12628,6 +13549,30 @@ fileprivate struct FfiConverterOptionTypeFfiMembershipFormat: FfiConverterRustBu
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiSignallingHealth: FfiConverterRustBuffer {
+    typealias SwiftType = FfiSignallingHealth?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiSignallingHealth.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiSignallingHealth.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiSlotEncryption: FfiConverterRustBuffer {
     typealias SwiftType = FfiSlotEncryption?
 
@@ -12644,6 +13589,30 @@ fileprivate struct FfiConverterOptionTypeFfiSlotEncryption: FfiConverterRustBuff
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiSlotEncryption.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiUnableToDecrypt: FfiConverterRustBuffer {
+    typealias SwiftType = FfiUnableToDecrypt?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiUnableToDecrypt.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiUnableToDecrypt.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -13433,6 +14402,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_disconnect() != 1846) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_interruptions() != 5226) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_local_identity() != 62357) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13440,6 +14412,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_event() != 33443) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_interruptions() != 50138) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_next_local_state() != 46506) {
@@ -13505,10 +14480,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_is_live() != 60709) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_leave() != 59173) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_leave() != 63866) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_lower_hand() != 18687) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_lower_hand() != 2682) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_member_count() != 8093) {
@@ -13520,7 +14495,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_membership_event_id() != 8682) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_raise_hand() != 56791) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_raise_hand() != 1183) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_raised_hands() != 34024) {
@@ -13529,7 +14504,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_room_id() != 59542) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_send_reaction() != 63547) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_send_reaction() != 63896) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_slot_id() != 64029) {
@@ -13547,7 +14522,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_wait_for_end() != 2943) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_report_connectivity() != 62959) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_room() != 42080) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_signalling_health() != 17394) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_subscribe_signalling_health() != 57815) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtclogsink_log() != 41057) {
@@ -13575,6 +14559,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_subscribe_membership_snapshots() != 48816) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_signallinghealthsubscription_next() != 62731) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_todevicesink_on_to_device_message() != 45386) {
