@@ -1206,6 +1206,39 @@ mod tests {
         );
     }
 
+    /// An app killed without a delayed leave leaves its membership in the
+    /// sticky map, in everyone's call until it expires. Joining again from the
+    /// same device ends it with a leave under its sticky key, once, as the
+    /// room-state format does by reusing its state key.
+    #[tokio::test]
+    async fn a_rejoin_ends_the_previous_participation_that_never_left() {
+        let sender = alice_backend();
+        let mut room = encrypted_call_room(sender.clone()).await;
+        // A fresh process: the killed one's membership is still sticky.
+        admit_peer(&mut room, "@alice:example.org", "ALICEDEV", "alice-a").await;
+
+        join_as(&mut room, "alice-b").await;
+        // Seen again, as on the next sync: still one leave.
+        admit_peer(&mut room, "@alice:example.org", "ALICEDEV", "alice-a").await;
+        tokio::task::yield_now().await;
+
+        let leaves: Vec<serde_json::Value> = sender
+            .sticky_events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, content, _)| content.clone())
+            .filter(|content| content["msc4354_sticky_key"] == "alice-a")
+            .collect();
+        assert_eq!(
+            leaves.len(),
+            1,
+            "one leave for the stale participation: {leaves:?}"
+        );
+        assert_eq!(leaves[0]["member"]["membership"], "leave");
+        assert_eq!(leaves[0]["leave_reason"]["code"], "superseded");
+    }
+
     /// A join hands back the event id of the membership it sent, so an
     /// application can relate its own events to it without asking again.
     #[tokio::test]

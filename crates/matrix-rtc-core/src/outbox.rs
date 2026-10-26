@@ -50,6 +50,10 @@ pub enum SendKind {
     Membership,
     /// Our delayed leave: arming, restarting and cancelling it.
     DelayedLeave,
+    /// The leave for a previous participation of this device that never left.
+    SupersededLeave {
+        sticky_key: String,
+    },
     /// The media key to one member.
     KeyDistribution {
         member_id: String,

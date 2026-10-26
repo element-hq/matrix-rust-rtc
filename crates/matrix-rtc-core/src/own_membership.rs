@@ -84,6 +84,10 @@ use crate::outbox::{Outbox, PendingSend, SendFailure, SendKind, SendPolicy, Slot
 use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
 use crate::transport::{MemberTransports, RtcTransport};
 
+/// The `leave_reason.code` of the leave that ends a previous participation of
+/// this device (MSC4143 leaves application codes open).
+pub const SUPERSEDED_LEAVE_CODE: &str = "superseded";
+
 /// Default keep-alive timeout in milliseconds (30 seconds).
 pub const DEFAULT_KEEP_ALIVE_TIMEOUT_MS: u64 = 30_000;
 
@@ -1186,6 +1190,48 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             }
         }
         self.republish().await;
+    }
+
+    /// Ends a previous participation of this device that never left, by
+    /// putting a leave in the sticky map under its `sticky_key`.
+    ///
+    /// An app killed without a delayed leave to fire stays in everyone's call
+    /// until its membership expires. The room-state format overwrites it on the
+    /// next join by reusing its state key; MSC4143 mints a fresh `member.id` per
+    /// join, so here it is ended explicitly, with its own leave code so it
+    /// reads as replaced rather than hung up. One attempt, while we are joined:
+    /// best effort.
+    pub async fn clear_superseded(&self, sticky_key: String) {
+        let content = serde_json::to_value(RawStickyEventContent::for_leave(
+            self.slot_id.clone(),
+            sticky_key.clone(),
+            Some(LeaveReason::with_reason(
+                LeaveCode::Other(SUPERSEDED_LEAVE_CODE.to_owned()),
+                "Replaced by a newer participation of the same device",
+            )),
+        ))
+        .expect("m.rtc.member content is always serializable");
+        let Some(pending) = self.begin_if_joined(SendKind::SupersededLeave {
+            sticky_key: sticky_key.clone(),
+        }) else {
+            return;
+        };
+        log::info!(
+            "[{}] ending {sticky_key}, a previous participation of this device that never left",
+            self.room_id
+        );
+        match pending
+            .run(SendPolicy::single_attempt(), || {
+                self.publish_once(content.clone())
+            })
+            .await
+        {
+            Ok(_) | Err(SendFailure::Superseded | SendFailure::Cancelled) => {}
+            Err(failure) => log::warn!(
+                "[{}] could not end the previous participation {sticky_key}: {failure}",
+                self.room_id
+            ),
+        }
     }
 
     /// Re-sends our join content, retried until it lands, is superseded or the

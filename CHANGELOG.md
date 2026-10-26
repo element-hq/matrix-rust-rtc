@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Fixed
+
+- Joining again from a device whose previous participation never left (an app killed with no delayed leave) sends a leave for it, so it no longer stays in everyone's call until it expires.
+
 ## v0.5.0-rc.7 - 2026-10-26
 
 ### Breaking
