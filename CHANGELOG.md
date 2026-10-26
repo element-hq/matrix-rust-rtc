@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.6 - 2026-10-26
+
 ### Breaking
 
 - `ConnectionState` (FFI `FfiConnectionState`, web `RtcConnectionState`) gains `Connecting`: our own media before our SFU is first up, so a call no longer opens with `own_media` reconnecting (034 C11).
