@@ -43,8 +43,9 @@ pub mod token;
 pub mod transport_impl;
 
 pub use keys::{
-    KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyBridge, NATIVE_KEY_RING_MAX,
-    ParticipantKey, SwitchCompleteListener, msc4195_key_provider, msc4195_key_provider_options,
+    ConnectionKeyProvider, KeyDiscardListener, KeyImportListener, LocalKeyIndexHook,
+    MediaKeyBridge, Msc4195KeyProviders, NATIVE_KEY_RING_MAX, ParticipantKey,
+    SwitchCompleteListener, msc4195_key_provider, msc4195_key_provider_options,
     msc4195_media_key_bridge,
 };
 pub use session::{LiveKitConnection, LiveKitSession};

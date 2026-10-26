@@ -73,13 +73,14 @@ const AUDIO_CHANNELS: i32 = 1;
 /// The MSC4195 LiveKit backend of [`MediaTransport`].
 ///
 /// One instance serves a whole call: [`MediaTransport::connect`] can be
-/// invoked once per focus, and every connection shares the same E2EE
-/// `KeyProvider` handle (keys are indexed by pseudonymous identity, which is
-/// globally unique per membership, so one ring serves all foci).
+/// invoked once per focus. Every connection has its own E2EE `KeyProvider`,
+/// since LiveKit keeps the SFU's SIF trailer there, and every key is installed
+/// in each (keys are indexed by pseudonymous identity, which is globally
+/// unique per membership, so the same keys serve all foci).
 pub struct LiveKitMediaTransport {
     http: reqwest::Client,
     backend: Arc<dyn MatrixBackend>,
-    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    key_providers: crate::Msc4195KeyProviders,
     auto_subscribe: bool,
     /// How a `(user, device, member_id)` triple becomes an SFU participant
     /// identity. The MSC4195 hash by default.
@@ -95,17 +96,17 @@ pub struct LiveKitMediaTransport {
 }
 
 impl LiveKitMediaTransport {
-    /// `key_provider` MUST be the same handle given to the
+    /// `key_providers` MUST be the same handle given to the
     /// [`crate::MediaKeyBridge`] importing the core's media keys.
     pub fn new(
         http: reqwest::Client,
         backend: Arc<dyn MatrixBackend>,
-        key_provider: livekit::e2ee::key_provider::KeyProvider,
+        key_providers: crate::Msc4195KeyProviders,
     ) -> Self {
         Self {
             http,
             backend,
-            key_provider,
+            key_providers,
             auto_subscribe: true,
             identity_mapper: Arc::new(pseudonymous_identity),
             token_endpoint: TokenEndpoint::default(),
@@ -192,7 +193,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 connector: Connector {
                     http: self.http.clone(),
                     backend: self.backend.clone(),
-                    key_provider: self.key_provider.clone(),
+                    key_provider: self.key_providers.connection_provider(),
                     auto_subscribe: self.auto_subscribe,
                     config: Mutex::new(config),
                     token: Mutex::new(None),
@@ -295,7 +296,8 @@ struct Handover {
 struct Connector {
     http: reqwest::Client,
     backend: Arc<dyn MatrixBackend>,
-    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    /// This connection's own: a reconnect sets the SFU's trailer on it again.
+    key_provider: crate::ConnectionKeyProvider,
     auto_subscribe: bool,
     /// The focus connects go to; a take-over moves it (034 R25).
     config: Mutex<LiveKitTransportConfig>,
@@ -467,7 +469,10 @@ impl TransportConnection for LiveKitTransportConnection {
         let token = connector.token(fresh_token).await?;
         let connection = LiveKitSession::connect_with_options(
             &token,
-            e2ee_room_options(connector.key_provider.clone(), connector.auto_subscribe),
+            e2ee_room_options(
+                connector.key_provider.provider().clone(),
+                connector.auto_subscribe,
+            ),
         )
         .await
         .map_err(classify_room_error)?;

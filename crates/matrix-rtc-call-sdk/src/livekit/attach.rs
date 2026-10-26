@@ -15,8 +15,8 @@ use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::compat::MembershipFormat;
 
 use matrix_rtc_livekit::{
-    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
-    identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
+    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, Msc4195KeyProviders,
+    TokenEndpoint, identity_mapper, msc4195_media_key_bridge,
 };
 
 /// What [`attach_livekit`] needs besides the call.
@@ -60,11 +60,11 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
 ) -> Result<LiveKitAttachment, AttachError> {
     // One mapper for the core, the transport, our own identity and the ring.
     let mapper = identity_mapper(options.format);
-    let provider = msc4195_key_provider();
-    let key_bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
+    let providers = Msc4195KeyProviders::new();
+    let key_bridge = Arc::new(msc4195_media_key_bridge(providers.clone()));
     let (own_user_id, own_device_id) = (backend.own_user_id(), backend.own_device_id());
     let transport = Arc::new(
-        LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, provider)
+        LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, providers)
             .with_auto_subscribe(options.auto_subscribe)
             .with_identity_mapper(mapper.clone())
             .with_token_endpoint(TokenEndpoint::for_format(options.format)),
