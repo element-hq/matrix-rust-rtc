@@ -11,7 +11,9 @@ license.workspace = true
 publish = false
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+# No `rlib`: Cargo silently skips the profile's LTO when it is built alongside
+# `cdylib` and `staticlib`, and nothing depends on this crate as a library.
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
