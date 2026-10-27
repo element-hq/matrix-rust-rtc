@@ -1301,13 +1301,21 @@ public protocol MatrixBackend: AnyObject, Sendable {
     func sendStickyEvent(roomId: String, eventType: String, contentJson: String, durationMs: UInt64) async throws  -> String
     
     /**
-     * With `state_key`, a delayed state event; otherwise a delayed
-     * message-like event. Returns the MSC4140 delay id. A homeserver that
-     * refuses delayed events (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`)
-     * does not fail the join: report the `errcode` and the library stops
-     * asking.
+     * A delayed state event, the room-state format's dead man's switch.
+     * Returns the MSC4140 delay id. A homeserver that refuses delayed events
+     * (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`) does not fail the
+     * join: report the `errcode` and the library stops asking.
      */
-    func sendDelayedEvent(roomId: String, eventType: String, stateKey: String?, contentJson: String, delayMs: UInt64) async throws  -> String
+    func sendDelayedStateEvent(roomId: String, eventType: String, stateKey: String, contentJson: String, delayMs: UInt64) async throws  -> String
+    
+    /**
+     * A delayed sticky event (MSC4140 and MSC4354), the sticky formats' dead
+     * man's switch, kept `sticky_duration_ms` in the sticky map once it fires.
+     * Returns the MSC4140 delay id. An SDK that cannot send one answers
+     * `M_UNRECOGNIZED` and the library joins without it; never send a plain
+     * delayed event instead, which fires without ending the membership.
+     */
+    func sendDelayedStickyEvent(roomId: String, eventType: String, contentJson: String, stickyDurationMs: UInt64, delayMs: UInt64) async throws  -> String
     
     /**
      * MSC4140's restart action. Never emulate it with cancel-and-resend.
@@ -1474,19 +1482,42 @@ open func sendStickyEvent(roomId: String, eventType: String, contentJson: String
 }
     
     /**
-     * With `state_key`, a delayed state event; otherwise a delayed
-     * message-like event. Returns the MSC4140 delay id. A homeserver that
-     * refuses delayed events (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`)
-     * does not fail the join: report the `errcode` and the library stops
-     * asking.
+     * A delayed state event, the room-state format's dead man's switch.
+     * Returns the MSC4140 delay id. A homeserver that refuses delayed events
+     * (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`) does not fail the
+     * join: report the `errcode` and the library stops asking.
      */
-open func sendDelayedEvent(roomId: String, eventType: String, stateKey: String?, contentJson: String, delayMs: UInt64)async throws  -> String  {
+open func sendDelayedStateEvent(roomId: String, eventType: String, stateKey: String, contentJson: String, delayMs: UInt64)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_matrix_rtc_ffi_fn_method_matrixbackend_send_delayed_event(
+                uniffi_matrix_rtc_ffi_fn_method_matrixbackend_send_delayed_state_event(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(roomId),FfiConverterString.lower(eventType),FfiConverterOptionString.lower(stateKey),FfiConverterString.lower(contentJson),FfiConverterUInt64.lower(delayMs)
+                    FfiConverterString.lower(roomId),FfiConverterString.lower(eventType),FfiConverterString.lower(stateKey),FfiConverterString.lower(contentJson),FfiConverterUInt64.lower(delayMs)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeFfiBackendError_lift
+        )
+}
+    
+    /**
+     * A delayed sticky event (MSC4140 and MSC4354), the sticky formats' dead
+     * man's switch, kept `sticky_duration_ms` in the sticky map once it fires.
+     * Returns the MSC4140 delay id. An SDK that cannot send one answers
+     * `M_UNRECOGNIZED` and the library joins without it; never send a plain
+     * delayed event instead, which fires without ending the membership.
+     */
+open func sendDelayedStickyEvent(roomId: String, eventType: String, contentJson: String, stickyDurationMs: UInt64, delayMs: UInt64)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_matrixbackend_send_delayed_sticky_event(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(roomId),FfiConverterString.lower(eventType),FfiConverterString.lower(contentJson),FfiConverterUInt64.lower(stickyDurationMs),FfiConverterUInt64.lower(delayMs)
                 )
             },
             pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
@@ -1810,7 +1841,7 @@ fileprivate struct UniffiCallbackInterfaceMatrixBackend {
             )
             uniffiOutReturn.pointee = uniffiForeignFuture
         },
-        sendDelayedEvent: { (
+        sendDelayedStateEvent: { (
             uniffiHandle: UInt64,
             roomId: RustBuffer,
             eventType: RustBuffer,
@@ -1826,11 +1857,62 @@ fileprivate struct UniffiCallbackInterfaceMatrixBackend {
                 guard let uniffiObj = try? FfiConverterTypeMatrixBackend.handleMap.get(handle: uniffiHandle) else {
                     throw UniffiInternalError.unexpectedStaleHandle
                 }
-                return try await uniffiObj.sendDelayedEvent(
+                return try await uniffiObj.sendDelayedStateEvent(
                      roomId: try FfiConverterString.lift(roomId),
                      eventType: try FfiConverterString.lift(eventType),
-                     stateKey: try FfiConverterOptionString.lift(stateKey),
+                     stateKey: try FfiConverterString.lift(stateKey),
                      contentJson: try FfiConverterString.lift(contentJson),
+                     delayMs: try FfiConverterUInt64.lift(delayMs)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterString.lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeFfiBackendError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        sendDelayedStickyEvent: { (
+            uniffiHandle: UInt64,
+            roomId: RustBuffer,
+            eventType: RustBuffer,
+            contentJson: RustBuffer,
+            stickyDurationMs: UInt64,
+            delayMs: UInt64,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> String in
+                guard let uniffiObj = try? FfiConverterTypeMatrixBackend.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.sendDelayedStickyEvent(
+                     roomId: try FfiConverterString.lift(roomId),
+                     eventType: try FfiConverterString.lift(eventType),
+                     contentJson: try FfiConverterString.lift(contentJson),
+                     stickyDurationMs: try FfiConverterUInt64.lift(stickyDurationMs),
                      delayMs: try FfiConverterUInt64.lift(delayMs)
                 )
             }
@@ -14360,40 +14442,43 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_sticky_event() != 8357) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_delayed_event() != 39713) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_delayed_state_event() != 65487) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_restart_delayed_event() != 29442) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_delayed_sticky_event() != 1464) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_cancel_delayed_event() != 60730) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_restart_delayed_event() != 38670) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_to_device_message() != 22050) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_cancel_delayed_event() != 34909) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_state_event() != 14328) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_to_device_message() != 13878) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_room_event() != 1855) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_state_event() != 33440) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_redact_event() != 26136) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_send_room_event() != 63197) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_subscribe_room() != 31365) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_redact_event() != 9244) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_subscribe_to_device() != 58929) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_subscribe_room() != 42011) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_relations() != 39815) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_subscribe_to_device() != 49528) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_openid_token() != 6382) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_relations() != 57609) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_rtc_transports() != 26487) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_openid_token() != 11831) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_rtc_transports() != 59550) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_audio_stream() != 28423) {
