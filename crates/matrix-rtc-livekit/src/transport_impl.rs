@@ -45,7 +45,7 @@ use livekit::webrtc::video_frame::{
 use livekit::webrtc::video_source::native::NativeVideoSource;
 use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_stream::native::NativeVideoStream;
-use livekit_api::signal_client::SignalError;
+use livekit_signaling::SignalError;
 use matrix_rtc_transport::livekit::TokenServiceError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
