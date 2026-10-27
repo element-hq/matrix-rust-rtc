@@ -4,40 +4,31 @@
 # SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 # Please see LICENSE in the repository root for full details.
 
-# Installs a clang new enough to build webrtc-sys on a Linux host, and points
+# Installs a clang new enough to build webrtc-sys on an Ubuntu host, and points
 # CC/CXX at it for the later steps of a workflow job.
 #
 # webrtc-sys compiles against the libc++ shipped inside the prebuilt libwebrtc,
-# which needs clang 21 or later (its build script checks); Ubuntu 24.04 has 18
-# and no newer package, so this takes LLVM's release tarball, as LiveKit's own
-# CI does. Android builds use the NDK's clang and do not need it.
+# which needs clang 21 or later (its build script checks); Ubuntu 24.04 has 18,
+# so this takes the clang package alone from LLVM's apt repository. Android
+# builds use the NDK's clang and do not need it.
 set -euo pipefail
 
-LLVM_VERSION="${LLVM_VERSION:-21.1.8}"
-LLVM_ROOT="/opt/llvm-$LLVM_VERSION"
+CLANG_VERSION="${CLANG_VERSION:-21}"
+CODENAME="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+KEYRING=/usr/share/keyrings/apt.llvm.org.gpg
 
-case "$(uname -m)" in
-x86_64) arch=X64 ;;
-aarch64 | arm64) arch=ARM64 ;;
-*)
-    echo "install-clang.sh: unsupported architecture $(uname -m)" >&2
-    exit 1
-    ;;
-esac
+curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+    https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor --yes -o "$KEYRING"
+echo "deb [signed-by=$KEYRING] http://apt.llvm.org/$CODENAME/ llvm-toolchain-$CODENAME-$CLANG_VERSION main" |
+    sudo tee /etc/apt/sources.list.d/llvm-"$CLANG_VERSION".list >/dev/null
+sudo apt-get update -o Acquire::Retries=5
+sudo apt-get install -y -o Acquire::Retries=5 --no-install-recommends "clang-$CLANG_VERSION"
 
-if [ ! -x "$LLVM_ROOT/bin/clang++" ]; then
-    url="https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/LLVM-$LLVM_VERSION-Linux-$arch.tar.xz"
-    echo "install-clang.sh: fetching $url" >&2
-    sudo mkdir -p "$LLVM_ROOT"
-    curl --fail --location --silent --show-error --retry 3 "$url" |
-        sudo tar -xJ --strip-components=1 -C "$LLVM_ROOT"
-fi
-
-"$LLVM_ROOT/bin/clang++" --version
+"clang++-$CLANG_VERSION" --version
 
 if [ -n "${GITHUB_ENV:-}" ]; then
     {
-        echo "CC=$LLVM_ROOT/bin/clang"
-        echo "CXX=$LLVM_ROOT/bin/clang++"
+        echo "CC=clang-$CLANG_VERSION"
+        echo "CXX=clang++-$CLANG_VERSION"
     } >>"$GITHUB_ENV"
 fi
