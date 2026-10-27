@@ -20,7 +20,7 @@ log only.
 
 - Joining again from a device whose previous participation never left (an app killed with no delayed leave) sends a leave for it, so it no longer stays in everyone's call until it expires.
 - A member muting no longer shows as a decryption failure to those who receive them through a second SFU: each SFU connection has its own key provider, so each keeps its own SIF trailer.
-- Native media moves to LiveKit 0.9.7, whose libwebrtc (`webrtc-a545de4`) lets a frame carrying the SFU's SIF trailer skip decryption only when it is a known silence or blank payload, so an SFU can no longer inject media under a participant's name.
+- Native media moves to LiveKit 0.9.7, whose libwebrtc (`webrtc-a545de4`) lets a frame carrying the SFU's SIF trailer skip decryption only when it is a known silence or blank payload, so an SFU can no longer inject media under a participant's name; single peer connection mode stays off, as remote video on the connection we publish on gets no sink in it.
 
 ## v0.5.0-rc.7 - 2026-10-26
 
