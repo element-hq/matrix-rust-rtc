@@ -9,11 +9,15 @@
 //! the local sender's index switch, the MSC4143 `delayBeforeUse` wait — lives
 //! in [`matrix_rtc_transport::keys`], shared with the web binding. This module
 //! contributes only what is LiveKit-native: a [`KeyProvider`] configured for
-//! MSC4195 per-participant mode, and its [`FrameKeyRing`] adapter.
+//! MSC4195 per-participant mode, one per SFU connection
+//! ([`Msc4195KeyProviders`]), and their [`FrameKeyRing`] adapter.
 //!
 //! `MediaKeyBridge` remains this crate's name for the shared
 //! [`MediaKeyHandler`]; build one over a provider with
 //! [`msc4195_media_key_bridge`].
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use livekit::e2ee::key_provider::{KeyDerivationAlgorithm, KeyProvider, KeyProviderOptions};
@@ -63,8 +67,97 @@ pub fn msc4195_key_provider() -> KeyProvider {
     KeyProvider::new(msc4195_key_provider_options())
 }
 
-/// [`FrameKeyRing`] over a LiveKit [`KeyProvider`].
-struct LiveKitKeyRing(KeyProvider);
+/// The key providers of a call's SFU connections, one per connection, with
+/// every key installed in each.
+///
+/// LiveKit keeps an SFU room's SIF trailer on the key provider, set at each
+/// room connect (`livekit` 0.7.48 `Room::connect`). The trailer marks the
+/// unencrypted silence frames the SFU itself sends while a publisher is muted,
+/// which the frame cryptor passes through. A provider shared by two SFU
+/// connections holds only the last one's trailer, so the other SFU's mute
+/// frames fail to decrypt, and a member muting shows as a decryption failure
+/// to anyone receiving them through a second SFU.
+#[derive(Clone, Default)]
+pub struct Msc4195KeyProviders(Arc<Mutex<Providers>>);
+
+#[derive(Default)]
+struct Providers {
+    next_id: u64,
+    live: Vec<(u64, KeyProvider)>,
+    /// Every key installed, so a provider made later starts with them all.
+    keys: HashMap<String, BTreeMap<u8, Vec<u8>>>,
+}
+
+impl Msc4195KeyProviders {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A provider for one SFU connection, holding every key installed so far
+    /// and every key installed while it lives.
+    pub fn connection_provider(&self) -> ConnectionKeyProvider {
+        let provider = msc4195_key_provider();
+        let mut providers = self.0.lock().expect("key providers mutex poisoned");
+        for (identity, ring) in &providers.keys {
+            let identity = ParticipantIdentity::from(identity.clone());
+            for (index, key) in ring {
+                provider.set_key(&identity, i32::from(*index), key.clone());
+            }
+        }
+        let id = providers.next_id;
+        providers.next_id += 1;
+        providers.live.push((id, provider.clone()));
+        ConnectionKeyProvider {
+            id,
+            provider,
+            providers: self.clone(),
+        }
+    }
+
+    /// `false` when a live provider refused the key.
+    fn set_key(&self, identity: &str, index: u8, key: Vec<u8>) -> bool {
+        let mut providers = self.0.lock().expect("key providers mutex poisoned");
+        providers
+            .keys
+            .entry(identity.to_owned())
+            .or_default()
+            .insert(index, key.clone());
+        // `rtc_backend_identity` equals `identity::pseudonymous_identity(...)`
+        // and maps directly onto the LiveKit participant identity.
+        let identity = ParticipantIdentity::from(identity.to_owned());
+        providers
+            .live
+            .iter()
+            .fold(true, |installed, (_, provider)| {
+                provider.set_key(&identity, i32::from(index), key.clone()) && installed
+            })
+    }
+}
+
+/// One SFU connection's provider; it stops receiving keys when dropped.
+pub struct ConnectionKeyProvider {
+    id: u64,
+    provider: KeyProvider,
+    providers: Msc4195KeyProviders,
+}
+
+impl ConnectionKeyProvider {
+    /// The handle to give the connection's [`livekit::RoomOptions`].
+    pub fn provider(&self) -> &KeyProvider {
+        &self.provider
+    }
+}
+
+impl Drop for ConnectionKeyProvider {
+    fn drop(&mut self) {
+        if let Ok(mut providers) = self.providers.0.lock() {
+            providers.live.retain(|(id, _)| *id != self.id);
+        }
+    }
+}
+
+/// [`FrameKeyRing`] over every SFU connection's [`KeyProvider`].
+struct LiveKitKeyRing(Msc4195KeyProviders);
 
 #[async_trait]
 impl FrameKeyRing for LiveKitKeyRing {
@@ -73,22 +166,17 @@ impl FrameKeyRing for LiveKitKeyRing {
     }
 
     async fn set_key(&self, identity: &str, index: u8, key: Vec<u8>) -> bool {
-        // `rtc_backend_identity` equals `identity::pseudonymous_identity(...)`
-        // and maps directly onto the LiveKit participant identity.
-        let identity = ParticipantIdentity::from(identity.to_owned());
-        self.0.set_key(&identity, i32::from(index), key)
+        self.0.set_key(identity, index, key)
     }
 }
 
-/// A [`MediaKeyBridge`] that forwards every signalled key into `provider` via
-/// [`KeyProvider::set_key`], keyed by the participant's pseudonymous identity
-/// and the signalled key index.
+/// A [`MediaKeyBridge`] that installs every signalled key in each of
+/// `providers` via [`KeyProvider::set_key`], keyed by the participant's
+/// pseudonymous identity and the signalled key index.
 ///
-/// [`KeyProvider`] is a shared handle: clone it and hand the clone to
-/// [`livekit::RoomOptions`] so the connected room decrypts with the same key
-/// ring.
-pub fn msc4195_media_key_bridge(provider: KeyProvider) -> MediaKeyBridge {
-    MediaKeyHandler::with_ring(std::sync::Arc::new(LiveKitKeyRing(provider)))
+/// Give the same `providers` to the transport, which takes one per connection.
+pub fn msc4195_media_key_bridge(providers: Msc4195KeyProviders) -> MediaKeyBridge {
+    MediaKeyHandler::with_ring(Arc::new(LiveKitKeyRing(providers)))
 }
 
 #[cfg(test)]
@@ -116,8 +204,7 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_rejects_unrepresentable_key_index() {
-        let provider = msc4195_key_provider();
-        let bridge = msc4195_media_key_bridge(provider);
+        let bridge = msc4195_media_key_bridge(Msc4195KeyProviders::new());
 
         // Index 255 cannot be stored in the native ring; forwarding it would
         // abort the process. The bridge must survive it and still record.
@@ -135,8 +222,10 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_forwards_key_material_to_provider() {
-        let provider = msc4195_key_provider();
-        let bridge = msc4195_media_key_bridge(provider.clone());
+        let providers = Msc4195KeyProviders::new();
+        let connection = providers.connection_provider();
+        let provider = connection.provider().clone();
+        let bridge = msc4195_media_key_bridge(providers);
 
         bridge
             .on_new_key_material(KeyMaterialSignal {
@@ -149,9 +238,34 @@ mod tests {
 
         // Recorded, as before.
         assert!(bridge.key_for("participant-p1").is_some());
-        // And imported into the shared provider handle.
+        // And imported into the connection's provider.
         let identity = ParticipantIdentity::from("participant-p1".to_owned());
         assert!(provider.get_key(&identity, 3).is_some());
+    }
+
+    /// Each SFU connection keeps its own trailer, so each has its own provider,
+    /// and a connection made after a key was signalled still gets it.
+    #[tokio::test]
+    async fn every_connection_gets_every_key_in_its_own_provider() {
+        let providers = Msc4195KeyProviders::new();
+        let first = providers.connection_provider();
+        let bridge = msc4195_media_key_bridge(providers.clone());
+        bridge
+            .on_new_key_material(KeyMaterialSignal {
+                key: vec![7u8; 32],
+                key_index: 1,
+                rtc_backend_identity: "participant-p3".to_owned(),
+                use_after_ms: 0,
+            })
+            .await;
+        let second = providers.connection_provider();
+
+        let identity = ParticipantIdentity::from("participant-p3".to_owned());
+        assert!(first.provider().get_key(&identity, 1).is_some());
+        assert!(second.provider().get_key(&identity, 1).is_some());
+
+        drop(first);
+        assert_eq!(providers.0.lock().unwrap().live.len(), 1);
     }
 
     #[test]

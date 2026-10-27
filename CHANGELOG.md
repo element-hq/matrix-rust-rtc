@@ -15,6 +15,7 @@ log only.
 ### Fixed
 
 - Joining again from a device whose previous participation never left (an app killed with no delayed leave) sends a leave for it, so it no longer stays in everyone's call until it expires.
+- A member muting no longer shows as a decryption failure to those who receive them through a second SFU: each SFU connection has its own key provider, so each keeps its own SIF trailer.
 
 ## v0.5.0-rc.7 - 2026-10-26
 
