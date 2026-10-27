@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.8 - 2026-10-27
+
 ### Breaking
 
 - `MatrixBackend::send_delayed_event` (FFI `sendDelayedEvent`, web `sendDelayedEvent`) is `send_delayed_state_event` and `send_delayed_sticky_event`, so a sticky-format delayed leave replaces the membership it ends; the Rust SDK backend answers the sticky one as unsupported until matrix-rust-sdk#6973.
