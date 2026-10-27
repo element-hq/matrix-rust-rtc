@@ -304,17 +304,30 @@ pub trait MatrixBackend: Send + Sync {
         duration_ms: u64,
     ) -> Result<String, FfiBackendError>;
 
-    /// With `state_key`, a delayed state event; otherwise a delayed
-    /// message-like event. Returns the MSC4140 delay id. A homeserver that
-    /// refuses delayed events (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`)
-    /// does not fail the join: report the `errcode` and the library stops
-    /// asking.
-    async fn send_delayed_event(
+    /// A delayed state event, the room-state format's dead man's switch.
+    /// Returns the MSC4140 delay id. A homeserver that refuses delayed events
+    /// (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`) does not fail the
+    /// join: report the `errcode` and the library stops asking.
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content_json: String,
+        delay_ms: u64,
+    ) -> Result<String, FfiBackendError>;
+
+    /// A delayed sticky event (MSC4140 and MSC4354), the sticky formats' dead
+    /// man's switch, kept `sticky_duration_ms` in the sticky map once it fires.
+    /// Returns the MSC4140 delay id. An SDK that cannot send one answers
+    /// `M_UNRECOGNIZED` and the library joins without it; never send a plain
+    /// delayed event instead, which fires without ending the membership.
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content_json: String,
+        sticky_duration_ms: u64,
         delay_ms: u64,
     ) -> Result<String, FfiBackendError>;
 
@@ -472,23 +485,52 @@ impl CoreBackend for FfiBackend {
         )
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
         let content_json = to_json(&content)?;
         let what = format!(
-            "delayed [{room_id}] type={event_type} state_key={state_key:?} delay={delay_ms}ms"
+            "delayed state [{room_id}] type={event_type} state_key={state_key} delay={delay_ms}ms"
         );
         trace_command_content(&what, &content_json);
         log_command(
             &what,
             self.host
-                .send_delayed_event(room_id, event_type, state_key, content_json, delay_ms)
+                .send_delayed_state_event(room_id, event_type, state_key, content_json, delay_ms)
+                .await
+                .map_err(FfiBackendError::into_delayed_error),
+        )
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        let content_json = to_json(&content)?;
+        let what = format!(
+            "delayed sticky [{room_id}] type={event_type} duration={sticky_duration_ms}ms \
+             delay={delay_ms}ms"
+        );
+        trace_command_content(&what, &content_json);
+        log_command(
+            &what,
+            self.host
+                .send_delayed_sticky_event(
+                    room_id,
+                    event_type,
+                    content_json,
+                    sticky_duration_ms,
+                    delay_ms,
+                )
                 .await
                 .map_err(FfiBackendError::into_delayed_error),
         )
@@ -878,11 +920,11 @@ pub(crate) mod test_support {
             Ok(format!("$sticky-{}", self.sends.lock().unwrap().len()))
         }
 
-        async fn send_delayed_event(
+        async fn send_delayed_state_event(
             &self,
             room_id: String,
             event_type: String,
-            state_key: Option<String>,
+            state_key: String,
             content_json: String,
             _delay_ms: u64,
         ) -> Result<String, FfiBackendError> {
@@ -890,12 +932,28 @@ pub(crate) mod test_support {
                 return Err(refusal);
             }
             self.record(&event_type);
-            let carrier = if state_key.is_some() {
-                Carrier::DelayedState
-            } else {
-                Carrier::DelayedSticky
-            };
-            self.record_send(carrier, &event_type, state_key, &content_json);
+            self.record_send(
+                Carrier::DelayedState,
+                &event_type,
+                Some(state_key),
+                &content_json,
+            );
+            Ok(format!("event-{room_id}-{event_type}"))
+        }
+
+        async fn send_delayed_sticky_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            content_json: String,
+            _sticky_duration_ms: u64,
+            _delay_ms: u64,
+        ) -> Result<String, FfiBackendError> {
+            if let Some(refusal) = self.delayed_refusal() {
+                return Err(refusal);
+            }
+            self.record(&event_type);
+            self.record_send(Carrier::DelayedSticky, &event_type, None, &content_json);
             Ok(format!("event-{room_id}-{event_type}"))
         }
 

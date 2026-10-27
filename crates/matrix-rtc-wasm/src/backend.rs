@@ -83,6 +83,13 @@ fn backend_error(error: JsValue) -> BackendError {
 /// Reads the event id out of whatever a send method resolved to: matrix-js-sdk's
 /// `{ event_id }`, a wrapper's `{ eventId }`, or a bare string. Anything else
 /// is a failed send, not a silent success.
+/// A delayed send resolves with the bare MSC4140 delay id.
+fn js_delay_id(resolved: &JsValue, method: &str) -> Result<String, CommandError> {
+    resolved.as_string().ok_or_else(|| {
+        CommandError::ClientRejected(format!("{method} did not return a string delay id"))
+    })
+}
+
 fn js_event_id(resolved: &JsValue, method: &str) -> Result<String, CommandError> {
     if let Some(event_id) = resolved.as_string() {
         return Ok(event_id);
@@ -305,39 +312,60 @@ impl MatrixBackend for JsBackend {
         js_event_id(&resolved, "sendStickyEvent")
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
         self.log_command(&format!(
-            "send_delayed_event: room={room_id}, type={event_type}, state_key={state_key:?}, \
-             delay={delay_ms}ms"
+            "send_delayed_state_event: room={room_id}, type={event_type}, \
+             state_key={state_key}, delay={delay_ms}ms"
         ));
         let resolved = self
             .call_async(
-                "sendDelayedEvent",
+                "sendDelayedStateEvent",
                 vec![
                     JsValue::from_str(&room_id),
                     JsValue::from_str(&event_type),
-                    match &state_key {
-                        Some(state_key) => JsValue::from_str(state_key),
-                        None => JsValue::NULL,
-                    },
+                    JsValue::from_str(&state_key),
                     to_plain_js(&content)?,
                     JsValue::from_f64(delay_ms as f64),
                 ],
             )
             .await
             .map_err(delayed_error)?;
-        resolved.as_string().ok_or_else(|| {
-            CommandError::ClientRejected(
-                "sendDelayedEvent did not return a string delay id".to_owned(),
+        js_delay_id(&resolved, "sendDelayedStateEvent")
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        self.log_command(&format!(
+            "send_delayed_sticky_event: room={room_id}, type={event_type}, \
+             duration={sticky_duration_ms}ms, delay={delay_ms}ms"
+        ));
+        let resolved = self
+            .call_async(
+                "sendDelayedStickyEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_type),
+                    to_plain_js(&content)?,
+                    JsValue::from_f64(sticky_duration_ms as f64),
+                    JsValue::from_f64(delay_ms as f64),
+                ],
             )
-        })
+            .await
+            .map_err(delayed_error)?;
+        js_delay_id(&resolved, "sendDelayedStickyEvent")
     }
 
     async fn restart_delayed_event(

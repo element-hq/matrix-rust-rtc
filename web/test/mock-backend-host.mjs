@@ -72,9 +72,14 @@ export function mockBackendHost({
       stickyEventsSent.push({ roomId, eventType, content, eventId });
       return Promise.resolve({ event_id: eventId });
     },
-    sendDelayedEvent: (roomId, eventType, stateKey, content, delayMs) => {
+    sendDelayedStateEvent: (roomId, eventType, stateKey, content, delayMs) => {
       const delayId = `delayed-event-${delayedEventsSent.length}`;
       delayedEventsSent.push({ roomId, eventType, stateKey, content, delayMs, delayId });
+      return Promise.resolve(delayId);
+    },
+    sendDelayedStickyEvent: (roomId, eventType, content, stickyDurationMs, delayMs) => {
+      const delayId = `delayed-event-${delayedEventsSent.length}`;
+      delayedEventsSent.push({ roomId, eventType, stateKey: null, content, stickyDurationMs, delayMs, delayId });
       return Promise.resolve(delayId);
     },
     restartDelayedEvent: () => Promise.resolve(),

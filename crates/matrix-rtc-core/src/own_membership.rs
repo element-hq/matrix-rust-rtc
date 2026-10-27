@@ -747,11 +747,13 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 self.key(SendKind::DelayedLeave),
                 SendPolicy::single_attempt().deadline(remaining() / 2),
                 || {
-                    self.backend.send_delayed_event(
+                    // Sticky, to replace the join's entry in the sticky map, and
+                    // for as long as the join would have stayed there.
+                    self.backend.send_delayed_sticky_event(
                         room_id.clone(),
                         "m.rtc.member".to_string(),
-                        None,
                         delayed_content.clone(),
+                        self.sticky_duration_ms,
                         keep_alive_timeout_ms,
                     )
                 },
@@ -1432,11 +1434,11 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         let delayed_content = self.build_delayed_leave_content(&self.slot_id, &self.sticky_key);
         let delayed_event_id = pending
             .run(policy, || {
-                self.backend.send_delayed_event(
+                self.backend.send_delayed_sticky_event(
                     self.room_id.clone(),
                     "m.rtc.member".to_string(),
-                    None,
                     delayed_content.clone(),
+                    self.sticky_duration_ms,
                     keep_alive_timeout_ms,
                 )
             })
@@ -2380,12 +2382,24 @@ mod tests {
             Ok("$sticky".to_string())
         }
 
-        async fn send_delayed_event(
+        async fn send_delayed_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            _state_key: String,
+            content: Value,
+            delay_ms: u64,
+        ) -> Result<String, CommandError> {
+            self.send_delayed_sticky_event(room_id, event_type, content, 0, delay_ms)
+                .await
+        }
+
+        async fn send_delayed_sticky_event(
             &self,
             _room_id: String,
             _event_type: String,
-            _state_key: Option<String>,
             _content: Value,
+            _sticky_duration_ms: u64,
             _delay_ms: u64,
         ) -> Result<String, CommandError> {
             let mut scheduled = self.scheduled.lock().unwrap();
@@ -2510,12 +2524,24 @@ mod tests {
             Ok("$sticky".to_string())
         }
 
-        async fn send_delayed_event(
+        async fn send_delayed_state_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            _state_key: String,
+            content: Value,
+            delay_ms: u64,
+        ) -> Result<String, CommandError> {
+            self.send_delayed_sticky_event(room_id, event_type, content, 0, delay_ms)
+                .await
+        }
+
+        async fn send_delayed_sticky_event(
             &self,
             _room_id: String,
             _event_type: String,
-            _state_key: Option<String>,
             _content: Value,
+            _sticky_duration_ms: u64,
             _delay_ms: u64,
         ) -> Result<String, CommandError> {
             if self.accepts_now.load(Ordering::Relaxed) {

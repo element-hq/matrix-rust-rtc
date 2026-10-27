@@ -317,26 +317,56 @@ pub trait MatrixBackend: MaybeSend {
         duration_ms: u64,
     ) -> Result<String, CommandError>;
 
-    /// Send a delayed event to a Matrix room (MSC4140).
+    /// Send a delayed state event to a Matrix room (MSC4140): the room-state
+    /// format's dead man's switch, which overwrites the membership under its
+    /// state key when it fires.
     ///
-    /// With `state_key`, the delayed event is a state event; otherwise a
-    /// message-like one. Returns the MSC4140 **delay id** on success — the
-    /// handle used to restart or cancel the scheduled send. It is not an event
-    /// id: the event has none until it actually fires.
+    /// Returns the MSC4140 **delay id** on success — the handle used to restart
+    /// or cancel the scheduled send. It is not an event id: the event has none
+    /// until it actually fires.
     ///
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the event should be sent
     /// * `event_type` - The event type
-    /// * `state_key` - The state key, for a delayed state event
+    /// * `state_key` - The state key
     /// * `content` - The event content as a JSON value
     /// * `delay_ms` - Delay in milliseconds before the event is sent
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
+        delay_ms: u64,
+    ) -> Result<String, CommandError>;
+
+    /// Send a delayed sticky event to a Matrix room (MSC4140 and MSC4354): the
+    /// sticky formats' dead man's switch. It has to be sticky to replace the
+    /// sticky membership it ends; a plain delayed event would fire and change
+    /// nothing.
+    ///
+    /// A host whose SDK cannot send one answers
+    /// [`CommandError::DelayedEventsNotSupported`]: the core then joins without
+    /// a dead man's switch, with a shorter membership lifetime instead. It MUST
+    /// NOT fall back to a plain delayed event.
+    ///
+    /// Returns the MSC4140 delay id, as [`Self::send_delayed_state_event`].
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The room ID where the event should be sent
+    /// * `event_type` - The event type (e.g., "m.rtc.member")
+    /// * `content` - The event content as a JSON value
+    /// * `sticky_duration_ms` - How long the event stays in the sticky map
+    ///   once it fires, as [`Self::send_sticky_event`]'s `duration_ms`
+    /// * `delay_ms` - Delay in milliseconds before the event is sent
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
         delay_ms: u64,
     ) -> Result<String, CommandError>;
 
@@ -356,7 +386,7 @@ pub trait MatrixBackend: MaybeSend {
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the delayed event was scheduled
-    /// * `delay_id` - The MSC4140 delay id returned by `send_delayed_event`.
+    /// * `delay_id` - The MSC4140 delay id returned by a delayed send.
     async fn restart_delayed_event(
         &self,
         room_id: String,
@@ -368,7 +398,7 @@ pub trait MatrixBackend: MaybeSend {
     /// # Arguments
     ///
     /// * `room_id` - The room ID where the delayed event was scheduled
-    /// * `delay_id` - The MSC4140 delay id returned by `send_delayed_event`.
+    /// * `delay_id` - The MSC4140 delay id returned by a delayed send.
     async fn cancel_delayed_event(
         &self,
         room_id: String,
@@ -537,12 +567,23 @@ impl MatrixBackend for NoopBackend {
         Ok("$mock-sticky-event".to_string())
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         _room_id: String,
         _event_type: String,
-        _state_key: Option<String>,
+        _state_key: String,
         _content: Value,
+        _delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        Ok("mock-event-id".to_string())
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        _room_id: String,
+        _event_type: String,
+        _content: Value,
+        _sticky_duration_ms: u64,
         _delay_ms: u64,
     ) -> Result<String, CommandError> {
         Ok("mock-event-id".to_string())
@@ -831,6 +872,26 @@ impl MockBackend {
             .collect()
     }
 
+    /// Both delayed sends, one method to script: [`MockMethod::DelayedEvent`].
+    async fn record_delayed(
+        &self,
+        room_id: String,
+        event_type: String,
+        state_key: Option<String>,
+        content: Value,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        self.attempt(MockMethod::DelayedEvent).await?;
+        self.delayed_events.lock().unwrap().push((
+            room_id.clone(),
+            event_type.clone(),
+            state_key,
+            content,
+            delay_ms,
+        ));
+        Ok(format!("delayed-{}-{}", room_id, event_type))
+    }
+
     /// Logs a call to `method` and plays its next scripted outcome: `Ok(())`
     /// to go on as unscripted, the error to fail with, or never for a hang.
     async fn attempt(&self, method: MockMethod) -> Result<(), BackendError> {
@@ -915,23 +976,29 @@ impl MatrixBackend for MockBackend {
         Ok(format!("$sticky-{}", guard.len()))
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        self.attempt(MockMethod::DelayedEvent).await?;
-        self.delayed_events.lock().unwrap().push((
-            room_id.clone(),
-            event_type.clone(),
-            state_key,
-            content,
-            delay_ms,
-        ));
-        Ok(format!("delayed-{}-{}", room_id, event_type))
+        self.record_delayed(room_id, event_type, Some(state_key), content, delay_ms)
+            .await
+    }
+
+    /// Recorded with no state key; the sticky duration is not kept.
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        _sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        self.record_delayed(room_id, event_type, None, content, delay_ms)
+            .await
     }
 
     async fn restart_delayed_event(

@@ -283,9 +283,17 @@ fn verdict(checks: &[(&str, bool)]) -> Result<(), Box<dyn Error>> {
     }
 }
 
-/// Synapse down for 15 s under a call (R12, R19, R21), long enough for a
-/// keep-alive beat to fail (a bare restart can fall between two, and no
-/// failed send means nothing to report): media keeps flowing, both
+/// A send during the outage, so there is a failure to report. Bounded: the
+/// first attempt failing is what is reported; its retries may outlast it.
+async fn react_during_outage(call: &LiveKitCall) {
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), call.send_reaction("👋", "wave")).await;
+}
+
+/// Synapse down for 15 s under a call (R12, R19, R21), with a reaction sent
+/// by each client meanwhile (no failed send means nothing to report, and the
+/// Rust SDK backend has no keep-alive beat to fail until it can send a
+/// delayed sticky leave, matrix-rust-sdk#6973): media keeps flowing, both
 /// clients report signalling unreachable and then reachable again, neither
 /// call ends, the membership count is two throughout, and bob never sees
 /// alice leave — the delayed leave Synapse may fire on its way back up is
@@ -302,9 +310,11 @@ async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
     let bob_unreachable = watch_unreachable(&bob.call);
     let _restore = Restore(&["synapse"]);
     compose_async(&["stop", "synapse"]).await?;
-    let (during, _) = tokio::join!(
+    let (during, _, _, _) = tokio::join!(
         record_peer_tone(&bob.call, "bob-during-restart", 440.0),
         tokio::time::sleep(Duration::from_secs(15)),
+        react_during_outage(&alice.call),
+        react_during_outage(&bob.call),
     );
     compose_async(&["start", "synapse"]).await?;
 

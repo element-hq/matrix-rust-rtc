@@ -87,8 +87,10 @@ export interface MatrixBackendHost {
     /** MSC4354 sticky send; pass `durationMs` through verbatim. Never called for a room opened in `room_state` mode, so a host without sticky support may reject it there. */
     sendStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, durationMs: number): Promise<{ event_id: string } | { eventId: string } | string>;
     sendStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>): Promise<{ event_id: string } | { eventId: string } | string>;
-    /** MSC4140 delayed send — a delayed STATE event when `stateKey` is set; resolves with the bare delay id. A rejection carrying `errcode` lets the library tell a homeserver without delayed events apart. */
-    sendDelayedEvent(roomId: string, eventType: string, stateKey: string | null, content: Record<string, unknown>, delayMs: number): Promise<string>;
+    /** MSC4140 delayed STATE event, the `room_state` mode's dead man's switch; resolves with the bare delay id. A rejection carrying `errcode` lets the library tell a homeserver without delayed events apart. */
+    sendDelayedStateEvent(roomId: string, eventType: string, stateKey: string, content: Record<string, unknown>, delayMs: number): Promise<string>;
+    /** MSC4140 delayed STICKY event (MSC4354), kept `stickyDurationMs` once it fires; resolves with the bare delay id. A client that cannot send one rejects with `errcode: 'M_UNRECOGNIZED'`; never send a plain delayed event instead, which fires without ending the membership. */
+    sendDelayedStickyEvent(roomId: string, eventType: string, content: Record<string, unknown>, stickyDurationMs: number, delayMs: number): Promise<string>;
     /** MSC4140 `restart` — never cancel+resend. */
     restartDelayedEvent(roomId: string, delayId: string): Promise<unknown>;
     cancelDelayedEvent(roomId: string, delayId: string): Promise<unknown>;

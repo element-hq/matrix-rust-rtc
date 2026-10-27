@@ -152,20 +152,26 @@ export class MatrixHost {
     return this.client.sendStateEvent(roomId, eventType, content, stateKey);
   }
 
-  /** A delayed STATE event when `stateKey` is set (the pre-sticky dialect's leave). */
-  async sendDelayedEvent(roomId, eventType, stateKey, content, delayMs) {
-    const response =
-      stateKey === null || stateKey === undefined
-        ? await this.client._unstable_sendDelayedEvent(roomId, { delay: delayMs }, null, eventType, content)
-        : await this.client._unstable_sendDelayedStateEvent(
-            roomId,
-            { delay: delayMs },
-            eventType,
-            content,
-            stateKey,
-          );
+  /** The pre-sticky dialect's leave. */
+  async sendDelayedStateEvent(roomId, eventType, stateKey, content, delayMs) {
+    const response = await this.client._unstable_sendDelayedStateEvent(
+      roomId,
+      { delay: delayMs },
+      eventType,
+      content,
+      stateKey,
+    );
     // The library expects the bare MSC4140 delay id.
     return response.delay_id;
+  }
+
+  /**
+   * Not wired to matrix-js-sdk yet: a plain delayed event would fire without ending the
+   * sticky membership, so this says it cannot, and the library joins without a dead man's
+   * switch, on a shorter membership lifetime.
+   */
+  sendDelayedStickyEvent() {
+    return Promise.reject(Object.assign(new Error('no delayed sticky events'), { errcode: 'M_UNRECOGNIZED' }));
   }
 
   restartDelayedEvent(_roomId, delayId) {

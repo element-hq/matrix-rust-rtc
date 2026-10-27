@@ -213,20 +213,27 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         }
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        if state_key.is_some() {
-            return self
-                .inner
-                .send_delayed_event(room_id, event_type, state_key, content, delay_ms)
-                .await;
-        }
+        self.inner
+            .send_delayed_state_event(room_id, event_type, state_key, content, delay_ms)
+            .await
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
         // The delayed leave follows the same routing as the join it pairs
         // with. No lifetime: its legacy content is `{}`.
         match self
@@ -236,13 +243,15 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
             MemberEventRoute::Sticky {
                 event_type,
                 content,
-            }
-            | MemberEventRoute::Room {
-                event_type,
-                content,
             } => {
                 self.inner
-                    .send_delayed_event(room_id, wire(event_type), None, content, delay_ms)
+                    .send_delayed_sticky_event(
+                        room_id,
+                        wire(event_type),
+                        content,
+                        sticky_duration_ms,
+                        delay_ms,
+                    )
                     .await
             }
             MemberEventRoute::State {
@@ -251,15 +260,19 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
                 content,
             } => {
                 self.inner
-                    .send_delayed_event(
+                    .send_delayed_state_event(
                         room_id,
                         event_type.to_owned(),
-                        Some(state_key),
+                        state_key,
                         content,
                         delay_ms,
                     )
                     .await
             }
+            // Only a non-membership event takes this route, and nothing delays one.
+            MemberEventRoute::Room { event_type, .. } => Err(CommandError::from_message(format!(
+                "{event_type} has no delayed form"
+            ))),
         }
     }
 
@@ -529,11 +542,11 @@ mod tests {
             dialect(MembershipFormat::RoomState, "!legacy:example.org"),
         );
         backend
-            .send_delayed_event(
+            .send_delayed_sticky_event(
                 "!legacy:example.org".to_owned(),
                 "m.rtc.member".to_owned(),
-                None,
                 json!({ "slot_id": "m.call#room", "msc4354_sticky_key": "k", "member": { "membership": "leave" } }),
+                3_600_000,
                 30_000,
             )
             .await
