@@ -73,6 +73,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
+      # webrtc-sys needs clang 21+ for libwebrtc's bundled libc++; the runner has 18.
+      - name: Install clang for webrtc-sys
+        run: ./scripts/install-clang.sh
+
       # Same key as the E2E Call workflow: identical tree, and the matrix-sdk
       # build dominates the job either way.
       - name: Rust cache

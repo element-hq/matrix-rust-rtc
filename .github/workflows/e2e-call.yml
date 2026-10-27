@@ -41,6 +41,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
+      # webrtc-sys needs clang 21+ for libwebrtc's bundled libc++; the runner has 18.
+      - name: Install clang for webrtc-sys
+        run: ./scripts/install-clang.sh
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:

@@ -62,6 +62,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libglib2.0-dev
 
+      # webrtc-sys needs clang 21+ for libwebrtc's bundled libc++; the runner has 18.
+      - name: Install clang for webrtc-sys
+        run: ./scripts/install-clang.sh
+
       # Covers the whole workspace, including matrix-rtc-livekit. Note this
       # does NOT cover matrix-rtc-wasm, whose body is cfg-gated to wasm32 (its
       # JS-backed futures are !Send, so it cannot compile on a host target) —
