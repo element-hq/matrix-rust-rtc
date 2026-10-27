@@ -86,9 +86,12 @@ fn probe_undecryptable(
 }
 
 /// Why a remote member's media cannot be shown now: sent in clear at once, a
-/// key failure only once it has lasted `grace`.
+/// key failure only once it has lasted `grace`, and only while they publish
+/// something. A member with no streams, such as a client that died without
+/// leaving, has nothing to fail to decrypt, whatever key state it left behind.
 fn unable_to_decrypt(
     member_id: &str,
+    publishing: bool,
     grace: Duration,
     sent_in_clear: &HashSet<String>,
     undecryptable_since: &HashMap<String, rt::Instant>,
@@ -96,6 +99,9 @@ fn unable_to_decrypt(
 ) -> Option<UnableToDecrypt> {
     if sent_in_clear.contains(member_id) {
         return Some(UnableToDecrypt::NotEncrypted);
+    }
+    if !publishing {
+        return None;
     }
     if undecryptable_since
         .get(member_id)
@@ -972,6 +978,7 @@ impl Actor {
                         .unwrap_or_default(),
                     unable_to_decrypt(
                         &participant.member_id,
+                        !participant.streams.is_empty(),
                         self.stability.key_grace,
                         &self.sent_in_clear,
                         &self.undecryptable_since,
@@ -5117,6 +5124,12 @@ mod tests {
                 ])
                 .unwrap();
             rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
             let state = |state| {
                 own.send(ConnectionEvent::EncryptionStateChanged {
                     identity: "id-bob".to_owned(),
@@ -5161,6 +5174,12 @@ mod tests {
                 ])
                 .unwrap();
             rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
             own.send(ConnectionEvent::EncryptionStateChanged {
                 identity: "id-bob".to_owned(),
                 state: FrameEncryptionState::MissingKey,
@@ -5188,6 +5207,12 @@ mod tests {
                 ])
                 .unwrap();
             rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
             own.send(ConnectionEvent::EncryptionStateChanged {
                 identity: "id-bob".to_owned(),
                 state: FrameEncryptionState::DecryptionFailed,
@@ -5198,6 +5223,43 @@ mod tests {
                 tile(&fx, "bob").unable_to_decrypt,
                 Some(UnableToDecrypt::BadKey)
             );
+        }
+
+        /// C6: a member who publishes nothing has nothing to fail to decrypt.
+        /// Their tracks gone, as when a client dies without leaving, the key
+        /// state it left behind no longer shows on their tile.
+        #[tokio::test(start_paused = true)]
+        async fn a_member_without_media_is_never_shown_undecryptable() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.memberships
+                .send(vec![
+                    member("own", "@alice:example.org"),
+                    member("bob", "@bob:example.org"),
+                ])
+                .unwrap();
+            rostered(&fx, &["own", "bob"]).await;
+            own.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
+            own.send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+            wait_until(|| record(&fx).unable_to_decrypt == ["bob"]).await;
+
+            own.send(ConnectionEvent::TrackRemoved {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+            })
+            .unwrap();
+            wait_until(|| record(&fx).unable_to_decrypt.is_empty()).await;
+            assert_eq!(tile(&fx, "bob").unable_to_decrypt, None);
         }
 
         /// C6: a track declared unencrypted is never added, and its member
@@ -5376,6 +5438,12 @@ mod tests {
             let fx = fixture();
             let peer = with_bob_on_a_peer_focus(&fx).await;
             let own = wait_sender(&fx, OWN_FOCUS);
+            peer.send(ConnectionEvent::TrackAdded {
+                identity: "id-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
             peer.send(ConnectionEvent::Reconnecting).unwrap();
             own.send(ConnectionEvent::RemoteJoined {
                 identity: "id-stranger".to_owned(),
