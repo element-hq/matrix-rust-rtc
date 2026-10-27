@@ -166,6 +166,10 @@ pub(crate) fn e2ee_room_options(
     // are actually subscribed and unneeded ones stop being encoded.
     options.dynacast = true;
     options.auto_subscribe = auto_subscribe;
+    // Two peer connections per SFU, as before livekit 0.7.51 made one the
+    // default: in single-PC mode, remote video arriving on the connection we
+    // also publish on decodes but never reaches its track's sink (black tiles).
+    options.single_peer_connection = false;
     options
 }
 
