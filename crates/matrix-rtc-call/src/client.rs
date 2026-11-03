@@ -616,6 +616,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             slot_id,
             member_id,
             transport,
+            format: self.mode,
             state: self.state.clone(),
             end,
             upkeep,
@@ -935,6 +936,7 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     slot_id: String,
     member_id: String,
     transport: TransportIntent,
+    format: MembershipFormat,
     state: SharedState<B>,
     end: Arc<SessionEnd>,
     /// The core's upkeep for this join, aborted when the session object
@@ -955,6 +957,11 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     /// Our `member.id` in this participation.
     pub fn member_id(&self) -> &str {
         &self.member_id
+    }
+
+    /// The membership format this session was joined in.
+    pub fn format(&self) -> MembershipFormat {
+        self.format
     }
 
     /// What this participation publishes on, as its join resolved it.

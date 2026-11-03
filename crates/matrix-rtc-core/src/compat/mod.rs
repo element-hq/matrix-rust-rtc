@@ -89,6 +89,8 @@
 //!
 //! 4. `compat` — the binding-shaped mode vocabulary, given at `RtcClient::room`.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 
 pub mod dialect_backend;
@@ -131,6 +133,17 @@ impl MembershipFormat {
     /// Whether membership is carried as room state in this mode.
     pub fn reads_state_membership(self) -> bool {
         matches!(self, Self::RoomState)
+    }
+
+    /// The slot id to name in an MSC4195 token request. The authorisation
+    /// service derives the LiveKit room from it, so it must be the one this
+    /// generation's peers name: Element Call spells the room-wide slot
+    /// `m.call#ROOM`.
+    pub fn token_slot_id(self, slot_id: &str) -> Cow<'_, str> {
+        match self {
+            Self::Msc => Cow::Borrowed(slot_id),
+            Self::RoomState => sticky_2025::legacy_room_slot_id(slot_id),
+        }
     }
 }
 
@@ -269,6 +282,19 @@ mod tests {
             "application": { "type": "m.call", "notification_type": "ring" },
             "m.mentions": { "user_ids": [], "room": true },
         })
+    }
+
+    /// `/sfu/get` fixes the slot to `m.call#ROOM`; a room-state peer asking
+    /// the homeserver must land in that same LiveKit room.
+    #[test]
+    fn the_room_state_format_asks_for_tokens_in_element_calls_spelling() {
+        let format = MembershipFormat::RoomState;
+        assert_eq!(format.token_slot_id("m.call#room"), "m.call#ROOM");
+        assert_eq!(format.token_slot_id("m.call#standup"), "m.call#standup");
+        assert_eq!(
+            MembershipFormat::Msc.token_slot_id("m.call#room"),
+            "m.call#room"
+        );
     }
 
     fn state_dialect() -> OutboundDialect {

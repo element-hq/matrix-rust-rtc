@@ -147,7 +147,7 @@ where
 
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
-        slot_id: slot_id.clone(),
+        slot_id: call.format().token_slot_id(&slot_id).into_owned(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: options.own_user_id.clone(),

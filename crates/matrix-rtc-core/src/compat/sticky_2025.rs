@@ -153,6 +153,18 @@ fn lift_room_slot_id(object: &mut Map<String, Value>) {
     }
 }
 
+/// `{application}#room` → `{application}#ROOM`, the inverse of
+/// [`lift_room_slot_id`]: how the JS SDK spells the room-wide slot.
+pub(crate) fn legacy_room_slot_id(slot_id: &str) -> std::borrow::Cow<'_, str> {
+    match slot_id
+        .strip_suffix(crate::ROOM_APPLICATION_SLOT_ID)
+        .and_then(|application| application.strip_suffix('#'))
+    {
+        Some(application) => format!("{application}#{LEGACY_ROOM_APPLICATION_SLOT_ID}").into(),
+        None => slot_id.into(),
+    }
+}
+
 /// `rtc_transports: [...]` → `transports: {published: [...], can_subscribe: [...]}`.
 fn lift_rtc_transports(object: &mut Map<String, Value>) {
     if object.contains_key("transports") {
