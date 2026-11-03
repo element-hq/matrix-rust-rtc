@@ -21,11 +21,12 @@ use matrix_rtc_call_sdk::{
     Interruptions, MediaAttachment, Participant, StabilityConfig, UnableToDecrypt, attach_media,
 };
 use matrix_rtc_core::compat::MembershipFormat;
+use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper};
 use matrix_rtc_transport::keys::MediaKeyHandler;
-use matrix_rtc_transport::livekit::{TokenEndpoint, identity_mapper};
+use matrix_rtc_transport::livekit::identity_mapper;
 use matrix_rtc_transport::{FrameEncryptionState, TransportConnection as _};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
@@ -46,9 +47,9 @@ struct WasmMediaSessionConfig {
     #[serde(default)]
     key_ring_size: Option<u16>,
     /// Element Call compatibility generation this room was joined for:
-    /// `"current"` (default), `"sticky_2025"`, or `"room_state"`. Decides the
-    /// participant-identity derivation and the token endpoint, so it must
-    /// match the membership the page published.
+    /// `"current"` (default) or `"room_state"`; must match the mode the room
+    /// was opened in. The participant identity and the token endpoint follow
+    /// the published transport, not this.
     #[serde(default)]
     format: Option<String>,
     /// How much the tile order is damped. Omitted takes the defaults; so does
@@ -162,7 +163,7 @@ impl WasmRtcCall {
         }
         // One mapper for the core, the transport, our own identity and the
         // ring: they must not skew.
-        let mapper = identity_mapper(compat);
+        let mapper = identity_mapper();
         // Frame encryption: livekit-js owns the key provider; the shared
         // handler forwards every signalled key into it through the delegate.
         let ring = JsFrameKeyRing::new(
@@ -185,8 +186,8 @@ impl WasmRtcCall {
             delegate.clone(),
             backend.clone(),
             mapper.clone(),
-            TokenEndpoint::for_format(compat),
         ));
+        let memberships = self.inner().subscribe_memberships().await;
         let MediaAttachment {
             engine,
             own_connection,
@@ -200,7 +201,6 @@ impl WasmRtcCall {
                 own_user_id: backend.own_user_id(),
                 own_device_id: backend.own_device_id(),
                 identity_mapper: mapper.clone(),
-                format: compat,
                 stability: config
                     .stability
                     .as_ref()
@@ -224,15 +224,20 @@ impl WasmRtcCall {
         // holds the object borrowed across its awaits, so a parked long-poll
         // would make every other session call throw ("recursive use of an
         // object"). The pumps borrow nothing from the session.
+        let identities = RosterIdentities {
+            mapper,
+            memberships,
+            own_identity: own_identity.clone(),
+        };
         if let Some(on_participants) = delegate_callback(&delegate, "onParticipants") {
             let mut participants_rx = engine.subscribe_participants();
-            let mapper = mapper.clone();
+            let identities = identities.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 while participants_rx.changed().await.is_ok() {
                     let roster: Vec<Participant> = participants_rx.borrow_and_update().clone();
                     let roster: Vec<WasmParticipant> = roster
                         .iter()
-                        .map(|participant| to_wasm_participant(&mapper, participant))
+                        .map(|participant| to_wasm_participant(&identities, participant))
                         .collect();
                     match serde_wasm_bindgen::to_value(&roster) {
                         Ok(roster) => {
@@ -308,7 +313,7 @@ impl WasmRtcCall {
             engine,
             own_connection,
             _handler: handler,
-            identity_mapper: mapper,
+            identities,
             own_identity,
         })
     }
@@ -341,8 +346,36 @@ pub struct WasmMediaSession {
     /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _handler: Arc<MediaKeyHandler>,
-    identity_mapper: matrix_rtc_core::RtcIdentityMapper,
+    identities: RosterIdentities,
     own_identity: String,
+}
+
+/// What a roster entry's livekit-js identity derives from: the transport the
+/// member publishes on, which the roster does not carry, so it is looked up in
+/// the call's memberships.
+#[derive(Clone)]
+struct RosterIdentities {
+    mapper: RtcIdentityMapper,
+    memberships: watch::Receiver<Vec<JoinedMembership>>,
+    own_identity: String,
+}
+
+impl RosterIdentities {
+    fn identity(&self, participant: &Participant) -> Option<String> {
+        if participant.is_local {
+            return Some(self.own_identity.clone());
+        }
+        let memberships = self.memberships.borrow();
+        let membership = memberships
+            .iter()
+            .find(|membership| membership.member_id == participant.member_id)?;
+        (self.mapper)(&IdentitySubject {
+            user_id: &membership.sender,
+            device_id: membership.origin.sender_device_id(),
+            member_id: &membership.member_id,
+            transports: &membership.transports,
+        })
+    }
 }
 
 #[wasm_bindgen]
@@ -355,7 +388,7 @@ impl WasmMediaSession {
             .engine
             .participants()
             .iter()
-            .map(|participant| to_wasm_participant(&self.identity_mapper, participant))
+            .map(|participant| to_wasm_participant(&self.identities, participant))
             .collect();
         serde_wasm_bindgen::to_value(&roster).map_err(|err| JsError::new(&err.to_string()))
     }
@@ -367,8 +400,9 @@ impl WasmMediaSession {
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
-    /// Our own livekit-js participant identity (the MSC4195 pseudonymous
-    /// identity, or the legacy `{user}:{device}` in that compatibility mode).
+    /// Our own livekit-js participant identity: the MSC4195 hash when we
+    /// publish on a transport naming only an SFU `url`, else the legacy
+    /// `{user}:{device}` the JWT service's `/sfu/get` mints.
     #[wasm_bindgen(js_name = ownRtcIdentity)]
     pub fn own_rtc_identity(&self) -> String {
         self.own_identity.clone()
@@ -389,15 +423,12 @@ impl WasmMediaSession {
 }
 
 fn to_wasm_participant(
-    mapper: &matrix_rtc_core::RtcIdentityMapper,
+    identities: &RosterIdentities,
     participant: &Participant,
 ) -> WasmParticipant {
-    // No attributable device, no identity — such a member also cannot be
-    // reached on the media plane (same rule as `remote_identity`).
-    let rtc_identity = participant
-        .device_id
-        .as_deref()
-        .map(|device_id| mapper(&participant.user_id, device_id, &participant.member_id));
+    // Derived as `remote_identity` derives it: `None` when the member cannot
+    // be reached on the media plane either.
+    let rtc_identity = identities.identity(participant);
     WasmParticipant {
         member_id: participant.member_id.clone(),
         user_id: participant.user_id.clone(),

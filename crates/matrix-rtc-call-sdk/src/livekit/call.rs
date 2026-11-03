@@ -162,23 +162,13 @@ pub struct LiveKitCallOptions {
     /// with Element Call builds that have not caught up with the 2026 MSC4143
     /// rewrite.
     ///
-    /// [`MembershipFormat::Sticky2025`] keeps a join MSC4143-valid — the
-    /// legacy fields ride alongside. A leave and a media key cannot: a leave
-    /// becomes the legacy bare-sticky-key content (that generation has no
-    /// `membership` field, and a padded spec leave would read to it as still
-    /// joined), and keys go out as `io.element.call.encryption_keys` *instead of*
-    /// the spec type, since a to-device message has only one type. A call in that
-    /// mode therefore exchanges keys with legacy peers and not with spec-current
-    /// ones.
-    ///
-    /// [`MembershipFormat::RoomState`] goes further and is not additive at
-    /// all: the membership moves to `org.matrix.msc3401.call.member` room state,
+    /// [`MembershipFormat::RoomState`] is not additive at all: the membership moves to `org.matrix.msc3401.call.member` room state,
     /// the SFU participant identity becomes the plain `{user}:{device}` string,
     /// and the token comes from the pre-MSC4195 `/sfu/get` endpoint. Nothing
     /// about such a call is visible to a spec-current peer.
     ///
     /// Reading the 2025 sticky dialect needs no flag and is always on. See
-    /// [`matrix_rtc_core::compat`], and delete all of it once Element Call catches up.
+    /// [`matrix_rtc_core::compat`].
     pub format: MembershipFormat,
     /// A group call, with or without a notification, or a DM call, with or
     /// without a ring. The default is a quiet group join.
@@ -275,12 +265,6 @@ impl LiveKitCall {
 
         match options.format {
             MembershipFormat::Current => {}
-            MembershipFormat::Sticky2025 => log::warn!(
-                "[{room_id}/{}] joining in pre-2026 Element Call compatibility mode: media keys \
-                 go out as {} and will not reach spec-current peers",
-                options.slot_id,
-                compat::LEGACY_KEY_EVENT_TYPE,
-            ),
             MembershipFormat::RoomState => log::warn!(
                 "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
                  membership goes out as {} room state, our SFU identity is the plain \
@@ -344,7 +328,6 @@ impl LiveKitCall {
             &call,
             room.backend().clone(),
             LiveKitAttachOptions {
-                format: options.format,
                 http: options.http.clone(),
                 auto_subscribe: options.auto_subscribe,
                 stability: options.stability.clone(),

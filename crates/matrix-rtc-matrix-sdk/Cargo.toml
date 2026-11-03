@@ -50,6 +50,10 @@ tokio = { workspace = true }
 # ruma's typed RTC events: upstream ruma does not model the 2026 MSC4143 rewrite,
 # and the core must not depend on ruma anyway.
 matrix-sdk = { workspace = true, features = ["experimental-send-custom-to-device", "unstable-msc4354"] }
+# Through matrix-sdk's own ruma, only to switch on the MSC4195 homeserver
+# `get_token` request (`MatrixBackend::livekit_token`), which matrix-sdk does
+# not enable.
+ruma = { version = "0.17", features = ["client-api-c", "unstable-msc4195"] }
 # Only needed to name `crypto::CollectStrategy` (the key-sharing strategy passed
 # to `encrypt_and_send_raw_to_device`); matrix-sdk does not re-export it.
 # `e2e-encryption` gates the `crypto` re-export.

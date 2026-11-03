@@ -14,8 +14,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
 use matrix_rtc_core::{
-    BackendError, CommandError, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink,
+    BackendError, CommandError, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken, RoomSink,
+    RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -604,6 +605,27 @@ impl MatrixBackend for JsBackend {
             .map_err(backend_error)?;
         serde_wasm_bindgen::from_value(result)
             .map_err(|e| BackendError::new(format!("getOpenIdToken resolved to a non-token: {e}")))
+    }
+
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        let request = request
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| BackendError::new(format!("livekit token request: {e}")))?;
+        let result = self
+            .call_async("getLivekitToken", vec![request])
+            .await
+            .map_err(backend_error)?;
+        #[derive(serde::Deserialize)]
+        struct Response {
+            jwt: String,
+        }
+        // `{ jwt }` as the homeserver answers it, or the bare JWT.
+        if let Some(jwt) = result.as_string() {
+            return Ok(jwt);
+        }
+        serde_wasm_bindgen::from_value::<Response>(result)
+            .map(|response| response.jwt)
+            .map_err(|e| BackendError::new(format!("getLivekitToken resolved to a non-token: {e}")))
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {

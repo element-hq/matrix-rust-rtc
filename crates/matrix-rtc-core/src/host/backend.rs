@@ -162,6 +162,27 @@ pub struct OpenIdToken {
     pub expires_in: u64,
 }
 
+/// The body of an MSC4195 LiveKit token request to the homeserver:
+/// `POST /_matrix/client/v1/rtc/livekit/get_token`, unstable
+/// `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`.
+///
+/// The homeserver answers `{"jwt": ...}`; the token's participant identity is
+/// `base64(sha256(canonical_json([sender, member_id])))`. A DTO rather than a
+/// client SDK type, so the core does not depend on any host's Matrix types.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveKitTokenRequest {
+    /// The homeserver operating the SFU; the requesting server's own when
+    /// omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// The SFU's WebSocket URL.
+    pub url: String,
+    pub room_id: String,
+    pub slot_id: String,
+    /// The `member.id` of our own `m.rtc.member` event.
+    pub member_id: String,
+}
+
 /// What the client reports about how an event or to-device message arrived.
 ///
 /// Only what a client can honestly say: whether it decrypted the event, which
@@ -532,6 +553,14 @@ pub trait MatrixBackend: MaybeSend {
         Err(BackendError::not_implemented("openid_token"))
     }
 
+    /// A LiveKit JWT from the homeserver (MSC4195), for the SFU and membership
+    /// `request` names. A homeserver without the endpoint answers 404 /
+    /// `M_UNRECOGNIZED`; the host passes that through as is.
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        let _ = request;
+        Err(BackendError::not_implemented("livekit_token"))
+    }
+
     /// The homeserver's `rtc_transports` array, raw, from
     /// `GET /_matrix/client/v1/rtc/transports`; an empty array when the
     /// endpoint is missing.
@@ -750,6 +779,10 @@ pub struct MockBackend {
     pub transports: std::sync::Mutex<Result<Value, BackendError>>,
     /// How many times `rtc_transports` was asked.
     pub transports_requests: std::sync::atomic::AtomicUsize,
+    /// Every `livekit_token` request, in order.
+    pub livekit_token_requests: std::sync::Mutex<Vec<LiveKitTokenRequest>>,
+    /// What `livekit_token` answers.
+    pub livekit_token_answer: std::sync::Mutex<Result<String, BackendError>>,
     /// When set, `subscribe_room` fails with it.
     pub room_subscription_error: std::sync::Mutex<Option<BackendError>>,
     /// When set, sticky sends fail with this message and are not recorded.
@@ -790,6 +823,8 @@ impl Default for MockBackend {
             relations_answers: Default::default(),
             transports: std::sync::Mutex::new(Ok(Value::Array(Vec::new()))),
             transports_requests: Default::default(),
+            livekit_token_requests: Default::default(),
+            livekit_token_answer: std::sync::Mutex::new(Ok("mock-jwt".to_owned())),
             room_subscription_error: Default::default(),
             sticky_event_error: Default::default(),
             scripted: Default::default(),
@@ -1161,6 +1196,14 @@ impl MatrixBackend for MockBackend {
             matrix_server_name: "example.org".to_owned(),
             expires_in: 3600,
         })
+    }
+
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        self.livekit_token_requests
+            .lock()
+            .unwrap()
+            .push(request.clone());
+        self.livekit_token_answer.lock().unwrap().clone()
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {

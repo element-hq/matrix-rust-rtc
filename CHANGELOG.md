@@ -11,14 +11,18 @@ log only.
 ### Breaking
 
 - A reaction's `sound` is no longer optional: a reaction without a sound of its own plays `generic` (037).
+- LiveKit tokens follow the published transport, not the membership format: `/sfu/get` for a `livekit_service_url`, the homeserver's `get_token` via the new `MatrixBackend::livekit_token` for a bare `url`; the standalone `/get_token` is gone (029).
+- The `Sticky2025` membership format is removed; its 2025 member content is still read (029).
 
 ### Added
 
 - The 🛎️ `bell` reaction (037).
+- LiveKit transports naming an SFU `url`, with or without `livekit_service_url`, are published and joined, and transport discovery keeps them as the homeserver serves them (029).
 
 ### Fixed
 
 - A received reaction from the catalogue shows the catalogue's emoji (037).
+- Current Element Call sees our calls again on homeservers advertising a `livekit_service_url`, now that we publish under the `{user}:{device}` identity `/sfu/get` mints (029).
 
 ## v0.5.0-rc.8 - 2026-10-27
 

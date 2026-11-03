@@ -51,7 +51,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 
 use matrix_rtc_core::MatrixBackend;
-use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
+use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
@@ -60,10 +60,11 @@ use matrix_rtc_transport::{
     TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
-use crate::identity::pseudonymous_identity;
 use crate::session::LiveKitSession;
-use crate::token::MemberClaims;
-use crate::{LiveKitTransportConfig, SfuToken, TokenEndpoint, acquire_token, e2ee_room_options};
+use crate::{
+    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
+    identity_mapper,
+};
 
 /// Sample rate remote audio is resampled to before crossing the transport
 /// boundary, matching what the recording helpers in [`crate::media`] use.
@@ -75,24 +76,24 @@ const AUDIO_CHANNELS: i32 = 1;
 /// One instance serves a whole call: [`MediaTransport::connect`] can be
 /// invoked once per focus. Every connection has its own E2EE `KeyProvider`,
 /// since LiveKit keeps the SFU's SIF trailer there, and every key is installed
-/// in each (keys are indexed by pseudonymous identity, which is globally
-/// unique per membership, so the same keys serve all foci).
+/// in each (keys are indexed by participant identity, which is unique per
+/// membership, so the same keys serve all foci).
+///
+/// A connection key names a [`LiveKitTarget`]: how its token is obtained (the
+/// legacy JWT service, or the homeserver) and for which SFU.
 pub struct LiveKitMediaTransport {
     http: reqwest::Client,
     backend: Arc<dyn MatrixBackend>,
     key_providers: crate::Msc4195KeyProviders,
     auto_subscribe: bool,
-    /// How a `(user, device, member_id)` triple becomes an SFU participant
-    /// identity. The MSC4195 hash by default.
+    /// How a member becomes an SFU participant identity: the one its published
+    /// transport's token flow mints, by default.
     ///
     /// MUST be the same value installed on the core's encryption manager. A
     /// divergence does not error — it silences: every `identity_map` lookup
     /// misses, so peers sit in the roster with no media and their keys are
-    /// installed under an identity the SFU never assigned. See [`matrix_rtc_core::compat`].
+    /// installed under an identity the SFU never assigned.
     identity_mapper: RtcIdentityMapper,
-    /// Which authorisation-service dialect to speak. MSC4195 `/get_token` by
-    /// default.
-    token_endpoint: TokenEndpoint,
 }
 
 impl LiveKitMediaTransport {
@@ -108,8 +109,7 @@ impl LiveKitMediaTransport {
             backend,
             key_providers,
             auto_subscribe: true,
-            identity_mapper: Arc::new(pseudonymous_identity),
-            token_endpoint: TokenEndpoint::default(),
+            identity_mapper: identity_mapper(),
         }
     }
 
@@ -123,20 +123,12 @@ impl LiveKitMediaTransport {
 
     /// Substitute the participant-identity derivation.
     ///
-    /// A builder rather than a `new` parameter: the MSC4195 derivation is the
-    /// default and every spec-current caller leaves it alone. The caller that
-    /// does substitute it, `matrix_rtc_call_sdk::attach_livekit`, passes the same `Arc` it
-    /// gives the core's encryption manager, which is the point: the derivation
-    /// sites must not skew. Temporary; see [`matrix_rtc_core::compat`].
+    /// A builder rather than a `new` parameter: the transport-driven derivation
+    /// is the default. `matrix_rtc_call_sdk::attach_livekit` passes the same
+    /// `Arc` it gives the core's encryption manager, which is the point: the
+    /// derivation sites must not skew.
     pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
         self.identity_mapper = identity_mapper;
-        self
-    }
-
-    /// Substitute the authorisation-service dialect. Temporary; see
-    /// [`matrix_rtc_core::compat`].
-    pub fn with_token_endpoint(mut self, token_endpoint: TokenEndpoint) -> Self {
-        self.token_endpoint = token_endpoint;
         self
     }
 }
@@ -149,7 +141,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
 
     async fn connect_own(
         &self,
-        livekit_service_url: &str,
+        connection_key: &str,
         ctx: &ConnectionContext,
     ) -> Result<
         (
@@ -158,36 +150,40 @@ impl OwnFocusTransport for LiveKitMediaTransport {
         ),
         TransportError,
     > {
-        let connection = self.prepare_own(livekit_service_url, ctx);
+        let connection = self.prepare_own(connection_key, ctx);
         let events = connection.reconnect(false).await?;
         Ok((connection, events))
     }
 
     fn prepare_own(
         &self,
-        livekit_service_url: &str,
+        connection_key: &str,
         ctx: &ConnectionContext,
     ) -> LiveKitTransportConnection {
+        // A bare URL, as a host connecting outside a call may pass, names a
+        // legacy JWT service.
+        let target = LiveKitTarget::from_connection_key(connection_key).unwrap_or_else(|| {
+            LiveKitTarget::SfuGet {
+                service_url: connection_key.to_owned(),
+            }
+        });
+        let own_identity = target.own_identity(
+            &ctx.member.user_id,
+            &ctx.member.device_id,
+            &ctx.member.member_id,
+        );
         let config = LiveKitTransportConfig {
-            livekit_service_url: livekit_service_url.to_owned(),
+            target,
             room_id: ctx.room_id.clone(),
             slot_id: ctx.slot_id.clone(),
-            member: MemberClaims {
-                id: ctx.member.member_id.clone(),
-                claimed_user_id: ctx.member.user_id.clone(),
-                claimed_device_id: ctx.member.device_id.clone(),
-            },
-            token_endpoint: self.token_endpoint,
+            member_id: ctx.member.member_id.clone(),
+            device_id: ctx.member.device_id.clone(),
         };
         LiveKitTransportConnection {
-            connection_key: livekit_service_url.to_owned(),
+            connection_key: connection_key.to_owned(),
             shared: Arc::new(ConnectionShared {
                 session: watch::Sender::new(None),
-                own_identity: (self.identity_mapper)(
-                    &ctx.member.user_id,
-                    &ctx.member.device_id,
-                    &ctx.member.member_id,
-                ),
+                own_identity,
                 local_key_index: Mutex::new(None),
                 local_tracks: Mutex::new(Vec::new()),
                 connector: Connector {
@@ -210,29 +206,29 @@ impl MediaTransport for LiveKitMediaTransport {
         "livekit"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
-        match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+    fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
+        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+    }
+
+    fn shares_identity(&self, a: &str, b: &str) -> bool {
+        match (
+            LiveKitTarget::from_connection_key(a),
+            LiveKitTarget::from_connection_key(b),
+        ) {
+            (Some(a), Some(b)) => a.same_flow(&b),
+            _ => false,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        // MSC4195: identity = hash(user, device, member_id); the device is the
-        // one that encrypted the member event (MSC4143 dropped
-        // `claimed_device_id`), or — on the pre-sticky legacy path — the one the
-        // member event merely claims. Either way, without an attributable device
-        // there is no identity to expect on the SFU, and no device to address a
-        // media key to.
-        //
-        // Through the mapper rather than `pseudonymous_identity` directly, so a
-        // legacy call derives peer identities exactly as it derives its own.
-        let device_id = member.origin.sender_device_id()?;
-        Some((self.identity_mapper)(
-            &member.sender,
-            device_id,
-            &member.member_id,
-        ))
+        // Through the mapper rather than a derivation of its own, so peers'
+        // identities are derived exactly as the core addresses their keys.
+        (self.identity_mapper)(&IdentitySubject {
+            user_id: &member.sender,
+            device_id: member.origin.sender_device_id(),
+            member_id: &member.member_id,
+            transports: &member.transports,
+        })
     }
 
     async fn connect(
@@ -267,7 +263,9 @@ pub struct LiveKitTransportConnection {
 struct ConnectionShared {
     /// The connected room; `None` before the first connect.
     session: watch::Sender<Option<Arc<LiveKitSession>>>,
-    /// Our own MSC4195 participant identity on this connection.
+    /// Our own participant identity on this connection: what its target's
+    /// token flow mints. A take-over keeps it, since only a target of the same
+    /// flow is ever taken over.
     own_identity: String,
     /// The key index our own frames must carry, once a rotation has activated.
     ///
@@ -320,7 +318,8 @@ impl Connector {
     }
 }
 
-/// A token-service failure: a 4xx, or a host refusal of the OpenID token, is a
+/// A token failure: a 4xx from the JWT service, a 4xx other than a rate limit
+/// from the homeserver (a 404 there: it lacks MSC4195), or a host refusal, is a
 /// refusal; anything else may pass.
 fn classify_token_error(error: crate::Error) -> TransportError {
     match &error {
@@ -329,7 +328,12 @@ fn classify_token_error(error: crate::Error) -> TransportError {
         {
             TransportError::Refused(error.to_string())
         }
-        crate::Error::OpenIdToken(backend) if backend.is_permanent() => {
+        crate::Error::Backend(backend)
+            if backend.is_permanent()
+                || backend
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status) && status != 429) =>
+        {
             TransportError::Refused(error.to_string())
         }
         _ => TransportError::Connect(error.to_string()),
@@ -542,7 +546,7 @@ impl TransportConnection for LiveKitTransportConnection {
         } = *handover;
         log::info!(
             "our own handle takes over the room of {}",
-            config.livekit_service_url
+            config.target.describe()
         );
         let previous = {
             let mut installs = self
@@ -1424,5 +1428,60 @@ mod tests {
             classify_room_error(signal_client_error(403)),
             TransportError::Refused(_)
         ));
+    }
+
+    fn cs_api_config() -> LiveKitTransportConfig {
+        LiveKitTransportConfig {
+            target: LiveKitTarget::CsApi {
+                url: "wss://sfu.other.org".into(),
+                server_name: "other.org".into(),
+            },
+            room_id: "!room:example.org".into(),
+            slot_id: "m.call#room".into(),
+            member_id: "member-1".into(),
+            device_id: "DEVICE".into(),
+        }
+    }
+
+    /// A transport naming only an SFU `url` gets its token from the homeserver,
+    /// for that SFU's server, and connects to that very `url`: the answer
+    /// carries no SFU URL of its own.
+    #[tokio::test]
+    async fn a_url_only_target_asks_the_homeserver_for_its_sfu() {
+        let backend = matrix_rtc_core::testing::MockBackend::new();
+        let token = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
+            .await
+            .expect("a token");
+        assert_eq!(token.jwt, "mock-jwt");
+        assert_eq!(token.url, "wss://sfu.other.org");
+        assert_eq!(
+            *backend.livekit_token_requests.lock().unwrap(),
+            [matrix_rtc_core::LiveKitTokenRequest {
+                server_name: Some("other.org".into()),
+                url: "wss://sfu.other.org".into(),
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                member_id: "member-1".into(),
+            }]
+        );
+    }
+
+    /// A homeserver without MSC4195 refuses for good; a rate limit may pass.
+    #[tokio::test]
+    async fn a_homeserver_without_the_endpoint_is_a_refusal() {
+        let backend = matrix_rtc_core::testing::MockBackend::new();
+        for (status, refused) in [(404, true), (403, true), (429, false), (502, false)] {
+            *backend.livekit_token_answer.lock().unwrap() = Err(
+                matrix_rtc_core::BackendError::with_matrix_error(None, Some(status), "no"),
+            );
+            let error = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
+                .await
+                .expect_err("no token");
+            assert_eq!(
+                matches!(classify_token_error(error), TransportError::Refused(_)),
+                refused,
+                "status {status}"
+            );
+        }
     }
 }

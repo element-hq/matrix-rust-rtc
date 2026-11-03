@@ -36,7 +36,6 @@ top of that file.
 | Test name             | Element Call ("Developer" tab) | Our `MembershipFormat`  | Generation |
 | --------------------- | ------------------------------ | ----------------------- | ---------- |
 | `ec-2024 state events`| `Compatibility: state events`  | `RoomState`             | pre-MSC4354: membership as `org.matrix.msc3401.call.member` room state, plain `{user}:{device}` identities, `/sfu/get` |
-| `ec-2025 sticky events`| `Matrix 2.0`                  | `Sticky2025`            | MSC4354 sticky membership carrying the pre-2026 field names, MSC4195 hashed identities, `/get_token` |
 
 The tests are **not** named after Element Call's UI labels, deliberately.
 `Matrix 2.0` is Element Call's name for its 2025 generation, not for the

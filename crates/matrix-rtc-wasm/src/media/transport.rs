@@ -37,12 +37,13 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
-use matrix_rtc_core::{JoinedMembership, MatrixBackend, RtcIdentityMapper, RtcTransport};
-use matrix_rtc_transport::keys::FrameKeyRing;
-use matrix_rtc_transport::livekit::token::{
-    get_token_request, legacy_token_request, parse_sfu_token,
+use matrix_rtc_core::{
+    BackendError, IdentitySubject, JoinedMembership, LiveKitTokenRequest, MatrixBackend,
+    RtcIdentityMapper, RtcTransport,
 };
-use matrix_rtc_transport::livekit::{SfuToken, TokenEndpoint};
+use matrix_rtc_transport::keys::FrameKeyRing;
+use matrix_rtc_transport::livekit::token::{legacy_token_request, parse_sfu_token};
+use matrix_rtc_transport::livekit::{LiveKitTarget, SfuToken};
 use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaStreamKind, MediaTransport,
     OwnFocusTransport, RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
@@ -305,12 +306,12 @@ pub(crate) struct JsMediaTransport {
 }
 
 /// What a connect needs: the delegate that fetches and connects, and the
-/// backend that answers the OpenID token requests.
+/// backend that answers the OpenID and homeserver token requests.
 struct JsConnector {
     delegate: JsValue,
-    /// The page's Matrix backend, which answers the OpenID token requests.
+    /// The page's Matrix backend, which answers the OpenID token requests and
+    /// the homeserver's MSC4195 `get_token`.
     backend: Arc<dyn MatrixBackend>,
-    token_endpoint: TokenEndpoint,
 }
 
 impl JsMediaTransport {
@@ -318,59 +319,73 @@ impl JsMediaTransport {
         delegate: JsValue,
         backend: Arc<dyn MatrixBackend>,
         identity_mapper: RtcIdentityMapper,
-        token_endpoint: TokenEndpoint,
     ) -> Self {
         Self {
-            connector: Rc::new(JsConnector {
-                delegate,
-                backend,
-                token_endpoint,
-            }),
+            connector: Rc::new(JsConnector { delegate, backend }),
             identity_mapper,
         }
     }
 }
 
 impl JsConnector {
-    /// Obtain a fresh OpenID token from the backend and exchange it for an
-    /// SFU JWT: Rust builds the request and decodes the response
-    /// (`matrix_rtc_transport::livekit`), the delegate performs the fetch.
+    /// Obtain an SFU token through the flow the connection key's target
+    /// selects: the homeserver's MSC4195 `get_token` through the backend, or an
+    /// OpenID token exchanged at the legacy JWT service's `/sfu/get`, where
+    /// Rust builds the request and decodes the response
+    /// (`matrix_rtc_transport::livekit`) and the delegate performs the fetch.
+    /// No fallback between the two: each mints a different identity.
     async fn acquire_token(
         &self,
-        livekit_service_url: &str,
+        connection_key: &str,
         ctx: &ConnectionContext,
     ) -> Result<SfuToken, TransportError> {
-        let openid = self.backend.openid_token().await.map_err(|error| {
-            let message = format!("openid token: {error}");
-            if error.is_permanent() {
+        // A bare URL, as a page connecting outside a call may pass, names a
+        // legacy JWT service.
+        let target = LiveKitTarget::from_connection_key(connection_key).unwrap_or_else(|| {
+            LiveKitTarget::SfuGet {
+                service_url: connection_key.to_owned(),
+            }
+        });
+        let backend_error = |what: &str, error: BackendError| {
+            let message = format!("{what}: {error}");
+            let refused = error.is_permanent()
+                || error
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status) && status != 429);
+            if refused {
                 TransportError::Refused(message)
             } else {
                 TransportError::Connect(message)
             }
-        })?;
-
-        let (url, body) = match self.token_endpoint {
-            TokenEndpoint::Msc4195 => get_token_request(
-                livekit_service_url,
-                &ctx.room_id,
-                &ctx.slot_id,
-                &matrix_rtc_transport::livekit::MemberClaims {
-                    id: ctx.member.member_id.clone(),
-                    claimed_user_id: ctx.member.user_id.clone(),
-                    claimed_device_id: ctx.member.device_id.clone(),
-                },
-                &openid,
-            ),
-            // `room` is the room id, because that is the `livekit_alias` this
-            // generation announces on a focus; the two must agree or the
-            // clients land in different LiveKit rooms.
-            TokenEndpoint::LegacyElementCall => legacy_token_request(
-                livekit_service_url,
-                &ctx.room_id,
-                &ctx.member.device_id,
-                &openid,
-            ),
         };
+        let service_url = match target {
+            LiveKitTarget::CsApi { url, server_name } => {
+                let jwt = self
+                    .backend
+                    .livekit_token(&LiveKitTokenRequest {
+                        server_name: Some(server_name),
+                        url: url.clone(),
+                        room_id: ctx.room_id.clone(),
+                        slot_id: ctx.slot_id.clone(),
+                        member_id: ctx.member.member_id.clone(),
+                    })
+                    .await
+                    .map_err(|error| backend_error("homeserver livekit token", error))?;
+                return Ok(SfuToken { jwt, url });
+            }
+            LiveKitTarget::SfuGet { service_url } => service_url,
+        };
+
+        let openid = self
+            .backend
+            .openid_token()
+            .await
+            .map_err(|error| backend_error("openid token", error))?;
+        // `room` is the room id, because that is the `livekit_alias` the
+        // legacy generation announces on a focus; the two must agree or the
+        // clients land in different LiveKit rooms.
+        let (url, body) =
+            legacy_token_request(&service_url, &ctx.room_id, &ctx.member.device_id, &openid);
 
         // The JSON-compatible serializer, so the body reaches the delegate as
         // a plain object — the default turns serde maps into ES `Map`s, which
@@ -473,24 +488,29 @@ impl MediaTransport for JsMediaTransport {
         "livekit"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
-        match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+    fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
+        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+    }
+
+    fn shares_identity(&self, a: &str, b: &str) -> bool {
+        match (
+            LiveKitTarget::from_connection_key(a),
+            LiveKitTarget::from_connection_key(b),
+        ) {
+            (Some(a), Some(b)) => a.same_flow(&b),
+            _ => false,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        // Same rule as the native transport: without an attributable sending
-        // device there is no identity to expect on the SFU. Through the mapper
-        // rather than `pseudonymous_identity` directly, so a legacy call
-        // derives peer identities exactly as it derives its own.
-        let device_id = member.origin.sender_device_id()?;
-        Some((self.identity_mapper)(
-            &member.sender,
-            device_id,
-            &member.member_id,
-        ))
+        // Same rule as the native transport, through the mapper so peers'
+        // identities are derived exactly as the core addresses their keys.
+        (self.identity_mapper)(&IdentitySubject {
+            user_id: &member.sender,
+            device_id: member.origin.sender_device_id(),
+            member_id: &member.member_id,
+            transports: &member.transports,
+        })
     }
 
     async fn connect(

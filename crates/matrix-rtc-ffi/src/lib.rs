@@ -179,8 +179,14 @@ impl From<FfiSlotEncryption> for matrix_rtc_core::SlotEncryption {
 /// A transport a member publishes media on (MSC4143 `transports.published`).
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiRtcTransport {
-    /// MSC4195 LiveKit transport.
-    LiveKit { livekit_service_url: String },
+    /// MSC4195 LiveKit transport: an SFU `url`, the legacy JWT service's
+    /// `livekit_service_url`, or both; `server_name` names the SFU's
+    /// homeserver when it is not the publisher's.
+    LiveKit {
+        url: Option<String>,
+        livekit_service_url: Option<String>,
+        server_name: Option<String>,
+    },
     /// A transport this SDK does not know; kept for forward compatibility.
     Unsupported { transport_type: String },
 }
@@ -189,7 +195,9 @@ impl From<&matrix_rtc_core::RtcTransport> for FfiRtcTransport {
     fn from(transport: &matrix_rtc_core::RtcTransport) -> Self {
         match transport {
             matrix_rtc_core::RtcTransport::LiveKit(livekit) => FfiRtcTransport::LiveKit {
-                livekit_service_url: livekit.livekit_service_url.clone(),
+                url: livekit.url().map(str::to_owned),
+                livekit_service_url: livekit.livekit_service_url().map(str::to_owned),
+                server_name: livekit.server_name().map(str::to_owned),
             },
             matrix_rtc_core::RtcTransport::Unsupported(unsupported) => {
                 FfiRtcTransport::Unsupported {
@@ -411,7 +419,7 @@ impl RtcRoom {
             self.room_id,
             params.summary()
         );
-        let mut options = params.into_call();
+        let mut options = params.into_call()?;
         options.join.keep_alive_interval_ms = interval.map(|interval| interval.as_millis() as u64);
         let room = self.open().await?;
         let joined = room.join_call(options).await.inspect_err(|error| {
@@ -1131,7 +1139,8 @@ mod tests {
         FfiJoinSessionParams {
             application_slot_id: None,
             transport: FfiJoinTransport::Publish {
-                livekit_service_url: SFU.to_owned(),
+                url: None,
+                livekit_service_url: Some(SFU.to_owned()),
             },
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
@@ -1281,7 +1290,9 @@ mod tests {
         assert_eq!(
             joined[0].transports,
             vec![FfiRtcTransport::LiveKit {
-                livekit_service_url: SFU.to_owned(),
+                url: None,
+                livekit_service_url: Some(SFU.to_owned()),
+                server_name: None,
             }]
         );
         assert_eq!(joined[0].can_subscribe, vec!["livekit".to_owned()]);
@@ -1791,48 +1802,6 @@ mod tests {
     // The dialects are tested in `matrix_rtc_core::compat`. Tested here: the
     // mode chosen when the room opens reaches every send, the two of the join
     // included.
-
-    #[tokio::test]
-    async fn a_sticky_compat_join_is_readable_by_both_generations() {
-        let mock = MockHost::new();
-        let client = RtcClient::new(mock.clone());
-        let room = open(
-            &client,
-            &mock,
-            Some(FfiMembershipFormat::Sticky2025),
-            false,
-            vec![open_slot(None)],
-            Vec::new(),
-        )
-        .await;
-
-        let call = room.clone().join_call(join_params()).await.expect("join");
-        let membership = mock
-            .sends()
-            .into_iter()
-            .find(|send| send.carrier == Carrier::Sticky)
-            .expect("the membership should still be a sticky event");
-        assert_eq!(membership.event_type, "org.matrix.msc4143.rtc.member");
-        assert_eq!(
-            membership.content.pointer("/member/id").unwrap(),
-            &serde_json::json!(call.member_id()),
-        );
-        assert_eq!(
-            membership.content.pointer("/member/user_id").unwrap(),
-            &serde_json::json!("@alice:example.org"),
-        );
-        assert_eq!(
-            membership.content.pointer("/member/device_id").unwrap(),
-            &serde_json::json!("DEVICE"),
-        );
-        assert_eq!(
-            membership
-                .content
-                .pointer("/rtc_transports/0/livekit_service_url")
-                .unwrap(),
-            &serde_json::json!(SFU),
-        );
-    }
 
     #[tokio::test]
     async fn a_pre_sticky_join_publishes_room_state() {

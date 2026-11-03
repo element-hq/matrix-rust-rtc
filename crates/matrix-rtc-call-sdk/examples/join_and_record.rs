@@ -84,16 +84,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let insecure_tls = env::var("INSECURE_TLS").is_ok();
     // Set for a call shared with Element Call on the JS SDK.
     //
-    // `sticky` (or a bare value, for continuity with when this was a boolean):
-    // our membership also carries the pre-2026 fields it needs, and our media
-    // key goes out under the to-device type it listens for, and only that one.
-    //
     // `state`: the generation before MSC4354, where membership is room state.
     // Nothing about such a call is visible to a spec-current peer.
     let format = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
         None => MembershipFormat::Current,
         Some("state") => MembershipFormat::RoomState,
-        Some(_) => MembershipFormat::Sticky2025,
+        Some(other) => return Err(format!("unknown LEGACY_ELEMENT_CALL {other:?}").into()),
     };
     let record_secs: u64 = env::var("RECORD_SECS")
         .ok()
@@ -191,9 +187,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         &room,
         LiveKitCallOptions {
             slot_id,
-            livekit_transport: Some(LiveKitTransport {
-                livekit_service_url,
-            }),
+            livekit_transport: Some(LiveKitTransport::service(livekit_service_url)),
             http: Some(http),
             format,
             ..LiveKitCallOptions::default()

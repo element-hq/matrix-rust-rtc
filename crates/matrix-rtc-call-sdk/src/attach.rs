@@ -11,14 +11,13 @@
 //! media (peers in the roster with nothing to decrypt), so every host — the
 //! FFI and wasm media sessions, the native `LiveKitCall` facade — goes through
 //! [`attach_media`] rather than repeating it. Transport-specific setup (the key
-//! ring, the token endpoint) stays with the caller.
+//! ring) stays with the caller.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
-use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{MatrixBackend, RtcIdentityMapper, TransportIntent};
+use matrix_rtc_core::{IdentitySubject, MatrixBackend, RtcIdentityMapper, TransportIntent};
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
     TransportConnection, TransportError,
@@ -34,14 +33,11 @@ pub struct AttachOptions {
     /// The account and device the call was joined as.
     pub own_user_id: String,
     pub own_device_id: String,
-    /// How `(user, device, member_id)` becomes a transport identity. MUST be
+    /// How a member becomes a transport identity. MUST be
     /// the one the transport was built with: the core's encryption manager,
     /// the transport, our own identity and the key ring all derive through
     /// it, and a skew between them is silent.
     pub identity_mapper: RtcIdentityMapper,
-    /// The membership format the call's room was opened in: the token request
-    /// names the slot as that generation spells it.
-    pub format: MembershipFormat,
     /// Damping of the tile order.
     pub stability: StabilityConfig,
     /// How long our own focus may stay unreachable before the call ends
@@ -104,14 +100,16 @@ where
         )));
     }
     let own_key = match call.transport() {
-        TransportIntent::Publish(published) => {
-            Some(transport.connection_key(published).ok_or_else(|| {
-                AttachError::UnsupportedTransport(format!(
-                    "the call publishes on {published:?}, which is not a {} transport",
-                    transport.transport_type(),
-                ))
-            })?)
-        }
+        TransportIntent::Publish(published) => Some(
+            transport
+                .connection_key(published, &options.own_user_id)
+                .ok_or_else(|| {
+                    AttachError::UnsupportedTransport(format!(
+                        "the call publishes on {published:?}, which is not a {} transport",
+                        transport.transport_type(),
+                    ))
+                })?,
+        ),
         TransportIntent::ReceiveOnly { .. } => None,
     };
     log::info!(
@@ -149,8 +147,7 @@ where
 
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
-        // The token request names the slot as this generation spells it.
-        slot_id: options.format.token_slot_id(&slot_id).into_owned(),
+        slot_id: slot_id.clone(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: options.own_user_id.clone(),
@@ -204,8 +201,19 @@ where
         );
     }
 
-    let own_identity =
-        (options.identity_mapper)(&options.own_user_id, &options.own_device_id, &member_id);
+    // Derived as the core derives it for our own key: from the transport we
+    // publish on, falling back the same way when nothing is published.
+    let own_transports = match call.transport() {
+        TransportIntent::Publish(published) => std::slice::from_ref(published),
+        TransportIntent::ReceiveOnly { .. } => &[],
+    };
+    let own_identity = (options.identity_mapper)(&IdentitySubject {
+        user_id: &options.own_user_id,
+        device_id: Some(&options.own_device_id),
+        member_id: &member_id,
+        transports: own_transports,
+    })
+    .unwrap_or_else(|| format!("{}:{}", options.own_user_id, options.own_device_id));
     let own_connection = match &own_key {
         Some(own_key) => {
             // Not awaited: the join already has the user in the call, and our

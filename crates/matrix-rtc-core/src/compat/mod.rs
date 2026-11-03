@@ -20,14 +20,14 @@
 //! There are two, and they disagree about more than field names:
 //!
 //! - [`sticky_2025`] — the 2025 format. Already MSC4354 sticky-based; only the
-//!   fields inside the member content differ.
+//!   fields inside the member content differ. We only read it now.
 //! - [`room_state`] — the format before MSC4354, when membership was
 //!   `org.matrix.msc3401.call.member` **room state**. A different carrier, a
 //!   different SFU participant identity, and a different token endpoint.
 //!
-//! [`MembershipFormat`] selects between them and current MSC4143. It is an enum
-//! rather than a pair of flags because the generations are mutually exclusive by
-//! construction: a membership is a sticky event or a state event, never both.
+//! [`MembershipFormat`] selects between current MSC4143 and the state format. It
+//! is an enum rather than a flag because the generations are mutually exclusive
+//! by construction: a membership is a sticky event or a state event, never both.
 //!
 //! # Why it is shaped this way
 //!
@@ -53,19 +53,17 @@
 //!
 //! # What this module cannot own
 //!
-//! Three things about the state dialect refuse to be JSON, and are named here so
+//! One thing about the state dialect refuses to be JSON, and is named here so
 //! the boundary stays deliberate rather than eroding: the choice of ruma request
-//! type (a membership is `PUT .../state/...` rather than a sticky send), the
-//! choice of token endpoint, and the participant-identity derivation. Each is one
-//! `match` on [`MembershipFormat`] or [`OutboundDialect`] at the call site.
+//! type (a membership is `PUT .../state/...` rather than a sticky send).
 //! [`MemberEventRoute`] exists precisely to keep the *decision* here while the
 //! *performing* stays in the `sdk` module.
 //!
-//! The identity derivation is the one that also refuses to be *Matrix*: it
-//! hashes per MSC4195, which is a LiveKit document. So it lives wholly in the
-//! transport crate — `matrix_rtc_livekit::identity_mapper` matches on
-//! [`MembershipFormat`] there rather than this module reaching for a hash it has
-//! no business knowing.
+//! The LiveKit token endpoint and participant identity are not the format's at
+//! all: they follow the published transport (a `livekit_service_url` means the
+//! JWT service's `/sfu/get` and `{user}:{device}`, a bare SFU `url` the
+//! homeserver's MSC4195 `get_token` and a hash), and live wholly in the
+//! transport crate (`matrix_rtc_transport::livekit`).
 //!
 //! # Call sites
 //!
@@ -85,16 +83,11 @@
 //! In `matrix-rtc-livekit`:
 //!
 //! 3. `matrix_rtc_call_sdk::LiveKitCall::join` — mode selection and the member id.
-//! 4. `identity_mapper` — the participant-identity derivation (see above).
-//! 5. `transport_impl` + `token` — `/sfu/get`.
 //!
 //! In `matrix-rtc-ffi` and `matrix-rtc-wasm`, which reach the same dialects from
 //! a host that owns its own Matrix stack:
 //!
-//! 6. `compat` — the binding-shaped mode vocabulary, given at `RtcClient::room`.
-//! 7. `media::session` — the identity derivation and token endpoint again.
-
-use std::borrow::Cow;
+//! 4. `compat` — the binding-shaped mode vocabulary, given at `RtcClient::room`.
 
 use serde_json::Value;
 
@@ -109,33 +102,24 @@ pub use dialect_backend::{DialectBackend, DialectHold};
 pub use room_state::{
     RoomStateDialect, STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
 };
-pub use sticky_2025::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent, Sticky2025Dialect};
+pub use sticky_2025::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent};
 
 /// Which MatrixRTC membership format a room is read and written in.
 ///
-/// Mutually exclusive by construction, because the two legacy generations
-/// disagree about the *carrier* of a membership, not just its fields. Reading the
-/// 2025 sticky dialect needs no flag and is always on regardless of this setting;
-/// see the module docs.
+/// Mutually exclusive by construction, because the generations disagree about
+/// the *carrier* of a membership, not just its fields. Reading the 2025 sticky
+/// dialect needs no flag and is always on regardless of this setting; see the
+/// module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
     /// interoperates with spec-current peers.
     #[default]
     Current,
-    /// The 2025 format: MSC4354 sticky events carrying the pre-2026 field names
-    /// alongside the spec ones.
-    ///
-    /// Joins stay MSC4143-valid — the legacy fields ride alongside — so one event
-    /// serves both dialects. Leaves and media keys cannot be additive: a leave
-    /// becomes the legacy bare-sticky-key content, and keys go out as
-    /// `io.element.call.encryption_keys` *instead of* the spec type, since a
-    /// to-device message has only one type.
-    Sticky2025,
     /// The format before MSC4354: membership as
-    /// `org.matrix.msc3401.call.member` **room state**, plain
-    /// `{user}:{device}` SFU identities, and the pre-MSC4195 `/sfu/get` token
-    /// endpoint.
+    /// `org.matrix.msc3401.call.member` **room state**, published with legacy
+    /// foci (`livekit_service_url`), so `/sfu/get` tokens and `{user}:{device}`
+    /// SFU identities.
     ///
     /// Nothing about this format is additive — a session joined this way is
     /// visible to that generation of clients and to nobody else. It exists for interop
@@ -148,17 +132,6 @@ impl MembershipFormat {
     pub fn reads_state_membership(self) -> bool {
         matches!(self, Self::RoomState)
     }
-
-    /// The slot id to name in an MSC4195 token request in this mode, which
-    /// must be the one peers of this generation name there too: the
-    /// authorisation service derives the SFU room from it.
-    pub fn token_slot_id(self, slot_id: &str) -> Cow<'_, str> {
-        match self {
-            Self::Sticky2025 => sticky_2025::legacy_slot_id(slot_id),
-            // `RoomState` asks `/sfu/get`, which takes no slot id.
-            Self::Current | Self::RoomState => Cow::Borrowed(slot_id),
-        }
-    }
 }
 
 /// Where a member event goes on the wire, and in what shape.
@@ -168,8 +141,7 @@ impl MembershipFormat {
 #[derive(Clone, Debug)]
 pub enum MemberEventRoute {
     /// An MSC4354 sticky timeline event — the only carrier the spec knows, and
-    /// the one both [`MembershipFormat::Current`] and
-    /// [`MembershipFormat::Sticky2025`] take.
+    /// the one [`MembershipFormat::Current`] takes.
     Sticky { event_type: String, content: Value },
     /// A room state event, which is how MatrixRTC membership worked before
     /// MSC4354. The core's sticky `duration_ms` is meaningless here: room state
@@ -192,8 +164,6 @@ pub enum MemberEventRoute {
 pub enum OutboundDialect {
     /// Current MSC4143 + MSC4354, unmodified.
     None,
-    /// Element Call as of 2025.
-    Sticky(Sticky2025Dialect),
     /// Element Call before MSC4354.
     State(RoomStateDialect),
 }
@@ -203,8 +173,8 @@ impl OutboundDialect {
     ///
     /// Anything that is not a membership passes through untouched — the legacy
     /// generations differ about memberships, not about everything — but its
-    /// *carrier* still follows the generation: a sticky event for the two that
-    /// have a sticky map, an ordinary room event for the pre-sticky one, which
+    /// *carrier* still follows the generation: a sticky event where there is a
+    /// sticky map, an ordinary room event for the pre-sticky one, which
     /// has none. That keeps a host that cannot send sticky events at all (no
     /// MSC4354 in its SDK) able to run a [`MembershipFormat::RoomState`]
     /// call end to end, notification included.
@@ -221,13 +191,13 @@ impl OutboundDialect {
         content: Value,
         lifetime_ms: Option<u64>,
     ) -> MemberEventRoute {
-        if !Sticky2025Dialect::is_member_event(&event_type) {
+        if !sticky_2025::is_member_event(&event_type) {
             return match self {
                 Self::State(_) => MemberEventRoute::Room {
                     event_type,
                     content,
                 },
-                Self::None | Self::Sticky(_) => MemberEventRoute::Sticky {
+                Self::None => MemberEventRoute::Sticky {
                     event_type,
                     content,
                 },
@@ -239,14 +209,6 @@ impl OutboundDialect {
                 event_type,
                 content,
             },
-            Self::Sticky(dialect) => {
-                let mut content = content;
-                dialect.rewrite_member_content(&mut content);
-                MemberEventRoute::Sticky {
-                    event_type,
-                    content,
-                }
-            }
             Self::State(dialect) => MemberEventRoute::State {
                 event_type: STATE_MEMBER_EVENT_TYPE,
                 state_key: dialect.state_key(),
@@ -262,16 +224,13 @@ impl OutboundDialect {
     /// for [`OutboundDialect::None`]. The event type never moves — both
     /// generations already agree on it — so only the content is passed.
     ///
-    /// Both legacy generations read the same flat shape, so both delegate to the
-    /// one implementation: the pre-sticky one never sends notifications itself,
-    /// but a client of that vintage still parses this shape and there is no
-    /// other for it to read.
+    /// The pre-sticky generation reads the 2025 flat shape: it never sends
+    /// notifications itself, but a client of that vintage still parses this
+    /// shape and there is no other for it to read.
     pub fn rewrite_notification(&self, event_type: &str, content: Value) -> Value {
         let flattened = match self {
             Self::None => None,
-            Self::Sticky(_) | Self::State(_) => {
-                sticky_2025::flatten_notification_content(event_type, &content)
-            }
+            Self::State(_) => sticky_2025::flatten_notification_content(event_type, &content),
         };
         flattened.unwrap_or(content)
     }
@@ -279,10 +238,9 @@ impl OutboundDialect {
     /// Translate an outbound media key into the legacy type and shape, or `None`
     /// to send it untouched.
     ///
-    /// Both legacy generations use the same to-device type and the same content,
-    /// so both arms delegate to the one implementation. The state dialect gets
-    /// the right `member.id` for free: in that mode the core's member id already
-    /// *is* the legacy `membershipID`.
+    /// The pre-sticky generation uses the 2025 to-device type and content. The
+    /// state dialect gets the right `member.id` for free: in that mode the
+    /// core's member id already *is* the legacy `membershipID`.
     pub fn rewrite_key_message(
         &self,
         message_type: &str,
@@ -290,7 +248,6 @@ impl OutboundDialect {
     ) -> Option<(String, Value)> {
         match self {
             Self::None => None,
-            Self::Sticky(dialect) => dialect.rewrite_key_message(message_type, content),
             Self::State(dialect) => sticky_2025::rewrite_key_message(
                 dialect.own_device_id(),
                 dialect.slot_id(),
@@ -335,24 +292,18 @@ mod tests {
         );
     }
 
-    /// Both generations with a sticky map keep the notification sticky, and the
+    /// A format with a sticky map keeps the notification sticky, and the
     /// non-member short-circuit leaves the content alone.
     #[test]
-    fn a_notification_stays_sticky_in_the_other_dialects() {
-        for dialect in [
-            OutboundDialect::None,
-            OutboundDialect::Sticky(Sticky2025Dialect::new(
-                "@us:example.io",
-                "DEVICE",
-                "m.call#room",
-            )),
-        ] {
-            let route =
-                dialect.route_member_event("m.rtc.notification".into(), notification(), None);
-            assert!(
-                matches!(route, MemberEventRoute::Sticky { ref content, .. } if *content == notification()),
-                "got {route:?}"
-            );
-        }
+    fn a_notification_stays_sticky_in_the_current_format() {
+        let route = OutboundDialect::None.route_member_event(
+            "m.rtc.notification".into(),
+            notification(),
+            None,
+        );
+        assert!(
+            matches!(route, MemberEventRoute::Sticky { ref content, .. } if *content == notification()),
+            "got {route:?}"
+        );
     }
 }

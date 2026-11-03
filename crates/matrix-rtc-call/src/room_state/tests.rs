@@ -81,9 +81,9 @@ fn member_event(
 }
 
 fn join_params() -> JoinSessionParams {
-    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(LiveKitTransport {
-        livekit_service_url: "https://sfu.example.org".to_owned(),
-    }))
+    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+        LiveKitTransport::service("https://sfu.example.org".to_owned()),
+    ))
 }
 
 type Call = CallRoomState<DialectBackend<MockBackend>>;

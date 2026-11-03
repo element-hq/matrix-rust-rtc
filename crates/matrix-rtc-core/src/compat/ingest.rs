@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use super::{
     MemberContent, MembershipFormat, OutboundDialect, RoomStateDialect, STATE_MEMBER_EVENT_TYPE,
-    Sticky2025Dialect, room_state, sticky_2025,
+    room_state, sticky_2025,
 };
 
 /// One `m.rtc.member` sticky event, with its content raw.
@@ -108,9 +108,6 @@ pub fn outbound_dialect(
 ) -> OutboundDialect {
     match compat {
         MembershipFormat::Current => OutboundDialect::None,
-        MembershipFormat::Sticky2025 => {
-            OutboundDialect::Sticky(Sticky2025Dialect::new(user_id, device_id, slot_id))
-        }
         MembershipFormat::RoomState => {
             OutboundDialect::State(RoomStateDialect::new(user_id, device_id, room_id, slot_id))
         }
@@ -620,7 +617,7 @@ mod tests {
         });
 
         let sticky = parse_legacy_key(
-            MembershipFormat::Sticky2025,
+            MembershipFormat::Current,
             "@alice:example.org",
             Some("ALICEDEVICE"),
             &content,

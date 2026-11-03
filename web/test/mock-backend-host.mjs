@@ -119,6 +119,7 @@ export function mockBackendHost({
         matrix_server_name: 'example.org',
         expires_in: 3600,
       }),
+    getLivekitToken: (request) => Promise.resolve({ jwt: `jwt-for-${request.url}` }),
     rtcTransports: () => Promise.resolve(transports),
     // Test access.
     _sink: (roomId) => rooms.get(roomId)?.sink,

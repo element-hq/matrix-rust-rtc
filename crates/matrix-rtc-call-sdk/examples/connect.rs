@@ -27,7 +27,7 @@ use std::error::Error;
 
 use livekit::RoomEvent;
 use matrix_rtc_call_sdk::SdkMatrixBackend;
-use matrix_rtc_livekit::{LiveKitTransportConfig, MemberClaims, TokenEndpoint, connect};
+use matrix_rtc_livekit::{LiveKitTarget, LiveKitTransportConfig, connect};
 
 fn required(name: &str) -> Result<String, Box<dyn Error>> {
     env::var(name).map_err(|_| format!("missing required env var {name}").into())
@@ -71,15 +71,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     //    a real client uses its `m.rtc.member` membership id.
     let member_id = env::var("MEMBER_ID").unwrap_or_else(|_| format!("{user}-{device_id}"));
     let config = LiveKitTransportConfig {
-        livekit_service_url,
+        target: LiveKitTarget::SfuGet {
+            service_url: livekit_service_url,
+        },
         room_id,
         slot_id,
-        member: MemberClaims {
-            id: member_id,
-            claimed_user_id: user.clone(),
-            claimed_device_id: device_id,
-        },
-        token_endpoint: TokenEndpoint::default(),
+        member_id,
+        device_id,
     };
 
     // 3. HTTP client for the authorisation service exchange.

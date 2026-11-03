@@ -74,8 +74,6 @@ use tokio::signal::unix::{SignalKind, signal};
 enum MembershipFormatArg {
     /// Current MSC4143 + MSC4354 only.
     Current,
-    /// Element Call as of 2025: sticky events with the pre-2026 field names.
-    Sticky,
     /// Element Call before MSC4354: membership as room state.
     State,
 }
@@ -84,7 +82,6 @@ impl From<MembershipFormatArg> for MembershipFormat {
     fn from(arg: MembershipFormatArg) -> Self {
         match arg {
             MembershipFormatArg::Current => Self::Current,
-            MembershipFormatArg::Sticky => Self::Sticky2025,
             MembershipFormatArg::State => Self::RoomState,
         }
     }
@@ -597,9 +594,7 @@ impl Fleet {
                 LiveKitCallOptions {
                     slot_id: args.slot_id.clone(),
                     application: args.application.clone(),
-                    livekit_transport: Some(LiveKitTransport {
-                        livekit_service_url: args.livekit_url.clone(),
-                    }),
+                    livekit_transport: Some(LiveKitTransport::service(args.livekit_url.clone())),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
                     format: args.format.into(),

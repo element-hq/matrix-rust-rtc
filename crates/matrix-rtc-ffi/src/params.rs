@@ -13,8 +13,13 @@ pub enum FfiJoinTransport {
     /// Publish on the first LiveKit transport the homeserver advertises
     /// (`rtcTransports` on the backend); the join fails if there is none.
     Advertised,
-    /// Publish on this LiveKit focus, whatever the homeserver advertises.
-    Publish { livekit_service_url: String },
+    /// Publish on this LiveKit transport, whatever the homeserver advertises:
+    /// an SFU `url` (tokens from the homeserver), the legacy JWT service's
+    /// `livekit_service_url`, or both (tokens from the service). At least one.
+    Publish {
+        url: Option<String>,
+        livekit_service_url: Option<String>,
+    },
     /// Publish nothing and only receive, as a recorder or other observer does.
     ReceiveOnly,
 }
@@ -201,17 +206,27 @@ pub struct FfiLeaveSessionParams {
     pub leave_reason: Option<crate::FfiLeaveReason>,
 }
 
-impl From<FfiJoinTransport> for matrix_rtc_call::JoinTransport {
-    fn from(value: FfiJoinTransport) -> Self {
-        match value {
+impl TryFrom<FfiJoinTransport> for matrix_rtc_call::JoinTransport {
+    type Error = crate::MatrixRtcFfiError;
+
+    fn try_from(value: FfiJoinTransport) -> Result<Self, Self::Error> {
+        Ok(match value {
             FfiJoinTransport::Advertised => Self::Advertised,
             FfiJoinTransport::Publish {
+                url,
                 livekit_service_url,
-            } => Self::Publish(matrix_rtc_core::LiveKitTransport {
-                livekit_service_url,
-            }),
+            } => Self::Publish(
+                matrix_rtc_core::LiveKitTransport::new(url, livekit_service_url, None).ok_or_else(
+                    || {
+                        crate::MatrixRtcFfiError::InvalidInput(
+                            "a published LiveKit transport needs a url or a livekit_service_url"
+                                .to_owned(),
+                        )
+                    },
+                )?,
+            ),
             FfiJoinTransport::ReceiveOnly => Self::ReceiveOnly,
-        }
+        })
     }
 }
 
@@ -236,8 +251,15 @@ impl FfiJoinSessionParams {
         let transport = match &self.transport {
             FfiJoinTransport::Advertised => "advertised".to_owned(),
             FfiJoinTransport::Publish {
+                url,
                 livekit_service_url,
-            } => format!("publish:{livekit_service_url}"),
+            } => format!(
+                "publish:{}",
+                livekit_service_url
+                    .as_deref()
+                    .or(url.as_deref())
+                    .unwrap_or("?")
+            ),
             FfiJoinTransport::ReceiveOnly => "receive_only".to_owned(),
         };
 
@@ -263,20 +285,22 @@ impl FfiJoinSessionParams {
     /// host-chosen `member.id` reused across joins would keep the MSC4195
     /// participant identity stable while the key index restarts at 0, so peers
     /// decrypt new media with a stale key and never recover.
-    pub(crate) fn into_call(self) -> matrix_rtc_call::CallJoinOptions {
+    pub(crate) fn into_call(
+        self,
+    ) -> Result<matrix_rtc_call::CallJoinOptions, crate::MatrixRtcFfiError> {
         let mut options = matrix_rtc_call::CallJoinOptions::new();
         if let Some(name) = self.application_slot_id {
             options = options.slot(name);
         }
         let join = &mut options.join;
-        join.transport = self.transport.into();
+        join.transport = self.transport.try_into()?;
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
         options.kind = self.kind.into();
         options.reactions = self.reactions.map(Into::into);
-        options
+        Ok(options)
     }
 }
 

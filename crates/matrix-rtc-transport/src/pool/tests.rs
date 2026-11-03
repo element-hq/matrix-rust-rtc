@@ -54,9 +54,9 @@ impl MediaTransport for FakeTransport {
         "fake"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
+    fn connection_key(&self, transport: &RtcTransport, _publisher_user_id: &str) -> Option<String> {
         match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
+            RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(str::to_owned),
             RtcTransport::Unsupported(_) => None,
         }
     }
@@ -199,9 +199,9 @@ fn member_on(member_id: &str, focus: &str) -> JoinedMembership {
         membership_ts: None,
         origin_server_ts: None,
         application: "m.call".into(),
-        transports: vec![RtcTransport::LiveKit(LiveKitTransport {
-            livekit_service_url: focus.to_owned(),
-        })],
+        transports: vec![RtcTransport::LiveKit(LiveKitTransport::service(
+            focus.to_owned(),
+        ))],
         can_subscribe: vec!["livekit".to_owned()],
     }
 }
@@ -916,9 +916,7 @@ mod fallback {
             } => {
                 assert_eq!(
                     *transport,
-                    RtcTransport::LiveKit(LiveKitTransport {
-                        livekit_service_url: connection_key.clone(),
-                    })
+                    RtcTransport::LiveKit(LiveKitTransport::service(connection_key.clone()))
                 );
                 Some((*at, connection_key.clone()))
             }

@@ -294,9 +294,19 @@ pub trait MediaTransport: MaybeSend {
     /// (e.g. `"livekit"`). Used for logging and `can_subscribe` matching.
     fn transport_type(&self) -> &'static str;
 
-    /// The connection grouping key for a published transport, if this backend
-    /// can serve it. Members with equal keys share one connection.
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String>;
+    /// The connection grouping key for a transport published by
+    /// `publisher_user_id`, if this backend can serve it. Members with equal
+    /// keys share one connection, so the key must capture everything the
+    /// connection's authentication depends on.
+    fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String>;
+
+    /// Whether connecting through `a` and through `b` gives us the same
+    /// identity on the media plane: only then may our media move from one to
+    /// the other (034 R25) without peers losing track of us.
+    fn shares_identity(&self, a: &str, b: &str) -> bool {
+        let _ = (a, b);
+        true
+    }
 
     /// The identity this member will have on the media plane, used to
     /// reverse-map transport participants to memberships. `None` when the

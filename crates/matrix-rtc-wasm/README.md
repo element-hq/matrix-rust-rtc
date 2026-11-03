@@ -164,11 +164,13 @@ until it leaves or is freed.
 
 ### Older membership formats (Element Call compatibility)
 
-Pass `format` when opening the room (`rtc.room`) — `"current"` (default, spec-current),
-`"sticky_2025"` (Element Call "Matrix 2.0", 2025), or `"room_state"`
-(what deployed Element Call speaks) — and the library handles the rest:
-which room state it subscribes to, the inbound translation, outbound
-membership/key rewrites, identities, the token endpoint. Your host delivers
+Pass `format` when opening the room (`rtc.room`) — `"current"` (default, spec-current)
+or `"room_state"` (Element Call's pre-sticky generation) — and the library handles
+the rest: which room state it subscribes to, the inbound translation and the outbound
+membership/key rewrites. The token endpoint and the SFU identity follow the
+published transport, not the format: a transport naming `livekit_service_url` gets its
+tokens from that service's `/sfu/get`, one naming only an SFU `url` from the
+homeserver, through your host's `getLivekitToken`. Your host delivers
 the same raw events in every format; in `room_state` the dead man's switch
 comes through `sendDelayedStateEvent`, and in the sticky formats through
 `sendDelayedStickyEvent`.

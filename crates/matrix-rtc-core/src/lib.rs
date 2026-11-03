@@ -39,14 +39,15 @@ pub use encryption::types::{
     OutboundEncryptionKey, OutdatedKeyFilter, ParticipantDeviceInfo, ReceivedEncryptionKey,
 };
 pub use encryption::{
-    DiscardedKey, EncryptionKeySignalHandler, EncryptionManager, KEY_MESSAGE_TYPE, RtcClock,
-    RtcIdentityMapper,
+    DiscardedKey, EncryptionKeySignalHandler, EncryptionManager, IdentitySubject, KEY_MESSAGE_TYPE,
+    RtcClock, RtcIdentityMapper,
 };
 pub use error::{CommandError, JoinError, LeaveError};
 pub use host::application::ApplicationIntake;
 pub use host::backend::{
-    BackendError, EventEncryption, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink,
+    BackendError, EventEncryption, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken,
+    RoomSink, RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink,
 };
 pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
@@ -73,7 +74,8 @@ pub use slot::{
     SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus,
 };
 pub use transport::{
-    LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport,
+    LiveKitAuthFlow, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport,
+    UnsupportedTransport, server_name_of,
 };
 pub use wire::wire_event_type;
 
@@ -195,9 +197,7 @@ mod tests {
         member_id: &str,
     ) -> String {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com/jwt".to_owned(),
-            },
+            LiveKitTransport::service("https://example.com/jwt".to_owned()),
         ));
         params.membership_id = Some(member_id.to_owned());
         room.join(params).await.expect("join should succeed")
@@ -735,9 +735,9 @@ mod tests {
             assert_eq!(snapshot[0].member_id, "bob");
             assert_eq!(
                 snapshot[0].transports,
-                [RtcTransport::LiveKit(LiveKitTransport {
-                    livekit_service_url: "https://b".to_owned(),
-                })]
+                [RtcTransport::LiveKit(LiveKitTransport::service(
+                    "https://b".to_owned()
+                ))]
             );
             assert_eq!(room.hold_expires_at(), None, "nothing held");
         }
@@ -1261,9 +1261,7 @@ mod tests {
         join_as(&mut room, "alice-a").await;
 
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com/jwt".to_owned(),
-            },
+            LiveKitTransport::service("https://example.com/jwt".to_owned()),
         ));
         params.membership_id = Some("alice-b".to_owned());
 
@@ -1751,9 +1749,7 @@ mod tests {
         local_manage_media_keys: bool,
     ) {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com/jwt".to_owned(),
-            },
+            LiveKitTransport::service("https://example.com/jwt".to_owned()),
         ));
         params.membership_id = Some("alice-a".to_owned());
         params.encryption_config = Some(EncryptionConfig {
@@ -1829,9 +1825,7 @@ mod tests {
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://sfu.example.com/jwt".to_owned(),
-            },
+            LiveKitTransport::service("https://sfu.example.com/jwt".to_owned()),
         ));
         room.join(params).await.expect("join should succeed");
 
@@ -1897,8 +1891,8 @@ mod tests {
                 match &joined.transports[0] {
                     RtcTransport::LiveKit(livekit) => {
                         assert_eq!(
-                            livekit.livekit_service_url,
-                            "https://example.com/livekit/jwt"
+                            livekit.livekit_service_url(),
+                            Some("https://example.com/livekit/jwt")
                         );
                     }
                     RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),

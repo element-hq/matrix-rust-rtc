@@ -254,6 +254,7 @@ use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
+use crate::transport::RtcTransport;
 
 /// Message type for to-device encryption key distribution (MSC4143).
 ///
@@ -336,15 +337,29 @@ impl DiscardedKey {
     }
 }
 
-/// Maps a `(user_id, device_id, member_id)` triple to the RTC-backend
-/// participant identity that the media layer addresses keys by.
+/// What a member's RTC-backend participant identity is derived from.
+pub struct IdentitySubject<'a> {
+    /// The member's user id (the member event's `sender`).
+    pub user_id: &'a str,
+    /// The device that sent the member event, when it can be attributed.
+    pub device_id: Option<&'a str>,
+    /// The member's `member.id`.
+    pub member_id: &'a str,
+    /// The transports the member publishes on: how a backend issued its token,
+    /// and so which identity it holds, can depend on them.
+    pub transports: &'a [RtcTransport],
+}
+
+/// Maps a member to the RTC-backend participant identity that the media layer
+/// addresses keys by; `None` when the member lacks what the derivation needs.
 ///
 /// `matrix-rtc-core` stays agnostic about how that identity is derived: a
-/// consumer (e.g. the LiveKit transport, which uses the MSC4195 pseudonymous
-/// identity) injects the derivation via [`EncryptionManager::set_identity_mapper`].
-/// When no mapper is set, the manager falls back to its default identity
-/// (`user_id:device_id` for the own key, `member_id` for inbound keys).
-pub type RtcIdentityMapper = Arc<dyn Fn(&str, &str, &str) -> String + Send + Sync>;
+/// consumer (e.g. the LiveKit transport, whose identity follows the token flow
+/// the published transport selects) injects the derivation via
+/// [`EncryptionManager::set_identity_mapper`]. When no mapper is set, the
+/// manager falls back to its default identity (`user_id:device_id` for the own
+/// key, `member_id` for inbound keys).
+pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<String> + Send + Sync>;
 
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
@@ -397,6 +412,8 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// Optional consumer-supplied mapper from `(user_id, device_id, member_id)`
     /// to the RTC-backend participant identity (see [`RtcIdentityMapper`]).
     identity_mapper: Option<RtcIdentityMapper>,
+    /// The transports we publish on, from which our own identity derives.
+    own_transports: Vec<RtcTransport>,
 
     /// Track if key distribution is in progress
     key_distribution_in_progress: Arc<Mutex<bool>>,
@@ -530,6 +547,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             config: EncryptionConfig::default(),
             signal_handler: None,
             identity_mapper: None,
+            own_transports: Vec::new(),
             key_distribution_in_progress: Arc::new(Mutex::new(false)),
             need_new_distribution: Arc::new(Mutex::new(false)),
             next_key_index: Arc::new(Mutex::new(0)),
@@ -592,10 +610,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // Our own outbound key, under the same identity `signal_key_to_app`
         // would use.
         if let Some(outbound) = self.get_outbound_key() {
-            let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
-                None => self.get_own_rtc_backend_identity(),
-            };
+            let rtc_backend_identity = self.own_rtc_identity();
             // Replay with whatever is *left* of this key's `delayBeforeUse`,
             // which is almost always nothing:
             //
@@ -642,13 +657,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 log::debug!("not replaying keys for {member_id}: no known membership");
                 continue;
             };
-            let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(
-                    &membership.sender,
-                    membership.origin.sender_device_id().unwrap_or(""),
-                    &membership.member_id,
-                ),
-                None => membership.member_id.clone(),
+            let Some(rtc_backend_identity) = self.peer_rtc_identity(membership) else {
+                log::debug!("not replaying keys for {member_id}: no derivable identity");
+                continue;
             };
             for key in keys {
                 signals.push(KeyMaterialSignal {
@@ -674,6 +685,40 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// identity carried in [`KeyMaterialSignal`]s (see [`RtcIdentityMapper`]).
     pub fn set_identity_mapper(&mut self, mapper: RtcIdentityMapper) {
         self.identity_mapper = Some(mapper);
+    }
+
+    /// Sets the transports we publish on, from which the mapper derives our
+    /// own identity. Empty for a receive-only participation.
+    pub fn set_own_transports(&mut self, transports: Vec<RtcTransport>) {
+        self.own_transports = transports;
+    }
+
+    /// Our RTC backend identity: the mapper's, else `user_id:device_id`.
+    fn own_rtc_identity(&self) -> String {
+        self.identity_mapper
+            .as_ref()
+            .and_then(|mapper| {
+                mapper(&IdentitySubject {
+                    user_id: &self.own_user_id,
+                    device_id: Some(&self.own_device_id),
+                    member_id: &self.own_member_id,
+                    transports: &self.own_transports,
+                })
+            })
+            .unwrap_or_else(|| self.get_own_rtc_backend_identity())
+    }
+
+    /// A peer's RTC backend identity: the mapper's, else their `member_id`.
+    fn peer_rtc_identity(&self, membership: &JoinedMembership) -> Option<String> {
+        match &self.identity_mapper {
+            Some(mapper) => mapper(&IdentitySubject {
+                user_id: &membership.sender,
+                device_id: membership.origin.sender_device_id(),
+                member_id: &membership.member_id,
+                transports: &membership.transports,
+            }),
+            None => Some(membership.member_id.clone()),
+        }
     }
 
     /// Gets the current timestamp in milliseconds.
@@ -1699,10 +1744,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// eagerly so the transport is listening.
     async fn signal_key_to_app(&self, key: &OutboundEncryptionKey, use_after_ms: u64) {
         if let Some(handler) = &self.signal_handler {
-            let rtc_backend_id = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
-                None => self.get_own_rtc_backend_identity(),
-            };
+            let rtc_backend_id = self.own_rtc_identity();
             let signal = KeyMaterialSignal {
                 key: key.key.clone(),
                 key_index: key.key_index,
@@ -1979,18 +2021,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         key: InboundEncryptionKey,
         membership: &JoinedMembership,
     ) {
-        // Compute the RTC backend identity for this participant. When a mapper is
-        // installed (e.g. the LiveKit transport's MSC4195 pseudonymous identity),
-        // derive it from the membership's user/device/member triple; otherwise
-        // fall back to the raw member_id (or `sender:device`).
-        let rtc_backend_id = match &self.identity_mapper {
-            Some(mapper) => mapper(
-                &membership.sender,
-                membership.origin.sender_device_id().unwrap_or(""),
-                &membership.member_id,
-            ),
-            None => membership.member_id.clone(),
-        };
+        // The participant's RTC backend identity, as the installed mapper derives
+        // it from the membership; `None` when it cannot be, and then the key is
+        // stored but there is no participant to hand it to.
+        let rtc_backend_id = self.peer_rtc_identity(membership);
 
         // Store the key: at most one entry per index, holding the newest material
         // we have seen for it.
@@ -2042,7 +2076,15 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
 
         // Signal to application
-        self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+        match rtc_backend_id {
+            Some(rtc_backend_id) => self.signal_inbound_key_to_app(key, rtc_backend_id).await,
+            None => log::debug!(
+                "[{}/{}] key from {} has no derivable participant identity; stored only",
+                self.room_id,
+                self.slot_id,
+                membership.member_id
+            ),
+        }
     }
 
     /// Signals an inbound key to the application layer.
@@ -2099,6 +2141,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             config: self.config.clone(),
             signal_handler: self.signal_handler.clone(),
             identity_mapper: self.identity_mapper.clone(),
+            own_transports: self.own_transports.clone(),
             key_distribution_in_progress: self.key_distribution_in_progress.clone(),
             need_new_distribution: self.need_new_distribution.clone(),
             next_key_index: self.next_key_index.clone(),
@@ -3004,11 +3047,14 @@ mod tests {
 
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
-        manager.set_identity_mapper(Arc::new(
-            |user_id: &str, device_id: &str, member_id: &str| {
-                format!("mapped:{user_id}/{device_id}/{member_id}")
-            },
-        ));
+        manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(format!(
+                "mapped:{}/{}/{}",
+                subject.user_id,
+                subject.device_id.unwrap_or_default(),
+                subject.member_id
+            ))
+        }));
 
         manager.replay_keys_to_handler().await;
 

@@ -88,7 +88,6 @@ async fn build_media_session(
         call.inner(),
         call.backend(),
         LiveKitAttachOptions {
-            format: compat,
             http: None,
             auto_subscribe: true,
             stability: config.stability.map(Into::into).unwrap_or_default(),

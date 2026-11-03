@@ -199,9 +199,7 @@ async fn two_in_a_call(
                 &room,
                 LiveKitCallOptions {
                     slot_id,
-                    livekit_transport: Some(LiveKitTransport {
-                        livekit_service_url: url,
-                    }),
+                    livekit_transport: Some(LiveKitTransport::service(url)),
                     http: Some(http?),
                     format: MembershipFormat::Current,
                     sfu_fallback: fallback,

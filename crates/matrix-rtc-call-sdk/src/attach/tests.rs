@@ -12,8 +12,8 @@ use matrix_rtc_call::{
 };
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
-    EventEncryption, EventIn, JoinedMembership, KEY_MESSAGE_TYPE, LeaveSessionParams, RoomOptions,
-    RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
+    EventEncryption, EventIn, IdentitySubject, JoinedMembership, KEY_MESSAGE_TYPE,
+    LeaveSessionParams, RoomOptions, RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -30,11 +30,21 @@ const PEER_FOCUS: &str = "https://sfu-b.example.org";
 /// Not the default derivation, so a key imported under the raw `member_id`
 /// fallback (the mapper installed too late) shows.
 fn mapper() -> RtcIdentityMapper {
-    Arc::new(|user: &str, device: &str, member: &str| format!("{user}|{device}|{member}"))
+    Arc::new(|subject: &IdentitySubject<'_>| {
+        Some(identity(
+            subject.user_id,
+            subject.device_id?,
+            subject.member_id,
+        ))
+    })
+}
+
+fn identity(user: &str, device: &str, member: &str) -> String {
+    format!("{user}|{device}|{member}")
 }
 
 fn bob_identity() -> String {
-    mapper()(BOB, "BOBDEV", "bob-1")
+    identity(BOB, "BOBDEV", "bob-1")
 }
 
 /// Every key the ring was handed, by identity.
@@ -159,16 +169,16 @@ impl MediaTransport for FakeTransport {
         "livekit"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
+    fn connection_key(&self, transport: &RtcTransport, _publisher_user_id: &str) -> Option<String> {
         match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
+            RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(str::to_owned),
             RtcTransport::Unsupported(_) => None,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
         let device = member.origin.sender_device_id()?;
-        Some(mapper()(&member.sender, device, &member.member_id))
+        Some(identity(&member.sender, device, &member.member_id))
     }
 
     async fn connect(
@@ -292,7 +302,6 @@ fn options(mock: &MockBackend) -> AttachOptions {
         own_user_id: mock.user_id.clone(),
         own_device_id: mock.device_id.clone(),
         identity_mapper: mapper(),
-        format: matrix_rtc_core::compat::MembershipFormat::Current,
         stability: StabilityConfig::default(),
         own_reconnect_budget: matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
         sfu_fallback: false,
@@ -341,7 +350,7 @@ async fn a_key_held_before_attaching_is_imported_under_the_mapped_identity_and_r
     assert!(attached.own_connection.is_some());
     assert_eq!(
         attached.own_identity,
-        mapper()(&mock.user_id, &mock.device_id, call.member_id())
+        identity(&mock.user_id, &mock.device_id, call.member_id())
     );
 }
 

@@ -18,7 +18,7 @@ Please see LICENSE in the repository root for full details.
  *   every change, plus timeline events and redactions as they arrive;
  *   `subscribeToDevice` delivers decrypted to-device messages with their Olm
  *   decryption metadata and MSC4153 cross-signing status; `relations`,
- *   `getOpenIdToken` and `rtcTransports` answer on request.
+ *   `getOpenIdToken`, `getLivekitToken` and `rtcTransports` answer on request.
  * The library parses every MatrixRTC content and applies the compatibility
  * dialects itself; this file hands events over verbatim.
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
@@ -393,21 +393,46 @@ export class MatrixHost {
     return this.client.getOpenIdToken();
   }
 
-  /** `GET /_matrix/client/v1/rtc/transports`; `[]` where the homeserver lacks it. */
+  /**
+   * The homeserver's MSC4195 LiveKit token, `{ jwt }`, from its `get_token`
+   * under the unstable prefix homeservers serve so far.
+   */
+  getLivekitToken(request) {
+    return this.client.http.authedRequest(
+      this.sdk.Method.Post,
+      '/rtc/livekit/get_token',
+      undefined,
+      request,
+      { prefix: '/_matrix/client/unstable/io.element.msc4195' },
+    );
+  }
+
+  /**
+   * The homeserver's transports, entries as served: `GET
+   * /_matrix/client/v1/rtc/transports` (`transports`), else the unstable
+   * endpoint (`rtc_transports`); `[]` where it serves neither.
+   */
   async rtcTransports() {
-    try {
-      const response = await this.client.http.authedRequest(
-        this.sdk.Method.Get,
-        '/rtc/transports',
-        undefined,
-        undefined,
-        { prefix: '/_matrix/client/v1' },
-      );
-      return response?.rtc_transports ?? [];
-    } catch (error) {
-      if (error?.httpStatus === 404) return [];
-      throw error;
+    const endpoints = [
+      { prefix: '/_matrix/client/v1', field: 'transports' },
+      { prefix: '/_matrix/client/unstable/org.matrix.msc4143', field: 'rtc_transports' },
+    ];
+    for (const { prefix, field } of endpoints) {
+      try {
+        const response = await this.client.http.authedRequest(
+          this.sdk.Method.Get,
+          '/rtc/transports',
+          undefined,
+          undefined,
+          { prefix },
+        );
+        return response?.[field] ?? [];
+      } catch (error) {
+        if (error?.httpStatus === 404 || error?.errcode === 'M_UNRECOGNIZED') continue;
+        throw error;
+      }
     }
+    return [];
   }
 
   // --- shapes ------------------------------------------------------------

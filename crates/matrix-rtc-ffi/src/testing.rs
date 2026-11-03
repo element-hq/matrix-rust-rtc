@@ -27,9 +27,9 @@ use matrix_rtc_core::{
 use matrix_rtc_transport::testing::ScriptedTransport;
 
 use crate::backend::{
-    BackendSubscription, FfiBackendError, FfiEventEncryption, FfiEventIn, FfiOpenIdToken,
-    FfiRoomSubjects, FfiToDeviceDelivery, FfiToDeviceMessageIn, FfiToDeviceRecipient,
-    MatrixBackend, RoomSink, ToDeviceSink, events_into_core, parse_content,
+    BackendSubscription, FfiBackendError, FfiEventEncryption, FfiEventIn, FfiLiveKitTokenRequest,
+    FfiOpenIdToken, FfiRoomSubjects, FfiToDeviceDelivery, FfiToDeviceMessageIn,
+    FfiToDeviceRecipient, MatrixBackend, RoomSink, ToDeviceSink, events_into_core, parse_content,
 };
 use crate::media::{MediaFfiError, MediaSession, MediaSessionConfig};
 use crate::runtime::runtime;
@@ -600,6 +600,13 @@ impl MatrixBackend for ScriptedMatrixBackend {
             .collect())
     }
 
+    async fn livekit_token(
+        &self,
+        request: FfiLiveKitTokenRequest,
+    ) -> Result<String, FfiBackendError> {
+        Ok(format!("scripted-jwt-for-{}", request.url))
+    }
+
     async fn openid_token(&self) -> Result<FfiOpenIdToken, FfiBackendError> {
         Ok(FfiOpenIdToken {
             access_token: "scripted-openid-token".to_owned(),
@@ -742,8 +749,7 @@ pub async fn connect_scripted_media_session(
 ) -> Result<Arc<MediaSession>, MediaFfiError> {
     runtime()
         .spawn(async move {
-            let format = call.format();
-            let mapper = matrix_rtc_transport::livekit::identity_mapper(format);
+            let mapper = matrix_rtc_transport::livekit::identity_mapper();
             transport.inner.set_identity_mapper(mapper.clone());
             let backend = call.backend();
             let key_handler = Arc::new(matrix_rtc_transport::MediaKeyHandler::new());
@@ -755,7 +761,6 @@ pub async fn connect_scripted_media_session(
                     own_user_id: backend.own_user_id(),
                     own_device_id: backend.own_device_id(),
                     identity_mapper: mapper,
-                    format,
                     stability: config.stability.map(Into::into).unwrap_or_default(),
                     own_reconnect_budget: config.own_reconnect_budget_ms.map_or(
                         matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
@@ -833,7 +838,8 @@ mod tests {
                 .join_call(FfiJoinSessionParams {
                     application_slot_id: None,
                     transport: FfiJoinTransport::Publish {
-                        livekit_service_url: FOCUS.to_owned(),
+                        url: None,
+                        livekit_service_url: Some(FOCUS.to_owned()),
                     },
                     keep_alive_timeout_ms: None,
                     sticky_duration_ms: None,

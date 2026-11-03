@@ -379,9 +379,7 @@ mod tests {
     #[test]
     fn test_membership_id_is_unique_per_call() {
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
 
         let first = params.membership_id();
@@ -396,9 +394,7 @@ mod tests {
     #[test]
     fn test_explicit_membership_id() {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
         params.membership_id = Some("custom-id".to_string());
 
@@ -408,9 +404,7 @@ mod tests {
     #[test]
     fn test_keep_alive_timeout_default() {
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
 
         assert_eq!(
@@ -422,9 +416,7 @@ mod tests {
     #[test]
     fn test_keep_alive_timeout_custom() {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
         params.keep_alive_timeout_ms = Some(60_000);
 
@@ -434,9 +426,7 @@ mod tests {
     #[test]
     fn test_validate_success() {
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
 
         assert!(params.validate().is_ok());
@@ -473,9 +463,9 @@ mod tests {
         let params = params
             .member_id("mine")
             .keep_alive_interval_ms(5_000)
-            .transport(RtcTransport::LiveKit(LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            }));
+            .transport(RtcTransport::LiveKit(LiveKitTransport::service(
+                "https://example.com".to_string(),
+            )));
         assert_eq!(params.membership_id(), "mine");
         assert_eq!(params.effective_keep_alive_interval_ms(), 5_000);
         assert!(matches!(

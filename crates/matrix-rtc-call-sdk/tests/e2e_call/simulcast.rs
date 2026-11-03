@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use matrix_rtc_call_sdk::LiveKitCall;
+use matrix_rtc_core::LiveKitTransport;
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_transport::{
     Dimensions, FrameStream, LocalTrackHandle, MediaConstraints, MediaStreamKind, PublishOptions,
@@ -240,7 +241,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
     )
     .await?;
 
-    let url = cfg.livekit_service_url.clone();
+    let url = LiveKitTransport::service(cfg.livekit_service_url.clone());
     let alice = join_call(&cfg, alice, alice_room, &alice_creds.user, &url, compat).await?;
     let bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &url, compat).await?;
     let carol = join_call(&cfg, carol, carol_room, &carol_creds.user, &url, compat).await?;

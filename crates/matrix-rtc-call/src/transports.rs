@@ -10,8 +10,8 @@
 use std::time::Duration;
 
 use matrix_rtc_core::{
-    BackendError, CommandError, JoinError, LiveKitTransport, MatrixBackend, Outbox, RtcTransport,
-    SendKind, SendPolicy, SlotKey, TransportIntent, executor,
+    BackendError, CommandError, JoinError, LiveKitTransport, MatrixBackend, Outbox,
+    RawRtcTransport, RtcTransport, SendKind, SendPolicy, SlotKey, TransportIntent, executor,
 };
 use serde_json::Value;
 
@@ -40,15 +40,11 @@ impl From<LiveKitTransport> for JoinTransport {
     }
 }
 
-fn publish(livekit_service_url: &str) -> TransportIntent {
-    TransportIntent::Publish(RtcTransport::LiveKit(LiveKitTransport {
-        livekit_service_url: livekit_service_url.to_owned(),
-    }))
-}
-
 /// The join's own choice wins; [`JoinTransport::Advertised`] takes the first
-/// LiveKit entry of the homeserver's `rtc_transports` array, which MSC4143
-/// orders by preference. No entry is an error rather than a guess.
+/// LiveKit entry of the homeserver's transports array, which MSC4143 orders by
+/// preference: type `livekit` (what implementations write) or `m.livekit`,
+/// naming an SFU `url`, a `livekit_service_url`, or both. No entry is an error
+/// rather than a guess.
 pub fn choose(
     rtc_transports: &Value,
     chosen: JoinTransport,
@@ -64,9 +60,16 @@ pub fn choose(
             .as_array()
             .into_iter()
             .flatten()
-            .find(|entry| entry.get("type").and_then(Value::as_str) == Some(LIVEKIT_TRANSPORT_TYPE))
-            .and_then(|entry| entry.get("livekit_service_url")?.as_str())
-            .map(publish)
+            .filter_map(|entry| serde_json::from_value::<RawRtcTransport>(entry.clone()).ok())
+            // Published as advertised: whether it names an SFU `url`, the
+            // legacy `livekit_service_url`, or both decides how every client
+            // gets its token for it, and so the identity peers expect us under.
+            .find_map(|entry| match entry.into_typed() {
+                RtcTransport::LiveKit(livekit) => {
+                    Some(TransportIntent::Publish(RtcTransport::LiveKit(livekit)))
+                }
+                RtcTransport::Unsupported(_) => None,
+            })
             // Final: the homeserver's configuration, not a failure to reach it.
             .ok_or_else(|| {
                 BackendError::new("the homeserver advertises no livekit transport")
@@ -126,9 +129,7 @@ mod tests {
     use super::*;
 
     fn livekit(url: &str) -> JoinTransport {
-        JoinTransport::Publish(LiveKitTransport {
-            livekit_service_url: url.to_owned(),
-        })
+        JoinTransport::Publish(LiveKitTransport::service(url.to_owned()))
     }
 
     #[tokio::test]
@@ -146,8 +147,8 @@ mod tests {
         .await;
         assert!(matches!(
             chosen.unwrap(),
-            TransportIntent::Publish(RtcTransport::LiveKit(LiveKitTransport { livekit_service_url }))
-                if livekit_service_url == "https://override"
+            TransportIntent::Publish(RtcTransport::LiveKit(livekit))
+                if livekit.livekit_service_url() == Some("https://override")
         ));
 
         assert!(
@@ -186,8 +187,8 @@ mod tests {
             Ok(json!([{ "type": "livekit", "livekit_service_url": "https://advertised" }]));
         assert!(matches!(
             advertised(&backend).await.unwrap(),
-            TransportIntent::Publish(RtcTransport::LiveKit(LiveKitTransport { livekit_service_url }))
-                if livekit_service_url == "https://advertised"
+            TransportIntent::Publish(RtcTransport::LiveKit(livekit))
+                if livekit.livekit_service_url() == Some("https://advertised")
         ));
     }
 
@@ -244,7 +245,42 @@ mod tests {
         else {
             panic!("a livekit transport");
         };
-        assert_eq!(livekit.livekit_service_url, "https://first.example.org");
+        assert_eq!(
+            livekit.livekit_service_url(),
+            Some("https://first.example.org")
+        );
+    }
+
+    /// Whatever fields the homeserver advertises are what we publish: they
+    /// decide how every client gets a token for the transport.
+    #[test]
+    fn an_advertised_url_transport_is_taken_with_all_its_fields() {
+        let transports = json!([
+            { "type": "livekit" },
+            { "type": "m.livekit", "url": "wss://sfu.example.org" },
+        ]);
+        let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
+            choose(&transports, JoinTransport::Advertised).unwrap()
+        else {
+            panic!("a livekit transport");
+        };
+        assert_eq!(livekit, LiveKitTransport::sfu("wss://sfu.example.org"));
+
+        let transports = json!([{
+            "type": "livekit",
+            "url": "wss://sfu.example.org",
+            "livekit_service_url": "https://jwt.example.org",
+        }]);
+        let TransportIntent::Publish(RtcTransport::LiveKit(livekit)) =
+            choose(&transports, JoinTransport::Advertised).unwrap()
+        else {
+            panic!("a livekit transport");
+        };
+        assert_eq!(livekit.url(), Some("wss://sfu.example.org"));
+        assert_eq!(
+            livekit.livekit_service_url(),
+            Some("https://jwt.example.org")
+        );
     }
 
     #[test]

@@ -12,9 +12,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use matrix_rtc_core::{
-    BackendError, CommandError, EventEncryption, EventIn, MatrixBackend as CoreBackend,
-    OpenIdToken, RoomSink as CoreRoomSink, RoomSubjects, Subscription as CoreSubscription,
-    ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink as CoreToDeviceSink,
+    BackendError, CommandError, EventEncryption, EventIn, LiveKitTokenRequest,
+    MatrixBackend as CoreBackend, OpenIdToken, RoomSink as CoreRoomSink, RoomSubjects,
+    Subscription as CoreSubscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink as CoreToDeviceSink,
 };
 use serde_json::Value;
 
@@ -204,6 +205,21 @@ pub struct FfiOpenIdToken {
     pub token_type: String,
     pub matrix_server_name: String,
     pub expires_in_secs: u64,
+}
+
+/// An MSC4195 LiveKit token request to the homeserver:
+/// `POST /_matrix/client/v1/rtc/livekit/get_token` (unstable
+/// `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`), with
+/// this record as the JSON body. A DTO, so no client SDK type crosses the FFI.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLiveKitTokenRequest {
+    /// The SFU's homeserver; the homeserver's own when `None` (omit the field).
+    pub server_name: Option<String>,
+    /// The SFU's WebSocket URL.
+    pub url: String,
+    pub room_id: String,
+    pub slot_id: String,
+    pub member_id: String,
 }
 
 /// Where the host delivers a room's subjects. Every call returns at once.
@@ -411,6 +427,16 @@ pub trait MatrixBackend: Send + Sync {
 
     /// A fresh OpenID token for the account.
     async fn openid_token(&self) -> Result<FfiOpenIdToken, FfiBackendError>;
+
+    /// The homeserver's MSC4195 LiveKit token: `POST` `request` to
+    /// `get_token` (see [`FfiLiveKitTokenRequest`]) and return the `jwt` of
+    /// the answer. Used for transports naming an SFU `url` without a
+    /// `livekit_service_url`. A host that cannot make the request fails with
+    /// `M_UNRECOGNIZED`, status 404, as a homeserver without it would.
+    async fn livekit_token(
+        &self,
+        request: FfiLiveKitTokenRequest,
+    ) -> Result<String, FfiBackendError>;
 
     /// The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`,
     /// as JSON; `[]` when the homeserver lacks the endpoint.
@@ -711,6 +737,19 @@ impl CoreBackend for FfiBackend {
             matrix_server_name: token.matrix_server_name,
             expires_in: token.expires_in_secs,
         })
+    }
+
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        self.host
+            .livekit_token(FfiLiveKitTokenRequest {
+                server_name: request.server_name.clone(),
+                url: request.url.clone(),
+                room_id: request.room_id.clone(),
+                slot_id: request.slot_id.clone(),
+                member_id: request.member_id.clone(),
+            })
+            .await
+            .map_err(FfiBackendError::into_backend_error)
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
@@ -1079,6 +1118,13 @@ pub(crate) mod test_support {
                 matrix_server_name: "example.org".to_owned(),
                 expires_in_secs: 3600,
             })
+        }
+
+        async fn livekit_token(
+            &self,
+            request: FfiLiveKitTokenRequest,
+        ) -> Result<String, FfiBackendError> {
+            Ok(format!("jwt-for-{}", request.url))
         }
 
         async fn rtc_transports(&self) -> Result<String, FfiBackendError> {

@@ -816,7 +816,7 @@ async fn a_call_knows_the_transport_its_join_resolved() {
     assert!(matches!(
         call.transport(),
         TransportIntent::Publish(matrix_rtc_core::RtcTransport::LiveKit(livekit))
-            if livekit.livekit_service_url == "https://sfu.example.org"
+            if livekit.livekit_service_url() == Some("https://sfu.example.org")
     ));
     call.leave(LeaveSessionParams::new()).await.expect("leave");
 

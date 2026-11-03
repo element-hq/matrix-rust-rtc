@@ -106,7 +106,15 @@ export interface MatrixBackendHost {
     /** `GET /rooms/{room}/relations/{event}/{relType}/{eventType}`, decrypted. */
     relations(roomId: string, eventId: string, relType: string, eventType: string): Promise<EventIn[]>;
     getOpenIdToken(): Promise<{ access_token: string; token_type: string; matrix_server_name: string; expires_in: number }>;
-    /** The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`; `[]` when the endpoint is missing. */
+    /**
+     * The homeserver's MSC4195 LiveKit token: `POST` `request` as the body to
+     * `/_matrix/client/v1/rtc/livekit/get_token` (homeservers serve it at
+     * `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token` so
+     * far) and resolve with the answer, `{ jwt }`. Used for transports naming an
+     * SFU `url` without a `livekit_service_url`.
+     */
+    getLivekitToken(request: { server_name?: string; url: string; room_id: string; slot_id: string; member_id: string }): Promise<{ jwt: string }>;
+    /** The transports array of `GET /_matrix/client/v1/rtc/transports` (`transports`; the unstable endpoint's `rtc_transports`), entries as served; `[]` when the endpoint is missing. */
     rtcTransports(): Promise<unknown[]>;
 }
 
@@ -134,7 +142,7 @@ export interface RtcInterruptions {
 }
 
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
-export type MembershipFormatMode = "current" | "sticky_2025" | "room_state";
+export type MembershipFormatMode = "current" | "room_state";
 
 /** One roster entry, as `participants()` returns it. */
 export interface RtcParticipant {
@@ -254,7 +262,7 @@ export interface MediaDelegate {
 /** What a join publishes on: the homeserver's advertised LiveKit transport, a given LiveKit focus, or nothing. */
 export type JoinTransportIn =
     | { kind: 'advertised' }
-    | { kind: 'publish'; livekit_service_url: string }
+    | { kind: 'publish'; url?: string; livekit_service_url?: string }
     | { kind: 'receive_only' };
 
 /** `joinCall`'s parameters. */

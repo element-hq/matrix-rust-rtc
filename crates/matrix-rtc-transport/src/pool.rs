@@ -1692,7 +1692,15 @@ impl MediaPool {
         let Some(target) = self
             .pool
             .iter()
-            .filter(|(key, entry)| **key != own_key && !entry.members.is_empty())
+            .filter(|(key, entry)| {
+                **key != own_key
+                    && !entry.members.is_empty()
+                    // Our media must keep the identity peers map us by.
+                    && entry
+                        .backend
+                        .as_ref()
+                        .is_some_and(|backend| backend.shares_identity(&own_key, key))
+            })
             .max_by(|(a_key, a), (b_key, b)| {
                 a.members
                     .len()
@@ -1782,15 +1790,17 @@ impl MediaPool {
 
     /// The transport a member publishes on that `key` serves.
     fn transport_for_key(&self, key: &str) -> Option<RtcTransport> {
-        self.members_snapshot
-            .iter()
-            .flat_map(|member| &member.transports)
-            .find(|transport| {
-                self.transports
-                    .iter()
-                    .any(|backend| backend.connection_key(transport).as_deref() == Some(key))
-            })
-            .cloned()
+        self.members_snapshot.iter().find_map(|member| {
+            member
+                .transports
+                .iter()
+                .find(|transport| {
+                    self.transports.iter().any(|backend| {
+                        backend.connection_key(transport, &member.sender).as_deref() == Some(key)
+                    })
+                })
+                .map(|transport| transport.as_published_by(&member.sender))
+        })
     }
 
     fn muted(&mut self, identity: &str, kind: MediaStreamKind, muted: bool) {
@@ -1837,7 +1847,7 @@ fn select_transport(
 ) -> Option<(Arc<dyn MediaTransport>, String)> {
     for backend in transports {
         for transport in &member.transports {
-            if let Some(key) = backend.connection_key(transport) {
+            if let Some(key) = backend.connection_key(transport, &member.sender) {
                 return Some((backend.clone(), key));
             }
         }

@@ -84,6 +84,9 @@ async function waitFor(probe, description, attempts = 100) {
   throw new Error(`timed out waiting for ${description}`);
 }
 
+// The pool's key for a focus reached through the legacy JWT service.
+const sfuGetKey = (serviceUrl) => JSON.stringify({ flow: 'sfu_get', service_url: serviceUrl });
+
 describe('web media roster over a fake transport delegate', () => {
   it('reconciles memberships, foci, and sink events into the roster', async () => {
     if (!existsSync(nodeBindingUrl)) {
@@ -133,28 +136,28 @@ describe('web media roster over a fake transport delegate', () => {
     // engine starts reconciling the moment it exists.)
     // `connectMedia` does not wait for it (034 R24).
     const ownConnect = await waitFor(
-      () => log.connects.find((c) => c.connectionKey === OWN_FOCUS),
+      () => log.connects.find((c) => c.connectionKey === sfuGetKey(OWN_FOCUS)),
       'the own focus connected',
     );
     expect(ownConnect).toEqual({
-      connectionKey: OWN_FOCUS,
+      connectionKey: sfuGetKey(OWN_FOCUS),
       sfuUrl: 'wss://sfu.example.org',
       jwt: 'the-jwt',
     });
-    const ownTokenRequest = log.tokenRequests.find(
-      (r) => r.url === `${OWN_FOCUS}/get_token`,
-    );
-    expect(ownTokenRequest.body.member.id).toBe(memberId);
+    // A transport naming the JWT service gets its token from `/sfu/get`.
+    const ownTokenRequest = log.tokenRequests.find((r) => r.url === `${OWN_FOCUS}/sfu/get`);
+    expect(ownTokenRequest.body.device_id).toBe(DEVICE_ID);
 
     // The second focus is the engine's to open: one pooled connection for the
     // far member, keyed by its livekit_service_url.
     await waitFor(
-      () => log.connects.some((c) => c.connectionKey === PEER_FOCUS),
+      () => log.connects.some((c) => c.connectionKey === sfuGetKey(PEER_FOCUS)),
       'the peer-focus connection',
     );
     expect(log.connects.length).toBe(2);
 
-    // Roster: signalling truth, each entry carrying its MSC4195 identity.
+    // Roster: signalling truth, each entry carrying the identity `/sfu/get`
+    // minted for it.
     const roster = await waitFor(() => {
       const participants = session.participants();
       return participants.length === 3 ? participants : null;
@@ -166,8 +169,8 @@ describe('web media roster over a fake transport delegate', () => {
     expect(peer.is_local).toBe(false);
     expect(peer.connection).toBe('connected');
     expect(peer.unable_to_decrypt ?? null).toBe(null);
-    // base64(SHA256(...)), unpadded: 43 chars.
-    expect(peer.rtc_identity).toHaveLength(43);
+    expect(peer.rtc_identity).toBe('@peer:example.org:PEERDEVICE');
+    expect(me.rtc_identity).toBe(`${USER_ID}:${DEVICE_ID}`);
 
     // Media arriving through the sink attaches to the signalled entry.
     const sink = log.sinks[0];

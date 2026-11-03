@@ -122,8 +122,9 @@ impl Msc4195KeyProviders {
             .entry(identity.to_owned())
             .or_default()
             .insert(index, key.clone());
-        // `rtc_backend_identity` equals `identity::pseudonymous_identity(...)`
-        // and maps directly onto the LiveKit participant identity.
+        // `rtc_backend_identity` is what the member's token flow minted
+        // (`identity_mapper`), so it maps directly onto the LiveKit
+        // participant identity.
         let identity = ParticipantIdentity::from(identity.to_owned());
         providers
             .live
