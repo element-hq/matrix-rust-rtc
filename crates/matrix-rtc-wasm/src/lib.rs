@@ -487,27 +487,26 @@ pub fn reaction_catalog() -> Result<JsValue, JsError> {
     struct Kind {
         name: &'static str,
         emoji: &'static str,
-        sound: Option<&'static str>,
+        sound: String,
     }
     let catalogue: Vec<Kind> = matrix_rtc_call::KNOWN_REACTIONS
         .iter()
         .map(|kind| Kind {
             name: kind.name,
             emoji: kind.emoji,
-            sound: kind.sound,
+            sound: matrix_rtc_call::sound_for(kind.name)
+                .asset_name()
+                .to_owned(),
         })
         .collect();
     serde_wasm_bindgen::to_value(&catalogue).map_err(|err| JsError::new(&err.to_string()))
 }
 
 /// The sound asset to play for a reaction `name`: a catalogue entry's sound,
-/// `"generic"` for a name outside the catalogue, or `undefined` for a silent
-/// one.
+/// or `"generic"` for any other name.
 #[wasm_bindgen(js_name = reactionSoundFor)]
-pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_call::sound_for(&name)
-        .asset_name()
-        .map(str::to_owned)
+pub fn reaction_sound_for(name: String) -> String {
+    matrix_rtc_call::sound_for(&name).asset_name().to_owned()
 }
 
 /// WASM-friendly join session parameters.

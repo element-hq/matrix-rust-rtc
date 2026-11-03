@@ -829,7 +829,7 @@ async fn verify_reactions(alice: &LiveKitCall, bob: &LiveKitCall) -> Result<bool
     let reaction_ok = matches!(
         &reaction,
         Some(CallEvent::Reaction { emoji, name, sound, .. })
-            if emoji == "👏" && name == "clapping" && sound.as_deref() == Some("clap")
+            if emoji == "👏" && name == "clapping" && sound == "clap"
     );
     println!("[bob] saw alice's reaction: {reaction:?}");
 

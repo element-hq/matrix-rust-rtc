@@ -167,8 +167,9 @@ pub enum CallEvent {
     /// A participant sent an emoji reaction. Transient: show `emoji` for a few
     /// seconds (Element Call uses three) and play `sound` if reaction sounds
     /// are on. The SDK does no audio; `sound` is the base name of the asset
-    /// to play (`clap`, `party`, …, or `generic` for an unknown `name`), or
-    /// `None` for a silent reaction. Sent only while we are in the call, and
+    /// to play (`clap`, `party`, …, or `generic` for a `name` without a
+    /// sound of its own), and `emoji` is the catalogue's for a catalogue
+    /// `name`, as Element Call shows. Sent only while we are in the call, and
     /// only for a recent reaction (`ReactionsConfig::max_age_ms`), so a sync
     /// catching up never replays a burst of them.
     Reaction {
@@ -176,7 +177,7 @@ pub enum CallEvent {
         emoji: String,
         /// The reaction's `name` as sent, e.g. `clapping`. Empty if none.
         name: String,
-        sound: Option<String>,
+        sound: String,
     },
     /// A transport-level participant appeared that maps to no signalled
     /// membership. It gets no subscription (and could not be decrypted

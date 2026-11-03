@@ -1679,7 +1679,7 @@ impl Actor {
             member_id: reaction.member_id,
             emoji: reaction.emoji,
             name: reaction.name,
-            sound: reaction.sound.asset_name().map(str::to_owned),
+            sound: reaction.sound.asset_name().to_owned(),
         });
     }
 
@@ -2451,7 +2451,7 @@ mod tests {
             member_id: member_id.to_owned(),
             emoji: "👏".to_owned(),
             name: "clapping".to_owned(),
-            sound: Some("clap".to_owned()),
+            sound: "clap".to_owned(),
         }
     }
 

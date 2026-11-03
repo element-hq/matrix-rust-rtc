@@ -13,7 +13,8 @@
 //!   `m.reference` relation to the sender's `m.rtc.member` event, plus `emoji`
 //!   and `name`. It is transient: Element Call shows it for three seconds and
 //!   ignores further reactions from the same member while one is showing. The
-//!   `name` selects a sound; an unknown name plays a generic one.
+//!   `name` selects a sound and, for a catalogue name, the emoji shown; any
+//!   name without a sound of its own plays a generic one.
 //! - A raised hand is a plain `m.reaction` annotation of the membership event
 //!   with key [`RAISED_HAND_KEY`]. There is no "lowered" event: the annotation
 //!   is redacted instead.
@@ -94,8 +95,8 @@ pub struct ReactionKind {
     pub name: &'static str,
     /// The emoji Element Call sends for it.
     pub emoji: &'static str,
-    /// The sound asset Element Call plays for it, if any, by base name
-    /// (`party` → `party.ogg`). `None` is silent — not the generic sound.
+    /// Its own sound asset, by base name (`party` → `party.ogg`). `None`
+    /// plays [`GENERIC_SOUND`], as Element Call does.
     pub sound: Option<&'static str>,
 }
 
@@ -185,10 +186,15 @@ pub const KNOWN_REACTIONS: &[ReactionKind] = &[
         emoji: "🥁",
         sound: Some("baduntss"),
     },
+    ReactionKind {
+        name: "bell",
+        emoji: "🛎️",
+        sound: Some("bell"),
+    },
 ];
 
-/// Base name of the sound Element Call plays for a reaction whose `name` it
-/// does not know.
+/// Base name of the sound Element Call plays for a reaction without a sound of
+/// its own: a `name` it does not know, or a catalogue entry with no sound.
 pub const GENERIC_SOUND: &str = "generic";
 
 /// The catalogue entry for a reaction `name`, if it is one Element Call knows.
@@ -204,22 +210,19 @@ pub fn reaction_kind(name: &str) -> Option<&'static ReactionKind> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactionSound {
-    /// A known reaction with no sound. Silent.
-    None,
-    /// A known reaction with a sound, by asset base name.
+    /// A known reaction with a sound of its own, by asset base name.
     Named(String),
-    /// A reaction whose `name` is not in the catalogue. Element Call plays its
-    /// generic reaction sound for these.
+    /// Any other reaction: a `name` outside the catalogue, or a catalogue
+    /// entry without a sound. Element Call plays [`GENERIC_SOUND`] for these.
     Generic,
 }
 
 impl ReactionSound {
-    /// The asset base name to play, or `None` for silence.
-    pub fn asset_name(&self) -> Option<&str> {
+    /// The asset base name to play.
+    pub fn asset_name(&self) -> &str {
         match self {
-            Self::None => None,
-            Self::Named(name) => Some(name),
-            Self::Generic => Some(GENERIC_SOUND),
+            Self::Named(name) => name,
+            Self::Generic => GENERIC_SOUND,
         }
     }
 }
@@ -230,8 +233,7 @@ pub fn sound_for(name: &str) -> ReactionSound {
         Some(ReactionKind {
             sound: Some(sound), ..
         }) => ReactionSound::Named((*sound).to_owned()),
-        Some(_) => ReactionSound::None,
-        None => ReactionSound::Generic,
+        _ => ReactionSound::Generic,
     }
 }
 
@@ -399,7 +401,8 @@ pub struct ReceivedReaction {
     pub member_id: String,
     /// The reacting user.
     pub sender: String,
-    /// The emoji to show: the first grapheme of what was sent.
+    /// The emoji to show: the catalogue's for a catalogue `name`, as Element
+    /// Call shows, otherwise the first grapheme of what was sent.
     pub emoji: String,
     /// The reaction's `name`, verbatim. Empty when the sender gave none.
     pub name: String,
@@ -782,7 +785,7 @@ impl ReactionsState {
                 let _ = self.reactions_tx.send(ReceivedReaction {
                     member_id: member.member_id.clone(),
                     sender: member.sender.clone(),
-                    emoji,
+                    emoji: reaction_kind(&name).map_or(emoji, |kind| kind.emoji.to_owned()),
                     sound: sound_for(&name),
                     name,
                 });
@@ -1224,11 +1227,11 @@ mod tests {
             sound_for("drum"),
             ReactionSound::Named("baduntss".to_owned())
         );
-        assert_eq!(sound_for("thumbsup"), ReactionSound::None);
+        assert_eq!(sound_for("bell"), ReactionSound::Named("bell".to_owned()));
+        assert_eq!(sound_for("thumbsup"), ReactionSound::Generic);
         assert_eq!(sound_for("something-new"), ReactionSound::Generic);
         assert_eq!(sound_for(""), ReactionSound::Generic);
-        assert_eq!(ReactionSound::Generic.asset_name(), Some("generic"));
-        assert_eq!(ReactionSound::None.asset_name(), None);
+        assert_eq!(ReactionSound::Generic.asset_name(), "generic");
     }
 
     #[test]

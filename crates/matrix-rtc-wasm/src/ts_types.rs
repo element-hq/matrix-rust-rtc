@@ -175,9 +175,9 @@ export type RtcCallEvent =
     /** Only for a hand raised while we are in the call; the state is `hand_raised_at_ms` / `hand_raised_position`. */
     | { type: "hand_raised"; member_id: string; raised_at_ms: number }
     | { type: "hand_lowered"; member_id: string }
-    /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`null` = silent).
+    /** Transient: show `emoji` for ~3 s; `sound` is the asset base name to play (`generic` when it has none of its own).
      *  Only while we are in the call, and only for a recent reaction (`reactions.max_age_ms`). */
-    | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string | null }
+    | { type: "reaction"; member_id: string; emoji: string; name: string; sound: string }
     | { type: "unknown_participant"; identity: string };
 
 /** How far our own media has got. */
@@ -302,8 +302,8 @@ export interface RaisedHand {
 export interface ReactionKind {
     name: string;
     emoji: string;
-    /** Base name of the sound asset Element Call plays for it, or `null` for a silent reaction. */
-    sound: string | null;
+    /** Base name of the sound asset Element Call plays for it (`generic` when it has none of its own). */
+    sound: string;
 }
 
 /** MSC4143 `content.encryption` of an `m.rtc.slot` (`openSlot`). */

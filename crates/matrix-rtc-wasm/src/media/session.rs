@@ -535,12 +535,12 @@ enum WasmCallEvent {
     HandLowered {
         member_id: String,
     },
-    /// Transient; `sound` is the asset base name to play, `None` for silence.
+    /// Transient; `sound` is the asset base name to play (`generic` when it has none of its own).
     Reaction {
         member_id: String,
         emoji: String,
         name: String,
-        sound: Option<String>,
+        sound: String,
     },
     /// `identity` is the transport identity the key installed under: keys
     /// held before media connects surface while `connectMedia` is still

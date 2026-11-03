@@ -8,6 +8,18 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- A reaction's `sound` is no longer optional: a reaction without a sound of its own plays `generic` (037).
+
+### Added
+
+- The 🛎️ `bell` reaction (037).
+
+### Fixed
+
+- A received reaction from the catalogue shows the catalogue's emoji (037).
+
 ## v0.5.0-rc.8 - 2026-10-27
 
 ### Breaking
