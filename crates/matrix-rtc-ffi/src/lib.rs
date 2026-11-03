@@ -233,8 +233,8 @@ pub struct FfiReactionKind {
     /// The emoji Element Call shows for it.
     pub emoji: String,
     /// Base name of the sound asset Element Call plays for it (`clap`,
-    /// `party`, …), or `None` for a silent reaction.
-    pub sound: Option<String>,
+    /// `party`, …, or `generic` for an entry without a sound of its own).
+    pub sound: String,
 }
 
 /// The SDK release version (e.g. `0.5.0-rc.1`), to show or attach to log
@@ -248,8 +248,8 @@ pub fn sdk_version() -> String {
 ///
 /// The names are the interoperable part: a reaction sent with one of these
 /// names plays the same sound on Element Call as on a host that bundles the
-/// assets under the `sound` base names here, plus `generic` for names outside
-/// the catalogue. The SDK plays nothing itself.
+/// assets under the `sound` base names here (`generic` among them, which also
+/// plays for names outside the catalogue). The SDK plays nothing itself.
 #[uniffi::export]
 pub fn reaction_catalog() -> Vec<FfiReactionKind> {
     matrix_rtc_call::KNOWN_REACTIONS
@@ -257,18 +257,18 @@ pub fn reaction_catalog() -> Vec<FfiReactionKind> {
         .map(|kind| FfiReactionKind {
             name: kind.name.to_owned(),
             emoji: kind.emoji.to_owned(),
-            sound: kind.sound.map(str::to_owned),
+            sound: matrix_rtc_call::sound_for(kind.name)
+                .asset_name()
+                .to_owned(),
         })
         .collect()
 }
 
 /// The sound asset to play for a reaction `name`: a catalogue entry's sound,
-/// `generic` for a name outside the catalogue, or `None` for a silent one.
+/// or `generic` for any other name.
 #[uniffi::export]
-pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_call::sound_for(&name)
-        .asset_name()
-        .map(str::to_owned)
+pub fn reaction_sound_for(name: String) -> String {
+    matrix_rtc_call::sound_for(&name).asset_name().to_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]

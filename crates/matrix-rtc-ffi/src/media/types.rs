@@ -761,14 +761,14 @@ pub enum FfiCallEvent {
     /// A participant sent an emoji reaction. Transient: show `emoji` for a
     /// few seconds (Element Call uses three) and, if reaction sounds are on,
     /// play the asset named by `sound` (`clap`, `party`, …, `generic` for a
-    /// name outside the catalogue; see `reactionCatalog()`). `None` is a
-    /// silent reaction. Sent only while we are in the call and for a recent
+    /// name without a sound of its own; see `reactionCatalog()`). `emoji` is
+    /// the catalogue's for a catalogue name, as Element Call shows. Sent only while we are in the call and for a recent
     /// reaction (`FfiReactionsConfig.max_age_ms`), never as a replayed burst.
     Reaction {
         member_id: String,
         emoji: String,
         name: String,
-        sound: Option<String>,
+        sound: String,
     },
     /// A transport-level participant with no signalled membership; it gets
     /// no subscription. Diagnostics only.
