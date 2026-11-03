@@ -30,7 +30,7 @@
 //!   each on their own (`two_foci`, MSC4195 multi-SFU), or one peer redialling
 //!   while the other stays (`rejoin`).
 //! - [`MembershipFormat`] — the wire dialect both peers speak: spec-current
-//!   (`current`) or pre-sticky room state (`room_state`). In `room_state` step 4 is skipped (that
+//!   (`msc`) or pre-sticky room state (`room_state`). In `room_state` step 4 is skipped (that
 //!   generation has no slot concept) and membership is
 //!   `org.matrix.msc3401.call.member` room state rather than a sticky event.
 //!
@@ -476,15 +476,15 @@ macro_rules! e2e_tests {
 }
 
 e2e_tests! {
-    e2e_call_single_focus_current => (SingleFocus, Current),
+    e2e_call_single_focus_msc => (SingleFocus, Msc),
     e2e_call_single_focus_room_state => (SingleFocus, RoomState),
-    e2e_call_two_foci_current => (TwoFoci, Current),
+    e2e_call_two_foci_msc => (TwoFoci, Msc),
     e2e_call_two_foci_room_state => (TwoFoci, RoomState),
-    e2e_call_rejoin_current => (RejoinSameProcess, Current),
+    e2e_call_rejoin_msc => (RejoinSameProcess, Msc),
     e2e_call_rejoin_room_state => (RejoinSameProcess, RoomState),
-    e2e_call_slot_closed_current => (SlotClosed, Current),
-    e2e_call_single_focus_current_sfu_url => (SingleFocus, Current, Sfu),
-    e2e_call_two_foci_current_sfu_url_and_service => (TwoFoci, Current, Sfu),
+    e2e_call_slot_closed_msc => (SlotClosed, Msc),
+    e2e_call_single_focus_msc_sfu_url => (SingleFocus, Msc, Sfu),
+    e2e_call_two_foci_msc_sfu_url_and_service => (TwoFoci, Msc, Sfu),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.

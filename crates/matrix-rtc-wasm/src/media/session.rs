@@ -47,7 +47,7 @@ struct WasmMediaSessionConfig {
     #[serde(default)]
     key_ring_size: Option<u16>,
     /// Element Call compatibility generation this room was joined for:
-    /// `"current"` (default) or `"room_state"`; must match the mode the room
+    /// `"msc"` (default) or `"room_state"`; must match the mode the room
     /// was opened in. The participant identity and the token endpoint follow
     /// the published transport, not this.
     #[serde(default)]
@@ -154,7 +154,7 @@ impl WasmRtcCall {
                 )));
             }
         }
-        if compat != MembershipFormat::Current {
+        if compat != MembershipFormat::Msc {
             log::info!(
                 "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
                 self.inner().room_id(),

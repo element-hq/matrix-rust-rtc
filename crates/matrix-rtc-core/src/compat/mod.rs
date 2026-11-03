@@ -115,7 +115,7 @@ pub enum MembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
     /// interoperates with spec-current peers.
     #[default]
-    Current,
+    Msc,
     /// The format before MSC4354: membership as
     /// `org.matrix.msc3401.call.member` **room state**, published with legacy
     /// foci (`livekit_service_url`), so `/sfu/get` tokens and `{user}:{device}`
@@ -141,7 +141,7 @@ impl MembershipFormat {
 #[derive(Clone, Debug)]
 pub enum MemberEventRoute {
     /// An MSC4354 sticky timeline event — the only carrier the spec knows, and
-    /// the one [`MembershipFormat::Current`] takes.
+    /// the one [`MembershipFormat::Msc`] takes.
     Sticky { event_type: String, content: Value },
     /// A room state event, which is how MatrixRTC membership worked before
     /// MSC4354. The core's sticky `duration_ms` is meaningless here: room state

@@ -124,7 +124,7 @@ impl WasmRtcClient {
     /// returned room ends its subscriptions without leaving; `close` leaves
     /// first.
     ///
-    /// `options` is `{ format?: "current" | "room_state" }`.
+    /// `options` is `{ format?: "msc" | "room_state" }`.
     pub async fn room(
         &self,
         room_id: String,
@@ -463,7 +463,7 @@ impl WasmRtcCall {
 /// How a room is opened.
 #[derive(Debug, Default, Deserialize)]
 pub struct WasmRoomOptions {
-    /// `"current"` (the default) or `"room_state"`. One decision for the room:
+    /// `"msc"` (the default) or `"room_state"`. One decision for the room:
     /// what the library subscribes to, how it renders our sends, the
     /// `member.id` we join with and how an inbound media key is bound. The SFU
     /// identity and the token endpoint follow the transport instead.

@@ -62,7 +62,7 @@ const { client, userId, deviceId } =
 const host = new MatrixHost({ sdk, client });  // the MatrixBackendHost
 const rtc = new bindings.WasmRtcClient(host);   // one per Matrix session; no I/O
 // Subscribes through the host and resolves once the room's current state is in.
-const rtcRoom = await rtc.room(roomId, { format: 'current' });
+const rtcRoom = await rtc.room(roomId, { format: 'msc' });
 
 // 1. Publish our membership (starts the keep-alive machinery). The transport
 //    comes from the homeserver's /rtc/transports unless you pin one here.
@@ -164,7 +164,7 @@ until it leaves or is freed.
 
 ### Older membership formats (Element Call compatibility)
 
-Pass `format` when opening the room (`rtc.room`) — `"current"` (default, spec-current)
+Pass `format` when opening the room (`rtc.room`) — `"msc"` (default, spec-current)
 or `"room_state"` (Element Call's pre-sticky generation) — and the library handles
 the rest: which room state it subscribes to, the inbound translation and the outbound
 membership/key rewrites. The token endpoint and the SFU identity follow the

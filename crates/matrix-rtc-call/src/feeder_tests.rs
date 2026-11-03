@@ -114,7 +114,7 @@ fn member_event(sender: &str, member_id: &str, event_id: &str) -> EventIn {
 
 #[tokio::test]
 async fn a_raised_hand_reaches_the_call_layer_and_a_redaction_lowers_it() {
-    let harness = Harness::attach(MembershipFormat::Current).await;
+    let harness = Harness::attach(MembershipFormat::Msc).await;
     harness.seed_room_state();
     harness
         .sink()

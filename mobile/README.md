@@ -285,7 +285,7 @@ when you open the room to speak it:
 
 | Mode | Element Call generation | Membership lives in |
 | --- | --- | --- |
-| `null` / `CURRENT` | none — current MSC4143 + MSC4354 | sticky events |
+| `null` / `MSC` | none — current MSC4143 + MSC4354 | sticky events |
 | `ROOM_STATE` | before MSC4354 | `org.matrix.msc3401.call.member` room state |
 
 It is one decision, not a wire-format flag: it also fixes the `member.id` you
@@ -326,7 +326,7 @@ absorbs that: it does not subscribe to slot state for the room at all, leaving
 the condition unenforced — that generation predates the concept entirely, so
 "unknowable" is the honest answer rather than "closed".
 
-In `CURRENT` the condition stays enforced. Someone has to open the slot —
+In `MSC` the condition stays enforced. Someone has to open the slot —
 otherwise the room reads as all-closed, and `join` refuses with `SlotClosed`.
 Open it yourself if nobody else does (it needs the power level for `m.rtc.slot`
 state; the room creator by default, or set it in the room's initial state):

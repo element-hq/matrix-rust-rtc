@@ -141,7 +141,7 @@ export class WebPeerApp {
     // its current state (encryption, slots, members, membership) before
     // publishing ours.
     this.rtcRoom = await this.rtc.room(roomId, {
-      format: compat === 'current' ? undefined : compat,
+      format: compat === 'msc' ? undefined : compat,
     });
 
     this.rtcCall = await this.rtcRoom.joinCall({
@@ -161,7 +161,7 @@ export class WebPeerApp {
     this.call.onRoomCreated = (room, key) => this.onRoomCreated(room, key);
 
     await this.call.connect({
-      format: compat === 'current' ? undefined : compat,
+      format: compat === 'msc' ? undefined : compat,
     });
 
     await this.publishMedia(focusUrl, publish);

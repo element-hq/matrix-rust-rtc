@@ -13,6 +13,7 @@ log only.
 - A reaction's `sound` is no longer optional: a reaction without a sound of its own plays `generic` (037).
 - LiveKit tokens follow the published transport, not the membership format: `/sfu/get` for a `livekit_service_url`, the homeserver's `get_token` via the new `MatrixBackend::livekit_token` for a bare `url`; the standalone `/get_token` is gone (029).
 - The `Sticky2025` membership format is removed; its 2025 member content is still read (029).
+- `MembershipFormat::Current` is `MembershipFormat::Msc` (FFI `MSC`, web `"msc"`) (029).
 
 ### Added
 

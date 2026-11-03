@@ -87,7 +87,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     // `state`: the generation before MSC4354, where membership is room state.
     // Nothing about such a call is visible to a spec-current peer.
     let format = match env::var("LEGACY_ELEMENT_CALL").ok().as_deref() {
-        None => MembershipFormat::Current,
+        None => MembershipFormat::Msc,
         Some("state") => MembershipFormat::RoomState,
         Some(other) => return Err(format!("unknown LEGACY_ELEMENT_CALL {other:?}").into()),
     };

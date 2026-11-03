@@ -73,7 +73,7 @@ use tokio::signal::unix::{SignalKind, signal};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum MembershipFormatArg {
     /// Current MSC4143 + MSC4354 only.
-    Current,
+    Msc,
     /// Element Call before MSC4354: membership as room state.
     State,
 }
@@ -81,7 +81,7 @@ enum MembershipFormatArg {
 impl From<MembershipFormatArg> for MembershipFormat {
     fn from(arg: MembershipFormatArg) -> Self {
         match arg {
-            MembershipFormatArg::Current => Self::Current,
+            MembershipFormatArg::Msc => Self::Msc,
             MembershipFormatArg::State => Self::RoomState,
         }
     }
@@ -229,7 +229,7 @@ struct Args {
     /// `org.matrix.msc3401.call.member` room state — nothing about such a run is
     /// visible to a spec-current peer. Note `--open-slot` is pointless with
     /// `state`: that generation has no slot concept.
-    #[arg(long, value_enum, default_value_t = MembershipFormatArg::Current)]
+    #[arg(long, value_enum, default_value_t = MembershipFormatArg::Msc)]
     format: MembershipFormatArg,
 
     #[arg(long)]

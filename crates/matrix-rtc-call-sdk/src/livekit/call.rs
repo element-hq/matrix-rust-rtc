@@ -264,7 +264,7 @@ impl LiveKitCall {
         let room_id = room.room_id().to_string();
 
         match options.format {
-            MembershipFormat::Current => {}
+            MembershipFormat::Msc => {}
             MembershipFormat::RoomState => log::warn!(
                 "[{room_id}/{}] joining in pre-sticky Element Call compatibility mode: our \
                  membership goes out as {} room state, our SFU identity is the plain \

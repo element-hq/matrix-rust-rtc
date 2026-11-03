@@ -200,7 +200,7 @@ const SCREEN_STEPS: &[Step] = &[
 ];
 
 async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
-    let compat = MembershipFormat::Current;
+    let compat = MembershipFormat::Msc;
     let [alice_creds, bob_creds, carol_creds] =
         credentials_for(&cfg, ["alice", "bob", "carol"]).await?;
 

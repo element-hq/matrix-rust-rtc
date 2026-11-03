@@ -278,7 +278,7 @@ Membership is always applied as a complete set: a member whose event is absent f
   implementation available to test against — still speaks. They carry any
   application. Pure JSON translation: its unit tests need no homeserver.
   Scaffolding with a delete-by date, selected per room by `MembershipFormat`:
-  - The 2025 sticky format is only *read*: permissive and always on, `Current`
+  - The 2025 sticky format is only *read*: permissive and always on, `Msc`
     included (it only fills in modern fields that are absent, so spec-shaped
     events pass through untouched). We no longer write it.
   - **`RoomState`**, the format before MSC4354: membership as

@@ -115,7 +115,7 @@ fn member_event(sender: &str, member_id: &str, event_id: &str) -> EventIn {
 
 #[tokio::test]
 async fn attach_subscribes_to_what_the_mode_needs() {
-    let harness = Harness::attach(MembershipFormat::Current).await;
+    let harness = Harness::attach(MembershipFormat::Msc).await;
     let subjects = &harness.mock.room_subscription(ROOM).unwrap().subjects;
     assert_eq!(
         subjects.state_event_types,
@@ -167,7 +167,7 @@ async fn pre_sticky_state_membership_is_funnelled() {
 
 #[tokio::test]
 async fn a_2025_sticky_member_is_read_in_the_current_format() {
-    let harness = Harness::attach(MembershipFormat::Current).await;
+    let harness = Harness::attach(MembershipFormat::Msc).await;
     harness.seed_room_state();
     harness.sink().on_sticky_events(vec![EventIn {
         content: json!({
@@ -201,10 +201,7 @@ fn a_legacy_key_is_bound_in_the_mode_its_room_was_opened_in() {
     let key_in = |mode: MembershipFormat| {
         parse_key_message(|_| Some(Arc::new(mode)), message.clone()).expect("a key")
     };
-    assert_eq!(
-        key_in(MembershipFormat::Current).member_id,
-        "ec-session-uuid"
-    );
+    assert_eq!(key_in(MembershipFormat::Msc).member_id, "ec-session-uuid");
     assert_eq!(
         key_in(MembershipFormat::RoomState).member_id,
         format!("{BOB}:BOBDEVICE")

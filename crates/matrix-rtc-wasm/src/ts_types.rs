@@ -142,7 +142,7 @@ export interface RtcInterruptions {
 }
 
 export type RtcStreamKind = "microphone" | "camera" | "screen_share" | "screen_share_audio" | "data";
-export type MembershipFormatMode = "current" | "room_state";
+export type MembershipFormatMode = "msc" | "room_state";
 
 /** One roster entry, as `participants()` returns it. */
 export interface RtcParticipant {

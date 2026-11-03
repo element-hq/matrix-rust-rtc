@@ -35,7 +35,7 @@ pub enum FfiMembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
     /// interoperates with spec-current peers.
     #[default]
-    Current,
+    Msc,
     /// Element Call before MSC4354: membership as `org.matrix.msc3401.call.member`
     /// **room state**, plain `{user}:{device}` SFU identities, and the
     /// pre-MSC4195 `/sfu/get` token endpoint.
@@ -48,13 +48,13 @@ pub enum FfiMembershipFormat {
 impl From<FfiMembershipFormat> for MembershipFormat {
     fn from(value: FfiMembershipFormat) -> Self {
         match value {
-            FfiMembershipFormat::Current => Self::Current,
+            FfiMembershipFormat::Msc => Self::Msc,
             FfiMembershipFormat::RoomState => Self::RoomState,
         }
     }
 }
 
-/// An absent mode is [`MembershipFormat::Current`]: hosts that predate this option,
+/// An absent mode is [`MembershipFormat::Msc`]: hosts that predate this option,
 /// and every host not talking to Element Call, leave the field unset.
 pub(crate) fn resolve(compat: Option<FfiMembershipFormat>) -> MembershipFormat {
     compat.unwrap_or_default().into()

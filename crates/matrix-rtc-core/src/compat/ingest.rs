@@ -107,7 +107,7 @@ pub fn outbound_dialect(
     slot_id: &str,
 ) -> OutboundDialect {
     match compat {
-        MembershipFormat::Current => OutboundDialect::None,
+        MembershipFormat::Msc => OutboundDialect::None,
         MembershipFormat::RoomState => {
             OutboundDialect::State(RoomStateDialect::new(user_id, device_id, room_id, slot_id))
         }
@@ -617,7 +617,7 @@ mod tests {
         });
 
         let sticky = parse_legacy_key(
-            MembershipFormat::Current,
+            MembershipFormat::Msc,
             "@alice:example.org",
             Some("ALICEDEVICE"),
             &content,
