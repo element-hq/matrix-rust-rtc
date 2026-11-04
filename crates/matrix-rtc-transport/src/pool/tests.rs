@@ -1645,3 +1645,29 @@ async fn a_track_sent_in_clear_is_reported_once_its_member_maps() {
         "left the SFU"
     );
 }
+
+/// Same SFU, one member through `/sfu/get`, one through the homeserver: two
+/// connections, which is worth a log. Agreeing members are not reported.
+#[test]
+fn an_sfu_reached_through_both_token_flows_is_reported() {
+    let on = |member_id: &str, transport: LiveKitTransport| JoinedMembership {
+        transports: vec![RtcTransport::LiveKit(transport)],
+        ..member_on(member_id, "unused")
+    };
+    let both = || {
+        LiveKitTransport::new(
+            Some("wss://sfu.example.org".into()),
+            Some("https://jwt.example.org".into()),
+            None,
+        )
+        .unwrap()
+    };
+    let bare = || LiveKitTransport::sfu("wss://sfu.example.org");
+
+    assert_eq!(
+        split_flow_sfus(&[on("alice", both()), on("bob", bare())]),
+        vec!["wss://sfu.example.org".to_owned()]
+    );
+    assert!(split_flow_sfus(&[on("alice", both()), on("bob", both())]).is_empty());
+    assert!(split_flow_sfus(&[on("alice", bare()), on("bob", bare())]).is_empty());
+}

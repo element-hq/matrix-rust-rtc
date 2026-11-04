@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matrix_rtc_core::executor as rt;
-use matrix_rtc_core::{JoinedMembership, RtcTransport};
+use matrix_rtc_core::{JoinedMembership, LiveKitAuthFlow, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -381,6 +381,8 @@ pub struct MediaPool {
     members_snapshot: Vec<JoinedMembership>,
     /// Every `member_id` of the latest snapshot, mapped or not.
     known_members: HashSet<String>,
+    /// SFU URLs already reported as reached through both token flows.
+    split_flow_sfus: HashSet<String>,
     /// Transport identity → `member_id`.
     identity_map: HashMap<String, String>,
     /// `member_id` → transport identity (the reverse of `identity_map`),
@@ -447,6 +449,7 @@ impl MediaPool {
             tracks,
             members_snapshot: Vec::new(),
             known_members: HashSet::new(),
+            split_flow_sfus: HashSet::new(),
             identity_map: HashMap::new(),
             member_identities: HashMap::new(),
             constraints: HashMap::new(),
@@ -1012,6 +1015,15 @@ impl MediaPool {
                     .or_insert_with(|| (backend, HashSet::new()))
                     .1
                     .insert(member.member_id.clone());
+            }
+        }
+
+        for url in split_flow_sfus(&self.members_snapshot) {
+            if self.split_flow_sfus.insert(url.clone()) {
+                log::warn!(
+                    "SFU {url} is advertised both with and without a livekit_service_url: \
+                     members reach it through two token flows, so two connections"
+                );
             }
         }
 
@@ -1853,6 +1865,34 @@ fn select_transport(
         }
     }
     None
+}
+
+/// SFU URLs that some members reach through `/sfu/get` (their transport also
+/// names a `livekit_service_url`) and others through the homeserver (a bare
+/// `url`). Not wrong, but each flow is its own connection to the same SFU.
+fn split_flow_sfus(members: &[JoinedMembership]) -> Vec<String> {
+    let mut flows: HashMap<&str, (bool, bool)> = HashMap::new();
+    for member in members {
+        let livekit = member
+            .transports
+            .iter()
+            .find_map(|transport| match transport {
+                RtcTransport::LiveKit(livekit) => Some(livekit),
+                RtcTransport::Unsupported(_) => None,
+            });
+        let Some(livekit) = livekit else { continue };
+        let Some(url) = livekit.url() else { continue };
+        let seen = flows.entry(url).or_default();
+        match livekit.auth_flow() {
+            LiveKitAuthFlow::SfuGet { .. } => seen.0 = true,
+            LiveKitAuthFlow::CsApi { .. } => seen.1 = true,
+        }
+    }
+    flows
+        .into_iter()
+        .filter(|(_, (sfu_get, cs_api))| *sfu_get && *cs_api)
+        .map(|(url, _)| url.to_owned())
+        .collect()
 }
 
 #[cfg(test)]
