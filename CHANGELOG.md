@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.9 - 2026-11-04
+
 ### Breaking
 
 - A reaction's `sound` is no longer optional: a reaction without a sound of its own plays `generic` (037).

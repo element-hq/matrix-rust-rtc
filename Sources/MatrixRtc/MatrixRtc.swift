@@ -1369,6 +1369,15 @@ public protocol MatrixBackend: AnyObject, Sendable {
     func openidToken() async throws  -> FfiOpenIdToken
     
     /**
+     * The homeserver's MSC4195 LiveKit token: `POST` `request` to
+     * `get_token` (see [`FfiLiveKitTokenRequest`]) and return the `jwt` of
+     * the answer. Used for transports naming an SFU `url` without a
+     * `livekit_service_url`. A host that cannot make the request fails with
+     * `M_UNRECOGNIZED`, status 404, as a homeserver without it would.
+     */
+    func livekitToken(request: FfiLiveKitTokenRequest) async throws  -> String
+    
+    /**
      * The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`,
      * as JSON; `[]` when the homeserver lacks the endpoint.
      */
@@ -1710,6 +1719,30 @@ open func openidToken()async throws  -> FfiOpenIdToken  {
             completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
             freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
             liftFunc: FfiConverterTypeFfiOpenIdToken_lift,
+            errorHandler: FfiConverterTypeFfiBackendError_lift
+        )
+}
+    
+    /**
+     * The homeserver's MSC4195 LiveKit token: `POST` `request` to
+     * `get_token` (see [`FfiLiveKitTokenRequest`]) and return the `jwt` of
+     * the answer. Used for transports naming an SFU `url` without a
+     * `livekit_service_url`. A host that cannot make the request fails with
+     * `M_UNRECOGNIZED`, status 404, as a homeserver without it would.
+     */
+open func livekitToken(request: FfiLiveKitTokenRequest)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_matrixbackend_livekit_token(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeFfiLiveKitTokenRequest_lower(request)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
             errorHandler: FfiConverterTypeFfiBackendError_lift
         )
 }
@@ -2342,6 +2375,49 @@ fileprivate struct UniffiCallbackInterfaceMatrixBackend {
                     uniffiCallbackData,
                     UniffiForeignFutureStructRustBuffer(
                         returnValue: FfiConverterTypeFfiOpenIdToken_lower(returnValue),
+                        callStatus: RustCallStatus()
+                    )
+                )
+            }
+            let uniffiHandleError = { (statusCode, errorBuf) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: RustBuffer.empty(),
+                        callStatus: RustCallStatus(code: statusCode, errorBuf: errorBuf)
+                    )
+                )
+            }
+            let uniffiForeignFuture = uniffiTraitInterfaceCallAsyncWithError(
+                makeCall: makeCall,
+                handleSuccess: uniffiHandleSuccess,
+                handleError: uniffiHandleError,
+                lowerError: FfiConverterTypeFfiBackendError_lower
+            )
+            uniffiOutReturn.pointee = uniffiForeignFuture
+        },
+        livekitToken: { (
+            uniffiHandle: UInt64,
+            request: RustBuffer,
+            uniffiFutureCallback: @escaping UniffiForeignFutureCompleteRustBuffer,
+            uniffiCallbackData: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<UniffiForeignFuture>
+        ) in
+            let makeCall = {
+                () async throws -> String in
+                guard let uniffiObj = try? FfiConverterTypeMatrixBackend.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try await uniffiObj.livekitToken(
+                     request: try FfiConverterTypeFfiLiveKitTokenRequest_lift(request)
+                )
+            }
+
+            let uniffiHandleSuccess = { (returnValue: String) in
+                uniffiFutureCallback(
+                    uniffiCallbackData,
+                    UniffiForeignFutureStructRustBuffer(
+                        returnValue: FfiConverterString.lower(returnValue),
                         callStatus: RustCallStatus()
                     )
                 )
@@ -6848,6 +6924,118 @@ public func FfiConverterTypeFfiLeaveSessionParams_lower(_ value: FfiLeaveSession
 
 
 /**
+ * An MSC4195 LiveKit token request to the homeserver:
+ * `POST /_matrix/client/v1/rtc/livekit/get_token` (unstable
+ * `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`), with
+ * this record as the JSON body. A DTO, so no client SDK type crosses the FFI.
+ */
+public struct FfiLiveKitTokenRequest {
+    /**
+     * The SFU's homeserver; the homeserver's own when `None` (omit the field).
+     */
+    public var serverName: String?
+    /**
+     * The SFU's WebSocket URL.
+     */
+    public var url: String
+    public var roomId: String
+    public var slotId: String
+    public var memberId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The SFU's homeserver; the homeserver's own when `None` (omit the field).
+         */serverName: String?, 
+        /**
+         * The SFU's WebSocket URL.
+         */url: String, roomId: String, slotId: String, memberId: String) {
+        self.serverName = serverName
+        self.url = url
+        self.roomId = roomId
+        self.slotId = slotId
+        self.memberId = memberId
+    }
+}
+
+#if compiler(>=6)
+extension FfiLiveKitTokenRequest: Sendable {}
+#endif
+
+
+extension FfiLiveKitTokenRequest: Equatable, Hashable {
+    public static func ==(lhs: FfiLiveKitTokenRequest, rhs: FfiLiveKitTokenRequest) -> Bool {
+        if lhs.serverName != rhs.serverName {
+            return false
+        }
+        if lhs.url != rhs.url {
+            return false
+        }
+        if lhs.roomId != rhs.roomId {
+            return false
+        }
+        if lhs.slotId != rhs.slotId {
+            return false
+        }
+        if lhs.memberId != rhs.memberId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(serverName)
+        hasher.combine(url)
+        hasher.combine(roomId)
+        hasher.combine(slotId)
+        hasher.combine(memberId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiLiveKitTokenRequest: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiLiveKitTokenRequest {
+        return
+            try FfiLiveKitTokenRequest(
+                serverName: FfiConverterOptionString.read(from: &buf), 
+                url: FfiConverterString.read(from: &buf), 
+                roomId: FfiConverterString.read(from: &buf), 
+                slotId: FfiConverterString.read(from: &buf), 
+                memberId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiLiveKitTokenRequest, into buf: inout [UInt8]) {
+        FfiConverterOptionString.write(value.serverName, into: &buf)
+        FfiConverterString.write(value.url, into: &buf)
+        FfiConverterString.write(value.roomId, into: &buf)
+        FfiConverterString.write(value.slotId, into: &buf)
+        FfiConverterString.write(value.memberId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiLiveKitTokenRequest_lift(_ buf: RustBuffer) throws -> FfiLiveKitTokenRequest {
+    return try FfiConverterTypeFfiLiveKitTokenRequest.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiLiveKitTokenRequest_lower(_ value: FfiLiveKitTokenRequest) -> RustBuffer {
+    return FfiConverterTypeFfiLiveKitTokenRequest.lower(value)
+}
+
+
+/**
  * Our own tile, beside the roster and never in it, and whether we are
  * sharing our screen — publication state (up and unmuted), not intent, so
  * it goes false however the share ended. Contract C3, C8.
@@ -7543,9 +7731,9 @@ public struct FfiReactionKind {
     public var emoji: String
     /**
      * Base name of the sound asset Element Call plays for it (`clap`,
-     * `party`, …), or `None` for a silent reaction.
+     * `party`, …, or `generic` for an entry without a sound of its own).
      */
-    public var sound: String?
+    public var sound: String
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7558,8 +7746,8 @@ public struct FfiReactionKind {
          */emoji: String, 
         /**
          * Base name of the sound asset Element Call plays for it (`clap`,
-         * `party`, …), or `None` for a silent reaction.
-         */sound: String?) {
+         * `party`, …, or `generic` for an entry without a sound of its own).
+         */sound: String) {
         self.name = name
         self.emoji = emoji
         self.sound = sound
@@ -7603,14 +7791,14 @@ public struct FfiConverterTypeFfiReactionKind: FfiConverterRustBuffer {
             try FfiReactionKind(
                 name: FfiConverterString.read(from: &buf), 
                 emoji: FfiConverterString.read(from: &buf), 
-                sound: FfiConverterOptionString.read(from: &buf)
+                sound: FfiConverterString.read(from: &buf)
         )
     }
 
     public static func write(_ value: FfiReactionKind, into buf: inout [UInt8]) {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterString.write(value.emoji, into: &buf)
-        FfiConverterOptionString.write(value.sound, into: &buf)
+        FfiConverterString.write(value.sound, into: &buf)
     }
 }
 
@@ -10331,11 +10519,11 @@ public enum FfiCallEvent {
      * A participant sent an emoji reaction. Transient: show `emoji` for a
      * few seconds (Element Call uses three) and, if reaction sounds are on,
      * play the asset named by `sound` (`clap`, `party`, …, `generic` for a
-     * name outside the catalogue; see `reactionCatalog()`). `None` is a
-     * silent reaction. Sent only while we are in the call and for a recent
+     * name without a sound of its own; see `reactionCatalog()`). `emoji` is
+     * the catalogue's for a catalogue name, as Element Call shows. Sent only while we are in the call and for a recent
      * reaction (`FfiReactionsConfig.max_age_ms`), never as a replayed burst.
      */
-    case reaction(memberId: String, emoji: String, name: String, sound: String?
+    case reaction(memberId: String, emoji: String, name: String, sound: String
     )
     /**
      * A transport-level participant with no signalled membership; it gets
@@ -10393,7 +10581,7 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
         case 11: return .handLowered(memberId: try FfiConverterString.read(from: &buf)
         )
         
-        case 12: return .reaction(memberId: try FfiConverterString.read(from: &buf), emoji: try FfiConverterString.read(from: &buf), name: try FfiConverterString.read(from: &buf), sound: try FfiConverterOptionString.read(from: &buf)
+        case 12: return .reaction(memberId: try FfiConverterString.read(from: &buf), emoji: try FfiConverterString.read(from: &buf), name: try FfiConverterString.read(from: &buf), sound: try FfiConverterString.read(from: &buf)
         )
         
         case 13: return .unknownParticipant(identity: try FfiConverterString.read(from: &buf)
@@ -10482,7 +10670,7 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
             FfiConverterString.write(memberId, into: &buf)
             FfiConverterString.write(emoji, into: &buf)
             FfiConverterString.write(name, into: &buf)
-            FfiConverterOptionString.write(sound, into: &buf)
+            FfiConverterString.write(sound, into: &buf)
             
         
         case let .unknownParticipant(identity):
@@ -11148,9 +11336,11 @@ public enum FfiJoinTransport {
      */
     case advertised
     /**
-     * Publish on this LiveKit focus, whatever the homeserver advertises.
+     * Publish on this LiveKit transport, whatever the homeserver advertises:
+     * an SFU `url` (tokens from the homeserver), the legacy JWT service's
+     * `livekit_service_url`, or both (tokens from the service). At least one.
      */
-    case publish(livekitServiceUrl: String
+    case publish(url: String?, livekitServiceUrl: String?
     )
     /**
      * Publish nothing and only receive, as a recorder or other observer does.
@@ -11175,7 +11365,7 @@ public struct FfiConverterTypeFfiJoinTransport: FfiConverterRustBuffer {
         
         case 1: return .advertised
         
-        case 2: return .publish(livekitServiceUrl: try FfiConverterString.read(from: &buf)
+        case 2: return .publish(url: try FfiConverterOptionString.read(from: &buf), livekitServiceUrl: try FfiConverterOptionString.read(from: &buf)
         )
         
         case 3: return .receiveOnly
@@ -11192,9 +11382,10 @@ public struct FfiConverterTypeFfiJoinTransport: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
         
         
-        case let .publish(livekitServiceUrl):
+        case let .publish(url,livekitServiceUrl):
             writeInt(&buf, Int32(2))
-            FfiConverterString.write(livekitServiceUrl, into: &buf)
+            FfiConverterOptionString.write(url, into: &buf)
+            FfiConverterOptionString.write(livekitServiceUrl, into: &buf)
             
         
         case .receiveOnly:
@@ -11462,18 +11653,7 @@ public enum FfiMembershipFormat {
      * Current MSC4143 + MSC4354 only. The default, and the only mode that
      * interoperates with spec-current peers.
      */
-    case current
-    /**
-     * Element Call as of 2025: MSC4354 sticky events carrying the pre-2026
-     * field names alongside the spec ones.
-     *
-     * Joins stay MSC4143-valid, so a spec-current peer still reads us. Leaves
-     * and media keys cannot be additive — a leave becomes the legacy
-     * bare-sticky-key content and keys go out as
-     * `io.element.call.encryption_keys` *instead of* the spec type — so in this
-     * mode keys are exchanged with legacy peers and not with spec-current ones.
-     */
-    case sticky2025
+    case msc
     /**
      * Element Call before MSC4354: membership as `org.matrix.msc3401.call.member`
      * **room state**, plain `{user}:{device}` SFU identities, and the
@@ -11500,11 +11680,9 @@ public struct FfiConverterTypeFfiMembershipFormat: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .current
+        case 1: return .msc
         
-        case 2: return .sticky2025
-        
-        case 3: return .roomState
+        case 2: return .roomState
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -11514,16 +11692,12 @@ public struct FfiConverterTypeFfiMembershipFormat: FfiConverterRustBuffer {
         switch value {
         
         
-        case .current:
+        case .msc:
             writeInt(&buf, Int32(1))
         
         
-        case .sticky2025:
-            writeInt(&buf, Int32(2))
-        
-        
         case .roomState:
-            writeInt(&buf, Int32(3))
+            writeInt(&buf, Int32(2))
         
         }
     }
@@ -11819,9 +11993,11 @@ extension FfiRingPhase: Equatable, Hashable {}
 public enum FfiRtcTransport {
     
     /**
-     * MSC4195 LiveKit transport.
+     * MSC4195 LiveKit transport: an SFU `url`, the legacy JWT service's
+     * `livekit_service_url`, or both; `server_name` names the SFU's
+     * homeserver when it is not the publisher's.
      */
-    case liveKit(livekitServiceUrl: String
+    case liveKit(url: String?, livekitServiceUrl: String?, serverName: String?
     )
     /**
      * A transport this SDK does not know; kept for forward compatibility.
@@ -11845,7 +12021,7 @@ public struct FfiConverterTypeFfiRtcTransport: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .liveKit(livekitServiceUrl: try FfiConverterString.read(from: &buf)
+        case 1: return .liveKit(url: try FfiConverterOptionString.read(from: &buf), livekitServiceUrl: try FfiConverterOptionString.read(from: &buf), serverName: try FfiConverterOptionString.read(from: &buf)
         )
         
         case 2: return .unsupported(transportType: try FfiConverterString.read(from: &buf)
@@ -11859,9 +12035,11 @@ public struct FfiConverterTypeFfiRtcTransport: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .liveKit(livekitServiceUrl):
+        case let .liveKit(url,livekitServiceUrl,serverName):
             writeInt(&buf, Int32(1))
-            FfiConverterString.write(livekitServiceUrl, into: &buf)
+            FfiConverterOptionString.write(url, into: &buf)
+            FfiConverterOptionString.write(livekitServiceUrl, into: &buf)
+            FfiConverterOptionString.write(serverName, into: &buf)
             
         
         case let .unsupported(transportType):
@@ -14325,8 +14503,8 @@ public func logEvent(level: RtcLogLevel, target: String, message: String)  {try!
  *
  * The names are the interoperable part: a reaction sent with one of these
  * names plays the same sound on Element Call as on a host that bundles the
- * assets under the `sound` base names here, plus `generic` for names outside
- * the catalogue. The SDK plays nothing itself.
+ * assets under the `sound` base names here (`generic` among them, which also
+ * plays for names outside the catalogue). The SDK plays nothing itself.
  */
 public func reactionCatalog() -> [FfiReactionKind]  {
     return try!  FfiConverterSequenceTypeFfiReactionKind.lift(try! rustCall() {
@@ -14336,10 +14514,10 @@ public func reactionCatalog() -> [FfiReactionKind]  {
 }
 /**
  * The sound asset to play for a reaction `name`: a catalogue entry's sound,
- * `generic` for a name outside the catalogue, or `None` for a silent one.
+ * or `generic` for any other name.
  */
-public func reactionSoundFor(name: String) -> String?  {
-    return try!  FfiConverterOptionString.lift(try! rustCall() {
+public func reactionSoundFor(name: String) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_matrix_rtc_ffi_fn_func_reaction_sound_for(
         FfiConverterString.lower(name),$0
     )
@@ -14400,10 +14578,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_func_log_event() != 11041) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_func_reaction_catalog() != 46221) {
+    if (uniffi_matrix_rtc_ffi_checksum_func_reaction_catalog() != 30899) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_func_reaction_sound_for() != 26431) {
+    if (uniffi_matrix_rtc_ffi_checksum_func_reaction_sound_for() != 36760) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_func_sdk_version() != 56977) {
@@ -14478,7 +14656,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_openid_token() != 11831) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_rtc_transports() != 59550) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_livekit_token() != 23726) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_matrixbackend_rtc_transports() != 11126) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_audio_stream() != 28423) {
