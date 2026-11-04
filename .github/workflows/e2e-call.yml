@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   e2e-call:
-    name: Two-client audio call
+    name: E2E call suite
     runs-on: ubuntu-latest
     # Generous: an uncached build of matrix-sdk alone takes ~25-45 minutes.
     # With a warm rust-cache the whole job is ~10 minutes.
