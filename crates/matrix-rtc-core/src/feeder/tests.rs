@@ -30,7 +30,7 @@ struct Harness {
 
 impl Harness {
     async fn attach() -> Self {
-        Self::attach_in(Arc::new(MembershipFormat::Current)).await
+        Self::attach_in(Arc::new(MembershipFormat::Msc)).await
     }
 
     async fn attach_in(dialect: Arc<dyn IngestDialect>) -> Self {
@@ -141,7 +141,7 @@ impl IngestDialect for StateDialect {
                 ..event
             })
             .collect();
-        MembershipFormat::Current.current_membership(room_id, sticky, Vec::new())
+        MembershipFormat::Msc.current_membership(room_id, sticky, Vec::new())
     }
 
     fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
@@ -468,7 +468,7 @@ async fn a_stalled_seeding_names_the_deliveries_it_waits_on() {
     let mock = Arc::new(MockBackend::new());
     let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
     let (_attachment, mut run) =
-        RoomFeeder::attach(mock.clone(), manager, Arc::new(MembershipFormat::Current))
+        RoomFeeder::attach(mock.clone(), manager, Arc::new(MembershipFormat::Msc))
             .await
             .expect("attach");
     assert_eq!(run.missing_subjects().len(), 4);
@@ -511,13 +511,10 @@ async fn an_application_gets_its_sticky_types_before_the_set_is_narrowed() {
         rtc: BaseRtcRoom::with_backend(ROOM, mock.clone()),
         received: Vec::new(),
     }));
-    let (attachment, run) = RoomFeeder::attach(
-        mock.clone(),
-        app.clone(),
-        Arc::new(MembershipFormat::Current),
-    )
-    .await
-    .expect("attach");
+    let (attachment, run) =
+        RoomFeeder::attach(mock.clone(), app.clone(), Arc::new(MembershipFormat::Msc))
+            .await
+            .expect("attach");
     tokio::spawn(run.run());
     let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
     sink.on_encryption(false);

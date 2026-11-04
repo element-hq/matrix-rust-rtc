@@ -278,11 +278,9 @@ Membership is always applied as a complete set: a member whose event is absent f
   implementation available to test against — still speaks. They carry any
   application. Pure JSON translation: its unit tests need no homeserver.
   Scaffolding with a delete-by date, selected per room by `MembershipFormat`:
-  - **`Sticky2025`**, the 2025 format: already MSC4354 sticky-based, differing
-    only in the fields inside the member content. *Reading* it is permissive and
-    always on, `Current` included (it only fills in modern fields that are
-    absent, so spec-shaped events pass through untouched); *writing* it is
-    opt-in, being the half that changes what other clients see.
+  - The 2025 sticky format is only *read*: permissive and always on, `Msc`
+    included (it only fills in modern fields that are absent, so spec-shaped
+    events pass through untouched). We no longer write it.
   - **`RoomState`**, the format before MSC4354: membership as
     `org.matrix.msc3401.call.member` **room state**, a plain `{user}:{device}` SFU
     participant identity, and the pre-MSC4195 `/sfu/get` token endpoint. Opt-in in
@@ -428,10 +426,12 @@ Membership is always applied as a complete set: a member whose event is absent f
   call SDK's scenario tests and the FFI's debug artifacts use it.
 - `livekit`: the pure half of the MSC4195 control plane, shared by the native
   transport and the web binding — `identity` (the hash derivations), `token`
-  (`/get_token` and legacy `/sfu/get` request builders and the response
-  decoder), `TokenEndpoint`, and `identity_mapper` (the per-generation identity
-  derivation, deliberately a Rust closure because `RtcIdentityMapper` is
-  `Send + Sync`). `matrix-rtc-livekit` re-exports its identity and token
+  (the legacy `/sfu/get` request builder and the response decoder),
+  `LiveKitTarget` (the token flow a transport's fields select, and the
+  connection key it groups by), and `identity_mapper` (the identity that flow
+  mints, deliberately a Rust closure because `RtcIdentityMapper` is
+  `Send + Sync`). The homeserver's MSC4195 `get_token` is the host's call,
+  `MatrixBackend::livekit_token`. `matrix-rtc-livekit` re-exports its identity and token
   endpoint pieces and adds the IO (reqwest, the LiveKit client).
 
 ## `crates/matrix-rtc-wasm`
@@ -515,13 +515,15 @@ Membership is always applied as a complete set: a member whose event is absent f
   hash derivations (`identity`), drives a LiveKit `Room` (`session`), and bridges
   core media keys into LiveKit per-participant frame encryption (`keys`,
   `MediaKeyBridge` → `KeyProvider`, HKDF mode, GCM frames).
-- Obtains the Matrix OpenID token via the core's `MatrixBackend::openid_token`,
-  so the crate is not hard-wired to a particular Matrix SDK. `MemberClaims`
-  stays here: those are the `/get_token` request body's claims, which no
-  homeserver ever sees.
+- Obtains its tokens through the core's `MatrixBackend` — an OpenID token
+  (`openid_token`) for a JWT service's `/sfu/get`, the homeserver's MSC4195 JWT
+  (`livekit_token`) otherwise — so the crate is not hard-wired to a particular
+  Matrix SDK.
 - Implements `matrix-rtc-transport`'s traits in `transport_impl`
-  (`LiveKitMediaTransport`): connection key = `livekit_service_url`, remote
-  identity = MSC4195 pseudonymous identity, `RoomEvent` → `ConnectionEvent`
+  (`LiveKitMediaTransport`): connection key = the `LiveKitTarget` (token flow
+  and what it authenticates against), remote identity = what that flow mints
+  (`{user}:{device}` from `/sfu/get`, `hash([sender, member.id])` from the
+  homeserver), `RoomEvent` → `ConnectionEvent`
   translation, and `NativeAudioStream` → owned PCM frame streams behind
   `RemoteTrackHandle`.
 - Knows no call: no `matrix-rtc-call`, no call SDK, no Matrix SDK. The token

@@ -35,16 +35,7 @@ pub enum FfiMembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
     /// interoperates with spec-current peers.
     #[default]
-    Current,
-    /// Element Call as of 2025: MSC4354 sticky events carrying the pre-2026
-    /// field names alongside the spec ones.
-    ///
-    /// Joins stay MSC4143-valid, so a spec-current peer still reads us. Leaves
-    /// and media keys cannot be additive — a leave becomes the legacy
-    /// bare-sticky-key content and keys go out as
-    /// `io.element.call.encryption_keys` *instead of* the spec type — so in this
-    /// mode keys are exchanged with legacy peers and not with spec-current ones.
-    Sticky2025,
+    Msc,
     /// Element Call before MSC4354: membership as `org.matrix.msc3401.call.member`
     /// **room state**, plain `{user}:{device}` SFU identities, and the
     /// pre-MSC4195 `/sfu/get` token endpoint.
@@ -57,14 +48,13 @@ pub enum FfiMembershipFormat {
 impl From<FfiMembershipFormat> for MembershipFormat {
     fn from(value: FfiMembershipFormat) -> Self {
         match value {
-            FfiMembershipFormat::Current => Self::Current,
-            FfiMembershipFormat::Sticky2025 => Self::Sticky2025,
+            FfiMembershipFormat::Msc => Self::Msc,
             FfiMembershipFormat::RoomState => Self::RoomState,
         }
     }
 }
 
-/// An absent mode is [`MembershipFormat::Current`]: hosts that predate this option,
+/// An absent mode is [`MembershipFormat::Msc`]: hosts that predate this option,
 /// and every host not talking to Element Call, leave the field unset.
 pub(crate) fn resolve(compat: Option<FfiMembershipFormat>) -> MembershipFormat {
     compat.unwrap_or_default().into()

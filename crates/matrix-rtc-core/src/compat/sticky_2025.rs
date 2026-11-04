@@ -3,13 +3,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! The pre-2026 Element Call wire format, translated to and from current
-//! MSC4143.
+//! Reading the 2025 Element Call wire format, and the legacy key and
+//! notification shapes the pre-sticky generation shares with it.
+//!
+//! We no longer *write* the 2025 format: its outbound dialect went with the
+//! `Sticky2025` membership format, once Element Call moved on. What stays is
+//! the permissive inbound normalisation (a spec-shaped event passes through
+//! untouched) and the legacy key/notification shapes
+//! [`RoomStateDialect`](super::RoomStateDialect) still speaks.
 //!
 //! Deliberately depends on nothing but `serde_json`: no `matrix-sdk` type, no
 //! `matrix-rtc-core` type. Everything is a plain JSON-in/JSON-out function, so
-//! the whole dialect is unit-testable without a homeserver and deleting it
-//! cannot break a signature anywhere else.
+//! the whole module is unit-testable without a homeserver.
 //!
 //! # The format, field by field
 //!
@@ -28,13 +33,8 @@
 //! Element Call runs as a widget, and the widget API gives it no access to
 //! decryption metadata. It therefore cannot learn the device that sent a member
 //! event, which is where MSC4143 (since the 2026 rewrite) says a member's device
-//! comes from. Two consequences shape this module:
+//! comes from. So:
 //!
-//! - It cannot address a to-device key to us unless our member event *states*
-//!   our device, so [`Sticky2025Dialect::rewrite_member_content`] puts
-//!   `member.user_id` / `member.device_id` back on the wire. Without them,
-//!   Element Call has no way to send us its media key and its media never
-//!   decrypts for us.
 //! - Its own member events carry the same self-asserted `member.device_id`.
 //!   Where we cannot do better — a member event that reached us unencrypted —
 //!   [`claimed_device_id`] surfaces it so the core has *some* device to bind the
@@ -47,8 +47,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
-
-use std::borrow::Cow;
 
 use serde_json::{Map, Value, json};
 
@@ -155,19 +153,15 @@ fn lift_room_slot_id(object: &mut Map<String, Value>) {
     }
 }
 
-/// The slot id this generation puts on the wire for `slot_id`: the room-wide
-/// slot as `{application}#ROOM`, any other slot unchanged.
-///
-/// Needed wherever the slot id leaves us, not only in member content: the
-/// MSC4195 `/get_token` body names it too, and the authorisation service
-/// derives the SFU room from it, so a mismatch there puts us in a different
-/// SFU room from Element Call.
-pub fn legacy_slot_id(slot_id: &str) -> Cow<'_, str> {
-    match slot_id.split_once('#') {
-        Some((application, crate::ROOM_APPLICATION_SLOT_ID)) => {
-            Cow::Owned(format!("{application}#{LEGACY_ROOM_APPLICATION_SLOT_ID}"))
-        }
-        _ => Cow::Borrowed(slot_id),
+/// `{application}#room` → `{application}#ROOM`, the inverse of
+/// [`lift_room_slot_id`]: how the JS SDK spells the room-wide slot.
+pub(crate) fn legacy_room_slot_id(slot_id: &str) -> std::borrow::Cow<'_, str> {
+    match slot_id
+        .strip_suffix(crate::ROOM_APPLICATION_SLOT_ID)
+        .and_then(|application| application.strip_suffix('#'))
+    {
+        Some(application) => format!("{application}#{LEGACY_ROOM_APPLICATION_SLOT_ID}").into(),
+        None => slot_id.into(),
     }
 }
 
@@ -247,14 +241,6 @@ pub(crate) fn is_leave(content: &Value) -> bool {
         .and_then(|member| member.get("membership"))
         .and_then(Value::as_str)
         == Some("leave")
-}
-
-/// The sticky key this content carries, under either spelling.
-fn sticky_key_of(content: &Value) -> Option<&str> {
-    content
-        .get("msc4354_sticky_key")
-        .or_else(|| content.get("sticky_key"))
-        .and_then(Value::as_str)
 }
 
 /// The device a member event claims to come from (`member.device_id`).
@@ -352,134 +338,9 @@ pub fn parse_key_message(sender: &str, content: &Value) -> Option<LegacyKeyMessa
     })
 }
 
-/// The outbound half: rewrites what we send so a pre-2026 Element Call can read
-/// it.
-///
-/// Opt-in per call (`matrix_rtc_call_sdk::LiveKitCallOptions::format`),
-/// because unlike the inbound normalisation this changes what every peer sees.
-///
-/// Member events are rewritten **additively** — the MSC4143 fields all stay put
-/// and the legacy ones are added alongside — so one event on the wire is
-/// readable by both dialects and a spec-current peer sees exactly what it would
-/// have seen anyway. Key messages cannot work that way: the message type is one
-/// or the other, so in this mode keys go out in the legacy dialect only.
-#[derive(Clone, Debug)]
-pub struct Sticky2025Dialect {
-    own_user_id: String,
-    own_device_id: String,
-    slot_id: String,
-}
-
-impl Sticky2025Dialect {
-    /// Builds the dialect for our own membership in `slot_id`.
-    ///
-    /// The user and device ids are the ones we publish in `member`; the slot id
-    /// is needed to reconstruct the legacy `session` object on key messages.
-    pub fn new(
-        own_user_id: impl Into<String>,
-        own_device_id: impl Into<String>,
-        slot_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            own_user_id: own_user_id.into(),
-            own_device_id: own_device_id.into(),
-            slot_id: slot_id.into(),
-        }
-    }
-
-    /// Whether `event_type` is a membership, and so needs the legacy aliases.
-    pub fn is_member_event(event_type: &str) -> bool {
-        event_type == MEMBER_EVENT_TYPE || event_type == "org.matrix.msc4143.rtc.member"
-    }
-
-    /// Rewrite an MSC4143 `m.rtc.member` content into something a pre-2026
-    /// Element Call can read, in place.
-    ///
-    /// A **join** is rewritten additively: every MSC4143 field stays and the
-    /// legacy ones are added beside it, so one event serves both dialects.
-    /// `member.user_id` / `member.device_id` are what let Element Call address a
-    /// to-device key to us at all (see the module docs); `rtc_transports` is
-    /// where it looks for our SFU; `versions` it expects to exist.
-    ///
-    /// A **leave** cannot be additive. Element Call has no `membership` field —
-    /// it signals departure by sending content holding nothing but the sticky
-    /// key — and its validator requires `rtc_transports` on anything it does
-    /// parse. Handed our spec leave it rejects the event outright; padded with
-    /// an empty `rtc_transports` it would read us as *joined* and publishing
-    /// nothing, which is a worse ghost than the one we are trying to clear. So a
-    /// leave is replaced wholesale with the legacy shape.
-    ///
-    /// That costs a spec-current peer nothing that matters: it cannot parse a
-    /// bare sticky key either, and a member event it cannot parse is one it
-    /// already treats as departed. Same outcome, which is what makes this safe
-    /// to do in a mode that is explicitly for talking to Element Call.
-    pub fn rewrite_member_content(&self, content: &mut Value) {
-        if is_leave(content)
-            && let Some(sticky_key) = sticky_key_of(content).map(str::to_owned)
-        {
-            *content = json!({ "msc4354_sticky_key": sticky_key });
-            return;
-        }
-
-        let Some(object) = content.as_object_mut() else {
-            return;
-        };
-
-        // Already the legacy leave (or otherwise not a membership we can dress
-        // up). Adding a `member` object here would turn a departure back into
-        // something that looks like a membership.
-        let Some(slot_id) = object.get("slot_id").and_then(Value::as_str) else {
-            return;
-        };
-
-        // Not additive: a slot id has one value, and Element Call matches it
-        // exactly. A spec-current peer loses nothing it had — in this mode our
-        // keys only go out in the legacy type anyway.
-        let legacy = legacy_slot_id(slot_id).into_owned();
-        object.insert("slot_id".to_owned(), Value::String(legacy));
-
-        // Mirror `transports.published` back into the flat array. A leave
-        // carries no transports, and then neither does the alias.
-        if !object.contains_key("rtc_transports")
-            && let Some(published) = object
-                .get("transports")
-                .and_then(|transports| transports.get("published"))
-                .and_then(Value::as_array)
-                .filter(|published| !published.is_empty())
-                .cloned()
-        {
-            object.insert("rtc_transports".to_owned(), Value::Array(published));
-        }
-
-        object
-            .entry("versions")
-            .or_insert_with(|| Value::Array(Vec::new()));
-
-        let member = object
-            .entry("member")
-            .or_insert_with(|| Value::Object(Map::new()));
-        if let Some(member) = member.as_object_mut() {
-            member
-                .entry("user_id")
-                .or_insert_with(|| Value::String(self.own_user_id.clone()));
-            member
-                .entry("device_id")
-                .or_insert_with(|| Value::String(self.own_device_id.clone()));
-        }
-    }
-
-    /// Translate an outbound media-key to-device message into the legacy type
-    /// and shape.
-    ///
-    /// Returns `None` for any other message type, which the caller then sends
-    /// untouched.
-    pub fn rewrite_key_message(
-        &self,
-        message_type: &str,
-        content: &Value,
-    ) -> Option<(String, Value)> {
-        rewrite_key_message(&self.own_device_id, &self.slot_id, message_type, content)
-    }
+/// Whether `event_type` is a membership, stable or unstable.
+pub fn is_member_event(event_type: &str) -> bool {
+    event_type == MEMBER_EVENT_TYPE || event_type == "org.matrix.msc4143.rtc.member"
 }
 
 /// Translate an outbound media-key to-device message into the legacy type and
@@ -812,168 +673,6 @@ mod tests {
         );
     }
 
-    fn dialect() -> Sticky2025Dialect {
-        Sticky2025Dialect::new("@bob:example.io", "BOBDEVICE", "m.call#room")
-    }
-
-    /// Additive: every MSC4143 field survives, so one event serves both
-    /// dialects.
-    #[test]
-    fn outbound_join_keeps_the_spec_fields_and_gains_the_legacy_ones() {
-        let mut content: Value = serde_json::from_str(SPEC_JOIN).unwrap();
-        dialect().rewrite_member_content(&mut content);
-
-        assert_eq!(content.pointer("/member/membership").unwrap(), "join");
-        assert_eq!(content.pointer("/member/id").unwrap(), "xyzABCDEF0123");
-        assert_eq!(
-            content.pointer("/transports/can_subscribe/0").unwrap(),
-            "livekit"
-        );
-
-        assert_eq!(
-            content.pointer("/member/user_id").unwrap(),
-            "@bob:example.io"
-        );
-        assert_eq!(content.pointer("/member/device_id").unwrap(), "BOBDEVICE");
-        assert_eq!(
-            content
-                .pointer("/rtc_transports/0/livekit_service_url")
-                .unwrap(),
-            "https://sfu.example.com"
-        );
-        assert_eq!(content.get("versions").unwrap(), &json!([]));
-    }
-
-    /// The JS SDK spells the room-wide slot `ROOM`, and slot ids compare
-    /// exactly: unmapped, Element Call and we sit in two sessions, each with
-    /// the other excluded. Ours goes out its way, its comes in ours.
-    #[test]
-    fn the_room_wide_slot_crosses_in_each_generations_spelling() {
-        let mut ours: Value = serde_json::from_str(SPEC_JOIN).unwrap();
-        dialect().rewrite_member_content(&mut ours);
-        assert_eq!(ours["slot_id"], "m.call#ROOM");
-
-        let (_, theirs) = normalized(LEGACY_JOIN);
-        assert_eq!(theirs["slot_id"], "m.call#room");
-    }
-
-    /// Only the room-wide slot has two spellings; a named slot is the same in
-    /// both generations and must not be touched either way.
-    #[test]
-    fn a_named_slot_keeps_its_spelling_both_ways() {
-        assert_eq!(legacy_slot_id("m.call#standup"), "m.call#standup");
-        assert_eq!(legacy_slot_id("m.call#ROOM"), "m.call#ROOM");
-
-        let mut ours: Value = serde_json::from_str(SPEC_JOIN).unwrap();
-        ours["slot_id"] = json!("m.call#standup");
-        dialect().rewrite_member_content(&mut ours);
-        assert_eq!(ours["slot_id"], "m.call#standup");
-
-        let mut theirs: Value = serde_json::from_str(LEGACY_JOIN).unwrap();
-        theirs["slot_id"] = json!("m.call#standup");
-        normalize_member_content(&mut theirs);
-        assert_eq!(theirs["slot_id"], "m.call#standup");
-    }
-
-    /// The token request names the slot too, and the authorisation service
-    /// derives the SFU room from it: only the 2025 format respells it.
-    #[test]
-    fn the_token_slot_id_follows_the_format() {
-        use super::super::MembershipFormat;
-
-        assert_eq!(
-            MembershipFormat::Sticky2025.token_slot_id("m.call#room"),
-            "m.call#ROOM"
-        );
-        assert_eq!(
-            MembershipFormat::Current.token_slot_id("m.call#room"),
-            "m.call#room"
-        );
-        assert_eq!(
-            MembershipFormat::RoomState.token_slot_id("m.call#room"),
-            "m.call#room"
-        );
-    }
-
-    /// A leave becomes the legacy shape outright: content holding nothing but
-    /// the sticky key, exactly what Element Call itself sends.
-    ///
-    /// Keeping `membership: "leave"` would be worse than useless — Element Call
-    /// has no such field, its validator would reject the event for the missing
-    /// `rtc_transports`, and padding that in would make us read as *joined*.
-    #[test]
-    fn outbound_leave_becomes_a_bare_sticky_key() {
-        let mut content = json!({
-            "slot_id": "m.call#room",
-            "member": { "id": "abc", "membership": "leave" },
-            "leave_reason": { "code": "leave" },
-            "msc4354_sticky_key": "abc"
-        });
-        dialect().rewrite_member_content(&mut content);
-
-        assert_eq!(content, json!({ "msc4354_sticky_key": "abc" }));
-    }
-
-    /// The delayed leave (the dead man's switch) travels the same path, so it
-    /// must come out the same way rather than carrying a `leave_reason` Element
-    /// Call would choke on.
-    #[test]
-    fn outbound_delayed_leave_becomes_a_bare_sticky_key_too() {
-        let mut content = json!({
-            "slot_id": "m.call#room",
-            "member": { "id": "abc", "membership": "leave" },
-            "leave_reason": {
-                "code": "delayed_leave",
-                "reason": "Dead man's switch: client failed to heartbeat"
-            },
-            "msc4354_sticky_key": "abc"
-        });
-        dialect().rewrite_member_content(&mut content);
-
-        assert_eq!(content, json!({ "msc4354_sticky_key": "abc" }));
-    }
-
-    /// A leave we cannot name a sticky key for is left alone: an empty object
-    /// would be a departure nobody can attribute.
-    #[test]
-    fn a_leave_without_a_sticky_key_is_not_replaced() {
-        let mut content = json!({
-            "slot_id": "m.call#room",
-            "member": { "id": "abc", "membership": "leave" }
-        });
-        dialect().rewrite_member_content(&mut content);
-
-        assert_eq!(content.pointer("/member/membership").unwrap(), "leave");
-    }
-
-    #[test]
-    fn outbound_aliases_are_idempotent() {
-        let mut once: Value = serde_json::from_str(SPEC_JOIN).unwrap();
-        dialect().rewrite_member_content(&mut once);
-        let mut twice = once.clone();
-        dialect().rewrite_member_content(&mut twice);
-
-        assert_eq!(once, twice);
-    }
-
-    /// Idempotent for leaves too. A second pass sees a bare sticky key with no
-    /// `slot_id` and must leave it be — growing a `member` object there would
-    /// turn the departure back into something membership-shaped.
-    #[test]
-    fn a_rewritten_leave_survives_a_second_pass() {
-        let mut content = json!({
-            "slot_id": "m.call#room",
-            "member": { "id": "abc", "membership": "leave" },
-            "msc4354_sticky_key": "abc"
-        });
-        dialect().rewrite_member_content(&mut content);
-        let once = content.clone();
-        dialect().rewrite_member_content(&mut content);
-
-        assert_eq!(content, once);
-        assert!(content.get("member").is_none());
-    }
-
     #[test]
     fn outbound_key_message_takes_the_legacy_type_and_shape() {
         let content = json!({
@@ -983,9 +682,9 @@ mod tests {
             "format": 0
         });
 
-        let (message_type, legacy) = dialect()
-            .rewrite_key_message("m.rtc.encryption_key", &content)
-            .expect("a key message must be rewritten");
+        let (message_type, legacy) =
+            rewrite_key_message("BOBDEVICE", "m.call#room", "m.rtc.encryption_key", &content)
+                .expect("a key message must be rewritten");
 
         assert_eq!(message_type, LEGACY_KEY_EVENT_TYPE);
         assert_eq!(legacy.pointer("/keys/index").unwrap(), 3);
@@ -1095,10 +794,15 @@ mod tests {
             "a spec-current call sends the spec shape"
         );
         assert!(
-            crate::compat::OutboundDialect::Sticky(dialect())
-                .rewrite_notification("m.rtc.notification", spec)
-                .get("application")
-                .is_none()
+            crate::compat::OutboundDialect::State(crate::compat::RoomStateDialect::new(
+                "@bob:example.io",
+                "BOBDEVICE",
+                "!room:example.io",
+                "m.call#room",
+            ))
+            .rewrite_notification("m.rtc.notification", spec)
+            .get("application")
+            .is_none()
         );
     }
 
@@ -1111,9 +815,13 @@ mod tests {
             "media_key": { "index": 0, "key": "aaaa" }
         });
         assert!(
-            dialect()
-                .rewrite_key_message("org.matrix.msc4143.rtc.encryption_key", &content)
-                .is_some()
+            rewrite_key_message(
+                "BOBDEVICE",
+                "m.call#room",
+                "org.matrix.msc4143.rtc.encryption_key",
+                &content
+            )
+            .is_some()
         );
     }
 
@@ -1121,9 +829,13 @@ mod tests {
     #[test]
     fn other_to_device_types_are_not_rewritten() {
         assert!(
-            dialect()
-                .rewrite_key_message("m.room_key.withheld", &json!({}))
-                .is_none()
+            rewrite_key_message(
+                "BOBDEVICE",
+                "m.call#room",
+                "m.room_key.withheld",
+                &json!({})
+            )
+            .is_none()
         );
     }
 

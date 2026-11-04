@@ -15,9 +15,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use matrix_rtc_core::{
-    BackendError, CommandError, EventEncryption, EventIn, MatrixBackend, OpenIdToken, RoomSink,
-    RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
-    ToDeviceSink,
+    BackendError, CommandError, EventEncryption, EventIn, LiveKitTokenRequest, MatrixBackend,
+    OpenIdToken, RoomSink, RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn,
+    ToDeviceRecipient, ToDeviceSink,
 };
 use matrix_sdk::deserialized_responses::{
     AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, RawAnySyncOrStrippedState, VerificationLevel,
@@ -41,6 +41,8 @@ use matrix_sdk::ruma::events::{
 use matrix_sdk::ruma::serde::Raw;
 use matrix_sdk::ruma::{DeviceId, EventId, OwnedEventId, OwnedUserId, RoomId, UInt, UserId};
 use matrix_sdk::{Client, Room, RoomMemberships};
+
+use crate::rtc_requests;
 use matrix_sdk_base::crypto::{CollectStrategy, OlmError};
 use serde_json::Value;
 use tokio::sync::broadcast::error::RecvError;
@@ -718,11 +720,41 @@ impl MatrixBackend for SdkMatrixBackend {
         })
     }
 
-    /// Through the SDK's discovery: cached, with a bounded request, and
-    /// falling back to the well-known `rtc_foci` when the homeserver lacks the
-    /// endpoint. Nothing discovered is an empty array ("none advertised"); a
-    /// failed request stays an error rather than reading as "none".
+    /// The homeserver's MSC4195 `get_token`, under its unstable path (the only
+    /// one homeservers serve so far).
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        use ruma::api::client::rtc::livekit::get_token::v1 as get_token;
+
+        let room_id = RoomId::parse(&request.room_id).map_err(|e| backend_error(e).permanent())?;
+        let mut sdk_request = get_token::Request::new(
+            request.url.clone(),
+            room_id,
+            request.slot_id.clone(),
+            request.member_id.clone(),
+        );
+        sdk_request.server_name = request
+            .server_name
+            .as_deref()
+            .map(ruma::ServerName::parse)
+            .transpose()
+            .map_err(|e| backend_error(e).permanent())?;
+        let response = self
+            .client
+            .send(sdk_request)
+            .await
+            .map_err(|error| sdk_backend_error(&error))?;
+        Ok(response.jwt)
+    }
+
+    /// The array exactly as the homeserver serves it (see [`rtc_requests`]):
+    /// the v1 endpoint, else the unstable one, else the SDK's discovery, which
+    /// falls back to the well-known `rtc_foci`. Nothing discovered is an empty
+    /// array ("none advertised"); a failed request stays an error rather than
+    /// reading as "none".
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
+        if let Some(transports) = rtc_requests::transports(&self.client).await? {
+            return Ok(transports);
+        }
         let transports = self
             .client
             .discover_rtc_transports()

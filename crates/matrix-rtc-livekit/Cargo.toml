@@ -54,4 +54,5 @@ jni = "0.21"
 testing = []
 
 [dev-dependencies]
+matrix-rtc-core = { path = "../matrix-rtc-core", features = ["testing"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "test-util"] }

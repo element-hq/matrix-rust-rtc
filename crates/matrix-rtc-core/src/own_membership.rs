@@ -124,11 +124,14 @@ pub(crate) fn now_ms() -> u64 {
 /// Converts an RtcTransport to a JSON value for event content.
 pub fn transport_to_json(transport: &RtcTransport) -> Value {
     match transport {
+        // Exactly the fields advertised, under the type every implementation
+        // still writes (not the MSC's `m.livekit`): which of `url` and
+        // `livekit_service_url` is present tells peers how we got our token.
         RtcTransport::LiveKit(livekit) => {
-            json!({
-                "type": "livekit",
-                "livekit_service_url": livekit.livekit_service_url
-            })
+            let mut obj = serde_json::to_value(livekit)
+                .expect("a LiveKit transport always serializes to an object");
+            obj["type"] = json!("livekit");
+            obj
         }
         RtcTransport::Unsupported(unsupported) => {
             let mut obj = json!({
@@ -2056,9 +2059,9 @@ mod tests {
             let joined = mock.last_sticky_event().unwrap().2;
 
             machine
-                .republish_transports(&RtcTransport::LiveKit(LiveKitTransport {
-                    livekit_service_url: "https://b".to_owned(),
-                }))
+                .republish_transports(&RtcTransport::LiveKit(LiveKitTransport::service(
+                    "https://b".to_owned(),
+                )))
                 .await;
 
             let moved = mock.last_sticky_event().unwrap().2;

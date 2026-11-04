@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    BackendError, CommandError, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceRecipient, ToDeviceSink, wire_event_type,
+    BackendError, CommandError, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken, RoomSink,
+    RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceRecipient, ToDeviceSink, wire_event_type,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -375,6 +375,10 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         self.inner.openid_token().await
     }
 
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        self.inner.livekit_token(request).await
+    }
+
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
         self.inner.rtc_transports().await
     }
@@ -494,7 +498,7 @@ mod tests {
         let (mock, backend) = backend();
         backend.set_dialect(
             "!legacy:example.org",
-            dialect(MembershipFormat::Sticky2025, "!legacy:example.org"),
+            dialect(MembershipFormat::RoomState, "!legacy:example.org"),
         );
         let key = |room_id: &str| {
             json!({

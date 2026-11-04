@@ -6,12 +6,11 @@ Please see LICENSE in the repository root for full details.
 */
 
 /**
- * The web stack and a real Element Call in the same call — EC's 2025 sticky
- * generation ("Matrix 2.0" in its Developer tab), our `sticky_2025` mode.
- * The web sibling of `element-call.spec.ts`'s second scenario, proving the
- * wasm compat seam end-to-end from a browser host: our membership goes out
- * with the legacy mirror fields (or EC shows no tile), EC's membership-less
- * member content normalises into our roster, and media keys cross as
+ * The web stack and a real Element Call in the same call — EC's pre-sticky
+ * generation ("Compatibility: state events" in its Developer tab), our
+ * `room_state` mode. The web sibling of `element-call.spec.ts`, proving the
+ * wasm compat seam end-to-end from a browser host: membership as room state,
+ * `{user}:{device}` identities from `/sfu/get`, and media keys crossing as
  * `io.element.call.encryption_keys` in both directions (or nothing decrypts —
  * asserted by the video pattern EC reads back and the audio energy we meter).
  */
@@ -36,7 +35,7 @@ interface Scenario {
   /** Element Call's Developer-tab dialect. */
   ec: RtcMode;
   /** The matching web-peer mode string. */
-  web: "room_state" | "sticky_2025";
+  web: "room_state";
   title: string;
 }
 
@@ -46,7 +45,6 @@ const SCENARIOS: Scenario[] = [
   // (msc3401 room state), the identity ({user}:{device}), the token endpoint
   // (/sfu/get), and the delayed leave (a delayed STATE event).
   { ec: "compat", web: "room_state", title: "ec-2024 state events" },
-  { ec: "2_0", web: "sticky_2025", title: "ec-2025 sticky events" },
 ];
 
 for (const scenario of SCENARIOS) {

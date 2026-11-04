@@ -16,10 +16,10 @@ the end-to-end test — see [`matrix-rtc-call-sdk`](../matrix-rtc-call-sdk/READM
 
 | Module | What it does |
 | --- | --- |
-| **`token`** | MSC4195 token exchange: Matrix OpenID token → LiveKit SFU JWT via the authorisation service's `POST /get_token`. The OpenID token comes through the core's `MatrixBackend::openid_token`, so this layer is not hard-wired to a particular Matrix SDK. |
-| **`identity`** | The MSC4195 hash derivations (`livekit_alias`, pseudonymous participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) picks the one a given compat generation's authorisation service issues. |
+| **`token`** | The legacy JWT service's token exchange: Matrix OpenID token → LiveKit SFU JWT via `POST /sfu/get`, for transports naming a `livekit_service_url`. A transport naming only an SFU `url` gets its JWT from the homeserver's MSC4195 `get_token` instead, through the core's `MatrixBackend::livekit_token`. |
+| **`identity`** | The MSC4195 hash derivations (`livekit_alias`, participant identity) used to map keys onto LiveKit participants; `identity_mapper` (crate root) gives each member the identity its published transport's token flow mints. |
 | **`session`** | Connects to the SFU and exposes the LiveKit room + event stream. |
-| **`keys`** | Bridges `matrix-rtc-core` media keys into the LiveKit `KeyProvider` (`MediaKeyBridge`), keyed by pseudonymous identity — this is what makes frame E2EE per-participant. |
+| **`keys`** | Bridges `matrix-rtc-core` media keys into the LiveKit `KeyProvider` (`MediaKeyBridge`), keyed by participant identity — this is what makes frame E2EE per-participant. |
 | **`media`** | `record_track` / `write_wav` (shipped: the recording-bot path), plus test-gated tone generation and frequency detection. |
 | **`transport_impl`** | `LiveKitMediaTransport`, `matrix-rtc-transport`'s `MediaTransport`/`OwnFocusTransport` over the LiveKit client, and its `LiveKitTransportConnection`. |
 

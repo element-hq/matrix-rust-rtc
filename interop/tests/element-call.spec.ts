@@ -38,7 +38,7 @@ interface Scenario {
   /** Element Call's Developer-tab dialect. */
   ec: RtcMode;
   /** The matching `MembershipFormat` for the Rust peer. */
-  rust: "state" | "sticky";
+  rust: "state";
   title: string;
 }
 
@@ -47,12 +47,6 @@ const SCENARIOS: Scenario[] = [
   // today, and the one with the most documented traps (plain `{user}:{device}`
   // identities, `/sfu/get`, membership as room state, no slot).
   { ec: "compat", rust: "state", title: "ec-2024 state events" },
-  // Element Call labels this "Matrix 2.0", but it is its *2025* sticky
-  // generation — MSC4354 membership carrying the pre-2026 field names. The
-  // actually-spec-current format is our `MembershipFormat::Current`, which Element
-  // Call does not speak at all. Naming the test after the UI string would
-  // propagate that confusion; the string itself lives in `RTC_MODE_LABEL`.
-  { ec: "2_0", rust: "sticky", title: "ec-2025 sticky events" },
 ];
 
 const DISPLAY_NAME = "Rust Peer";

@@ -100,15 +100,15 @@ livekit = { version = "0.9.7", features = [
 # of matrix-sdk and the `Client` one crate takes is not the one the other accepts.
 # MSC4354 sticky events come from its `unstable-msc4354` feature, which our
 # `matrix-sdk` features enable.
-matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
-matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
-matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "56bc59112822e7eb25943a95e02502855cdeef2d" }
+matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "56bc59112822e7eb25943a95e02502855cdeef2d" }
+matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "56bc59112822e7eb25943a95e02502855cdeef2d" }
 
 # matrix-rust-sdk carries these git pins in its own `[patch]` tables. Cargo does
 # NOT propagate a dependency's `[patch]` to the consuming workspace, so they are
 # replicated here verbatim, or the SDK fails to build; a downstream workspace
 # that depends on matrix-rtc-matrix-sdk, or -call-sdk with `matrix-sdk` on, must do the
-# same. Source: matrix-org/matrix-rust-sdk@c6ad52e Cargo.toml — keep in step when
+# same. Source: matrix-org/matrix-rust-sdk@56bc591 (matrix-sdk-ffi/20261020) Cargo.toml — keep in step when
 # bumping the rev above.
 [patch.crates-io]
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }

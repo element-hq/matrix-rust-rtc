@@ -11,6 +11,7 @@
 //! need the SDK — the Element Call dialects, the feeder, the transport choice —
 //! lives in `matrix-rtc-call`.
 
+mod rtc_requests;
 pub mod sdk;
 
 pub use sdk::{SdkMatrixBackend, TimelineIngest, timeline_ingest_from_raw};

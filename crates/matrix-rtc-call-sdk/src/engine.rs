@@ -2095,9 +2095,13 @@ mod tests {
             "fake"
         }
 
-        fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
+        fn connection_key(
+            &self,
+            transport: &RtcTransport,
+            _publisher_user_id: &str,
+        ) -> Option<String> {
             match transport {
-                RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
+                RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(str::to_owned),
                 RtcTransport::Unsupported(_) => None,
             }
         }
@@ -2294,9 +2298,9 @@ mod tests {
             membership_ts: None,
             origin_server_ts: None,
             application: "m.call".into(),
-            transports: vec![RtcTransport::LiveKit(LiveKitTransport {
-                livekit_service_url: focus.to_owned(),
-            })],
+            transports: vec![RtcTransport::LiveKit(LiveKitTransport::service(
+                focus.to_owned(),
+            ))],
             can_subscribe: vec!["livekit".to_owned()],
         }
     }

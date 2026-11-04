@@ -280,19 +280,18 @@ when (val event = session.nextEvent()) {
 ## Testing against Element Call
 
 Element Call is the only other MatrixRTC implementation there is to test against,
-and it still speaks a pre-2026 wire format — two of them, in fact, which disagree
-about where a membership lives rather than merely what it says. Pass
-`format` when you open the room to speak one of them:
+and its pre-sticky generation still speaks a pre-2026 wire format. Pass `format`
+when you open the room to speak it:
 
 | Mode | Element Call generation | Membership lives in |
 | --- | --- | --- |
-| `null` / `CURRENT` | none — current MSC4143 + MSC4354 | sticky events |
-| `STICKY2025` | 2025 | sticky events, legacy fields alongside the spec ones |
+| `null` / `MSC` | none — current MSC4143 + MSC4354 | sticky events |
 | `ROOM_STATE` | before MSC4354 | `org.matrix.msc3401.call.member` room state |
 
 It is one decision, not a wire-format flag: it also fixes the `member.id` you
-join with, how an inbound media key is bound to a membership, your SFU
-participant identity, and which token endpoint mints your JWT. Choose it once,
+join with and how an inbound media key is bound to a membership. Your SFU
+participant identity and the token endpoint follow the transport you publish
+on instead (see below). Choose it once,
 when opening the room — the join and the media session read it back from
 there. Getting a mode wrong
 produces no error: the call connects, the roster may even fill in, and nothing
@@ -315,7 +314,7 @@ val room = client.room(roomId, FfiRoomOptions(
   every event: it is the deadline base for a membership that states no
   `created_ts`, and `0` reads as long expired.
 - **Delayed leaves:** `sendDelayedStateEvent` is the `ROOM_STATE` dead man's
-  switch, `sendDelayedStickyEvent` the sticky formats'. The Rust SDK bindings
+  switch, `sendDelayedStickyEvent` the sticky format's. The Rust SDK bindings
   cannot send a delayed sticky event yet (matrix-rust-sdk#6973): answer
   `M_UNRECOGNIZED`, never a plain delayed event, and the call joins on a
   shorter membership lifetime.
@@ -327,21 +326,36 @@ absorbs that: it does not subscribe to slot state for the room at all, leaving
 the condition unenforced — that generation predates the concept entirely, so
 "unknowable" is the honest answer rather than "closed".
 
-In `STICKY2025` the condition stays enforced, because those rooms are
-otherwise spec-shaped and a slot in one is meaningful. Someone has to open the
-slot — otherwise the room reads as all-closed, and `join` refuses with
-`SlotClosed`. Element Call will not, so open it yourself (it needs the power
-level for `m.rtc.slot` state; the room creator by default, or set it in the
-room's initial state):
+In `MSC` the condition stays enforced. Someone has to open the slot —
+otherwise the room reads as all-closed, and `join` refuses with `SlotClosed`.
+Open it yourself if nobody else does (it needs the power level for `m.rtc.slot`
+state; the room creator by default, or set it in the room's initial state):
 
 ```kotlin
 room.openSlot("m.call#room", "m.call", FfiSlotEncryption.PerMember)
 ```
 
 `encryption` must be `PerMember` in an encrypted room and `null` elsewhere — the
-mismatch resolves the slot closed for everyone. It needs the power level for
-`m.rtc.slot` state (by default the room creator), and `closeSlot(slotId)`
-ends the call for every member, which is not the same as leaving it.
+mismatch resolves the slot closed for everyone. `closeSlot(slotId)` ends the
+call for every member, which is not the same as leaving it.
+
+### LiveKit tokens follow the transport
+
+A LiveKit transport names the legacy JWT service (`livekit_service_url`), the
+SFU (`url`), or both. With a `livekit_service_url` every token, to publish or to
+subscribe, comes from that service's `/sfu/get` with an OpenID token (your
+`openidToken`), and the SFU identity is `{user}:{device}`. With only a `url`,
+tokens come from the homeserver's MSC4195 `get_token`, which the library asks
+your backend's `livekitToken` for: `POST` the `FfiLiveKitTokenRequest` as the
+JSON body to `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`
+and return the answer's `jwt`; the identity is then a hash of your user id and
+`member.id`. Until your Matrix SDK can make that request, fail with
+`M_UNRECOGNIZED` / 404: `url`-only transports then cannot be joined or
+subscribed to, while transports with a `livekit_service_url` keep working.
+
+`rtcTransports` must return the transports exactly as the homeserver serves
+them, `url` included. A client SDK whose typed discovery keeps only
+`livekit_service_url` (matrix-rust-sdk's does today) loses it.
 
 Two traps that cost whole debugging sessions on the native path, and are not
 specific to it:

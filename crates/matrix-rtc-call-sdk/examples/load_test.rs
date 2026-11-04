@@ -73,9 +73,7 @@ use tokio::signal::unix::{SignalKind, signal};
 #[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum MembershipFormatArg {
     /// Current MSC4143 + MSC4354 only.
-    Current,
-    /// Element Call as of 2025: sticky events with the pre-2026 field names.
-    Sticky,
+    Msc,
     /// Element Call before MSC4354: membership as room state.
     State,
 }
@@ -83,8 +81,7 @@ enum MembershipFormatArg {
 impl From<MembershipFormatArg> for MembershipFormat {
     fn from(arg: MembershipFormatArg) -> Self {
         match arg {
-            MembershipFormatArg::Current => Self::Current,
-            MembershipFormatArg::Sticky => Self::Sticky2025,
+            MembershipFormatArg::Msc => Self::Msc,
             MembershipFormatArg::State => Self::RoomState,
         }
     }
@@ -232,7 +229,7 @@ struct Args {
     /// `org.matrix.msc3401.call.member` room state — nothing about such a run is
     /// visible to a spec-current peer. Note `--open-slot` is pointless with
     /// `state`: that generation has no slot concept.
-    #[arg(long, value_enum, default_value_t = MembershipFormatArg::Current)]
+    #[arg(long, value_enum, default_value_t = MembershipFormatArg::Msc)]
     format: MembershipFormatArg,
 
     #[arg(long)]
@@ -597,9 +594,7 @@ impl Fleet {
                 LiveKitCallOptions {
                     slot_id: args.slot_id.clone(),
                     application: args.application.clone(),
-                    livekit_transport: Some(LiveKitTransport {
-                        livekit_service_url: args.livekit_url.clone(),
-                    }),
+                    livekit_transport: Some(LiveKitTransport::service(args.livekit_url.clone())),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
                     format: args.format.into(),

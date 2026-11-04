@@ -521,7 +521,10 @@ mod tests {
                 assert_eq!(joined.origin.sender_device_id(), Some("DEVICEID"));
                 match &joined.transports[..] {
                     [RtcTransport::LiveKit(livekit)] => {
-                        assert_eq!(livekit.livekit_service_url, "https://sfu.example.com/jwt");
+                        assert_eq!(
+                            livekit.livekit_service_url(),
+                            Some("https://sfu.example.com/jwt")
+                        );
                     }
                     other => panic!("expected one livekit transport, got {other:?}"),
                 }

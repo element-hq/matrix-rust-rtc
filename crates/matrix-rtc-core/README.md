@@ -86,8 +86,7 @@ through its delayed leave.
 `RoomOptions::format` picks the MatrixRTC membership format the room is read and written in
 (`compat::MembershipFormat`):
 
-- `Current` (the default) is MSC4143 + MSC4354, and also reads the 2025 sticky shapes.
-- `Sticky2025` writes our membership with the 2025 fields alongside the spec ones.
+- `Msc` (the default) is MSC4143 + MSC4354, and also reads the 2025 sticky shapes.
 - `RoomState` reads and writes membership as pre-sticky `org.matrix.msc3401.call.member` room
   state, joining with the `{user}:{device}` member id that generation expects.
 

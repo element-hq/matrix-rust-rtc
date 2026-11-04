@@ -10,7 +10,7 @@
 //! dialect. A page chooses the mode once, when it opens the room
 //! (`room`'s `format`), and delivers the same raw events in
 //! every mode. This module owns only the mode-string vocabulary
-//! (`"current" | "sticky_2025" | "room_state"`).
+//! (`"msc" | "room_state"`).
 
 use matrix_rtc_core::compat::MembershipFormat;
 use wasm_bindgen::JsError;
@@ -19,12 +19,11 @@ use wasm_bindgen::JsError;
 /// the two can never disagree by spelling.
 pub(crate) fn parse_compat(value: Option<&str>) -> Result<MembershipFormat, JsError> {
     Ok(match value {
-        None | Some("current") => MembershipFormat::Current,
-        Some("sticky_2025") => MembershipFormat::Sticky2025,
+        None | Some("msc") => MembershipFormat::Msc,
         Some("room_state") => MembershipFormat::RoomState,
         Some(other) => {
             return Err(JsError::new(&format!(
-                "unknown format {other:?}: expected current | sticky_2025 | room_state",
+                "unknown format {other:?}: expected msc | room_state",
             )));
         }
     })

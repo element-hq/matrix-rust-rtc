@@ -3,12 +3,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! LiveKit SFU authorisation service token exchange shapes ([MSC4195]).
+//! The legacy LiveKit JWT service's token exchange shapes.
 //!
-//! A MatrixRTC client obtains a LiveKit JWT by `POST`ing a Matrix OpenID token
-//! (plus the room/slot/member identifiers) to the authorisation service's
-//! `/get_token` endpoint; the service validates the OpenID token against the
-//! homeserver and returns a `{ jwt, url }` pair used to connect to the SFU.
+//! A transport naming a `livekit_service_url` gets its token from that
+//! service's `/sfu/get`: the client `POST`s a Matrix OpenID token and the
+//! Matrix room id, and the service answers `{jwt, url}`. A transport naming
+//! only an SFU `url` gets its token from the homeserver instead (MSC4195
+//! `get_token`), which the host performs through
+//! `MatrixBackend::livekit_token` — so that request never passes through here.
 //!
 //! This module owns the exchange's *shapes* — endpoint URL, request body,
 //! response decoding — and nothing sends them: the native transport POSTs the
@@ -17,35 +19,12 @@
 //! the wire format has exactly one owner. Obtaining the OpenID token itself is
 //! a Client-Server API concern: the host supplies one through its
 //! `MatrixBackend::openid_token` (`matrix-rtc-core`).
-//!
-//! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 
 use serde::{Deserialize, Serialize};
 
 use matrix_rtc_core::OpenIdToken;
 
-/// Contents of the `member` field of the `m.rtc.member` event, identifying the
-/// joining membership to the authorisation service.
-///
-/// Stays here rather than in the bridge: these are the `member` claims of the
-/// MSC4195 `/get_token` request body, which no homeserver ever sees.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MemberClaims {
-    pub id: String,
-    pub claimed_user_id: String,
-    pub claimed_device_id: String,
-}
-
-/// JSON body of a `POST /get_token` request.
-#[derive(Serialize)]
-struct GetTokenRequest<'a> {
-    room_id: &'a str,
-    slot_id: &'a str,
-    openid_token: &'a OpenIdToken,
-    member: &'a MemberClaims,
-}
-
-/// Successful `POST /get_token` response: the JWT and the SFU URL to use.
+/// A token to connect with: the JWT and the SFU URL it is for.
 #[derive(Clone, Debug, Deserialize)]
 pub struct SfuToken {
     /// JWT to authenticate with the LiveKit SFU.
@@ -66,30 +45,6 @@ pub enum TokenServiceError {
     /// A 2xx response whose body is not the `{jwt, url}` shape.
     #[error("LiveKit authorisation service response did not decode: {0}")]
     Decode(#[from] serde_json::Error),
-}
-
-/// Build the MSC4195 `POST /get_token` request: the endpoint URL and the JSON
-/// body to send to it.
-///
-/// `livekit_service_url` is the `livekit_service_url` advertised by the
-/// transport (e.g. `https://matrix-rtc.example.com/livekit/jwt`); the
-/// `/get_token` path is appended to it.
-pub fn get_token_request(
-    livekit_service_url: &str,
-    room_id: &str,
-    slot_id: &str,
-    member: &MemberClaims,
-    openid_token: &OpenIdToken,
-) -> (String, serde_json::Value) {
-    let endpoint = format!("{}/get_token", livekit_service_url.trim_end_matches('/'));
-    let body = serde_json::to_value(GetTokenRequest {
-        room_id,
-        slot_id,
-        openid_token,
-        member,
-    })
-    .expect("token request bodies are plain structs of strings");
-    (endpoint, body)
 }
 
 /// JSON body of a pre-MSC4195 `POST /sfu/get` request.
@@ -113,16 +68,13 @@ struct LegacyGetTokenRequest<'a> {
 /// Build the **pre-MSC4195** `POST /sfu/get` request: the endpoint URL and the
 /// JSON body to send to it.
 ///
-/// For interoperating with Element Call builds older than MSC4354. Note there is
-/// deliberately **no** fallback from `/get_token` to this on a 404: the endpoint
-/// is not an independent choice, it comes bundled with the identity derivation
-/// and the membership carrier, both decided before any HTTP happens — so a 404
-/// cannot retroactively change what we already published. Worse, succeeding here
-/// with the wrong identity derivation produces a fully connected SFU session in
-/// which nothing decrypts and nobody appears, and peer foci retry connects
-/// indefinitely, so a wrong guess would never surface. A 404 stays loud.
-///
-/// Temporary; see `matrix_rtc_core::compat`.
+/// Used, for publishing and subscribing alike, on every transport that names a
+/// `livekit_service_url`. There is deliberately **no** fallback between this
+/// and the homeserver's `get_token`: the endpoint is not an independent choice,
+/// it mints the participant identity peers map us by, and that is decided by
+/// the transport we published before any HTTP happens. Succeeding through the
+/// other flow produces a fully connected SFU session in which nothing decrypts
+/// and nobody appears, so a wrong guess would never surface. A 404 stays loud.
 pub fn legacy_token_request(
     livekit_service_url: &str,
     room: &str,
@@ -141,8 +93,6 @@ pub fn legacy_token_request(
 
 /// Decode a token endpoint's raw response into an [`SfuToken`].
 ///
-/// The two dialects differ only in the path and the request body — the response
-/// is identical — so one decoder serves both.
 pub fn parse_sfu_token(status: u16, body: &str) -> Result<SfuToken, TokenServiceError> {
     if !(200..300).contains(&status) {
         return Err(TokenServiceError::Rejected {
@@ -166,50 +116,6 @@ mod tests {
         }
     }
 
-    fn sample_member() -> MemberClaims {
-        MemberClaims {
-            id: "xyzABCDEF10123".to_owned(),
-            claimed_user_id: "@user:matrix.example.com".to_owned(),
-            claimed_device_id: "DEVICEID".to_owned(),
-        }
-    }
-
-    // Mirrors the request body shape from the MSC4195 /get_token example.
-    #[test]
-    fn get_token_request_serializes_per_msc4195() {
-        let token = sample_token();
-        let member = sample_member();
-        let (endpoint, body) = get_token_request(
-            "https://matrix-rtc.example.com/livekit/jwt/",
-            "!tDLCaLXijNtYcJZEey:example.com",
-            "the_id",
-            &member,
-            &token,
-        );
-
-        assert_eq!(
-            endpoint,
-            "https://matrix-rtc.example.com/livekit/jwt/get_token"
-        );
-        let expected = serde_json::json!({
-            "room_id": "!tDLCaLXijNtYcJZEey:example.com",
-            "slot_id": "the_id",
-            "openid_token": {
-                "access_token": "FPkexLLvKbAHKclQhpvgfWxx",
-                "expires_in": 3600,
-                "matrix_server_name": "matrix.example.com",
-                "token_type": "Bearer"
-            },
-            "member": {
-                "id": "xyzABCDEF10123",
-                "claimed_device_id": "DEVICEID",
-                "claimed_user_id": "@user:matrix.example.com"
-            }
-        });
-        assert_eq!(body, expected);
-    }
-
-    // Mirrors the successful response example from MSC4195.
     #[test]
     fn sfu_token_deserializes_per_msc4195() {
         let token = parse_sfu_token(

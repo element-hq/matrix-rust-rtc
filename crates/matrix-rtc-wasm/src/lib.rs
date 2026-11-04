@@ -124,7 +124,7 @@ impl WasmRtcClient {
     /// returned room ends its subscriptions without leaving; `close` leaves
     /// first.
     ///
-    /// `options` is `{ format?: "current" | "sticky_2025" | "room_state" }`.
+    /// `options` is `{ format?: "msc" | "room_state" }`.
     pub async fn room(
         &self,
         room_id: String,
@@ -199,8 +199,8 @@ impl WasmRtcRoom {
     ///     omitted is the room-wide call, `room`
     ///   - `transport`: `{ kind: "advertised" }` (the default when omitted)
     ///     publishes on the first LiveKit transport the homeserver advertises
-    ///     (the host's `rtcTransports`); `{ kind: "publish",
-    ///     livekit_service_url }` publishes on that focus; `{ kind:
+    ///     (the host's `rtcTransports`); `{ kind: "publish", url?,
+    ///     livekit_service_url? }` publishes on that transport; `{ kind:
     ///     "receive_only" }` publishes nothing
     ///   - `keep_alive_timeout_ms` (default 30000), `sticky_duration_ms`
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
@@ -463,10 +463,10 @@ impl WasmRtcCall {
 /// How a room is opened.
 #[derive(Debug, Default, Deserialize)]
 pub struct WasmRoomOptions {
-    /// `"current"` (the default), `"sticky_2025"` or `"room_state"`. One
-    /// decision for the room: what the library subscribes to, how it renders
-    /// our sends, the `member.id` we join with, how an inbound media key is
-    /// bound, the SFU identity and the token endpoint.
+    /// `"msc"` (the default) or `"room_state"`. One decision for the room:
+    /// what the library subscribes to, how it renders our sends, the
+    /// `member.id` we join with and how an inbound media key is bound. The SFU
+    /// identity and the token endpoint follow the transport instead.
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -686,8 +686,11 @@ pub enum WasmJoinTransport {
     /// Publish on the first LiveKit transport the homeserver advertises.
     #[default]
     Advertised,
-    /// Publish on this LiveKit focus, whatever the homeserver advertises.
-    Publish { livekit_service_url: String },
+    /// Publish on this LiveKit transport, whatever the homeserver advertises:
+    /// `{ url?, livekit_service_url? }`, at least one. An SFU `url` alone gets
+    /// its tokens from the homeserver; a `livekit_service_url` from that JWT
+    /// service.
+    Publish(matrix_rtc_core::LiveKitTransport),
     /// Publish nothing and only receive, as a recorder or other observer does.
     ReceiveOnly,
 }
@@ -696,11 +699,7 @@ impl From<WasmJoinTransport> for JoinTransport {
     fn from(value: WasmJoinTransport) -> Self {
         match value {
             WasmJoinTransport::Advertised => Self::Advertised,
-            WasmJoinTransport::Publish {
-                livekit_service_url,
-            } => Self::Publish(matrix_rtc_core::LiveKitTransport {
-                livekit_service_url,
-            }),
+            WasmJoinTransport::Publish(transport) => Self::Publish(transport),
             WasmJoinTransport::ReceiveOnly => Self::ReceiveOnly,
         }
     }
@@ -926,44 +925,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    /// The sticky dialect's outbound rewrite, through the real send path: a
-    /// join in a `sticky_2025` room must put the EC-2025 mirror fields on
-    /// the wire, or that generation cannot see us.
-    #[wasm_bindgen_test]
-    async fn a_sticky_compat_join_mirrors_the_legacy_fields() {
-        #[derive(Serialize)]
-        struct TestTransport {
-            kind: &'static str,
-            livekit_service_url: &'static str,
-        }
-        #[derive(Serialize)]
-        struct TestJoinParams {
-            application_slot_id: &'static str,
-            transport: TestTransport,
-        }
-
-        let client = WasmRtcClient::new(mock_host(
-            "if (!Array.isArray(content.rtc_transports) \
-                 || !Array.isArray(content.versions) \
-                 || !content.member || content.member.user_id === undefined \
-                 || content.member.device_id === undefined) \
-                 return Promise.reject(new Error('legacy mirror fields missing: ' + JSON.stringify(content)));",
-        ));
-        let room = open(&client, Some("sticky_2025")).await;
-        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            application_slot_id: "room",
-            transport: TestTransport {
-                kind: "publish",
-                livekit_service_url: "https://sfu.example.org/livekit/jwt",
-            },
-        })
-        .unwrap();
-
-        room.join_call(params)
-            .await
-            .expect("the rewritten membership should satisfy the strict mock");
     }
 
     #[wasm_bindgen_test]

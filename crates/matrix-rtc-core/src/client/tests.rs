@@ -78,9 +78,9 @@ fn mock() -> Arc<MockBackend> {
 
 /// Who joins is the backend's account; the transport is the host's choice.
 fn join_params() -> JoinSessionParams {
-    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(LiveKitTransport {
-        livekit_service_url: "https://sfu.example.org".to_owned(),
-    }))
+    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+        LiveKitTransport::service("https://sfu.example.org".to_owned()),
+    ))
 }
 
 #[tokio::test(start_paused = true)]
@@ -260,27 +260,14 @@ async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() 
 }
 
 #[tokio::test]
-async fn a_sticky_2025_join_carries_the_legacy_fields() {
-    let mock = mock();
-    let client = BaseRtcClient::new(mock.clone());
-    let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
-    room.join(join_params()).await.expect("join");
-
-    let sticky = mock.sticky_events.lock().unwrap();
-    let (_, _, content, _) = sticky.last().expect("a membership");
-    assert_eq!(content["member"]["user_id"], mock.user_id.as_str());
-    assert_eq!(content["member"]["device_id"], mock.device_id.as_str());
-}
-
-#[tokio::test]
 async fn dropping_the_room_forgets_its_dialect() {
     let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
-    let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
     room.join(join_params()).await.expect("join");
     assert!(matches!(
         client.backend().dialect(ROOM),
-        OutboundDialect::Sticky(_)
+        OutboundDialect::State(_)
     ));
 
     drop(room);

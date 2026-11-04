@@ -54,9 +54,9 @@ impl MediaTransport for FakeTransport {
         "fake"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
+    fn connection_key(&self, transport: &RtcTransport, _publisher_user_id: &str) -> Option<String> {
         match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
+            RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(str::to_owned),
             RtcTransport::Unsupported(_) => None,
         }
     }
@@ -199,9 +199,9 @@ fn member_on(member_id: &str, focus: &str) -> JoinedMembership {
         membership_ts: None,
         origin_server_ts: None,
         application: "m.call".into(),
-        transports: vec![RtcTransport::LiveKit(LiveKitTransport {
-            livekit_service_url: focus.to_owned(),
-        })],
+        transports: vec![RtcTransport::LiveKit(LiveKitTransport::service(
+            focus.to_owned(),
+        ))],
         can_subscribe: vec!["livekit".to_owned()],
     }
 }
@@ -916,9 +916,7 @@ mod fallback {
             } => {
                 assert_eq!(
                     *transport,
-                    RtcTransport::LiveKit(LiveKitTransport {
-                        livekit_service_url: connection_key.clone(),
-                    })
+                    RtcTransport::LiveKit(LiveKitTransport::service(connection_key.clone()))
                 );
                 Some((*at, connection_key.clone()))
             }
@@ -1646,4 +1644,30 @@ async fn a_track_sent_in_clear_is_reported_once_its_member_maps() {
             .any(|event| matches!(event, PoolEvent::SentInClear { .. })),
         "left the SFU"
     );
+}
+
+/// Same SFU, one member through `/sfu/get`, one through the homeserver: two
+/// connections, which is worth a log. Agreeing members are not reported.
+#[test]
+fn an_sfu_reached_through_both_token_flows_is_reported() {
+    let on = |member_id: &str, transport: LiveKitTransport| JoinedMembership {
+        transports: vec![RtcTransport::LiveKit(transport)],
+        ..member_on(member_id, "unused")
+    };
+    let both = || {
+        LiveKitTransport::new(
+            Some("wss://sfu.example.org".into()),
+            Some("https://jwt.example.org".into()),
+            None,
+        )
+        .unwrap()
+    };
+    let bare = || LiveKitTransport::sfu("wss://sfu.example.org");
+
+    assert_eq!(
+        split_flow_sfus(&[on("alice", both()), on("bob", bare())]),
+        vec!["wss://sfu.example.org".to_owned()]
+    );
+    assert!(split_flow_sfus(&[on("alice", both()), on("bob", both())]).is_empty());
+    assert!(split_flow_sfus(&[on("alice", bare()), on("bob", bare())]).is_empty());
 }

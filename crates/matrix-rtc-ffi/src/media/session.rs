@@ -77,7 +77,7 @@ async fn build_media_session(
     // and the token endpoint, and those disagreeing with the membership we
     // already published is not an error but a silence. See `crate::compat`.
     let compat = call.format();
-    if compat != MembershipFormat::Current {
+    if compat != MembershipFormat::Msc {
         log::info!(
             "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
             call.room_id(),
@@ -88,7 +88,6 @@ async fn build_media_session(
         call.inner(),
         call.backend(),
         LiveKitAttachOptions {
-            format: compat,
             http: None,
             auto_subscribe: true,
             stability: config.stability.map(Into::into).unwrap_or_default(),

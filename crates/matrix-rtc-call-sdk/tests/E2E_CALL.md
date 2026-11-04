@@ -23,7 +23,8 @@ registration).
 | --- | --- |
 | **Room setup** | `alice` creates an **encrypted** room (`m.room.encryption`) with `shared` history visibility and invites `bob`; `bob` joins; both wait for the 2-member membership before any RTC signalling. |
 | **Signalling** | Each client publishes its own `m.rtc.member` membership as a sticky event (+ a dead-man's-switch delayed leave) and discovers the peer via `sticky_events().subscribe()` → the call crate's feeder → the room. Both peers join the room before RTC signalling. Success = each side sees 2 members. |
-| **Transport** | MSC4195 OpenID→JWT token exchange and SFU connect for both clients. |
+| **Transport** | Token exchange and SFU connect for both clients, through the flow the published transport selects: an OpenID token at the JWT service's `/sfu/get` for a transport naming `livekit_service_url` (identity `{user}:{device}`), the homeserver's MSC4195 `get_token` for one naming the SFU `url` alone (identity `hash([sender, member.id])`). Each run checks its identities are the ones its transports' flows mint. |
+| **Homeserver tokens** (`*_sfu_url*`) | `alice` publishes on SFU 1 named by `url` only, so her tokens come from Synapse, which proxies `get_token` to lk-jwt-service as an application service. `e2e_call_single_focus_msc_sfu_url`: `bob` does the same. `e2e_call_two_foci_msc_sfu_url_and_service`: `bob` stays on SFU 2's JWT service, so each side subscribes to the other through the other's flow. |
 | **Encryption** | The core `EncryptionManager` generates a per-participant media key and distributes it to the peer as an Olm-encrypted `m.rtc.encryption_key` to-device message (`SdkMatrixBackend::send_to_device_message`). Each side imports received keys into its LiveKit `KeyProvider` (`MediaKeyBridge`), addressed by the MSC4195 pseudonymous identity. Success = `bob` imported `alice`'s key. |
 | **Media** | 440 Hz tone published by `alice`, **GCM frame-encrypted** at the SFU, decrypted and recorded by `bob`, verified with a Goertzel filter (`media::detect_tone > 0.5`). A WAV is written to `target/e2e/received-<label>.wav` — inside the repo, not the system temp dir — and uploaded as a CI artifact on failure. A scenario that records twice (the redial) keeps both files. The tone only decodes because the keys were exchanged and mapped correctly. |
 | **Multi-SFU** (`e2e_call_two_foci_*`) | The same flow with `alice` publishing on SFU 1 and `bob` on SFU 2 (the backend stack runs two SFU + lk-jwt pairs). Each client's `CallEngine` reads the peer's `transports` from their membership and opens a second connection to the peer's focus (MSC4195 multi-SFU). Tones flow in **both directions** (alice 440 Hz, bob 660 Hz) and are received through the transport-agnostic media API (`LiveKitCall::participants` → `LiveKitCall::remote_track` → frame streams) instead of raw LiveKit events. |
@@ -115,7 +116,8 @@ collisions. Overrides for pointing at another deployment:
 | Env var | Default | Meaning |
 | --- | --- | --- |
 | `HOMESERVER_URL` | `http://localhost:8008` | Synapse CS-API base URL |
-| `LIVEKIT_SERVICE_URL` | `http://localhost:6080` | `lk-jwt` `/get_token` base URL, pinned via `LiveKitCallOptions::livekit_transport` (overrides the homeserver's MSC4143 transports endpoint) |
+| `LIVEKIT_SERVICE_URL` | `http://localhost:6080` | `lk-jwt` base URL (`/sfu/get`), pinned via `LiveKitCallOptions::livekit_transport` (overrides the homeserver's MSC4143 transports endpoint) |
+| `LIVEKIT_SFU_URL` | `ws://localhost:7880` | SFU 1's WebSocket URL, published alone by the `*_sfu_url*` cases; must equal SFU 1's lk-jwt `LIVEKIT_URL`, which the homeserver's `get_token` checks it against |
 | `SLOT_ID` | `m.call#room` | MatrixRTC slot |
 | `ALICE` / `ALICE_PW`, `BOB` / `BOB_PW` | *(auto-provisioned)* | Use pre-existing users instead of registering throwaways (for stacks with closed registration) |
 | `INSECURE_TLS` | *(unset)* | set (any value) to accept self-signed certs on a remote TLS stack |

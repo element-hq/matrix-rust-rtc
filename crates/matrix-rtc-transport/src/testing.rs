@@ -19,8 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
+use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::livekit::identity_mapper;
@@ -75,7 +74,7 @@ impl ScriptedTransport {
     pub fn new() -> Self {
         Self {
             state: Arc::default(),
-            identity_mapper: Arc::new(Mutex::new(identity_mapper(MembershipFormat::Current))),
+            identity_mapper: Arc::new(Mutex::new(identity_mapper())),
         }
     }
 
@@ -211,25 +210,30 @@ impl MediaTransport for ScriptedTransport {
         "livekit"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
+    /// The focus's URL, readable in assertions: the JWT service's when named,
+    /// else the SFU's.
+    fn connection_key(&self, transport: &RtcTransport, _publisher_user_id: &str) -> Option<String> {
         match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
+            RtcTransport::LiveKit(livekit) => livekit
+                .livekit_service_url()
+                .or(livekit.url())
+                .map(str::to_owned),
             RtcTransport::Unsupported(_) => None,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        let device_id = member.origin.sender_device_id()?;
         let identity_mapper = self
             .identity_mapper
             .lock()
             .expect("scripted transport poisoned")
             .clone();
-        Some(identity_mapper(
-            &member.sender,
-            device_id,
-            &member.member_id,
-        ))
+        identity_mapper(&IdentitySubject {
+            user_id: &member.sender,
+            device_id: member.origin.sender_device_id(),
+            member_id: &member.member_id,
+            transports: &member.transports,
+        })
     }
 
     async fn connect(

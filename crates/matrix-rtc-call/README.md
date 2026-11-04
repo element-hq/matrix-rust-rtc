@@ -69,16 +69,14 @@ The client tests and the feeder tests (`feeder_tests`, the call layer's timeline
 
 The boundary is load-bearing, so the exclusions are explicit:
 
-- **`MemberClaims`** stays in `matrix-rtc-livekit`. Those are the `member` claims
-  of the MSC4195 `/get_token` request body, which no homeserver ever sees.
 - **The pre-2026 membership formats** (`matrix_rtc_core::compat`): they carry
   any application, so they are the core's; a room is opened in one
   (`RoomOptions::format`).
 - **The participant-identity derivation** (`matrix_rtc_livekit::identity_mapper`)
-  and **the token endpoint** (`TokenEndpoint`). The format decides *which
-  generation*; what that means for an identity or an endpoint is MSC4195 — a
-  LiveKit document — so it lives with the transport. Each is one `match` on
-  `MembershipFormat`.
+  and **the token flow** (`LiveKitTarget`). Both follow the published LiveKit
+  transport, not the membership format: what a transport's fields mean for an
+  identity or an endpoint is MSC4195 — a LiveKit document — so it lives with
+  the transport.
 - **Media, frame encryption, and SFU connections.** `matrix-rtc-transport`
   defines the contract a transport implements (`matrix-rtc-livekit` natively),
   and `matrix-rtc-call-sdk` the call's media model over it.

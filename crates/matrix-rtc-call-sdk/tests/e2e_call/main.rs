@@ -30,8 +30,7 @@
 //!   each on their own (`two_foci`, MSC4195 multi-SFU), or one peer redialling
 //!   while the other stays (`rejoin`).
 //! - [`MembershipFormat`] — the wire dialect both peers speak: spec-current
-//!   (`current`), the 2025 sticky dialect (`sticky_2025`), or pre-sticky room
-//!   state (`room_state`). In `room_state` step 4 is skipped (that
+//!   (`msc`) or pre-sticky room state (`room_state`). In `room_state` step 4 is skipped (that
 //!   generation has no slot concept) and membership is
 //!   `org.matrix.msc3401.call.member` room state rather than a sticky event.
 //!
@@ -103,6 +102,11 @@ struct Config {
     /// Second focus (authorisation service of SFU 2), used by the two-foci
     /// scenario: bob publishes here while alice publishes on the first one.
     livekit_service_url_2: String,
+    /// The first SFU's WebSocket URL, for a transport naming the SFU alone:
+    /// its tokens come from the homeserver's MSC4195 `get_token`, which the
+    /// stack's Synapse proxies to the first lk-jwt-service. Must equal that
+    /// service's `LIVEKIT_URL`, which the homeserver checks the request against.
+    sfu_url: String,
     insecure_tls: bool,
 }
 
@@ -118,9 +122,24 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:6080".to_owned()),
             livekit_service_url_2: env::var("LIVEKIT_SERVICE_URL_2")
                 .unwrap_or_else(|_| "http://localhost:6081".to_owned()),
+            sfu_url: env::var("LIVEKIT_SFU_URL")
+                .unwrap_or_else(|_| "ws://localhost:7880".to_owned()),
             insecure_tls: env::var("INSECURE_TLS").is_ok(),
         }
     }
+}
+
+/// Which transports the participants publish on, and so how each gets its
+/// LiveKit tokens and which identity it holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Auth {
+    /// Every focus named by its JWT service: `/sfu/get`, `{user}:{device}`.
+    Service,
+    /// Alice's focus named by its SFU `url` alone: the homeserver's MSC4195
+    /// `get_token`, `hash([sender, member.id])`. Bob's too in a single-focus
+    /// run; in a two-foci one he stays on the second focus's JWT service, so
+    /// each side subscribes through the other's flow.
+    Sfu,
 }
 
 /// Which media topology a run exercises.
@@ -293,11 +312,11 @@ async fn join_call(
     synced: SyncedClient,
     room: matrix_sdk::Room,
     user: &str,
-    livekit_service_url: &str,
+    transport: &LiveKitTransport,
     compat: MembershipFormat,
 ) -> Result<Participant, Box<dyn Error>> {
     let SyncedClient { client: _, sync } = synced;
-    let call = open_call(cfg, &room, user, livekit_service_url, compat).await?;
+    let call = open_call(cfg, &room, user, transport, compat).await?;
     Ok(Participant { call, _sync: sync })
 }
 
@@ -307,7 +326,7 @@ async fn open_call(
     cfg: &Config,
     room: &matrix_sdk::Room,
     user: &str,
-    livekit_service_url: &str,
+    transport: &LiveKitTransport,
     compat: MembershipFormat,
 ) -> Result<LiveKitCall, Box<dyn Error>> {
     let http = reqwest::Client::builder()
@@ -317,9 +336,7 @@ async fn open_call(
         room,
         LiveKitCallOptions {
             slot_id: cfg.slot_id.clone(),
-            livekit_transport: Some(LiveKitTransport {
-                livekit_service_url: livekit_service_url.to_owned(),
-            }),
+            livekit_transport: Some(transport.clone()),
             http: Some(http),
             format: compat,
             ..LiveKitCallOptions::default()
@@ -443,27 +460,31 @@ async fn wait_for_key(call: &LiveKitCall, peer_identity: &str, label: &str) -> b
 
 /// One `#[test]` per (scenario, compat) pair.
 macro_rules! e2e_tests {
-    ($($name:ident => ($scenario:ident, $compat:ident),)*) => {$(
+    ($($name:ident => ($scenario:ident, $compat:ident $(, $auth:ident)?),)*) => {$(
         #[test]
         #[ignore = "requires the demo/backend docker stack (make backend-up)"]
         fn $name() {
-            harness(Scenario::$scenario, MembershipFormat::$compat);
+            harness(
+                Scenario::$scenario,
+                MembershipFormat::$compat,
+                e2e_tests!(@auth $($auth)?),
+            );
         }
     )*};
+    (@auth) => { Auth::Service };
+    (@auth $auth:ident) => { Auth::$auth };
 }
 
 e2e_tests! {
-    e2e_call_single_focus_current => (SingleFocus, Current),
-    e2e_call_single_focus_sticky_2025 => (SingleFocus, Sticky2025),
+    e2e_call_single_focus_msc => (SingleFocus, Msc),
     e2e_call_single_focus_room_state => (SingleFocus, RoomState),
-    e2e_call_two_foci_current => (TwoFoci, Current),
-    e2e_call_two_foci_sticky_2025 => (TwoFoci, Sticky2025),
+    e2e_call_two_foci_msc => (TwoFoci, Msc),
     e2e_call_two_foci_room_state => (TwoFoci, RoomState),
-    e2e_call_rejoin_current => (RejoinSameProcess, Current),
-    e2e_call_rejoin_sticky_2025 => (RejoinSameProcess, Sticky2025),
+    e2e_call_rejoin_msc => (RejoinSameProcess, Msc),
     e2e_call_rejoin_room_state => (RejoinSameProcess, RoomState),
-    e2e_call_slot_closed_current => (SlotClosed, Current),
-    e2e_call_slot_closed_sticky_2025 => (SlotClosed, Sticky2025),
+    e2e_call_slot_closed_msc => (SlotClosed, Msc),
+    e2e_call_single_focus_msc_sfu_url => (SingleFocus, Msc, Sfu),
+    e2e_call_two_foci_msc_sfu_url_and_service => (TwoFoci, Msc, Sfu),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -481,8 +502,8 @@ fn init_test_process() {
         .try_init();
 }
 
-fn harness(scenario: Scenario, compat: MembershipFormat) {
-    run_to_completion(OVERALL_DEADLINE, |cfg| run(cfg, scenario, compat));
+fn harness(scenario: Scenario, compat: MembershipFormat, auth: Auth) {
+    run_to_completion(OVERALL_DEADLINE, |cfg| run(cfg, scenario, compat, auth));
 }
 
 /// Run one end-to-end flow on a fresh runtime, panicking on failure or when
@@ -511,6 +532,7 @@ async fn run(
     cfg: Config,
     scenario: Scenario,
     compat: MembershipFormat,
+    auth: Auth,
 ) -> Result<(), Box<dyn Error>> {
     let (alice_creds, bob_creds) = credentials(&cfg).await?;
 
@@ -560,13 +582,16 @@ async fn run(
     //    connect, all through the facade). In two-foci mode each participant
     //    publishes on their own SFU; the engines then cross-connect to the
     //    peer's focus for subscribing (MSC4195 multi-SFU).
-    let bob_url = match scenario {
-        Scenario::SingleFocus | Scenario::RejoinSameProcess | Scenario::SlotClosed => {
-            cfg.livekit_service_url.clone()
-        }
-        Scenario::TwoFoci => cfg.livekit_service_url_2.clone(),
+    let alice_transport = match auth {
+        Auth::Service => LiveKitTransport::service(cfg.livekit_service_url.clone()),
+        Auth::Sfu => LiveKitTransport::sfu(cfg.sfu_url.clone()),
     };
-    let alice_url = cfg.livekit_service_url.clone();
+    let bob_transport = match scenario {
+        Scenario::SingleFocus | Scenario::RejoinSameProcess | Scenario::SlotClosed => {
+            alice_transport.clone()
+        }
+        Scenario::TwoFoci => LiveKitTransport::service(cfg.livekit_service_url_2.clone()),
+    };
     // Kept so bob can redial on the same room handle after hanging up.
     let bob_room_again = bob_room.clone();
     let alice = join_call(
@@ -574,11 +599,25 @@ async fn run(
         alice,
         alice_room,
         &alice_creds.user,
-        &alice_url,
+        &alice_transport,
         compat,
     )
     .await?;
-    let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_url, compat).await?;
+    let mut bob = join_call(&cfg, bob, bob_room, &bob_creds.user, &bob_transport, compat).await?;
+
+    // Identity proof: the identity each side publishes under is the one its
+    // transport's token flow mints — the hash from the homeserver, the
+    // unhashed `{user}:{device}` from a JWT service's `/sfu/get`.
+    let minted = |call: &LiveKitCall, transport: &LiveKitTransport| {
+        let hashed = !call.local_identity().contains(':');
+        hashed == transport.livekit_service_url().is_none()
+    };
+    let identities_ok = minted(&alice.call, &alice_transport) && minted(&bob.call, &bob_transport);
+    println!(
+        "[alice] identity {} ({auth:?}); [bob] identity {}",
+        alice.call.local_identity(),
+        bob.call.local_identity()
+    );
 
     // Signalling proof: each side discovers the other's membership, over
     // whichever carrier the compat mode uses (own + peer == 2).
@@ -653,7 +692,14 @@ async fn run(
         first_call.leave().await?;
 
         let mut second = Participant {
-            call: open_call(&cfg, &bob_room_again, &bob_creds.user, &bob_url, compat).await?,
+            call: open_call(
+                &cfg,
+                &bob_room_again,
+                &bob_creds.user,
+                &bob_transport,
+                compat,
+            )
+            .await?,
             _sync,
         };
         if !wait_for_members(&second.call, 2, "bob-redial").await {
@@ -721,6 +767,7 @@ async fn run(
 
     println!("\n=== RESULT ===");
     println!("compat mode:                            {compat:?}");
+    println!("transports ({auth:?}) mint the identities:  {identities_ok}");
     println!("membership discovered by alice:         {alice_sees}");
     println!("membership discovered by bob:           {bob_sees}");
     println!("alice's media key received by bob:      {alice_key_seen_by_bob}");
@@ -742,6 +789,7 @@ async fn run(
 
     if alice_sees
         && bob_sees
+        && identities_ok
         && alice_key_seen_by_bob
         && tone_ok
         && reactions_ok

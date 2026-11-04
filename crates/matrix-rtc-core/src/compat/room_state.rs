@@ -1299,7 +1299,7 @@ mod tests {
         assert!(matches!(
             joined.transports.first(),
             Some(RtcTransport::LiveKit(livekit))
-                if livekit.livekit_service_url == "https://mrtc.example.io/livekit/jwt"
+                if livekit.livekit_service_url() == Some("https://mrtc.example.io/livekit/jwt")
         ));
     }
 }

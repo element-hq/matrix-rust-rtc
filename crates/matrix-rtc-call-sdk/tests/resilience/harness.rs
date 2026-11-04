@@ -12,7 +12,6 @@ use std::time::Duration;
 
 use matrix_rtc_call::{CallJoinOptions, RtcCall, RtcClient, RtcRoom};
 use matrix_rtc_call_sdk::{AttachOptions, CallEvent, MediaAttachment, attach_media};
-use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     BackendError, EventEncryption, EventIn, Outbox, RoomOptions, SLOT_EVENT_TYPE, SignallingHealth,
@@ -141,8 +140,7 @@ pub async fn start(peers: &[Peer], own_sfu_down: bool, sfu_fallback: bool) -> Ca
         AttachOptions {
             own_user_id: mock.user_id.clone(),
             own_device_id: mock.device_id.clone(),
-            identity_mapper: identity_mapper(MembershipFormat::Current),
-            format: MembershipFormat::Current,
+            identity_mapper: identity_mapper(),
             stability: Default::default(),
             own_reconnect_budget: matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
             sfu_fallback,

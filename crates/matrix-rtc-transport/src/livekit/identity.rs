@@ -5,16 +5,17 @@
 
 //! Hash derivations defined by [MSC4195].
 //!
-//! Both the `livekit_alias` and the pseudonymous LiveKit participant identity
-//! are computed as `base64(SHA256(JSON.serialize([...])))`, where
+//! Both the `livekit_alias` and the LiveKit participant identity the
+//! homeserver mints are computed as `base64(SHA256(JSON.serialize([...])))`, where
 //! `JSON.serialize` is [Matrix canonical JSON] and `base64` is the unpadded
 //! standard alphabet.
 //!
 //! The `livekit_alias` and SFU URL normally reach the client baked into the JWT
 //! returned by the authorisation service, so a connecting client does not need
-//! to derive the alias itself. The pseudonymous identity, however, is needed to
+//! to derive the alias itself. The participant identity, however, is needed to
 //! map a received per-participant encryption key (from `matrix-rtc-core`) onto
-//! the corresponding LiveKit participant once E2EE is wired up.
+//! the corresponding LiveKit participant. The legacy JWT service's unhashed
+//! identity lives here too, so both derivations have one home.
 //!
 //! [MSC4195]: https://github.com/matrix-org/matrix-spec-proposals/pull/4195
 //! [Matrix canonical JSON]: https://spec.matrix.org/v1.18/appendices/#canonical-json
@@ -52,21 +53,21 @@ pub fn livekit_alias(room_id: &str, slot_id: &str) -> String {
     hash_string_array(&[room_id, slot_id])
 }
 
-/// Derive the pseudonymous LiveKit participant identity from MSC4195:
-/// `base64(SHA256(JSON.serialize([user_id, device_id, member_id])))`.
+/// The LiveKit participant identity the homeserver's MSC4195 `get_token`
+/// mints: `base64(SHA256(JSON.serialize([sender, member_id])))`.
 ///
-/// This is the `sub` the authorisation service places in the JWT, and the value
-/// used to associate an inbound `m.rtc.encryption_key` key with a LiveKit
-/// participant.
-///
-/// MSC4195 names the middle component `claimed_device_id` after the
-/// `m.rtc.member` field of the same name. MSC4143 has since removed that field,
-/// so for a peer the value is the device that encrypted their member event
-/// (`EncryptionInfo::sender_device`) — the same device, now authenticated rather
-/// than self-asserted. The hash itself is unchanged, so MSC4195's test vectors
-/// still hold.
-pub fn pseudonymous_identity(user_id: &str, device_id: &str, member_id: &str) -> String {
-    hash_string_array(&[user_id, device_id, member_id])
+/// This is the `sub` of the JWT, and the value used to associate an inbound
+/// `m.rtc.encryption_key` key with a LiveKit participant whose published
+/// transport selects that flow.
+pub fn msc4195_identity(sender: &str, member_id: &str) -> String {
+    hash_string_array(&[sender, member_id])
+}
+
+/// The identity the legacy JWT service's `/sfu/get` mints: the unhashed
+/// `{user_id}:{device_id}`, which clients predating the homeserver endpoints
+/// look for.
+pub fn legacy_identity(user_id: &str, device_id: &str) -> String {
+    matrix_rtc_core::compat::room_state::participant_identity(user_id, device_id)
 }
 
 #[cfg(test)]
@@ -90,16 +91,20 @@ mod tests {
         );
     }
 
+    // Verified test vector from the MSC4195 appendix.
     #[test]
-    fn pseudonymous_identity_is_stable_and_unpadded() {
-        let id = pseudonymous_identity("@user:matrix.example.com", "DEVICEID", "xyzABCDEF10123");
-        // SHA256 -> 32 bytes -> 43 unpadded base64 chars, no '=' padding.
-        assert_eq!(id.len(), 43);
-        assert!(!id.contains('='));
-        // Deterministic.
+    fn msc4195_identity_matches_msc4195_vector() {
         assert_eq!(
-            id,
-            pseudonymous_identity("@user:matrix.example.com", "DEVICEID", "xyzABCDEF10123")
+            msc4195_identity("@alice:example.com", "memberABC"),
+            "M3VnsLXrkbxIDINXO64u8PZzFyD9ZYFiQULR2dshWYs"
+        );
+    }
+
+    #[test]
+    fn legacy_identity_is_unhashed() {
+        assert_eq!(
+            legacy_identity("@alice:example.com", "DEVICE"),
+            "@alice:example.com:DEVICE"
         );
     }
 }

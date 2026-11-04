@@ -50,8 +50,8 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
 use matrix_rtc_core::{
     CommandError, EncryptionConfig, EncryptionKeySignalHandler, EncryptionManager, EventOrigin,
-    JoinedMembership, KeyMaterialSignal, KeyOrigin, MatrixBackend, ReceivedEncryptionKey,
-    ToDeviceDelivery, ToDeviceRecipient,
+    IdentitySubject, JoinedMembership, KeyMaterialSignal, KeyOrigin, MatrixBackend,
+    ReceivedEncryptionKey, ToDeviceDelivery, ToDeviceRecipient,
 };
 use serde_json::Value;
 
@@ -534,8 +534,8 @@ impl Call {
             Arc::new(move || clock.now())
         });
         manager.set_signal_handler(media.clone());
-        manager.set_identity_mapper(Arc::new(|user_id, device_id, _member_id| {
-            identity_of(user_id, device_id)
+        manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(identity_of(subject.user_id, subject.device_id?))
         }));
         manager.join().await.expect("join should succeed");
 

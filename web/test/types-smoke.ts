@@ -77,6 +77,7 @@ export function host(client: {
     relations: () => Promise.resolve([]),
     getOpenIdToken: () =>
       Promise.resolve({ access_token: 't', token_type: 'Bearer', matrix_server_name: 'hs', expires_in: 1 }),
+    getLivekitToken: () => Promise.resolve({ jwt: 'jwt' }),
     rtcTransports: () => Promise.resolve([{ type: 'livekit', livekit_service_url: 'https://sfu' }]),
   };
 }
@@ -85,7 +86,7 @@ export async function smoke(
   client: WasmRtcClient,
   delegate: MediaDelegate,
 ): Promise<void> {
-  const options: RoomOptionsIn = { format: 'sticky_2025' };
+  const options: RoomOptionsIn = { format: 'room_state' };
   const room: WasmRtcRoom = await client.room('!r:hs', options);
 
   const params: JoinParamsIn = {

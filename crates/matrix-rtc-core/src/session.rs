@@ -521,6 +521,11 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             self.slot_id.clone(),
             get_memberships_for_encryption,
         );
+        // Our identity on the media plane follows the transport we publish on.
+        encryption_manager.set_own_transports(match &transport {
+            TransportIntent::Publish(transport) => vec![transport.clone()],
+            TransportIntent::ReceiveOnly { .. } => Vec::new(),
+        });
         let manage_media_keys = encryption_config.manage_media_keys;
         encryption_manager.set_config(encryption_config);
         // One clock per client: key timings and the membership's share it.

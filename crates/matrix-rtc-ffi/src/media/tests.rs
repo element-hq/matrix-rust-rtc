@@ -34,7 +34,8 @@ fn config() -> MediaSessionConfig {
 
 fn dead_sfu() -> FfiJoinTransport {
     FfiJoinTransport::Publish {
-        livekit_service_url: DEAD_SFU_URL.to_owned(),
+        url: None,
+        livekit_service_url: Some(DEAD_SFU_URL.to_owned()),
     }
 }
 
