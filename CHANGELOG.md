@@ -24,6 +24,7 @@ log only.
 
 ### Fixed
 
+- The matrix-js-sdk host sends the delayed leave as a sticky delayed event, so a crashed web client's membership ends when it fires; without SDK or server support it still joins without one (038).
 - A call in a room whose encryption is off sends no media keys and connects without frame encryption, natively and on the web (038).
 - On the web an unencrypted track in an encrypted call is refused whatever the page's options (038).
 - A call joined in the clear leaves with `slot_closed` when the room's encryption turns on, rather than staying unencrypted (038).

@@ -52,12 +52,13 @@ use tokio::task::JoinHandle;
 // (`JoinSessionParams::sticky_duration_ms`), which re-sends the membership at
 // half that interval to stay in the map.
 //
-// NOTE: the delayed leave is a plain (non-sticky) delayed event, so it clears
-// nothing from the sticky map when it fires — crash cleanup relies entirely on
-// the membership's own sticky TTL expiring. Not an HTTP-level limitation: both
+// NOTE: this host sends no delayed leave (`send_delayed_sticky_event` refuses
+// until matrix-rust-sdk#6973): a plain delayed event would fire without ending
+// the sticky membership (spec 038 R13). The core then joins on a 5 minute
+// membership lifetime, which bounds a crash (R43). Both
 // `org.matrix.msc4140.delay` and `org.matrix.msc4354.sticky_duration_ms` are
-// query parameters on the same `PUT /send`, but ruma's request types cannot
-// express both, and neither MSC states that the two compose.
+// query parameters on the same `PUT /send`; ruma's request types cannot
+// express both yet.
 
 /// An SDK error that may carry the server's standard error body.
 trait ClientApiError: std::fmt::Display {
