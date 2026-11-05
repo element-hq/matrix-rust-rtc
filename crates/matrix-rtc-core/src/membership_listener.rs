@@ -77,7 +77,7 @@ mod tests {
             room_id: ROOM_ID.to_owned(),
             event_id: Some(event_id.to_owned()),
             sender: sender.to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: "m.rtc.member".to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {

@@ -1802,11 +1802,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             // names a device its author cannot send as.
             EventOrigin::Claimed { device_id } => device_id.as_str(),
 
-            // The host never said how the member event arrived, so there is
-            // nothing to check against and nothing to accuse it of — the same
-            // stance the rest of the design takes on unreported facts.
-            EventOrigin::Unknown => return Ok(()),
-
             // Either the member event was encrypted but could not be attributed
             // to a device — which should not happen, since Olm messages carry
             // the sender's device keys — or it arrived in the clear. Both leave
@@ -3472,31 +3467,6 @@ mod tests {
         // A claim naming some other device is not a licence to accept anything:
         // the key came from `device456`, so it does not match.
         assert_discarded(&claimed("someOtherDevice"), bob_key(vec![1u8; 32], 0)).await;
-    }
-
-    /// But an unreported origin is not an accusation: hosts that do not supply
-    /// decryption metadata keep working, as everywhere else in the design.
-    #[tokio::test]
-    async fn key_is_accepted_when_the_member_events_origin_is_unreported() {
-        let unreported = JoinedMembership {
-            origin: EventOrigin::Unknown,
-            ..bob_membership()
-        };
-        let manager = EncryptionManager::new(
-            Arc::new(NoopBackend),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
-            MEMBER_ID.to_string(),
-            ROOM_ID.to_string(),
-            SLOT_ID.to_string(),
-            create_mock_get_memberships(vec![unreported]),
-        );
-
-        manager
-            .receive_key(bob_key(vec![1u8; 32], 0))
-            .await
-            .expect("should succeed");
-        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
     }
 
     /// MSC4153: keys from devices that are not cross-signed are discarded when

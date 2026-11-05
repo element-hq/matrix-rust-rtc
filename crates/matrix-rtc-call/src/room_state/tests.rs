@@ -62,7 +62,7 @@ fn member_event(
         sender: sender.to_owned(),
         origin: match device {
             Some(device) => EventOrigin::encrypted(Some(device.to_owned())),
-            None => EventOrigin::Unknown,
+            None => EventOrigin::Cleartext,
         },
         event_type: "m.rtc.member".to_owned(),
         origin_server_ts: None,
@@ -144,7 +144,7 @@ fn timeline_event(
         room_id: ROOM.to_owned(),
         event_id: event_id.to_owned(),
         sender: sender.to_owned(),
-        origin: EventOrigin::Unknown,
+        origin: EventOrigin::Cleartext,
         event_type: event_type.to_owned(),
         origin_server_ts: ts,
         content,

@@ -109,7 +109,7 @@ mod tests {
             room_id: ROOM_ID.to_owned(),
             event_id: None,
             sender: sender.to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: EVENT_TYPE_RTC_MEMBER.to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {
@@ -1630,6 +1630,100 @@ mod tests {
         assert_eq!(room.member_count("m.call#room"), Some(1));
     }
 
+    /// Spec 038 R6: in an encrypted room a member's device is the one that
+    /// encrypted their member event. A cleartext event, or one decryption
+    /// attributed to no device, is not joined. A claimed device (room-state
+    /// format only) still is.
+    #[tokio::test]
+    async fn only_an_attributed_encrypted_member_is_joined_in_an_encrypted_room() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+
+        let attributed = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+            ..joined_event("@alice:example.org", "m.call#room", "alice-a")
+        };
+        let no_device = RawStickyEvent {
+            origin: EventOrigin::encrypted(None),
+            ..joined_event("@bob:example.org", "m.call#room", "bob-a")
+        };
+        let cleartext = RawStickyEvent {
+            origin: EventOrigin::Cleartext,
+            ..joined_event("@carol:example.org", "m.call#room", "carol-a")
+        };
+        let claimed = RawStickyEvent {
+            origin: EventOrigin::claimed("DANDEV"),
+            ..joined_event("@dan:example.org", "m.call#room", "dan-a")
+        };
+
+        room.set_current_sticky_state(vec![attributed, no_device, cleartext, claimed])
+            .await
+            .unwrap();
+        room.on_encryption_received(true).await;
+
+        let mut joined: Vec<_> = room
+            .subscribe_membership_snapshots("m.call#room")
+            .expect("the session should exist")
+            .borrow()
+            .iter()
+            .map(|m| m.member_id.clone())
+            .collect();
+        joined.sort();
+        assert_eq!(joined, ["alice-a", "dan-a"]);
+    }
+
+    /// Spec 038 R9: a redacted member event makes the member leave. Redaction
+    /// empties the content under the same sticky key, and the host's sticky
+    /// map hands that back in its next snapshot.
+    #[tokio::test]
+    async fn a_redacted_member_event_makes_the_member_leave() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+        let bob = joined_event("@bob:example.org", "m.call#room", "bob-a");
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            bob.clone(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(room.member_count("m.call#room"), Some(2));
+
+        let redacted: RawStickyEventContent = serde_json::from_value(serde_json::json!({
+            "slot_id": "m.call#room",
+            "sticky_key": "bob-a",
+        }))
+        .expect("a redacted member content keeps only what redaction preserves");
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            RawStickyEvent {
+                content: redacted,
+                ..bob
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R41: a membership whose stickiness lapsed is gone from the
+    /// host's sticky map, and so from the next snapshot; the member leaves.
+    #[tokio::test]
+    async fn a_member_missing_from_the_sticky_snapshot_has_left() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            joined_event("@bob:example.org", "m.call#room", "bob-a"),
+        ])
+        .await
+        .unwrap();
+        room.set_current_sticky_state(vec![joined_event(
+            "@alice:example.org",
+            "m.call#room",
+            "alice-a",
+        )])
+        .await
+        .unwrap();
+        assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
     /// An unencrypted room imposes no such requirement.
     #[tokio::test]
     async fn cleartext_member_events_are_fine_in_an_unencrypted_room() {
@@ -1860,7 +1954,7 @@ mod tests {
             room_id: ROOM_ID.to_owned(),
             event_id: None,
             sender: "@alice:example.org".to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: "m.rtc.member".to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {
@@ -1917,7 +2011,7 @@ mod tests {
             room_id: ROOM_ID.to_owned(),
             event_id: None,
             sender: "@alice:example.org".to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: "m.rtc.member".to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {

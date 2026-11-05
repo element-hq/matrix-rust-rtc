@@ -8,6 +8,11 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- In the MSC format a member event is read exactly as MSC4143 states it: Element Call's 2025 sticky content and self-claimed devices are only read in the room-state format (038).
+- In an encrypted room a member is joined only if decryption names the device that sent their member event; `EventOrigin::Unknown` is removed (038).
+
 ### Added
 
 - A join follows the call's voice/video intent from the memberships already in it and publishes it in ours; read it from `RtcCall::call_intent` to start the camera, and pass `intent` only to start a call (030).

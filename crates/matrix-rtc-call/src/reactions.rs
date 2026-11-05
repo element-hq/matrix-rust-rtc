@@ -1074,7 +1074,7 @@ mod tests {
             room_id: "!room:example.org".to_owned(),
             event_id: "$reaction".to_owned(),
             sender: sender.to_owned(),
-            origin: EventOrigin::Unknown,
+            origin: EventOrigin::Cleartext,
             event_type: event_type.to_owned(),
             origin_server_ts: 1_000,
             content,

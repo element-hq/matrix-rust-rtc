@@ -29,13 +29,9 @@ use thiserror::Error;
 /// This mirrors [`KeyOrigin`], which does the same job for to-device messages.
 ///
 /// [`KeyOrigin`]: crate::KeyOrigin
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventOrigin {
-    /// The host did not report how the event arrived. Rules that depend on it
-    /// are not applied.
-    #[default]
-    Unknown,
     /// The event arrived in the clear.
     Cleartext,
     /// The event arrived encrypted and was decrypted.
@@ -93,17 +89,16 @@ impl EventOrigin {
         match self {
             Self::Encrypted { sender_device_id } => sender_device_id.as_deref(),
             Self::Claimed { device_id } => Some(device_id.as_str()),
-            Self::Unknown | Self::Cleartext => None,
+            Self::Cleartext => None,
         }
     }
 
-    /// Whether the event arrived encrypted; `None` when the host did not say.
+    /// Whether the event arrived encrypted.
     ///
-    /// A claimed device says nothing about encryption, so it reports `None` —
-    /// the rules that depend on this are skipped rather than passed.
+    /// A claimed device says nothing about encryption, so it reports `None`.
     pub fn was_encrypted(&self) -> Option<bool> {
         match self {
-            Self::Unknown | Self::Claimed { .. } => None,
+            Self::Claimed { .. } => None,
             Self::Cleartext => Some(false),
             Self::Encrypted { .. } => Some(true),
         }
@@ -242,7 +237,6 @@ pub struct RawTimelineEvent {
     /// The event's sender.
     pub sender: String,
     /// How the event reached us.
-    #[serde(default)]
     pub origin: EventOrigin,
     /// The event type, verbatim.
     pub event_type: String,
@@ -488,11 +482,6 @@ mod tests {
 
         assert_eq!(EventOrigin::Cleartext.was_encrypted(), Some(false));
         assert_eq!(EventOrigin::Cleartext.sender_device_id(), None);
-
-        // Unreported is distinct from cleartext: the rules that depend on it
-        // are skipped rather than failed.
-        assert_eq!(EventOrigin::Unknown.was_encrypted(), None);
-        assert_eq!(EventOrigin::default(), EventOrigin::Unknown);
     }
 
     /// A claimed device is usable as a device but must never pass for
@@ -657,6 +646,39 @@ mod tests {
         assert_eq!(
             parsed.transports.unwrap().can_subscribe,
             vec!["livekit".to_owned()]
+        );
+    }
+
+    /// Spec 038 R3: our join content has exactly MSC4143's fields — in
+    /// particular no `member.user_id` / `device_id`, which Element Call's 2025
+    /// dialect sends.
+    #[test]
+    fn built_join_content_has_exactly_the_msc_fields() {
+        let built = RawStickyEventContent::for_join(
+            "m.call#room".to_owned(),
+            "xyzABCDEF0123".to_owned(),
+            "m.call".into(),
+            MemberTransports::publishing(RawRtcTransport {
+                transport_type: "m.livekit".to_owned(),
+                extra_fields: serde_json::from_value(
+                    serde_json::json!({ "url": "wss://sfu.example.org" }),
+                )
+                .unwrap(),
+            }),
+        );
+
+        assert_eq!(
+            serde_json::to_value(&built).unwrap(),
+            serde_json::json!({
+                "slot_id": "m.call#room",
+                "application": { "type": "m.call" },
+                "member": { "id": "xyzABCDEF0123", "membership": "join" },
+                "msc4354_sticky_key": "xyzABCDEF0123",
+                "transports": {
+                    "published": [{ "type": "m.livekit", "url": "wss://sfu.example.org" }],
+                    "can_subscribe": ["m.livekit"],
+                },
+            }),
         );
     }
 

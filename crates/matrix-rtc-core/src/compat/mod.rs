@@ -36,18 +36,16 @@
 //! this module and the feeder's [`IngestDialect`](crate::feeder::IngestDialect)
 //! seam, as JSON funnels at the very edge:
 //!
-//! - **Inbound for the sticky dialect**
+//! - **Inbound for Element Call's sticky dialect**
 //!   ([`sticky_2025::normalize_member_content`],
-//!   [`sticky_2025::parse_key_message`]) is *permissive and always on*. Every
-//!   rule is of the form "the modern field is absent and the legacy one is
-//!   present", so a spec-shaped event passes through byte-identical and no flag
-//!   is needed to protect it. Being always on is deliberate: a legacy path that
-//!   only compiles under a flag is a legacy path that rots.
+//!   [`sticky_2025::parse_key_message`]) runs in the room-state format only.
+//!   Element Call writes sticky memberships beside its state events during the
+//!   transition, and those must still read as its members. In MSC nothing is
+//!   normalised: a member event that is not MSC4143-shaped is not a member.
 //! - **Everything about the state dialect** is *opt-in*, in both directions.
 //!   Reading it is not normalisation — it is a second membership source, in a
 //!   different part of the room, with a lifetime the content states rather than
-//!   the homeserver enforcing. See [`room_state`] for why that cannot be
-//!   always-on the way its sibling is.
+//!   the homeserver enforcing. See [`room_state`].
 //! - **Outbound** ([`OutboundDialect`]) is opt-in for both, because it is the
 //!   half that changes what other clients see.
 //!
@@ -70,8 +68,8 @@
 //! In this crate:
 //!
 //! 1. `ingest` — the inbound half for every host: the `IngestDialect` the
-//!    feeder reads a room through, which normalises `m.rtc.member` content,
-//!    reads state-carried membership in `RoomState`, and parses legacy
+//!    feeder reads a room through, which normalises `m.rtc.member` content in
+//!    `RoomState` (and reads it strictly in `Msc`), reads state-carried membership in `RoomState`, and parses legacy
 //!    to-device keys, all in the format the room was opened in.
 //! 2. `dialect_backend::DialectBackend` — the outbound half for every host:
 //!    routes and rewrites the sends of the one `MatrixBackend` wrapper the
@@ -109,9 +107,8 @@ pub use sticky_2025::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent};
 /// Which MatrixRTC membership format a room is read and written in.
 ///
 /// Mutually exclusive by construction, because the generations disagree about
-/// the *carrier* of a membership, not just its fields. Reading the 2025 sticky
-/// dialect needs no flag and is always on regardless of this setting; see the
-/// module docs.
+/// the *carrier* of a membership, not just its fields. Element Call's sticky
+/// dialect is read in the room-state format only; see the module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that

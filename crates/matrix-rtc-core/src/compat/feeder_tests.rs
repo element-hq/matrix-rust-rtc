@@ -165,24 +165,39 @@ async fn pre_sticky_state_membership_is_funnelled() {
     assert_eq!(harness.member_count().await, Some(1));
 }
 
+/// Spec 038 R5: Element Call's 2025 sticky shape is not a member in MSC. Fed
+/// beside a spec-shaped member, only the latter is joined.
 #[tokio::test]
-async fn a_2025_sticky_member_is_read_in_the_current_format() {
+async fn a_2025_sticky_member_is_not_read_in_the_msc_format() {
     let harness = Harness::attach(MembershipFormat::Msc).await;
     harness.seed_room_state();
-    harness.sink().on_sticky_events(vec![EventIn {
-        content: json!({
-            "slot_id": SLOT,
-            "msc4354_sticky_key": "bob-1",
-            "application": { "type": "m.call" },
-            "member": { "id": "bob-1", "user_id": BOB, "device_id": "BOBDEVICE" },
-            "rtc_transports": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
-        }),
-        ..member_event(BOB, "bob-1", "$m1")
-    }]);
+    harness.sink().on_sticky_events(vec![
+        EventIn {
+            content: json!({
+                "slot_id": SLOT,
+                "msc4354_sticky_key": "bob-1",
+                "application": { "type": "m.call" },
+                "member": { "id": "bob-1", "user_id": BOB, "device_id": "BOBDEVICE" },
+                "rtc_transports": [{ "type": "livekit", "livekit_service_url": "https://sfu" }],
+            }),
+            ..member_event(BOB, "bob-1", "$m1")
+        },
+        member_event(ME, "me-1", "$m2"),
+    ]);
     harness.attachment.seeded().await;
     harness
         .wait_until(|| async { harness.member_count().await == Some(1) })
         .await;
+    let joined = harness
+        .manager
+        .lock()
+        .await
+        .subscribe_membership_snapshots(SLOT)
+        .expect("a session")
+        .borrow()
+        .clone();
+    assert_eq!(joined.len(), 1);
+    assert_eq!(joined[0].member_id, "me-1");
 }
 
 #[test]

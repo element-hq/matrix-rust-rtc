@@ -93,6 +93,10 @@ pub(crate) enum JoinCondition {
     /// MSC4143 requires `m.rtc.member` to be encrypted in an encrypted room,
     /// and one that is not "MUST be considered left".
     UnencryptedInEncryptedRoom,
+    /// Encrypted, but decryption named no sending device. In an encrypted room
+    /// MSC4143 identifies a member's device by the device that encrypted their
+    /// member event, so without one the member cannot be joined.
+    NoSendingDevice,
     /// The sender is no longer joined to the room.
     SenderNotInRoom,
     /// A previous participation of *this* device, still sticky under an older
@@ -1114,12 +1118,25 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
 
         // MSC4143: in an encrypted room `m.rtc.member` events MUST be
-        // encrypted, and one that is not "MUST be considered left". An event
-        // whose encryption the host did not report is not judged.
-        if self.room_encryption == RoomEncryption::Encrypted
-            && candidate.origin.was_encrypted() == Some(false)
-        {
-            return JoinCondition::UnencryptedInEncryptedRoom;
+        // encrypted, and one that is not "MUST be considered left". The member's
+        // device is the one that encrypted the event, never one the content
+        // claims.
+        //
+        // `Claimed` is the one exception, and it only ever comes from the
+        // room-state format: Element Call's state events cannot be encrypted at
+        // all, and that format exists to interoperate with it (spec 038 R32).
+        // The MSC format never produces it.
+        if self.room_encryption == RoomEncryption::Encrypted {
+            match &candidate.origin {
+                EventOrigin::Encrypted {
+                    sender_device_id: Some(_),
+                }
+                | EventOrigin::Claimed { .. } => {}
+                EventOrigin::Encrypted {
+                    sender_device_id: None,
+                } => return JoinCondition::NoSendingDevice,
+                EventOrigin::Cleartext => return JoinCondition::UnencryptedInEncryptedRoom,
+            }
         }
 
         // A previous participation of this very device is us, one call ago —
