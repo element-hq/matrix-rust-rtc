@@ -2192,6 +2192,32 @@ mod tests {
         assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
     }
 
+    /// Spec 038 R37: a join made in the clear leaves the moment the room's
+    /// encryption turns on, even though the slot (already declaring a
+    /// mechanism) stays open: its media was set up unencrypted.
+    #[tokio::test(start_paused = true)]
+    async fn encryption_turning_on_leaves_a_clear_join() {
+        let sender = alice_backend();
+        let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
+        room.on_encryption_received(false).await;
+        room.on_slots_received(vec![encrypted_call_slot()]).await;
+        join_as(&mut room, "alice-a").await;
+        assert_eq!(room.encrypts_media("m.call#room"), Some(false));
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+
+        room.on_encryption_received(true).await;
+
+        assert_eq!(
+            auto_leaves.try_recv().expect("an auto-leave").code,
+            LeaveCode::SlotClosed
+        );
+        assert_eq!(room.own_member_id("m.call#room"), None);
+        let (_, _, leave, _) = sender.last_sticky_event().expect("a leave was sent");
+        assert_eq!(leave["leave_reason"]["code"], "slot_closed", "{leave}");
+    }
+
     /// A leave that fails to send still ends our join and is announced, so the
     /// host stops publishing; the delayed leave stays armed to remove us.
     #[tokio::test(start_paused = true)]

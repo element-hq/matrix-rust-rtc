@@ -22,6 +22,7 @@ log only.
 
 - A call in a room whose encryption is off sends no media keys and connects without frame encryption, natively and on the web (038).
 - On the web an unencrypted track in an encrypted call is refused whatever the page's options (038).
+- A call joined in the clear leaves with `slot_closed` when the room's encryption turns on, rather than staying unencrypted (038).
 - Every key index, 0 to 255, is usable natively and on the web; native dropped index 255 and the web anything past 15 (038).
 
 ### Added

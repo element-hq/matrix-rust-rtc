@@ -1382,7 +1382,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// Sets whether the room is encrypted.
     ///
     /// In an encrypted room, members whose `m.rtc.member` event arrived in the
-    /// clear stop counting as joined.
+    /// clear stop counting as joined. A join whose media is in the clear
+    /// leaves at once with [`LeaveCode::SlotClosed`] when the room's
+    /// encryption turns on (spec 038 R37): its connections and tracks were set
+    /// up unencrypted, so the application rejoins to encrypt.
     pub async fn set_room_encryption(&mut self, room_encryption: RoomEncryption) {
         if self.room_encryption == room_encryption {
             return;
@@ -1393,7 +1396,15 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             self.room_encryption,
         );
         self.room_encryption = room_encryption;
-        self.refresh().await;
+        if room_encryption == RoomEncryption::Encrypted
+            && self.own_membership_machine.is_some()
+            && self.encrypts_media() == Some(false)
+        {
+            self.auto_leave(LeaveReason::new(LeaveCode::SlotClosed))
+                .await;
+        } else {
+            self.refresh().await;
+        }
     }
 
     /// Whether RTC data should be encrypted, per the slot and the room.
