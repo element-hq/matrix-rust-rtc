@@ -129,6 +129,10 @@ pub struct ConnectionContext {
     pub room_id: String,
     pub slot_id: String,
     pub member: OwnMemberClaims,
+    /// Whether media is frame-encrypted: off in a room whose encryption is
+    /// off (spec 038 R11). When on, a track arriving unencrypted is refused
+    /// (R12).
+    pub e2ee: bool,
 }
 
 /// Handle to one subscribed remote track: opens frame streams on demand.

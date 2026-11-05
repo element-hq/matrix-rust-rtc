@@ -2359,6 +2359,7 @@ mod tests {
                         user_id: "@alice:example.org".to_owned(),
                         device_id: "DEVICE".to_owned(),
                     },
+                    e2ee: true,
                 },
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
                 raised_hands: Some(raised_hands_rx),

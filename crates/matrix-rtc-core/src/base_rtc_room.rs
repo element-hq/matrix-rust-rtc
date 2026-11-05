@@ -400,6 +400,14 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             .is_some_and(|session| session.set_encryption_signal_handler(handler))
     }
 
+    /// Whether our join of one slot encrypts its media; `None` if it is not
+    /// joined. See [`SlotSession::encrypts_media`].
+    pub fn encrypts_media(&self, slot_id: &str) -> Option<bool> {
+        self.sessions
+            .get(slot_id)
+            .and_then(SlotSession::encrypts_media)
+    }
+
     /// Our `member.id` in one slot, or `None` if it is not joined.
     ///
     /// See [`SlotSession::own_member_id`]: it changes on every join, so read

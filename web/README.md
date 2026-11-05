@@ -29,7 +29,7 @@ import * as livekit from 'livekit-client';
 const call = new MatrixRtcCall({
   call: rtcCall,           // what `rtcRoom.joinCall(...)` returned
   livekit,
-  roomOptions: { e2ee: { worker: e2eeWorker } }, // omit to run without frame E2EE
+  roomOptions: { e2ee: { worker: e2eeWorker } }, // used when the room is encrypted
 });
 call.onParticipants = (roster) => render(roster);
 await call.connect(); // the focus is the join's, the account the backend's

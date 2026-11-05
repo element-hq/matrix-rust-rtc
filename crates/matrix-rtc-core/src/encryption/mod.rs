@@ -696,6 +696,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.identity_mapper = Some(mapper);
     }
 
+    /// Whether this manager sends and installs media keys at all: `false` in
+    /// a room whose encryption is off.
+    pub fn manages_media_keys(&self) -> bool {
+        self.config.manage_media_keys
+    }
+
     /// Sets the transports we publish on, from which the mapper derives our
     /// own identity. Empty for a receive-only participation.
     pub fn set_own_transports(&mut self, transports: Vec<RtcTransport>) {

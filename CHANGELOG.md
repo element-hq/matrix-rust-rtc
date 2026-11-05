@@ -16,8 +16,12 @@ log only.
 - MSC media keys go out as `io.element.call.encryption_keys` with exactly `room_id`, `member_id` and an unpadded `media_key`, and each room reads only its own format's key body (038).
 - An MSC room drops a media key shorter than 32 bytes (room-state rooms still take 16), and the web `connect` config no longer takes `keyRingSize` (038).
 
+- `ConnectionContext` carries `e2ee`, and the web delegate's `connect` request an `e2ee` flag that, not the page's `roomOptions.e2ee`, decides frame encryption (038).
+
 ### Fixed
 
+- A call in a room whose encryption is off sends no media keys and connects without frame encryption, natively and on the web (038).
+- On the web an unencrypted track in an encrypted call is refused whatever the page's options (038).
 - Every key index, 0 to 255, is usable natively and on the web; native dropped index 255 and the web anything past 15 (038).
 
 ### Added

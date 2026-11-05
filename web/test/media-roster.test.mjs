@@ -143,6 +143,8 @@ describe('web media roster over a fake transport delegate', () => {
       connectionKey: sfuGetKey(OWN_FOCUS),
       sfuUrl: 'wss://sfu.example.org',
       jwt: 'the-jwt',
+      // A clear room: no frame encryption (spec 038 R11).
+      e2ee: false,
     });
     // A transport naming the JWT service gets its token from `/sfu/get`.
     const ownTokenRequest = log.tokenRequests.find((r) => r.url === `${OWN_FOCUS}/sfu/get`);

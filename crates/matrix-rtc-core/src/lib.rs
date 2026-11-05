@@ -1872,6 +1872,27 @@ mod tests {
         );
     }
 
+    /// Spec 038 R11, with no slot to negotiate from (the room-state format
+    /// reads none): the room's encryption alone decides, over the caller's
+    /// preference, and decides the media too.
+    #[tokio::test]
+    async fn without_a_slot_the_room_decides_whether_media_is_encrypted() {
+        for (room_encrypted, expected) in [(false, false), (true, true)] {
+            let sender = alice_backend();
+            let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
+            room.on_encryption_received(room_encrypted).await;
+
+            join_and_admit_a_peer(&mut room, !room_encrypted).await;
+
+            assert_eq!(room.encrypts_media("m.call#room"), Some(expected));
+            assert_eq!(
+                !sender.to_device_messages.lock().unwrap().is_empty(),
+                expected,
+                "keys go out exactly when the room is encrypted (encrypted={room_encrypted})"
+            );
+        }
+    }
+
     /// Joins as alice with `local_manage_media_keys` as the caller's own
     /// preference, then lets bob in so a membership change triggers key
     /// distribution (if it is enabled at all).

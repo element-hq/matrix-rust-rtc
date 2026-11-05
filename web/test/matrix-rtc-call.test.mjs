@@ -68,6 +68,9 @@ function fakeLivekit() {
     async disconnect() {
       this.disconnected = true;
     }
+    async setE2EEEnabled(enabled) {
+      this.e2eeEnabled = enabled;
+    }
     getParticipantByIdentity(identity) {
       return this.remotes.get(identity);
     }
@@ -159,6 +162,8 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     const room = instances[0];
     expect(room.url).toBe('wss://sfu.example.org');
     expect(room.token).toBe('the-jwt');
+    // The room's encryption is off, so the media is not (spec 038 R11).
+    expect(room.options.e2ee).toBeUndefined();
 
     // Roster entries join to livekit participants by rtc_identity once the
     // room knows them.
@@ -196,5 +201,78 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
 
     await call.disconnect();
     expect(room.disconnected).toBe(true);
+  }, 20000);
+
+  it('frame-encrypts in an encrypted room and refuses an unencrypted track', async () => {
+    if (!existsSync(nodeBindingUrl)) return;
+    const bindings = await import(nodeBindingUrl);
+    const host = mockBackendHost({
+      userId: USER_ID,
+      deviceId: DEVICE_ID,
+      encrypted: true,
+      slots: [openSlotEvent(SLOT_ID, 'm.per_member')],
+      members: [USER_ID, '@peer:example.org'],
+    });
+    const client = new bindings.WasmRtcClient(host);
+    const rtcRoom = await client.room(ROOM_ID, undefined);
+    const rtcCall = await rtcRoom.joinCall({
+      application_slot_id: APPLICATION_SLOT_ID,
+      transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
+    });
+    host._sink(ROOM_ID).onStickyEvents([
+      memberEventIn({
+        sender: USER_ID,
+        deviceId: DEVICE_ID,
+        memberId: rtcCall.memberId,
+        slotId: SLOT_ID,
+        focus: OWN_FOCUS,
+      }),
+      memberEventIn({
+        sender: '@peer:example.org',
+        deviceId: 'PEERDEVICE',
+        memberId: 'peer-member-1',
+        slotId: SLOT_ID,
+        focus: OWN_FOCUS,
+      }),
+    ]);
+
+    const { module: livekit, instances } = fakeLivekit();
+    const call = new MatrixRtcCall({
+      call: rtcCall,
+      livekit,
+      fetchJson: () =>
+        Promise.resolve({
+          status: 200,
+          body: JSON.stringify({ jwt: 'the-jwt', url: 'wss://sfu.example.org' }),
+        }),
+      roomOptions: { e2ee: { worker: 'the-worker' } },
+    });
+    await call.connect();
+    await waitFor(() => instances.length === 1 || null, 'the own focus connected');
+    const room = instances[0];
+    expect(room.options.e2ee).toMatchObject({ worker: 'the-worker', keyProvider: call.keyProvider });
+    expect(room.e2eeEnabled).toBe(true);
+
+    // R12: an unencrypted track is refused, never shown as the member's.
+    const peer = await waitFor(
+      () => call.participants().find((p) => p.member_id === 'peer-member-1'),
+      'the peer on the roster',
+    );
+    const participant = new FakeParticipant(peer.rtc_identity);
+    room.remotes.set(peer.rtc_identity, participant);
+    room.emit(RoomEvent.ParticipantConnected, participant);
+    let unsubscribed = false;
+    room.emit(
+      RoomEvent.TrackSubscribed,
+      {},
+      { source: 'camera', isEncrypted: false, setSubscribed: () => (unsubscribed = true) },
+      participant,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(unsubscribed).toBe(true);
+    const entry = call.participants().find((p) => p.member_id === 'peer-member-1');
+    expect(entry.streams ?? []).toHaveLength(0);
+
+    await call.disconnect();
   }, 20000);
 });

@@ -37,8 +37,9 @@ export class MatrixRtcCall {
    * @param {(url: string, body: object) => Promise<{status: number, body: string}>}
    *   [options.fetchJson] - the token POST; defaults to global `fetch`.
    * @param {object} [options.roomOptions] - extra livekit-js `Room` options,
-   *   merged under the E2EE ones (pass `e2ee.worker` here to enable frame
-   *   encryption).
+   *   merged under the E2EE ones. Pass `e2ee.worker` here: the room decides
+   *   whether frames are encrypted, and an encrypted call without a worker
+   *   fails to connect.
    */
   constructor({ call, livekit, fetchJson, roomOptions }) {
     this.call = call;
@@ -155,7 +156,11 @@ export class MatrixRtcCall {
    * translation onto the sink, and hand back the close handle.
    */
   async connectRoom(request, sink) {
-    const e2ee = this.roomOptions.e2ee
+    // The room's encryption decides (spec 038 R11), not the page.
+    if (request.e2ee && !this.roomOptions.e2ee) {
+      throw new Error('this call is encrypted: pass roomOptions.e2ee.worker');
+    }
+    const e2ee = request.e2ee
       ? { keyProvider: this.keyProvider, ...this.roomOptions.e2ee }
       : undefined;
     const room = new this.livekit.Room({ ...this.roomOptions, e2ee });
@@ -165,7 +170,7 @@ export class MatrixRtcCall {
       // peers show it with a "not encrypted" warning while it decodes fine.
       await room.setE2EEEnabled(true);
     }
-    this.registerSink(room, sink, request.connectionKey);
+    this.registerSink(room, sink, request.connectionKey, request.e2ee);
     this.onRoomCreated(room, request.connectionKey);
     await room.connect(request.sfuUrl, request.jwt);
     this.rooms.set(request.connectionKey, room);
@@ -178,7 +183,7 @@ export class MatrixRtcCall {
   }
 
   /** The RoomEvent → sink translation table. */
-  registerSink(room, sink, connectionKey) {
+  registerSink(room, sink, connectionKey, encrypted) {
     const { RoomEvent } = this.livekit;
     const kindOf = (publication) =>
       KNOWN_KINDS.has(publication?.source) ? publication.source : null;
@@ -189,10 +194,10 @@ export class MatrixRtcCall {
     room.on(RoomEvent.ParticipantDisconnected, (participant) =>
       sink.remoteLeft(participant.identity),
     );
-    // In an encrypted room a track declared unencrypted is refused: its
-    // frames would play as they come, and the SFU relays that declaration.
-    const refused = (publication) =>
-      Boolean(this.roomOptions.e2ee) && publication?.isEncrypted === false;
+    // In an encrypted call a track declared unencrypted is refused, whatever
+    // the page's options: its frames would play as they come, and the SFU
+    // relays that declaration (spec 038 R12).
+    const refused = (publication) => Boolean(encrypted) && publication?.isEncrypted === false;
     room.on(RoomEvent.TrackSubscribed, (_track, publication, participant) => {
       const kind = kindOf(publication);
       if (!kind) return;

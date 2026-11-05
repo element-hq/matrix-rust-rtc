@@ -62,8 +62,7 @@ use matrix_rtc_transport::{
 
 use crate::session::LiveKitSession;
 use crate::{
-    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
-    identity_mapper,
+    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, identity_mapper, room_options,
 };
 
 /// Sample rate remote audio is resampled to before crossing the transport
@@ -190,6 +189,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     http: self.http.clone(),
                     backend: self.backend.clone(),
                     key_provider: self.key_providers.connection_provider(),
+                    e2ee: ctx.e2ee,
                     auto_subscribe: self.auto_subscribe,
                     config: Mutex::new(config),
                     token: Mutex::new(None),
@@ -296,6 +296,9 @@ struct Connector {
     backend: Arc<dyn MatrixBackend>,
     /// This connection's own: a reconnect sets the SFU's trailer on it again.
     key_provider: crate::ConnectionKeyProvider,
+    /// Whether frames are encrypted (spec 038 R11); when they are, a track
+    /// declared unencrypted is refused (R12).
+    e2ee: bool,
     auto_subscribe: bool,
     /// The focus connects go to; a take-over moves it (034 R25).
     config: Mutex<LiveKitTransportConfig>,
@@ -473,8 +476,10 @@ impl TransportConnection for LiveKitTransportConnection {
         let token = connector.token(fresh_token).await?;
         let connection = LiveKitSession::connect_with_options(
             &token,
-            e2ee_room_options(
-                connector.key_provider.provider().clone(),
+            room_options(
+                connector
+                    .e2ee
+                    .then(|| connector.key_provider.provider().clone()),
                 connector.auto_subscribe,
             ),
         )
@@ -1012,6 +1017,7 @@ async fn translate_room_events(
     owner: LiveKitTransportConnection,
     session: std::sync::Weak<LiveKitSession>,
 ) {
+    let e2ee = owner.shared.connector.e2ee;
     while let Some(event) = events.recv().await {
         let translated = match event {
             RoomEvent::ParticipantConnected(participant) => Some(ConnectionEvent::RemoteJoined {
@@ -1026,11 +1032,11 @@ async fn translate_room_events(
                 participant,
             } => {
                 let kind = stream_kind(publication.source(), publication.kind());
-                // Our rooms are always encrypted, and livekit attaches no frame
-                // cryptor to a track declared unencrypted: its frames would be
-                // played as they come. The SFU relays that declaration, so it
-                // could also inject frames of its own under this name.
-                if publication.encryption_type() == EncryptionType::None {
+                // In an encrypted call livekit attaches no frame cryptor to a
+                // track declared unencrypted: its frames would be played as
+                // they come. The SFU relays that declaration, so it could also
+                // inject frames of its own under this name (spec 038 R12).
+                if e2ee && publication.encryption_type() == EncryptionType::None {
                     publication.set_subscribed(false);
                     Some(ConnectionEvent::TrackNotEncrypted {
                         identity: participant.identity().to_string(),
@@ -1046,7 +1052,7 @@ async fn translate_room_events(
             }
             // A track refused as unencrypted was never added.
             RoomEvent::TrackUnsubscribed { publication, .. }
-                if publication.encryption_type() == EncryptionType::None =>
+                if e2ee && publication.encryption_type() == EncryptionType::None =>
             {
                 None
             }

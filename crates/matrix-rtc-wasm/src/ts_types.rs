@@ -242,7 +242,7 @@ export interface MediaDelegate {
     /** POST `body` as JSON to `url`; resolve with the HTTP status and raw response text. */
     fetchJson(url: string, body: Record<string, unknown>): Promise<{ status: number; body: string }>;
     /** Connect a livekit-js Room and register the RoomEvent translation onto `sink`. */
-    connect(request: { connectionKey: string; sfuUrl: string; jwt: string }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown> }>;
+    connect(request: { connectionKey: string; sfuUrl: string; jwt: string; e2ee: boolean }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown> }>;
     /** Install a media key in livekit-js's key provider (per participant, HKDF material). */
     setKey(identity: string, index: number, key: Uint8Array): Promise<boolean | void>;
     /** Move the local sender onto a rotated key index. */

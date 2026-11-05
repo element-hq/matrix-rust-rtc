@@ -21,10 +21,11 @@
 //! - `fetchJson(url, body) -> Promise<{status, body}>` — POST `body` (a plain
 //!   object) as JSON to `url`, resolving with the HTTP status and the raw
 //!   response text
-//! - `connect({connectionKey, sfuUrl, jwt}, sink) -> Promise<handle>` —
-//!   connect a livekit-js `Room` to `sfuUrl` with `jwt`, register the
-//!   RoomEvent translation onto `sink`, and resolve with a handle exposing
-//!   `close() -> Promise`
+//! - `connect({connectionKey, sfuUrl, jwt, e2ee}, sink) -> Promise<handle>` —
+//!   connect a livekit-js `Room` to `sfuUrl` with `jwt`, frame-encrypted
+//!   exactly when `e2ee` is set (refusing unencrypted tracks then), register
+//!   the RoomEvent translation onto `sink`, and resolve with a handle
+//!   exposing `close() -> Promise`
 //! - `setLocalKeyIndex(index)` — move the local sender onto a rotated key
 //!   index (see `MediaKeyHandler::set_local_sender`)
 //! - `setKey(identity, index, key: Uint8Array) -> Promise<boolean|void>` —
@@ -297,6 +298,9 @@ struct ConnectRequest<'a> {
     sfu_url: &'a str,
     /// The LiveKit JWT to connect with.
     jwt: &'a str,
+    /// Whether frames are encrypted, from the room's encryption (spec 038
+    /// R11); when they are, an unencrypted track is refused (R12).
+    e2ee: bool,
 }
 
 /// `matrix-rtc-media`'s transport over the JS delegate.
@@ -428,6 +432,7 @@ impl JsConnector {
         &self,
         connection_key: &str,
         sfu_token: &SfuToken,
+        e2ee: bool,
     ) -> Result<(JsValue, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let sink = WasmConnectionEventSink { tx };
@@ -435,6 +440,7 @@ impl JsConnector {
             connection_key,
             sfu_url: &sfu_token.url,
             jwt: &sfu_token.jwt,
+            e2ee,
         })
         .map_err(|error| {
             TransportError::Connect(format!("connect request did not serialize: {error}"))
@@ -590,7 +596,10 @@ impl TransportConnection for JsTransportConnection {
                 token
             }
         };
-        let (handle, events) = self.connector.connect(&self.connection_key, &token).await?;
+        let (handle, events) = self
+            .connector
+            .connect(&self.connection_key, &token, self.ctx.e2ee)
+            .await?;
         let previous = self.handle.borrow_mut().replace(handle);
         if let Some(previous) = previous {
             wasm_bindgen_futures::spawn_local(async move {

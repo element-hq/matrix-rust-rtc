@@ -156,15 +156,16 @@ pub async fn connect_e2ee(
     let sfu_token = acquire_token(http, config, backend).await?;
     LiveKitSession::connect_with_options(
         &sfu_token,
-        e2ee_room_options(key_provider, auto_subscribe),
+        room_options(Some(key_provider), auto_subscribe),
     )
     .await
 }
 
-/// The room options of an E2EE connection: GCM frame encryption through
-/// `key_provider`, dynacast, and `auto_subscribe` as given.
-pub(crate) fn e2ee_room_options(
-    key_provider: livekit::e2ee::key_provider::KeyProvider,
+/// The room options of a connection: GCM frame encryption through
+/// `key_provider` when there is one (none in a room whose encryption is off,
+/// spec 038 R11), dynacast, and `auto_subscribe` as given.
+pub(crate) fn room_options(
+    key_provider: Option<livekit::e2ee::key_provider::KeyProvider>,
     auto_subscribe: bool,
 ) -> livekit::RoomOptions {
     use livekit::RoomOptions;
@@ -172,7 +173,7 @@ pub(crate) fn e2ee_room_options(
 
     // RoomOptions is #[non_exhaustive]; mutate a default instance.
     let mut options = RoomOptions::default();
-    options.encryption = Some(E2eeOptions {
+    options.encryption = key_provider.map(|key_provider| E2eeOptions {
         encryption_type: EncryptionType::Gcm,
         key_provider,
     });

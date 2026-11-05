@@ -304,6 +304,15 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         }
     }
 
+    /// Whether this join encrypts its media, as decided when it joined;
+    /// `None` when not joined. Media connects with frame encryption exactly
+    /// when this is `Some(true)` (spec 038 R11).
+    pub fn encrypts_media(&self) -> Option<bool> {
+        self.encryption_manager
+            .as_ref()
+            .map(EncryptionManager::manages_media_keys)
+    }
+
     /// Re-signals every key already held to the installed signal handler.
     ///
     /// Call after both the handler and the identity mapper are in place; see
@@ -1401,7 +1410,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// key distribution.
     pub fn negotiated_encryption(&self) -> Option<bool> {
         let SlotKnowledge::Known(state) = &self.slot else {
-            return None;
+            // No slot to read a mechanism from (the room-state format reads
+            // none): the room alone decides, as it does for Element Call
+            // (spec 038 R11).
+            return match self.room_encryption {
+                RoomEncryption::Encrypted => Some(true),
+                RoomEncryption::Unencrypted => Some(false),
+                RoomEncryption::Unknown => None,
+            };
         };
 
         Some(

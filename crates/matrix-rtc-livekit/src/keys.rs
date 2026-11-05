@@ -265,16 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn room_options_accept_msc4195_e2ee() {
-        use livekit::RoomOptions;
-        use livekit::e2ee::{E2eeOptions, EncryptionType};
+    fn room_options_encrypt_exactly_when_given_a_key_provider() {
+        use livekit::e2ee::EncryptionType;
 
-        // RoomOptions is #[non_exhaustive]: mutate a default instance.
-        let mut options = RoomOptions::default();
-        options.encryption = Some(E2eeOptions {
-            encryption_type: EncryptionType::Gcm,
-            key_provider: msc4195_key_provider(),
-        });
-        assert!(options.encryption.is_some());
+        let encrypted = crate::room_options(Some(msc4195_key_provider()), true);
+        assert_eq!(
+            encrypted.encryption.map(|e2ee| e2ee.encryption_type),
+            Some(EncryptionType::Gcm)
+        );
+        // Spec 038 R11: a room whose encryption is off connects in the clear.
+        assert!(crate::room_options(None, true).encryption.is_none());
     }
 }
