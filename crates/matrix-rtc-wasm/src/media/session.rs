@@ -393,6 +393,14 @@ impl WasmMediaSession {
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
+    /// Participants on an SFU whose membership we have not received, by
+    /// livekit-js identity (spec 038 R25): listed once unmapped for 10 s
+    /// while signalling is healthy, apart from `interruptions()`.
+    #[wasm_bindgen(js_name = unverifiedParticipants)]
+    pub fn unverified_participants(&self) -> Vec<String> {
+        self.engine.unverified_participants()
+    }
+
     /// Our own livekit-js participant identity: the MSC4195 hash when we
     /// publish on a transport naming only an SFU `url`, else the legacy
     /// `{user}:{device}` the JWT service's `/sfu/get` mints.

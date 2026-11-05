@@ -33,7 +33,9 @@ pub struct Interruptions {
     /// [`crate::StabilityConfig::key_grace`], or sent in clear (R33). Each member's
     /// [`crate::Participant::unable_to_decrypt`] says which.
     pub unable_to_decrypt: Vec<String>,
-    /// Participants on an SFU whose membership we have not seen (R16).
+    /// Participants on an SFU whose membership we have not seen, while our
+    /// signalling is unhealthy (R16). While it is healthy they are listed
+    /// apart, as unverified, after a grace (spec 038 R25).
     pub unmappable: Vec<String>,
 }
 
