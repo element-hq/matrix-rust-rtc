@@ -501,7 +501,9 @@ async fn a_slot_id_of_another_application_is_refused() {
             ..JoinOptions::application("org.example.whiteboard")
         })
         .await,
-        Err(RtcError::Command(_))
+        Err(RtcError::Join(
+            matrix_rtc_core::JoinError::InvalidSlotId { .. }
+        ))
     ));
 }
 

@@ -111,7 +111,7 @@ impl JoinOptions {
     pub fn application(application: impl Into<ApplicationInfo>) -> Self {
         let application = application.into();
         Self {
-            slot_id: slot_id_of(&application, ROOM_APPLICATION_SLOT_ID),
+            slot_id: matrix_rtc_core::slot_id_of(&application, ROOM_APPLICATION_SLOT_ID),
             application,
             transport: JoinTransport::Advertised,
             encryption_config: None,
@@ -124,7 +124,7 @@ impl JoinOptions {
 
     /// Joins the application's slot `{application}#{application_slot_id}`.
     pub fn slot(mut self, application_slot_id: impl AsRef<str>) -> Self {
-        self.slot_id = slot_id_of(&self.application, application_slot_id.as_ref());
+        self.slot_id = matrix_rtc_core::slot_id_of(&self.application, application_slot_id.as_ref());
         self
     }
 
@@ -157,14 +157,6 @@ impl JoinOptions {
         self.degraded_lifetime_ms = Some(lifetime_ms);
         self
     }
-}
-
-/// `{application_type}#{application_slot_id}`, MSC4143's slot id.
-fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
-    format!(
-        "{}#{application_slot_id}",
-        application.application_type().unwrap_or_default()
-    )
 }
 
 /// A join into a call slot: the generic join plus what a call adds.
@@ -560,14 +552,13 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             degraded_lifetime_ms,
         } = options;
 
-        if let Some(application_type) = application.application_type()
-            && !slot_id.starts_with(&format!("{application_type}#"))
-        {
-            return Err(CommandError::from_message(format!(
-                "slot id '{slot_id}' does not belong to application '{application_type}': \
-                 MSC4143 slot ids are '{{application_type}}#{{slot}}'"
-            ))
-            .into());
+        // Before anything below acts on the slot: MSC4143's grammar, and the
+        // slot belonging to the application joining it (spec 038 R8).
+        if let Err(reason) = matrix_rtc_core::validate_slot_id(
+            &slot_id,
+            application.application_type().unwrap_or_default(),
+        ) {
+            return Err(JoinError::InvalidSlotId { slot_id, reason }.into());
         }
 
         if self.live_session(&slot_id) {

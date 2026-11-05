@@ -80,6 +80,11 @@ pub enum JoinError {
     #[error("slot '{slot_id}' is not open in this room")]
     SlotClosed { slot_id: String },
 
+    /// The slot id breaks MSC4143's grammar or length limit, or belongs to
+    /// another application (spec 038 R8).
+    #[error("slot id '{slot_id}' is invalid: {reason}")]
+    InvalidSlotId { slot_id: String, reason: String },
+
     /// The join did not complete within its budget: every step kept failing
     /// transiently, or did not answer (034 R6).
     #[error("the join did not complete within its budget")]

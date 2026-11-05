@@ -699,7 +699,7 @@ async fn disabled_reactions_neither_send_nor_receive() {
 async fn a_rooms_reactions_reach_the_session_holding_the_member() {
     let sender = alice_backend();
     let mut call = CallRoomState::with_backend(ROOM, dialect(&sender));
-    let other_slot = "m.call#OTHER";
+    let other_slot = "m.call#other";
 
     call.join(join_params().into()).await.expect("join slot A");
     call.join(
@@ -749,7 +749,7 @@ async fn a_rooms_reactions_reach_the_session_holding_the_member() {
     assert!(call.raised_hands(SLOT).unwrap().is_empty());
 
     assert!(matches!(
-        call.raise_hand("m.call#NOWHERE").await,
+        call.raise_hand("m.call#nowhere").await,
         Err(ReactionError::NoSession)
     ));
 }

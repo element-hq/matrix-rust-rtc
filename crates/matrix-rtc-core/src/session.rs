@@ -90,6 +90,9 @@ pub(crate) enum JoinCondition {
     Joined,
     /// The slot is closed, so nobody is joined to it.
     SlotClosed,
+    /// The member's `application.type` is not the one the open slot is for
+    /// (spec 038 R7).
+    ApplicationMismatch,
     /// MSC4143 requires `m.rtc.member` to be encrypted in an encrypted room,
     /// and one that is not "MUST be considered left".
     UnencryptedInEncryptedRoom,
@@ -420,6 +423,18 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         params.validate().map_err(|missing| {
             log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
             JoinError::MissingParameter(missing)
+        })?;
+        let application_type = params.application.application_type().unwrap_or_default();
+        crate::slot::validate_slot_id(&params.slot_id, application_type).map_err(|reason| {
+            log::warn!(
+                "[{}] join rejected: slot id '{}' is invalid: {reason}",
+                self.log_tag,
+                params.slot_id
+            );
+            JoinError::InvalidSlotId {
+                slot_id: params.slot_id.clone(),
+                reason,
+            }
         })?;
 
         let backend = self.backend.as_ref().ok_or_else(|| {
@@ -1113,7 +1128,12 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             // Nothing has told us about the slot, so this condition cannot be
             // evaluated; enforcing it would drop every member.
             SlotKnowledge::Unsupplied => {}
-            SlotKnowledge::Known(state) if state.is_open() => {}
+            SlotKnowledge::Known(SlotState::Open(open)) => {
+                if candidate.application.application_type() != Some(open.application_type.as_str())
+                {
+                    return JoinCondition::ApplicationMismatch;
+                }
+            }
             SlotKnowledge::Known(_) => return JoinCondition::SlotClosed,
         }
 

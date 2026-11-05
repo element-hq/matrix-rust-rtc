@@ -175,7 +175,7 @@ mod tests {
         assert_eq!(member_ids(&seen), vec![vec!["alice-a".to_owned()]]);
 
         let mut other_slot = joined("@carol:example.org", "carol-a", "$c1");
-        other_slot.content.slot_id = "m.call#OTHER".to_owned();
+        other_slot.content.slot_id = "m.call#other".to_owned();
         room.set_current_sticky_state(vec![
             joined("@alice:example.org", "alice-a", "$a1"),
             other_slot,

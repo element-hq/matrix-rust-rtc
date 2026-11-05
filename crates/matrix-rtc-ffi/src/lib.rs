@@ -1569,7 +1569,7 @@ mod tests {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let slot = FfiEventIn {
-            state_key: Some("m.call#TEST".to_owned()),
+            state_key: Some("m.call#test".to_owned()),
             ..open_slot(None)
         };
         let room = open(&client, &mock, None, false, vec![slot], Vec::new()).await;
@@ -1577,12 +1577,12 @@ mod tests {
         let call = room
             .clone()
             .join_call(FfiJoinSessionParams {
-                application_slot_id: Some("TEST".to_owned()),
+                application_slot_id: Some("test".to_owned()),
                 ..join_params()
             })
             .await
             .expect("join");
-        assert_eq!(call.slot_id(), "m.call#TEST");
+        assert_eq!(call.slot_id(), "m.call#test");
     }
 
     #[tokio::test]

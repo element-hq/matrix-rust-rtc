@@ -56,7 +56,7 @@ pub use host::event::{
 pub use join::{
     DEFAULT_JOIN_BUDGET_MS, DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
     JoinSessionParams, LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent,
-    generate_member_id,
+    generate_member_id, slot_id_of,
 };
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
@@ -70,8 +70,8 @@ pub use session::{
     MemberInfo, Membership, PendingLeave, RtcMembershipEvent, SlotSession,
 };
 pub use slot::{
-    EncryptionMechanism, OpenSlot, RawSlotEvent, RawSlotEventContent, RoomEncryption,
-    SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus,
+    EncryptionMechanism, MAX_SLOT_ID_BYTES, OpenSlot, RawSlotEvent, RawSlotEventContent,
+    RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus, validate_slot_id,
 };
 pub use transport::{
     LiveKitAuthFlow, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport,
@@ -1104,18 +1104,18 @@ mod tests {
     async fn a_slot_missing_from_the_current_state_is_cleared_too() {
         let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
         let in_call = joined_event("@alice:example.org", "m.call#room", "alice-a");
-        let in_other = joined_event("@bob:example.org", "m.call#OTHER", "bob-a");
+        let in_other = joined_event("@bob:example.org", "m.call#other", "bob-a");
 
         room.set_current_sticky_state(vec![in_call.clone(), in_other])
             .await
             .unwrap();
-        assert_eq!(room.member_count("m.call#OTHER"), Some(1));
+        assert_eq!(room.member_count("m.call#other"), Some(1));
 
         // Only the first slot is represented now; the second must empty.
         room.set_current_sticky_state(vec![in_call]).await.unwrap();
         assert_eq!(room.member_count("m.call#room"), Some(1));
         assert_eq!(
-            room.member_count("m.call#OTHER"),
+            room.member_count("m.call#other"),
             Some(0),
             "a slot absent from the current state is empty, not untouched"
         );
@@ -1539,11 +1539,11 @@ mod tests {
         // inheriting the forgotten "no slots".
         room.set_current_sticky_state(vec![
             joined_event("@alice:example.org", "m.call#room", "alice-a"),
-            joined_event("@bob:example.org", "m.call#OTHER", "bob-a"),
+            joined_event("@bob:example.org", "m.call#other", "bob-a"),
         ])
         .await
         .unwrap();
-        assert_eq!(room.member_count("m.call#OTHER"), Some(1));
+        assert_eq!(room.member_count("m.call#other"), Some(1));
     }
 
     /// Slot state naming another room is dropped, and says nothing about the
@@ -1722,6 +1722,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R7: a member is joined only to a slot of its own application.
+    #[tokio::test]
+    async fn a_member_of_another_application_is_not_joined_to_the_slot() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+        room.on_slots_received(vec![open_call_slot()]).await;
+
+        let mut other = joined_event("@bob:example.org", "m.call#room", "bob-a");
+        other.content.application = "org.example.board".into();
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            other,
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R8: a slot id that breaks MSC4143's grammar fails the join
+    /// before anything is sent.
+    #[tokio::test]
+    async fn a_join_with_an_invalid_slot_id_is_refused() {
+        let backend = alice_backend();
+        let mut room = BaseRtcRoom::with_backend(ROOM_ID, backend.clone());
+        let params = JoinSessionParams::application("m.call")
+            .slot("ROOM")
+            .transport(RtcTransport::LiveKit(LiveKitTransport::service(
+                "https://example.com/jwt".to_owned(),
+            )));
+
+        assert!(matches!(
+            room.join(params).await,
+            Err(JoinError::InvalidSlotId { .. })
+        ));
+        assert!(backend.sticky_events.lock().unwrap().is_empty());
     }
 
     /// An unencrypted room imposes no such requirement.
