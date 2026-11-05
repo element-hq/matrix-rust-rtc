@@ -279,7 +279,14 @@ export interface JoinParamsIn {
         manage_media_keys?: boolean;
         require_confirmed_sender?: boolean;
     };
-    notify?: { notification_type?: string; mentions?: Record<string, unknown>; lifetime_ms?: number };
+    /** A group call's notification, sent by the member who starts the call; one targeting nobody is refused. */
+    notify?: {
+        notification_type: "notification";
+        intent?: string;
+        lifetime_ms?: number;
+        mention_user_ids?: string[];
+        mention_room?: boolean;
+    };
     /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */
     reactions?: {
         enabled?: boolean;

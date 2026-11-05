@@ -75,6 +75,10 @@ pub enum RtcError {
     /// one.
     #[error("this session is over; join again for a new one")]
     SessionOver,
+    /// The join asked to notify nobody: no user named and not the room
+    /// (spec 038 R28).
+    #[error("the notification targets nobody: name users or the room")]
+    InviteTargetsNobody,
 }
 
 impl From<OpenError> for RtcError {
@@ -435,6 +439,13 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             reactions,
             intent,
         } = options;
+        if let CallKind::Group {
+            notify: Some(notify),
+        } = &kind
+            && notify.mentions.targets_nobody()
+        {
+            return Err(RtcError::InviteTargetsNobody);
+        }
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone(), deadline).await?;
         let mut state = self.state.lock().await;
@@ -624,7 +635,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let end = Arc::new(SessionEnd::new());
         self.sessions().insert(slot_id.clone(), end.clone());
         RtcSession {
-            _follow_auto_leave: auto_leaves.map(|leaves| follow_auto_leave(leaves, end.clone())),
+            _follow_auto_leave: auto_leaves.map(|leaves| {
+                follow_auto_leave(leaves, end.clone(), self.state.clone(), slot_id.clone())
+            }),
             room_id: self.room_id.clone(),
             slot_id,
             member_id,
@@ -908,10 +921,12 @@ async fn issue_leave<B: MatrixBackend + 'static>(
 
 /// Ends a session when the core leaves its slot on its own. The core's channel
 /// is per slot, so this stops at the first leave rather than adopt a later
-/// join's.
-fn follow_auto_leave(
+/// join's. A slot closing withdraws the invite we sent to it (spec 038 R31).
+fn follow_auto_leave<B: MatrixBackend + 'static>(
     mut leaves: broadcast::Receiver<LeaveReason>,
     end: Arc<SessionEnd>,
+    state: Arc<Mutex<State<B>>>,
+    slot_id: String,
 ) -> AbortOnDrop<()> {
     executor::spawn(async move {
         let reason = loop {
@@ -921,7 +936,11 @@ fn follow_auto_leave(
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         };
+        let slot_closed = reason.code == LeaveCode::SlotClosed;
         end.end(reason);
+        if slot_closed {
+            state.lock().await.withdraw_invite(&slot_id).await;
+        }
     })
     .abort_on_drop()
 }

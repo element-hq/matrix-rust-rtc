@@ -18,7 +18,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use matrix_rtc_core::compat::DialectBackend;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::outbox::{
     BACKOFF_INITIAL, BACKOFF_MAX, Outbox, SendFailure, SendKind, SendPolicy, SlotKey,
 };
@@ -33,7 +33,10 @@ use crate::direct_call::{
     CallKind, DECLINE_EVENT_TYPES, DirectCall, DirectCallEnd, DirectCallState, RingJob, callee_of,
 };
 use crate::intent::{CALL_INTENT_KEY, CallIntent, CallIntentConsensus};
-use crate::notification::{NotifyConfig, is_own_participation, notify_session_started};
+use crate::notification::{
+    INVITE_EVENT_TYPE, NotifyConfig, build_invite_withdrawal, is_own_participation,
+    notification_sticky_duration_ms, notify_session_started, others_joined,
+};
 use crate::reactions::{
     ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, Clock, HandRequests, HandSend,
     REACTION_EVENT_TYPE, RaisedHand, ReactionError, ReactionsConfig, ReactionsState,
@@ -276,6 +279,9 @@ struct CallState {
     own: Option<OwnCall>,
     /// The current join's DM lifecycle, if it is a DM call.
     direct: Option<Arc<DirectCall>>,
+    /// The sticky duration of the MSC invite this join sent, until withdrawn
+    /// (spec 038 R30, R31).
+    invite_sticky_ms: Option<u64>,
 }
 
 impl CallState {
@@ -288,6 +294,7 @@ impl CallState {
             members,
             own: None,
             direct: None,
+            invite_sticky_ms: None,
         }
     }
 
@@ -436,6 +443,44 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         })
     }
 
+    /// Remembers that this join invites the room to `slot_id`, so the invite
+    /// can be withdrawn (spec 038 R30, R31). Only MSC invites are: a
+    /// room-state notification is a plain room event.
+    fn record_invite(&self, slot_id: &str, notify: &NotifyConfig) {
+        if self.rtc.format() != MembershipFormat::Msc {
+            return;
+        }
+        let sticky_ms = notification_sticky_duration_ms(notify.lifetime_ms());
+        self.with_state(slot_id, |state| state.invite_sticky_ms = Some(sticky_ms));
+    }
+
+    /// Withdraws the invite this join sent to `slot_id`, if any: an
+    /// `m.rtc.invite` with only its sticky key, under the invite's sticky
+    /// duration, so it replaces the invite (spec 038 R30, R31). One attempt;
+    /// an invite left behind still ends with its lifetime.
+    pub(crate) async fn withdraw_invite(&self, slot_id: &str) {
+        let Some(Some(sticky_ms)) = self.with_state(slot_id, |state| state.invite_sticky_ms.take())
+        else {
+            return;
+        };
+        let Ok(backend) = self.backend() else {
+            return;
+        };
+        let tag = format!("{}/{slot_id}", self.room_id());
+        log::info!("[{tag}] withdrawing our invite");
+        if let Err(error) = backend
+            .send_sticky_event(
+                self.room_id(),
+                INVITE_EVENT_TYPE.to_owned(),
+                build_invite_withdrawal(slot_id),
+                sticky_ms,
+            )
+            .await
+        {
+            log::warn!("[{tag}] our invite was not withdrawn ({error}); it ends with its lifetime");
+        }
+    }
+
     /// Lowers our hand first, while the membership it annotates still stands.
     /// Best effort: peers drop the hand with the membership anyway.
     pub async fn leave(
@@ -459,6 +504,18 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
 
         if let Some(Some(direct)) = self.with_state(slot_id, |state| state.direct.clone()) {
             direct.finish_left();
+        }
+        // Our invite goes with us when nobody answered it (spec 038 R30);
+        // with others in the call, it is theirs to keep ringing.
+        if let Ok(backend) = self.backend() {
+            let members = self
+                .with_state(slot_id, |state| state.members.clone())
+                .unwrap_or_default();
+            if others_joined(&members, &backend.own_user_id(), &backend.own_device_id()) == 0 {
+                self.withdraw_invite(slot_id).await;
+            } else {
+                self.with_state(slot_id, |state| state.invite_sticky_ms = None);
+            }
         }
         self.rtc.leave(slot_id, params).await?;
 
@@ -980,10 +1037,14 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         if let Some(ring) = &ring
             && initial == DirectCallState::Sending
         {
+            let notify = ring.ring();
+            self.record_invite(&rtc.slot_id, &notify);
             joined.ring = Some(RingJob {
                 tag: tag.clone(),
                 room_id: self.room_id(),
-                notify: ring.ring(),
+                slot_id: rtc.slot_id.clone(),
+                format: self.rtc.format(),
+                notify,
                 application_type: rtc
                     .application
                     .application_type()
@@ -1034,6 +1095,12 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             .unwrap_or_default();
         let outbox = self.rtc.outbox().clone();
         let room_id = self.rtc.room_id().to_owned();
+        let format = self.rtc.format();
+        if !notify.mentions.targets_nobody()
+            && others_joined(&members, &backend.own_user_id(), &backend.own_device_id()) == 0
+        {
+            self.record_invite(&params.slot_id, notify);
+        }
         let notify = notify.clone();
         let params = params.clone();
         let member_event_id = member_event_id.to_owned();
@@ -1042,6 +1109,7 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
                 backend.as_ref(),
                 &outbox,
                 &room_id,
+                format,
                 &notify,
                 &params,
                 &members,

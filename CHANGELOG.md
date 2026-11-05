@@ -20,6 +20,7 @@ log only.
 - In the MSC format a call publishes on the homeserver's first `m.livekit` transport, written `{type: "m.livekit", url}`, and counts a peer's media only on `m.livekit` with a `url`, every token coming from the homeserver; `transports::choose`/`resolve` and `transport_to_json` take the room's format (038).
 - A join on a homeserver advertising no LiveKit transport of the room's format fails with `JoinError::NoLiveKitTransport`, and a homeserver without MSC4195's `get_token` ends the call at once with the new loss reason `token_endpoint_unsupported` instead of retrying (038).
 - A participant on an SFU with no membership is no longer an interruption while signalling is healthy: after 10 s it is listed by the new `unverified_participants` (engine, FFI and web media sessions) (038).
+- In the MSC format, starting or ringing a call sends an MSC4075 `m.rtc.invite` (`slot_id`, `sender_ts`, `lifetime`, `m.mentions`, sticky key) without waiting for our membership, withdrawn when we leave alone or the slot closes; an invite targeting nobody is refused with `RtcError::InviteTargetsNobody`; room-state keeps today's notification (038).
 
 ### Fixed
 

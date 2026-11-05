@@ -105,6 +105,11 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         }
     }
 
+    /// The format this room's memberships are read and written in.
+    pub fn format(&self) -> MembershipFormat {
+        self.format
+    }
+
     /// The room this object is scoped to.
     pub fn room_id(&self) -> &str {
         &self.room_id

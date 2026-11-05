@@ -269,6 +269,62 @@ async fn a_closed_slot_ends_the_session_and_says_why() {
     ));
 }
 
+/// Spec 038 R31: the slot closing withdraws the invite we sent to it.
+#[tokio::test]
+async fn a_closed_slot_withdraws_our_invite() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let sink = mock
+        .room_subscription(ROOM)
+        .expect("subscribed")
+        .sink
+        .clone();
+    // Nobody in the call yet: our join starts it, and invites.
+    sink.on_sticky_events(Vec::new());
+    settle().await;
+    let call = room
+        .join_call(CallJoinOptions::new().kind(crate::CallKind::Group {
+            notify: Some(crate::GroupNotify::default()),
+        }))
+        .await
+        .expect("join");
+    settle().await;
+    let invites = || {
+        mock.sticky_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, event_type, _, _)| {
+                event_type == matrix_rtc_core::wire_event_type("m.rtc.invite")
+            })
+            .map(|(_, _, content, _)| content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(invites().len(), 1, "the call starter invites");
+
+    sink.on_state_events(
+        SLOT_EVENT_TYPE.to_owned(),
+        vec![EventIn {
+            event_id: "$closed".to_owned(),
+            sender: BOB.to_owned(),
+            event_type: SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 3,
+            content: json!({ "status": "closed" }),
+            encryption: EventEncryption::Cleartext,
+        }],
+    );
+    settle().await;
+
+    assert!(!call.is_live());
+    assert_eq!(
+        invites().last(),
+        Some(&json!({ "msc4354_sticky_key": SLOT })),
+        "withdrawn"
+    );
+}
+
 /// A leave that fails to send still ends the session, so media stops
 /// publishing; the delayed leave removes the membership.
 #[tokio::test]

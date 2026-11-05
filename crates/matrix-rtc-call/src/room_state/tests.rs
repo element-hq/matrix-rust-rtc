@@ -845,9 +845,11 @@ fn notifications_sent(sender: &MockBackend) -> Vec<(Value, u64)> {
 /// notification to the membership that justifies it — so the event id the
 /// join's sticky send reported has to come back out as the relation target.
 #[tokio::test]
-async fn starting_a_call_notifies_the_room() {
+async fn starting_a_call_notifies_the_room_in_the_room_state_format() {
     let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
+    // Today's notification content is the room-state format's (spec 038 R36).
+    call.rtc_mut().set_format(MembershipFormat::RoomState);
 
     let notify = GroupNotify {
         intent: Some("video".to_owned()),
@@ -1049,8 +1051,18 @@ async fn dm(
     roster: Vec<RawStickyEvent>,
     ring: Option<RingConfig>,
 ) -> (Call, Arc<MockBackend>, CallJoined) {
+    dm_in(MembershipFormat::Msc, others, roster, ring).await
+}
+
+async fn dm_in(
+    format: MembershipFormat,
+    others: &[&str],
+    roster: Vec<RawStickyEvent>,
+    ring: Option<RingConfig>,
+) -> (Call, Arc<MockBackend>, CallJoined) {
     let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
+    call.rtc_mut().set_format(format);
     call.set_clock(paused_clock());
     call.rtc_mut()
         .on_members_received(
@@ -1111,7 +1123,8 @@ const RING: &str = "$sticky-2";
 
 #[tokio::test(start_paused = true)]
 async fn a_dm_call_rings_the_room_once_its_membership_is_sent() {
-    let (call, sender, mut joined) = dm(
+    let (call, sender, mut joined) = dm_in(
+        MembershipFormat::RoomState,
         &[BOB],
         Vec::new(),
         Some(RingConfig {
@@ -1387,7 +1400,8 @@ async fn the_call_ends_when_everyone_else_has_left() {
 #[tokio::test(start_paused = true)]
 async fn a_dm_that_is_not_one_to_one_is_a_group_call() {
     for others in [&[][..], &[BOB, CAROL][..]] {
-        let (_call, sender, joined) = dm(others, Vec::new(), ring()).await;
+        let (_call, sender, joined) =
+            dm_in(MembershipFormat::RoomState, others, Vec::new(), ring()).await;
 
         assert!(joined.direct.is_none(), "R37: no lifecycle");
         assert!(joined.ring.is_none());
@@ -1466,8 +1480,7 @@ async fn joining_a_voice_call_in_progress_follows_it() {
     assert_eq!(published_intent(&sender), "audio");
 }
 
-/// Starting a call is the host's choice, and the notification says the same
-/// as our membership even when the host stated it only on the join.
+/// Starting a call is the host's choice.
 #[tokio::test]
 async fn starting_a_call_uses_the_intent_asked_for() {
     let sender = alice_backend();
@@ -1482,6 +1495,25 @@ async fn starting_a_call_uses_the_intent_asked_for() {
 
     assert_eq!(joined.intent, CallIntent::Audio);
     assert_eq!(published_intent(&sender), "audio");
+}
+
+/// In room-state the notification says the same as our membership, even when
+/// the host stated the intent only on the join. An MSC invite carries no
+/// intent (spec 038 R26).
+#[tokio::test]
+async fn a_room_state_notification_states_the_intent_asked_for() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+    call.rtc_mut().set_format(MembershipFormat::RoomState);
+
+    let joined = join_asking(
+        &mut call,
+        Some(CallIntent::Audio),
+        Some(GroupNotify::default()),
+    )
+    .await;
+
+    assert_eq!(joined.intent, CallIntent::Audio);
     let sent = notifications_sent(&sender);
     assert_eq!(
         sent[0].0.pointer("/application/m.call.intent").unwrap(),
@@ -1516,4 +1548,83 @@ async fn starting_a_call_without_an_intent_is_video() {
 
     assert_eq!(joined.intent, CallIntent::Video);
     assert_eq!(published_intent(&sender), "video");
+}
+
+/// Spec 038 R26, R27, R29: in MSC, starting a call sends an `m.rtc.invite`
+/// of exactly MSC4075's fields, relating to nothing, its sticky entry
+/// outliving the 90 s lifetime.
+#[tokio::test]
+async fn starting_a_call_invites_the_room_in_the_msc_format() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+    let notify = GroupNotify {
+        mentions: crate::Mentions {
+            user_ids: vec![BOB.to_owned()],
+            room: false,
+        },
+        ..GroupNotify::default()
+    };
+    join_and_notify(&mut call, "alice-a", Some(notify)).await;
+
+    let sent = notifications_sent(&sender);
+    assert_eq!(sent.len(), 1);
+    let (content, duration_ms) = &sent[0];
+    let sender_ts = content["sender_ts"].as_u64().expect("a sender_ts");
+    assert_eq!(
+        *content,
+        json!({
+            "slot_id": SLOT,
+            "sender_ts": sender_ts,
+            "lifetime": DEFAULT_RING_LIFETIME_MS,
+            "m.mentions": { "user_ids": [BOB], "room": false },
+            "msc4354_sticky_key": SLOT,
+        })
+    );
+    assert_eq!(*duration_ms, 2 * DEFAULT_RING_LIFETIME_MS);
+}
+
+/// Spec 038 R30: leaving with nobody else joined withdraws our invite; with
+/// somebody in the call it stays.
+#[tokio::test]
+async fn a_lone_leave_withdraws_the_invite() {
+    for (others, withdrawn) in [(false, true), (true, false)] {
+        let sender = alice_backend();
+        let mut call = encrypted_call_manager(sender.clone()).await;
+        join_and_notify(&mut call, "alice-a", Some(GroupNotify::default())).await;
+        assert_eq!(notifications_sent(&sender).len(), 1, "invited");
+        if others {
+            set_roster(
+                &mut call,
+                vec![member_event(BOB, Some("BOBDEV"), BOB_MEMBER, "$bob")],
+            )
+            .await;
+        }
+
+        call.leave(SLOT, LeaveSessionParams::new())
+            .await
+            .expect("leave");
+
+        let sent = notifications_sent(&sender);
+        assert_eq!(sent.len(), if withdrawn { 2 } else { 1 }, "others={others}");
+        if withdrawn {
+            assert_eq!(sent[1].0, json!({ "msc4354_sticky_key": SLOT }));
+            assert_eq!(sent[1].1, sent[0].1, "under the invite's sticky duration");
+        }
+    }
+}
+
+/// Spec 038 R28: an invite targeting nobody is not sent.
+#[tokio::test]
+async fn an_invite_targeting_nobody_is_not_sent() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+    let notify = GroupNotify {
+        mentions: crate::Mentions {
+            user_ids: Vec::new(),
+            room: false,
+        },
+        ..GroupNotify::default()
+    };
+    join_and_notify(&mut call, "alice-a", Some(notify)).await;
+    assert!(notifications_sent(&sender).is_empty());
 }
