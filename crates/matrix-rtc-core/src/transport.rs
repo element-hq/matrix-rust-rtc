@@ -139,7 +139,21 @@ impl LiveKitTransport {
     }
 }
 
+/// The shortest media key any transport takes: LiveKit's 32 bytes (spec 038
+/// R16). Our keys are never shorter, and an MSC room drops a shorter one; a
+/// room-state room takes Element Call's 16-byte keys.
+pub const MIN_MEDIA_KEY_LEN: usize = 32;
+
 impl RtcTransport {
+    /// The media key length, in bytes, this transport needs from a member
+    /// publishing on it; `None` for a transport we do not understand.
+    pub fn required_key_len(&self) -> Option<usize> {
+        match self {
+            RtcTransport::LiveKit(_) => Some(MIN_MEDIA_KEY_LEN),
+            RtcTransport::Unsupported(_) => None,
+        }
+    }
+
     /// This transport as we would publish it after moving our media onto it
     /// from `publisher_user_id`'s membership (034 R25): an SFU the publisher's
     /// homeserver operates is named with that server, since peers would
@@ -347,6 +361,17 @@ mod tests {
             })),
             RtcTransport::Unsupported(_)
         ));
+    }
+
+    /// Spec 038 R16: a LiveKit member needs 32-byte keys; an unknown transport
+    /// asks for nothing, leaving the floor to decide.
+    #[test]
+    fn livekit_needs_32_byte_keys() {
+        let livekit = typed(json!({ "type": "livekit", "url": "wss://sfu" }));
+        assert_eq!(livekit.required_key_len(), Some(MIN_MEDIA_KEY_LEN));
+        assert_eq!(MIN_MEDIA_KEY_LEN, 32);
+        let other = typed(json!({ "type": "whip", "url": "https://whip" }));
+        assert_eq!(other.required_key_len(), None);
     }
 
     /// Peers read our token flow off the fields we publish, so they go out

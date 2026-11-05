@@ -230,11 +230,23 @@ fn a_legacy_key_is_bound_in_the_mode_its_room_was_opened_in() {
         content: json!({
             "room_id": ROOM,
             "member_id": "bob-1",
-            "media_key": { "index": 3, "key": "a2V5" },
+            "media_key": { "index": 3, "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8" },
         }),
         ..message
     };
     let key = key_in(MembershipFormat::Msc, &msc).expect("an MSC key");
     assert_eq!((key.member_id.as_str(), key.key_index), ("bob-1", 3));
     assert!(key_in(MembershipFormat::RoomState, &msc).is_none());
+
+    // R16: an MSC key under LiveKit's 32 bytes is dropped; a room-state key
+    // is taken at any length (the one above is three bytes).
+    let short = ToDeviceMessageIn {
+        content: json!({
+            "room_id": ROOM,
+            "member_id": "bob-1",
+            "media_key": { "index": 3, "key": "a2V5" },
+        }),
+        ..msc
+    };
+    assert!(key_in(MembershipFormat::Msc, &short).is_none());
 }

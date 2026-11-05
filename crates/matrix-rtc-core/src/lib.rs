@@ -74,8 +74,8 @@ pub use slot::{
     RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus, validate_slot_id,
 };
 pub use transport::{
-    LiveKitAuthFlow, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport,
-    UnsupportedTransport, server_name_of,
+    LiveKitAuthFlow, LiveKitTransport, MIN_MEDIA_KEY_LEN, MemberTransports, RawRtcTransport,
+    RtcTransport, UnsupportedTransport, server_name_of,
 };
 pub use wire::wire_event_type;
 

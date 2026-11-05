@@ -17,7 +17,7 @@ import { MatrixRtcCall } from '../src/matrix-rtc-call.mjs';
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
 const ROOM_ID = '!call:example.org';
-const APPLICATION_SLOT_ID = 'CALL';
+const APPLICATION_SLOT_ID = 'call';
 const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@me:example.org';
 const DEVICE_ID = 'MYDEVICE';
@@ -147,6 +147,10 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     call.onParticipants = (roster) => rosterUpdates.push(roster);
 
     await call.connect();
+
+    // Per-participant keys with a ring that holds every MSC4143 index, 0 to
+    // 255 (spec 038 R38).
+    expect(call.keyProvider.options).toMatchObject({ sharedKey: false, keyringSize: 256 });
 
     // One focus in play, so one Room, connected with what the token fetch
     // returned. The own focus connects after `connect` returns (034 R24).

@@ -20,10 +20,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, watch};
 
+use base64::Engine as _;
+
+use crate::encryption::MEDIA_KEY_BASE64;
 use crate::{
     ApplicationIntake, BackendError, EventEncryption, EventIn, EventOrigin, KEY_MESSAGE_TYPE,
-    KeyOrigin, MatrixBackend, RawSlotEvent, RawTimelineEvent, ReceivedEncryptionKey, RoomSink,
-    RoomSubjects, SLOT_EVENT_TYPE, Subscription, ToDeviceMessageIn, ToDeviceSink,
+    KeyOrigin, MIN_MEDIA_KEY_LEN, MatrixBackend, RawSlotEvent, RawTimelineEvent,
+    ReceivedEncryptionKey, RoomSink, RoomSubjects, SLOT_EVENT_TYPE, Subscription,
+    ToDeviceMessageIn, ToDeviceSink,
 };
 
 mod dialect;
@@ -696,6 +700,20 @@ pub fn parse_msc_key(message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKe
             );
         })
         .ok()?;
+    // LiveKit needs 32 bytes (spec 038 R16). Only an MSC room is this strict:
+    // Element Call's room-state keys, read by its own parser, may be 16.
+    let key_len = MEDIA_KEY_BASE64
+        .decode(&content.media_key.key)
+        .map(|key| key.len())
+        .unwrap_or(0);
+    if key_len < MIN_MEDIA_KEY_LEN {
+        log::warn!(
+            "ignoring a {} from {}: its media key is {key_len} bytes, under {MIN_MEDIA_KEY_LEN}",
+            message.event_type,
+            message.sender,
+        );
+        return None;
+    }
     Some(ReceivedEncryptionKey {
         origin: key_origin(&message.encryption, &message.sender),
         room_id: content.room_id,

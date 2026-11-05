@@ -284,7 +284,7 @@ fn bob_key() -> ToDeviceMessageIn {
         content: json!({
             "room_id": ROOM,
             "member_id": "bob-1",
-            "media_key": { "index": 0, "key": "AAECAwQFBgcICQoLDA0ODw==" },
+            "media_key": { "index": 0, "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8" },
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
     }

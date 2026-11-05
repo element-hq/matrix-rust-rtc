@@ -254,7 +254,7 @@ use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
-use crate::transport::RtcTransport;
+use crate::transport::{MIN_MEDIA_KEY_LEN, RtcTransport};
 
 /// Message type for to-device encryption key distribution (MSC4143).
 ///
@@ -735,14 +735,23 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         (self.clock)()
     }
 
-    /// Generates a new secure random 32-byte key.
+    /// The length of the keys we send: the longest any transport we publish
+    /// on needs, and never under [`MIN_MEDIA_KEY_LEN`] (spec 038 R16).
+    fn own_key_len(&self) -> usize {
+        self.own_transports
+            .iter()
+            .filter_map(RtcTransport::required_key_len)
+            .fold(MIN_MEDIA_KEY_LEN, usize::max)
+    }
+
+    /// Generates a new secure random key, as long as our transports need.
     ///
     /// Uses cryptographically secure random number generation via `OsRng`.
     pub fn generate_random_key(&self) -> Vec<u8> {
         use rand::RngCore;
         use rand_core::OsRng;
 
-        let mut key = vec![0u8; 32];
+        let mut key = vec![0u8; self.own_key_len()];
         OsRng.fill_bytes(&mut key);
         key
     }
@@ -1910,9 +1919,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             CommandError::SerializationError(format!("Failed to decode key: {}", e))
         })?;
 
-        if key_bytes.len() != 32 {
+        // Only a room-state key can be short here: an MSC room's parser drops
+        // one under 32 bytes (R16), while Element Call's room-state keys were
+        // 16 bytes until js-sdk #5649 and are taken as they come.
+        if key_bytes.len() < MIN_MEDIA_KEY_LEN {
             log::warn!(
-                "[{}/{}] Received key with unexpected length: {} (expected 32)",
+                "[{}/{}] Received a key of {} bytes, shorter than LiveKit needs",
                 self.room_id,
                 self.slot_id,
                 key_bytes.len()

@@ -14,6 +14,11 @@ log only.
 - In an encrypted room a member is joined only if decryption names the device that sent their member event; `EventOrigin::Unknown` is removed (038).
 - A join whose slot id breaks MSC4143's grammar or 255-byte limit fails with `JoinError::InvalidSlotId`, and a member of another application is not joined to a slot (038).
 - MSC media keys go out as `io.element.call.encryption_keys` with exactly `room_id`, `member_id` and an unpadded `media_key`, and each room reads only its own format's key body (038).
+- An MSC room drops a media key shorter than 32 bytes (room-state rooms still take 16), and the web `connect` config no longer takes `keyRingSize` (038).
+
+### Fixed
+
+- Every key index, 0 to 255, is usable natively and on the web; native dropped index 255 and the web anything past 15 (038).
 
 ### Added
 

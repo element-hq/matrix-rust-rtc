@@ -12,7 +12,7 @@ import { mockBackendHost, openSlotEvent } from './mock-backend-host.mjs';
 const nodeBindingUrl = new URL('../pkg/node/matrix_rtc_wasm.js', import.meta.url);
 
 const ROOM_ID = '!test:example.org';
-const APPLICATION_SLOT_ID = 'TEST';
+const APPLICATION_SLOT_ID = 'test';
 const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@alice:example.org';
 const DEVICE_ID = 'device123';

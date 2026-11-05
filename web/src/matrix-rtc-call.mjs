@@ -70,7 +70,7 @@ export class MatrixRtcCall {
    * The own focus is the one the join publishes on (none for a receive-only
    * call) and the account is the backend's.
    *
-   * @param {object} [config] - `{ keyRingSize?, format? }`
+   * @param {object} [config] - `{ format? }`
    */
   async connect(config = {}) {
     if (this.session) throw new Error('already connected');
@@ -78,10 +78,7 @@ export class MatrixRtcCall {
     this.keyProvider = makePerParticipantKeyProvider(this.livekit);
 
     this.session = await this.call.connectMedia(
-      {
-        key_ring_size: config.keyRingSize,
-        format: config.format,
-      },
+      { format: config.format },
       this.delegate(),
     );
 
@@ -284,8 +281,9 @@ function makePerParticipantKeyProvider(livekit) {
     constructor() {
       // No ratcheting: MSC4143 rotates by distributing whole new keys at new
       // indices. failureTolerance -1 keeps the cryptor trying (a key may
-      // simply not have arrived yet).
-      super({ sharedKey: false, ratchetWindowSize: 0, failureTolerance: -1 });
+      // simply not have arrived yet). keyringSize 256 makes every index,
+      // 0 to 255, usable (spec 038 R38); the wasm guard assumes the same.
+      super({ sharedKey: false, ratchetWindowSize: 0, failureTolerance: -1, keyringSize: 256 });
     }
 
     /** The `FrameKeyRing` shape: raw bytes, participant identity, key index. */

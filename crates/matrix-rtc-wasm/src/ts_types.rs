@@ -213,8 +213,6 @@ export type RtcCallStatus =
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
 export interface MediaSessionConfigIn {
-    /** livekit-js key-provider ring size when configured away from its default of 16. */
-    key_ring_size?: number;
     /** Cross-check only: the mode comes from the room. */
     format?: MembershipFormatMode;
     /** How much the tile order is damped; omitted fields take the defaults. */
