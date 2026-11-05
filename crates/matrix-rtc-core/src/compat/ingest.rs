@@ -15,7 +15,7 @@
 //! trickiest code in this repository.
 //!
 //! The dialect translation itself lives in the sibling modules
-//! ([`sticky_2025`], [`room_state`]) and is shared verbatim with the
+//! ([`element_call`], [`room_state`]) and is shared verbatim with the
 //! Rust-native path; this module owns only the host-shaped funnels around it,
 //! the [`IngestDialect`] the core's feeder reads a room through in each mode,
 //! and the two places a mode changes an identifier rather than a field
@@ -30,7 +30,7 @@ use serde_json::Value;
 
 use super::{
     MemberContent, MembershipFormat, OutboundDialect, RoomStateDialect, STATE_MEMBER_EVENT_TYPE,
-    room_state, sticky_2025,
+    element_call, room_state,
 };
 
 /// One `m.rtc.member` sticky event, with its content raw.
@@ -148,7 +148,7 @@ pub fn to_core_member_event(
     let mut value = event.content;
     let legacy = format == MembershipFormat::RoomState;
 
-    if legacy && sticky_2025::normalize_member_content(&mut value) == MemberContent::BareLeave {
+    if legacy && element_call::normalize_member_content(&mut value) == MemberContent::BareLeave {
         // A pre-2026 leave: the content is a sticky key and nothing else, so
         // there is no slot to file it under. Dropping it *is* the leave — the
         // membership set is applied whole, and a member who contributes no event
@@ -161,7 +161,7 @@ pub fn to_core_member_event(
     }
 
     let claimed_device = legacy
-        .then(|| sticky_2025::claimed_device_id(&value))
+        .then(|| element_call::claimed_device_id(&value))
         .flatten();
 
     let content: RawStickyEventContent = match serde_json::from_value(value) {
@@ -345,8 +345,8 @@ pub fn parse_legacy_key(
     sender: &str,
     sender_device_id: Option<&str>,
     content: &Value,
-) -> Option<sticky_2025::LegacyKeyMessage> {
-    let mut key = sticky_2025::parse_key_message(sender, content)?;
+) -> Option<element_call::LegacyKeyMessage> {
+    let mut key = element_call::parse_key_message(sender, content)?;
 
     // In the pre-sticky generation the `member.id` a key message carries is
     // Element Call's own per-session UUID, and it appears in *no* field of the
@@ -360,7 +360,7 @@ pub fn parse_legacy_key(
     if compat == MembershipFormat::RoomState {
         let device_id = sender_device_id
             .map(str::to_owned)
-            .or_else(|| sticky_2025::claimed_key_device_id(content))?;
+            .or_else(|| element_call::claimed_key_device_id(content))?;
         key.member_id = room_state::participant_identity(sender, &device_id);
     }
 

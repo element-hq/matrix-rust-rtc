@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! Reading the 2025 Element Call wire format, and the legacy key and
-//! notification shapes the pre-sticky generation shares with it.
+//! Element Call's own wire shapes, for the room-state format: its 2025 sticky
+//! member content, and the key and notification shapes it shares with its
+//! room-state generation.
 //!
-//! We no longer *write* the 2025 format: its outbound dialect went with the
-//! `Sticky2025` membership format, once Element Call moved on. What stays is
-//! the permissive inbound normalisation (a spec-shaped event passes through
-//! untouched) and the legacy key/notification shapes
-//! [`RoomStateDialect`](super::RoomStateDialect) still speaks.
+//! We no longer *write* the 2025 sticky content: its outbound dialect went with
+//! the `Sticky2025` membership format. What stays is its inbound normalisation,
+//! which only the room-state format runs (Element Call writes sticky
+//! memberships beside its state events), and the legacy key/notification shapes
+//! [`RoomStateDialect`](super::RoomStateDialect) still speaks. The MSC format
+//! reads none of it.
 //!
 //! Deliberately depends on nothing but `serde_json`: no `matrix-sdk` type, no
 //! `matrix-rtc-core` type. Everything is a plain JSON-in/JSON-out function, so

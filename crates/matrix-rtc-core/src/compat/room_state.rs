@@ -6,10 +6,9 @@
 //! The Element Call membership format from *before* MSC4354: MatrixRTC
 //! membership as `org.matrix.msc3401.call.member` **room state**.
 //!
-//! One generation older than [`super::sticky_2025`], which handles the sticky
-//! dialect. Both are Element Call; the difference is where the membership
-//! lives. A deployment speaks one or the other, never both, so the two files
-//! barely interact and either can be deleted without touching the other.
+//! One generation older than the sticky content [`super::element_call`] reads.
+//! Both are Element Call; the difference is where the membership lives. This
+//! module borrows a few helpers from its sibling (leaves, the legacy session).
 //!
 //! Depends on nothing but `serde_json`, for the same reasons as its sibling: the
 //! whole translation is unit-testable against captured payloads, and deleting it
@@ -102,7 +101,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
-use super::sticky_2025::{is_leave, legacy_session};
+use super::element_call::{is_leave, legacy_session};
 
 /// The state event type carrying a pre-sticky Element Call membership.
 pub const STATE_MEMBER_EVENT_TYPE: &str = "org.matrix.msc3401.call.member";
