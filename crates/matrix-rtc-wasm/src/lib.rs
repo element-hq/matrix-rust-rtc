@@ -116,6 +116,35 @@ impl WasmRtcClient {
         self.client.report_connectivity(online);
     }
 
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45), as `{ missing, warnings }`, each a list of `"matrix_rtc"`,
+    /// `"sticky_events"`, `"delayed_events"` or `"livekit_transport"`.
+    /// `serverFeatures` are the `unstable_features` of `/versions` that are
+    /// on (the host's `serverFeatures()`); the transports are asked of the
+    /// host. Never picks the format.
+    #[wasm_bindgen(js_name = mscSupport, unchecked_return_type = "MscSupport")]
+    pub async fn msc_support(&self, server_features: Vec<String>) -> Result<JsValue, JsError> {
+        let support = self
+            .client
+            .msc_support(&server_features)
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let name = |requirement: &matrix_rtc_core::MscRequirement| match requirement {
+            matrix_rtc_core::MscRequirement::MatrixRtc => "matrix_rtc",
+            matrix_rtc_core::MscRequirement::StickyEvents => "sticky_events",
+            matrix_rtc_core::MscRequirement::DelayedEvents => "delayed_events",
+            matrix_rtc_core::MscRequirement::LiveKitTransport => "livekit_transport",
+        };
+        let names =
+            |list: &[matrix_rtc_core::MscRequirement]| list.iter().map(name).collect::<Vec<_>>();
+        serde_json::json!({
+            "missing": names(&support.missing),
+            "warnings": names(&support.warnings),
+        })
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| JsError::new(&error.to_string()))
+    }
+
     /// Opens a room: the library subscribes to what the room needs in the
     /// given mode and applies its current state. Resolves once that state is
     /// applied, so a `joinCall` issued afterwards sees it.

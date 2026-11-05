@@ -54,6 +54,15 @@ describe('WASM bindings with a mock backend host', () => {
   });
 
   describe('WasmRtcClient, WasmRtcRoom and WasmRtcCall', () => {
+    it('checks the homeserver for the MSC format, naming what is missing (038 R45)', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const support = await client.mscSupport(['org.matrix.msc4143']);
+      expect(support).toEqual({
+        missing: ['sticky_events'],
+        warnings: ['delayed_events'],
+      });
+    });
+
     it('opens a room and subscribes to what it needs', async () => {
       const client = new bindings.WasmRtcClient(host);
       const room = await client.room(ROOM_ID, undefined);

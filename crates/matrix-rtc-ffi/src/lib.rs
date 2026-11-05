@@ -358,6 +358,18 @@ impl RtcClient {
         self.client.report_connectivity(online);
     }
 
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45). `server_features` are the `unstable_features` of `/versions`
+    /// that are on, which the host reads from its SDK; the transports are
+    /// asked of the backend. Names each missing piece; never picks the
+    /// format.
+    pub async fn msc_support(
+        &self,
+        server_features: Vec<String>,
+    ) -> Result<FfiMscSupport, MatrixRtcFfiError> {
+        Ok(self.client.msc_support(&server_features).await?.into())
+    }
+
     /// Opens a room: the library subscribes to what the room needs in the
     /// given mode and applies its current state. Resolves once that state is
     /// applied, so a `join_call` issued afterwards sees it.
@@ -789,6 +801,49 @@ pub enum FfiCallEnd {
         reason: FfiConnectionLossReason,
         message: String,
     },
+}
+
+/// One thing the MSC format relies on (spec 038 R45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMscRequirement {
+    /// MatrixRTC (MSC4143).
+    MatrixRtc,
+    /// Sticky events (MSC4354).
+    StickyEvents,
+    /// Delayed events (MSC4140): without them a call works on a 5 minute
+    /// membership lifetime.
+    DelayedEvents,
+    /// An `m.livekit` transport with an SFU `url`.
+    LiveKitTransport,
+}
+
+/// What the MSC support check found missing.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiMscSupport {
+    /// Without these an MSC call cannot work.
+    pub missing: Vec<FfiMscRequirement>,
+    /// Without these an MSC call works, worse.
+    pub warnings: Vec<FfiMscRequirement>,
+}
+
+impl From<matrix_rtc_core::MscRequirement> for FfiMscRequirement {
+    fn from(value: matrix_rtc_core::MscRequirement) -> Self {
+        match value {
+            matrix_rtc_core::MscRequirement::MatrixRtc => Self::MatrixRtc,
+            matrix_rtc_core::MscRequirement::StickyEvents => Self::StickyEvents,
+            matrix_rtc_core::MscRequirement::DelayedEvents => Self::DelayedEvents,
+            matrix_rtc_core::MscRequirement::LiveKitTransport => Self::LiveKitTransport,
+        }
+    }
+}
+
+impl From<matrix_rtc_core::MscSupport> for FfiMscSupport {
+    fn from(value: matrix_rtc_core::MscSupport) -> Self {
+        Self {
+            missing: value.missing.into_iter().map(Into::into).collect(),
+            warnings: value.warnings.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// Why our own SFU connection was given up. Contract C10.

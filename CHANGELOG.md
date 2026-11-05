@@ -15,12 +15,15 @@ log only.
 - A join whose slot id breaks MSC4143's grammar or 255-byte limit fails with `JoinError::InvalidSlotId`, and a member of another application is not joined to a slot (038).
 - MSC media keys go out as `io.element.call.encryption_keys` with exactly `room_id`, `member_id` and an unpadded `media_key`, and each room reads only its own format's key body (038).
 - An MSC room drops a media key shorter than 32 bytes (room-state rooms still take 16), and the web `connect` config no longer takes `keyRingSize` (038).
-
 - `ConnectionContext` carries `e2ee`, and the web delegate's `connect` request an `e2ee` flag that, not the page's `roomOptions.e2ee`, decides frame encryption (038).
 - In the MSC format a call publishes on the homeserver's first `m.livekit` transport, written `{type: "m.livekit", url}`, and counts a peer's media only on `m.livekit` with a `url`, every token coming from the homeserver; `transports::choose`/`resolve` and `transport_to_json` take the room's format (038).
 - A join on a homeserver advertising no LiveKit transport of the room's format fails with `JoinError::NoLiveKitTransport`, and a homeserver without MSC4195's `get_token` ends the call at once with the new loss reason `token_endpoint_unsupported` instead of retrying (038).
 - A participant on an SFU with no membership is no longer an interruption while signalling is healthy: after 10 s it is listed by the new `unverified_participants` (engine, FFI and web media sessions) (038).
 - In the MSC format, starting or ringing a call sends an MSC4075 `m.rtc.invite` (`slot_id`, `sender_ts`, `lifetime`, `m.mentions`, sticky key) without waiting for our membership, withdrawn when we leave alone or the slot closes; an invite targeting nobody is refused with `RtcError::InviteTargetsNobody`; room-state keeps today's notification (038).
+
+### Added
+
+- `msc_support` (core, `RtcClient`, FFI, web `mscSupport`) names what a homeserver lacks for the MSC format, from its `/versions` features (host helpers `server_features`/`serverFeatures`) and its transports, without choosing the format (038).
 
 ### Fixed
 

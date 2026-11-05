@@ -118,6 +118,15 @@ export interface MatrixBackendHost {
     rtcTransports(): Promise<unknown[]>;
 }
 
+/** One thing the MSC format relies on (spec 038 R45). */
+export type MscRequirement = "matrix_rtc" | "sticky_events" | "delayed_events" | "livekit_transport";
+
+/** `mscSupport`'s answer: `missing` stops an MSC call, `warnings` makes it worse. */
+export interface MscSupport {
+    missing: MscRequirement[];
+    warnings: MscRequirement[];
+}
+
 /** Whether the homeserver is answering the library's sends; distinct from the media `degraded` flag. */
 export type RtcSignallingHealth =
     | { type: "reachable" }

@@ -267,6 +267,18 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
         self.base.subscribe_signalling_health()
     }
 
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45), from the `unstable_features` of its `/versions` that are on,
+    /// which the host reads, and the transports it advertises, which this
+    /// asks for. Names each missing piece; never chooses the format.
+    pub async fn msc_support(
+        &self,
+        server_features: &[String],
+    ) -> Result<matrix_rtc_core::MscSupport, BackendError> {
+        let transports = self.backend().rtc_transports().await?;
+        Ok(matrix_rtc_core::msc_support(server_features, &transports))
+    }
+
     /// The host reports its Matrix client offline, or online once a request
     /// has succeeded since it was offline (R11). Optional: without it the
     /// library goes by its own sends.

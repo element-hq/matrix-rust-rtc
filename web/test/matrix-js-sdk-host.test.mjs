@@ -212,3 +212,20 @@ describe('MatrixHost delayed leave', () => {
     });
   });
 });
+
+describe('MatrixHost server features', () => {
+  it('lists the unstable features that are on (038 R45)', async () => {
+    const host = new MatrixHost({
+      sdk,
+      client: {
+        getVersions: () =>
+          Promise.resolve({
+            versions: ['v1.12'],
+            unstable_features: { 'org.matrix.msc4143': true, 'org.matrix.msc4354': false },
+          }),
+      },
+    });
+    expect(await host.serverFeatures()).toEqual(['org.matrix.msc4143']);
+  });
+});
+

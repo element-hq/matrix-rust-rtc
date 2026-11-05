@@ -201,6 +201,18 @@ export class MatrixHost {
     return response.delay_id;
   }
 
+  /**
+   * The homeserver's `unstable_features` that are on, for the library's
+   * `mscSupport` (spec 038 R45). Not part of the backend contract: the page
+   * calls it.
+   */
+  async serverFeatures() {
+    const versions = await this.client.getVersions();
+    return Object.entries(versions.unstable_features ?? {})
+      .filter(([, on]) => on === true)
+      .map(([feature]) => feature);
+  }
+
   restartDelayedEvent(_roomId, delayId) {
     return this.client._unstable_updateDelayedEvent(delayId, this.sdk.UpdateDelayedEventAction.Restart);
   }
