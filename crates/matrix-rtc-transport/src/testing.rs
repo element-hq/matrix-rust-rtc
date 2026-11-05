@@ -52,6 +52,8 @@ struct State {
     takeovers: Vec<String>,
     /// Every publication made, in order.
     local_tracks: Vec<Arc<ScriptedLocalTrack>>,
+    /// Our homeserver lacks MSC4195's `get_token`: every connect fails so.
+    no_token_endpoint: bool,
 }
 
 /// A [`MediaTransport`] whose connections a test scripts. Cheap to clone;
@@ -99,6 +101,15 @@ impl ScriptedTransport {
             .collect();
         foci.sort();
         foci
+    }
+
+    /// From now on our homeserver lacks MSC4195's `get_token`: every connect,
+    /// to any focus, fails with [`TransportError::TokenEndpointUnsupported`].
+    pub fn lack_token_endpoint(&self) {
+        self.state
+            .lock()
+            .expect("scripted transport poisoned")
+            .no_token_endpoint = true;
     }
 
     fn with_focus<R>(&self, key: &str, f: impl FnOnce(&mut Focus) -> R) -> R {
@@ -326,6 +337,17 @@ impl TransportConnection for ScriptedConnection {
         fresh_token: bool,
     ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
         let key = self.current();
+        if self
+            .transport
+            .state
+            .lock()
+            .expect("scripted transport poisoned")
+            .no_token_endpoint
+        {
+            return Err(TransportError::TokenEndpointUnsupported(
+                "M_UNRECOGNIZED".to_owned(),
+            ));
+        }
         self.transport.with_focus(&key, |focus| {
             focus.connects += 1;
             if focus.refused {

@@ -111,9 +111,19 @@ pub(crate) async fn acquire_token(
                 config.room_id,
                 config.slot_id
             );
-            let jwt = backend.livekit_token(&request).await.inspect_err(|error| {
-                log::warn!("homeserver SFU token request for {url} failed: {error}");
-            })?;
+            let jwt = backend
+                .livekit_token(&request)
+                .await
+                .inspect_err(|error| {
+                    log::warn!("homeserver SFU token request for {url} failed: {error}");
+                })
+                .map_err(|error| {
+                    if error.is_unrecognized_endpoint() {
+                        Error::TokenEndpointUnsupported(error)
+                    } else {
+                        Error::Backend(error)
+                    }
+                })?;
             Ok(SfuToken {
                 jwt,
                 url: url.clone(),
@@ -204,6 +214,10 @@ pub enum Error {
     /// token.
     #[error(transparent)]
     Backend(#[from] matrix_rtc_core::BackendError),
+
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token: {0}")]
+    TokenEndpointUnsupported(matrix_rtc_core::BackendError),
 
     /// Connecting to or operating the LiveKit SFU room failed.
     #[error("LiveKit room error: {0}")]

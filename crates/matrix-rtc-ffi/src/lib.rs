@@ -85,6 +85,13 @@ pub enum MatrixRtcFfiError {
         errcode: Option<String>,
         reason: String,
     },
+    /// The homeserver advertises no LiveKit transport of the room's format
+    /// to publish on (spec 038 R18).
+    #[error("the homeserver advertises no usable {transport_type} transport")]
+    NoLiveKitTransport { transport_type: String },
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token")]
+    TokenEndpointUnsupported,
 }
 
 impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
@@ -104,6 +111,12 @@ impl From<RtcError> for MatrixRtcFfiError {
                 Self::SlotClosed(slot_id)
             }
             RtcError::Join(matrix_rtc_core::JoinError::TimedOut) => Self::JoinTimedOut,
+            RtcError::Join(matrix_rtc_core::JoinError::NoLiveKitTransport { transport_type }) => {
+                Self::NoLiveKitTransport { transport_type }
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::TokenEndpointUnsupported) => {
+                Self::TokenEndpointUnsupported
+            }
             RtcError::Join(matrix_rtc_core::JoinError::Refused { errcode, message }) => {
                 Self::JoinRefused {
                     errcode,
@@ -787,6 +800,8 @@ pub enum FfiConnectionLossReason {
     Refused,
     /// Never established within the budget from the connect request.
     NeverConnected,
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    TokenEndpointUnsupported,
 }
 
 impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
@@ -795,6 +810,7 @@ impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
             call::ConnectionLossReason::Budget => Self::Budget,
             call::ConnectionLossReason::Refused => Self::Refused,
             call::ConnectionLossReason::NeverConnected => Self::NeverConnected,
+            call::ConnectionLossReason::TokenEndpointUnsupported => Self::TokenEndpointUnsupported,
         }
     }
 }

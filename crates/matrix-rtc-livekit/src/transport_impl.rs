@@ -321,11 +321,15 @@ impl Connector {
     }
 }
 
-/// A token failure: a 4xx from the JWT service, a 4xx other than a rate limit
-/// from the homeserver (a 404 there: it lacks MSC4195), or a host refusal, is a
-/// refusal; anything else may pass.
+/// A token failure: a homeserver without MSC4195's `get_token` ends the call
+/// (spec 038 R44); a 4xx from the JWT service, another 4xx other than a rate
+/// limit from the homeserver, or a host refusal, is a refusal; anything else
+/// may pass.
 fn classify_token_error(error: crate::Error) -> TransportError {
     match &error {
+        crate::Error::TokenEndpointUnsupported(_) => {
+            TransportError::TokenEndpointUnsupported(error.to_string())
+        }
         crate::Error::Service(TokenServiceError::Rejected { status, .. })
             if (400..500).contains(status) =>
         {
@@ -1472,22 +1476,34 @@ mod tests {
         );
     }
 
-    /// A homeserver without MSC4195 refuses for good; a rate limit may pass.
+    /// A homeserver without MSC4195 ends the call (spec 038 R44); another
+    /// refusal is one; a rate limit or a server error may pass.
     #[tokio::test]
-    async fn a_homeserver_without_the_endpoint_is_a_refusal() {
+    async fn a_homeserver_without_the_endpoint_is_told_from_a_refusal() {
         let backend = matrix_rtc_core::testing::MockBackend::new();
-        for (status, refused) in [(404, true), (403, true), (429, false), (502, false)] {
-            *backend.livekit_token_answer.lock().unwrap() = Err(
-                matrix_rtc_core::BackendError::with_matrix_error(None, Some(status), "no"),
-            );
+        for (errcode, status, expected) in [
+            (None, 404, "unsupported"),
+            (Some("M_UNRECOGNIZED"), 404, "unsupported"),
+            (Some("M_FORBIDDEN"), 403, "refused"),
+            (None, 429, "connect"),
+            (None, 502, "connect"),
+        ] {
+            *backend.livekit_token_answer.lock().unwrap() =
+                Err(matrix_rtc_core::BackendError::with_matrix_error(
+                    errcode.map(str::to_owned),
+                    Some(status),
+                    "no",
+                ));
             let error = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
                 .await
                 .expect_err("no token");
-            assert_eq!(
-                matches!(classify_token_error(error), TransportError::Refused(_)),
-                refused,
-                "status {status}"
-            );
+            let kind = match classify_token_error(error) {
+                TransportError::TokenEndpointUnsupported(_) => "unsupported",
+                TransportError::Refused(_) => "refused",
+                TransportError::Connect(_) => "connect",
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(kind, expected, "{errcode:?} / {status}");
         }
     }
 }

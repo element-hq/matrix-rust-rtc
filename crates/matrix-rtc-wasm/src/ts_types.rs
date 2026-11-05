@@ -208,7 +208,7 @@ export type RtcCallStatus =
     /** `loss_reason` and `message` (the transport's, for logs) are for `connection_closed` only. */
     | { type: "ended";
         reason: "left" | "declined" | "unanswered" | "ring_not_sent" | "others_left" | "empty" | "slot_closed" | "connection_closed";
-        loss_reason: "budget" | "refused" | "never_connected" | null;
+        loss_reason: "budget" | "refused" | "never_connected" | "token_endpoint_unsupported" | null;
         message: string | null };
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */

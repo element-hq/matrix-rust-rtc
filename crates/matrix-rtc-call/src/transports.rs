@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{
-    BackendError, CommandError, JoinError, LEGACY_LIVEKIT_TYPE, LiveKitTransport, MSC_LIVEKIT_TYPE,
+    CommandError, JoinError, LEGACY_LIVEKIT_TYPE, LiveKitTransport, MSC_LIVEKIT_TYPE,
     MatrixBackend, Outbox, RawRtcTransport, RtcTransport, SendKind, SendPolicy, SlotKey,
     TransportIntent, executor,
 };
@@ -59,7 +59,7 @@ pub fn choose(
     rtc_transports: &Value,
     chosen: JoinTransport,
     format: MembershipFormat,
-) -> Result<TransportIntent, CommandError> {
+) -> Result<TransportIntent, JoinError> {
     let transport_type = livekit_transport_type(format);
     match chosen {
         JoinTransport::Publish(transport) => {
@@ -84,13 +84,10 @@ pub fn choose(
                 }
                 RtcTransport::Unsupported(_) => None,
             })
-            // Final: the homeserver's configuration, not a failure to reach it.
-            .ok_or_else(|| {
-                BackendError::new(format!(
-                    "the homeserver advertises no usable {transport_type} transport"
-                ))
-                .permanent()
-                .into()
+            // Final: the homeserver's configuration, not a failure to reach it
+            // (R18).
+            .ok_or_else(|| JoinError::NoLiveKitTransport {
+                transport_type: transport_type.to_owned(),
             }),
     }
 }
@@ -126,10 +123,7 @@ pub async fn resolve<B: MatrixBackend + ?Sized>(
             .map_err(JoinError::from_send_failure)?,
         _ => Value::Null,
     };
-    choose(&rtc_transports, chosen, format).map_err(|error| JoinError::Refused {
-        errcode: None,
-        message: error.to_string(),
-    })
+    choose(&rtc_transports, chosen, format)
 }
 
 fn remaining(deadline: executor::Instant) -> Duration {
@@ -246,9 +240,10 @@ mod tests {
 
         *backend.transports.lock().unwrap() = Ok(json!([]));
         let started = executor::Instant::now();
+        // R18: typed, naming the format's type.
         assert!(matches!(
             advertised(&backend).await,
-            Err(JoinError::Refused { .. })
+            Err(JoinError::NoLiveKitTransport { transport_type }) if transport_type == "livekit"
         ));
         assert_eq!(started.elapsed(), Duration::ZERO);
     }

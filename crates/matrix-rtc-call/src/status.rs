@@ -104,6 +104,8 @@ pub enum ConnectionLossReason {
     Refused,
     /// Never established within the budget from the connect request.
     NeverConnected,
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    TokenEndpointUnsupported,
 }
 
 impl From<DirectCallEnd> for CallEnd {

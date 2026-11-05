@@ -310,3 +310,25 @@ async fn join_with_the_sfu_down() {
         }
     ));
 }
+
+/// Spec 038 R44: a homeserver without MSC4195's `get_token` ends the call at
+/// once with that reason; no connection is retried to the budget.
+#[tokio::test(start_paused = true)]
+async fn a_homeserver_without_get_token_ends_the_call_at_once() {
+    let call = start(&[BOB], true, false).await;
+    call.transport.lack_token_endpoint();
+    run_for(10).await;
+    assert!(
+        matches!(
+            call.call.status(),
+            CallStatus::Ended {
+                reason: CallEnd::ConnectionClosed {
+                    reason: ConnectionLossReason::TokenEndpointUnsupported,
+                    ..
+                }
+            }
+        ),
+        "{:?}",
+        call.call.status()
+    );
+}

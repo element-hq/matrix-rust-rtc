@@ -111,6 +111,11 @@ pub enum TransportError {
     /// cannot help (034 R24).
     #[error("refused: {0}")]
     Refused(String),
+    /// Our homeserver lacks MSC4195's `get_token` (a 404 or `M_UNRECOGNIZED`):
+    /// no token can be had for any SFU, ours or a peer's, so the call cannot
+    /// go on (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token: {0}")]
+    TokenEndpointUnsupported(String),
 }
 
 /// Our own membership identity, as transports need it for authentication and

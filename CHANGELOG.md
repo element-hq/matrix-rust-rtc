@@ -18,6 +18,7 @@ log only.
 
 - `ConnectionContext` carries `e2ee`, and the web delegate's `connect` request an `e2ee` flag that, not the page's `roomOptions.e2ee`, decides frame encryption (038).
 - In the MSC format a call publishes on the homeserver's first `m.livekit` transport, written `{type: "m.livekit", url}`, and counts a peer's media only on `m.livekit` with a `url`, every token coming from the homeserver; `transports::choose`/`resolve` and `transport_to_json` take the room's format (038).
+- A join on a homeserver advertising no LiveKit transport of the room's format fails with `JoinError::NoLiveKitTransport`, and a homeserver without MSC4195's `get_token` ends the call at once with the new loss reason `token_endpoint_unsupported` instead of retrying (038).
 
 ### Fixed
 

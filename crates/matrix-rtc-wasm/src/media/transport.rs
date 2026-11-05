@@ -374,7 +374,13 @@ impl JsConnector {
                         member_id: ctx.member.member_id.clone(),
                     })
                     .await
-                    .map_err(|error| backend_error("homeserver livekit token", error))?;
+                    .map_err(|error| {
+                        if error.is_unrecognized_endpoint() {
+                            TransportError::TokenEndpointUnsupported(error.to_string())
+                        } else {
+                            backend_error("homeserver livekit token", error)
+                        }
+                    })?;
                 return Ok(SfuToken { jwt, url });
             }
             LiveKitTarget::SfuGet { service_url } => service_url,

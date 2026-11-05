@@ -1406,6 +1406,9 @@ impl Actor {
                                 OwnConnectionLoss::NeverConnected => {
                                     ConnectionLossReason::NeverConnected
                                 }
+                                OwnConnectionLoss::TokenEndpointUnsupported => {
+                                    ConnectionLossReason::TokenEndpointUnsupported
+                                }
                             },
                             message,
                         );
