@@ -33,9 +33,11 @@ pub trait IngestDialect: MaybeSend {
         state: Vec<EventIn>,
     ) -> Vec<RawStickyEvent>;
 
-    /// A media key from a to-device message of a type beyond the spec's, which
-    /// the client subscribed to.
-    fn parse_key(&self, _message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
-        None
+    /// A media key from a to-device message naming this room: one of the spec's
+    /// key types, or a type beyond them the client subscribed to. The default
+    /// reads MSC4143's body; a dialect overriding it reads its own, and should
+    /// call [`super::parse_msc_key`] for anything it does not.
+    fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
+        super::parse_msc_key(message)
     }
 }

@@ -213,12 +213,28 @@ fn a_legacy_key_is_bound_in_the_mode_its_room_was_opened_in() {
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEVICE".to_owned()), None),
     };
-    let key_in = |mode: MembershipFormat| {
-        parse_key_message(|_| Some(Arc::new(mode)), message.clone()).expect("a key")
+    let key_in = |mode: MembershipFormat, message: &ToDeviceMessageIn| {
+        parse_key_message(|_| Some(Arc::new(mode)), message.clone())
     };
-    assert_eq!(key_in(MembershipFormat::Msc).member_id, "ec-session-uuid");
     assert_eq!(
-        key_in(MembershipFormat::RoomState).member_id,
+        key_in(MembershipFormat::RoomState, &message)
+            .expect("a key")
+            .member_id,
         format!("{BOB}:BOBDEVICE")
     );
+    // Spec 038 R14, R35: the same type carries both bodies, and a room reads
+    // only its own format's.
+    assert!(key_in(MembershipFormat::Msc, &message).is_none());
+
+    let msc = ToDeviceMessageIn {
+        content: json!({
+            "room_id": ROOM,
+            "member_id": "bob-1",
+            "media_key": { "index": 3, "key": "a2V5" },
+        }),
+        ..message
+    };
+    let key = key_in(MembershipFormat::Msc, &msc).expect("an MSC key");
+    assert_eq!((key.member_id.as_str(), key.key_index), ("bob-1", 3));
+    assert!(key_in(MembershipFormat::RoomState, &msc).is_none());
 }

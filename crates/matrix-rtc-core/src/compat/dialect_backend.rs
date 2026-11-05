@@ -451,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             mock.last_to_device_message().unwrap().2,
-            "org.matrix.msc4143.rtc.encryption_key"
+            "io.element.call.encryption_keys"
         );
     }
 
@@ -520,20 +520,15 @@ mod tests {
                 .unwrap();
         }
 
-        let types: Vec<String> = mock
-            .to_device_messages
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, _, message_type, _)| message_type.clone())
-            .collect();
-        assert_eq!(
-            types,
-            [
-                "io.element.call.encryption_keys",
-                "org.matrix.msc4143.rtc.encryption_key",
-            ]
+        // One type on the wire for both (spec 038 R14, R35); the body is the
+        // room's format's.
+        let sent = mock.to_device_messages.lock().unwrap().clone();
+        assert!(
+            sent.iter()
+                .all(|(_, _, message_type, _)| message_type == "io.element.call.encryption_keys")
         );
+        assert!(sent[0].3.get("keys").is_some(), "Element Call's shape");
+        assert!(sent[1].3.get("media_key").is_some(), "MSC4143's shape");
     }
 
     /// The pre-sticky delayed leave is a delayed state event: the wrapper

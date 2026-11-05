@@ -258,11 +258,20 @@ use crate::transport::RtcTransport;
 
 /// Message type for to-device encryption key distribution (MSC4143).
 ///
-/// - Stable: `m.rtc.encryption_key`
-/// - Unstable: `org.matrix.msc4143.rtc.encryption_key`
-///
-/// We use the unstable prefix for now as MSC4143 is still in draft.
-pub const KEY_MESSAGE_TYPE: &str = "org.matrix.msc4143.rtc.encryption_key";
+/// The stable id, as the core speaks everywhere; [`crate::wire_event_type`]
+/// maps it to the unstable `io.element.call.encryption_keys` MSC4143 names, the
+/// same type Element Call's legacy key shape travels under.
+pub const KEY_MESSAGE_TYPE: &str = "m.rtc.encryption_key";
+
+/// The engine for `media_key.key`: MSC4143 says unpadded base64, so we encode
+/// without padding, and decode with or without it.
+pub(crate) const MEDIA_KEY_BASE64: general_purpose::GeneralPurpose =
+    general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        general_purpose::GeneralPurposeConfig::new()
+            .with_encode_padding(false)
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
 
 /// Trait for handlers that receive key material signals.
 ///
@@ -1257,7 +1266,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // the key and never re-sent to — they could not decrypt us for the rest
         // of the call. Recording only the served recipients makes the next
         // rollout see the rest as newly joined and try again.
-        let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
+        let key_b64 = MEDIA_KEY_BASE64.encode(&outbound_key_to_use.key);
         let served = self
             .send_key_to_participants(&key_b64, outbound_key_to_use.key_index, &to_distribute_to)
             .await;
@@ -1450,7 +1459,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         let served = self
             .deliver_key(
-                &general_purpose::STANDARD.encode(&key),
+                &MEDIA_KEY_BASE64.encode(&key),
                 owed.key_index,
                 std::slice::from_ref(&owed.target),
             )
@@ -1626,8 +1635,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 "index": index,
                 "key": key_b64
             },
-            // MSC4143 `format`: 0 means the raw key bytes, unpadded-base64 encoded.
-            "format": 0
         });
 
         let memberships = (self.get_memberships.lock().unwrap())();
@@ -1848,7 +1855,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// Receives an encryption key from a to-device message.
     ///
     /// This is called when we receive a to-device message with type
-    /// `org.matrix.msc4143.rtc.encryption_key`.
+    /// `m.rtc.encryption_key` (on the wire, `io.element.call.encryption_keys`).
     ///
     /// Keys that fail the MSC4143 checks are discarded, and keys whose member
     /// event has not arrived yet are buffered together with their provenance so
@@ -1899,11 +1906,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             return Ok(());
         }
 
-        let key_bytes = general_purpose::STANDARD
-            .decode(&received.key_b64)
-            .map_err(|e| {
-                CommandError::SerializationError(format!("Failed to decode key: {}", e))
-            })?;
+        let key_bytes = MEDIA_KEY_BASE64.decode(&received.key_b64).map_err(|e| {
+            CommandError::SerializationError(format!("Failed to decode key: {}", e))
+        })?;
 
         if key_bytes.len() != 32 {
             log::warn!(
@@ -3582,7 +3587,7 @@ mod tests {
     /// The to-device payload states its encoding in `format`, which MSC4143
     /// defines as a number; `0` is raw bytes, base64 encoded.
     #[tokio::test]
-    async fn distributed_key_declares_msc4143_format() {
+    async fn distributed_key_has_exactly_the_msc_fields_and_an_unpadded_key() {
         let sender = Arc::new(MockBackend::new());
         let manager = EncryptionManager::new(
             sender.clone(),
@@ -3598,9 +3603,19 @@ mod tests {
         manager.on_memberships_update().await.unwrap();
 
         let messages = sender.to_device_messages.lock().unwrap();
-        let (_, _, _, content) = messages.first().expect("a key should have been sent");
-        assert_eq!(content.get("format").and_then(|v| v.as_u64()), Some(0));
-        assert!(content.get("version").is_none());
+        let (_, _, message_type, content) = messages.first().expect("a key should have been sent");
+        assert_eq!(message_type, KEY_MESSAGE_TYPE);
+        let mut fields: Vec<&str> = content
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort();
+        assert_eq!(fields, ["media_key", "member_id", "room_id"]);
+        let key = content.pointer("/media_key/key").unwrap().as_str().unwrap();
+        assert!(!key.ends_with('='), "MSC4143 media keys are unpadded");
+        assert_eq!(MEDIA_KEY_BASE64.decode(key).unwrap().len(), 32);
     }
 
     #[tokio::test]

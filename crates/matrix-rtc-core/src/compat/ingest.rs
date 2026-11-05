@@ -369,8 +369,8 @@ pub fn parse_legacy_key(
 
 /// How the core's feeder reads a room in each mode: every member event through
 /// [`to_core_member_event`] (strict in MSC, normalised in room-state), the
-/// pre-sticky membership state in [`MembershipFormat::RoomState`], and legacy
-/// media keys in every mode.
+/// pre-sticky membership state in [`MembershipFormat::RoomState`], and each
+/// format's own media key body.
 impl IngestDialect for MembershipFormat {
     fn membership_state_event_types(&self) -> Vec<String> {
         if self.reads_state_membership() {
@@ -402,7 +402,12 @@ impl IngestDialect for MembershipFormat {
         )
     }
 
+    /// MSC rooms read MSC4143's key body and room-state rooms Element Call's,
+    /// never the other: both travel under the same type (spec 038 R14, R35).
     fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
+        if *self == MembershipFormat::Msc {
+            return crate::feeder::parse_msc_key(message);
+        }
         let key = parse_legacy_key(
             *self,
             &message.sender,

@@ -703,7 +703,9 @@ async fn an_expired_key_is_rotated_at_its_deadline_with_nobody_ticking() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, _, event_type, _)| event_type == KEY_MESSAGE_TYPE)
+            .filter(|(_, _, event_type, _)| {
+                event_type == matrix_rtc_core::wire_event_type(KEY_MESSAGE_TYPE)
+            })
             .count()
     };
     let mock = mock();

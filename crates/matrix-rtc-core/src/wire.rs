@@ -30,7 +30,9 @@ pub fn wire_event_type(event_type: &str) -> &str {
     match event_type {
         "m.rtc.member" => "org.matrix.msc4143.rtc.member",
         "m.rtc.slot" => "org.matrix.msc4143.rtc.slot",
-        "m.rtc.encryption_key" => "org.matrix.msc4143.rtc.encryption_key",
+        // MSC4143 names Element Call's key type as the unstable id, so the
+        // room-state format's legacy key shape travels under the same type.
+        "m.rtc.encryption_key" => "io.element.call.encryption_keys",
         "m.rtc.notification" => "org.matrix.msc4075.rtc.notification",
         other => other,
     }
@@ -56,8 +58,10 @@ mod tests {
             wire_event_type("m.rtc.notification"),
             "org.matrix.msc4075.rtc.notification"
         );
-        // Already unstable in the core; must survive a round through the table.
-        assert_eq!(wire_event_type(KEY_MESSAGE_TYPE), KEY_MESSAGE_TYPE);
+        assert_eq!(
+            wire_event_type(KEY_MESSAGE_TYPE),
+            "io.element.call.encryption_keys"
+        );
     }
 
     #[test]

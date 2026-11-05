@@ -13,6 +13,7 @@ log only.
 - In the MSC format a member event is read exactly as MSC4143 states it: Element Call's 2025 sticky content and self-claimed devices are only read in the room-state format (038).
 - In an encrypted room a member is joined only if decryption names the device that sent their member event; `EventOrigin::Unknown` is removed (038).
 - A join whose slot id breaks MSC4143's grammar or 255-byte limit fails with `JoinError::InvalidSlotId`, and a member of another application is not joined to a slot (038).
+- MSC media keys go out as `io.element.call.encryption_keys` with exactly `room_id`, `member_id` and an unpadded `media_key`, and each room reads only its own format's key body (038).
 
 ### Added
 
