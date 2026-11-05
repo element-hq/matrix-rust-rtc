@@ -74,8 +74,8 @@ pub use slot::{
     RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus, validate_slot_id,
 };
 pub use transport::{
-    LiveKitAuthFlow, LiveKitTransport, MIN_MEDIA_KEY_LEN, MemberTransports, RawRtcTransport,
-    RtcTransport, UnsupportedTransport, server_name_of,
+    LEGACY_LIVEKIT_TYPE, LiveKitAuthFlow, LiveKitTransport, MIN_MEDIA_KEY_LEN, MSC_LIVEKIT_TYPE,
+    MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport, server_name_of,
 };
 pub use wire::wire_event_type;
 
@@ -197,7 +197,7 @@ mod tests {
         member_id: &str,
     ) -> String {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://example.com/jwt".to_owned()),
+            LiveKitTransport::sfu("wss://sfu.example.com"),
         ));
         params.membership_id = Some(member_id.to_owned());
         room.join(params).await.expect("join should succeed")
@@ -715,19 +715,19 @@ mod tests {
             let on = |focus: &str, event_id: &str| {
                 let mut event = member("@bob:x", "bob", event_id);
                 event.content.transports = Some(MemberTransports::publishing(RawRtcTransport {
-                    transport_type: "livekit".to_owned(),
-                    extra_fields: [("livekit_service_url".to_owned(), focus.into())].into(),
+                    transport_type: "m.livekit".to_owned(),
+                    extra_fields: [("url".to_owned(), focus.into())].into(),
                 }));
                 event
             };
             let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
-            room.set_current_sticky_state(vec![on("https://a", "$b1")])
+            room.set_current_sticky_state(vec![on("wss://a", "$b1")])
                 .await
                 .unwrap();
             let mut snapshots = room.subscribe_membership_snapshots(SLOT).unwrap();
             snapshots.mark_unchanged();
 
-            room.set_current_sticky_state(vec![on("https://b", "$b2")])
+            room.set_current_sticky_state(vec![on("wss://b", "$b2")])
                 .await
                 .unwrap();
             let snapshot = snapshots.borrow_and_update().clone();
@@ -735,9 +735,7 @@ mod tests {
             assert_eq!(snapshot[0].member_id, "bob");
             assert_eq!(
                 snapshot[0].transports,
-                [RtcTransport::LiveKit(LiveKitTransport::service(
-                    "https://b".to_owned()
-                ))]
+                [RtcTransport::LiveKit(LiveKitTransport::sfu("wss://b"))]
             );
             assert_eq!(room.hold_expires_at(), None, "nothing held");
         }
@@ -1261,7 +1259,7 @@ mod tests {
         join_as(&mut room, "alice-a").await;
 
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://example.com/jwt".to_owned()),
+            LiveKitTransport::sfu("wss://sfu.example.com"),
         ));
         params.membership_id = Some("alice-b".to_owned());
 
@@ -1750,8 +1748,8 @@ mod tests {
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, backend.clone());
         let params = JoinSessionParams::application("m.call")
             .slot("ROOM")
-            .transport(RtcTransport::LiveKit(LiveKitTransport::service(
-                "https://example.com/jwt".to_owned(),
+            .transport(RtcTransport::LiveKit(LiveKitTransport::sfu(
+                "wss://sfu.example.com",
             )));
 
         assert!(matches!(
@@ -1901,7 +1899,7 @@ mod tests {
         local_manage_media_keys: bool,
     ) {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://example.com/jwt".to_owned()),
+            LiveKitTransport::sfu("wss://sfu.example.com"),
         ));
         params.membership_id = Some("alice-a".to_owned());
         params.encryption_config = Some(EncryptionConfig {
@@ -1976,24 +1974,26 @@ mod tests {
         let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
+        // Both fields advertised: MSC publishes by the `url` alone (spec 038
+        // R17).
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://sfu.example.com/jwt".to_owned()),
+            LiveKitTransport::new(
+                Some("wss://sfu.example.com".to_owned()),
+                Some("https://sfu.example.com/jwt".to_owned()),
+                None,
+            )
+            .unwrap(),
         ));
         room.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
         let (_, _, content, _) = sticky.first().expect("a join should have been sent");
         assert_eq!(
-            content
-                .pointer("/transports/published/0/livekit_service_url")
-                .and_then(|v| v.as_str()),
-            Some("https://sfu.example.com/jwt")
-        );
-        assert_eq!(
-            content
-                .pointer("/transports/can_subscribe/0")
-                .and_then(|v| v.as_str()),
-            Some("livekit")
+            content["transports"],
+            serde_json::json!({
+                "published": [{ "type": "m.livekit", "url": "wss://sfu.example.com" }],
+                "can_subscribe": ["m.livekit"],
+            })
         );
     }
 
@@ -2004,8 +2004,8 @@ mod tests {
 
         let mut extra_fields = BTreeMap::new();
         extra_fields.insert(
-            "livekit_service_url".to_owned(),
-            serde_json::Value::String("https://example.com/livekit/jwt".to_owned()),
+            "url".to_owned(),
+            serde_json::Value::String("wss://sfu.example.com".to_owned()),
         );
 
         let event = RawStickyEvent {
@@ -2027,7 +2027,7 @@ mod tests {
                     membership: Some(Membership::Join),
                 },
                 transports: Some(MemberTransports::publishing(RawRtcTransport {
-                    transport_type: "livekit".to_owned(),
+                    transport_type: "m.livekit".to_owned(),
                     extra_fields,
                 })),
                 leave_reason: None,
@@ -2042,10 +2042,7 @@ mod tests {
                 assert_eq!(joined.transports.len(), 1);
                 match &joined.transports[0] {
                     RtcTransport::LiveKit(livekit) => {
-                        assert_eq!(
-                            livekit.livekit_service_url(),
-                            Some("https://example.com/livekit/jwt")
-                        );
+                        assert_eq!(livekit.url(), Some("wss://sfu.example.com"));
                     }
                     RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),
                 }

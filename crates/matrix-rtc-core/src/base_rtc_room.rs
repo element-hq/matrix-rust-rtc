@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, watch};
 
+use crate::compat::MembershipFormat;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
@@ -46,6 +47,9 @@ pub struct BaseRtcRoom<T: MatrixBackend> {
     /// Whether the room's `m.rtc.slot` state has been supplied. Once it has, a
     /// slot with no entry in `slots` is closed, as opposed to unknown.
     slot_state_known: bool,
+    /// How this room's memberships are read and ours written; the MSC
+    /// format unless the client opened the room otherwise.
+    format: MembershipFormat,
     /// Users joined to the room, when the host supplies them.
     room_members: Option<HashSet<String>>,
     room_encryption: Option<RoomEncryption>,
@@ -64,6 +68,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             backend: None,
             slots: HashMap::new(),
             slot_state_known: false,
+            format: MembershipFormat::Msc,
             room_members: None,
             room_encryption: None,
             membership_listeners: MembershipListeners::default(),
@@ -89,6 +94,15 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         let mut room = Self::new(room_id);
         room.backend = Some(backend);
         room
+    }
+
+    /// Sets the format this room's memberships are read and written in, as
+    /// the client opens it; before any join.
+    pub fn set_format(&mut self, format: MembershipFormat) {
+        self.format = format;
+        for session in self.sessions.values_mut() {
+            session.set_format(format);
+        }
     }
 
     /// The room this object is scoped to.
@@ -821,6 +835,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         let backend = self.backend.clone();
         let outbox = self.outbox.clone();
         let room_id = self.room_id.clone();
+        let format = self.format;
         let membership_scope = MembershipScope {
             slot_id: slot_id.to_owned(),
             listeners: self.membership_listeners.clone(),
@@ -846,6 +861,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
                 session.seed_room_members(room_members);
             }
             session.seed_room_encryption(encryption);
+            session.set_format(format);
             session
         })
     }
@@ -854,7 +870,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         &self,
         event: RawStickyEvent,
     ) -> Result<Option<RtcMembershipEvent>, EventConversionError> {
-        match event.try_into_membership_event() {
+        match event.try_into_membership_event_in(self.format) {
             Ok(event) => Ok(Some(event)),
             // Not an RTC member event at all — the host feeds us its whole
             // sticky map, so this is routine.

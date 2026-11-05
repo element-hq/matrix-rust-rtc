@@ -181,6 +181,8 @@ where
         let format = options.format;
         let shared = &self.shared;
         let _opening = shared.opening.lock().await;
+        // Before the feed: memberships are read, and ours written, in it.
+        room.lock().await.rtc().set_format(format);
 
         let needs_to_device = {
             let to_device = shared.to_device();

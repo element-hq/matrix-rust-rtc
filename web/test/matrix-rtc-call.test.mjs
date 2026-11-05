@@ -21,7 +21,7 @@ const APPLICATION_SLOT_ID = 'call';
 const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@me:example.org';
 const DEVICE_ID = 'MYDEVICE';
-const OWN_FOCUS = 'https://rtc.example.org/livekit/jwt';
+const OWN_FOCUS = 'wss://sfu.example.org';
 
 // --- a livekit-client stand-in -------------------------------------------
 
@@ -121,7 +121,7 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
 
     const rtcCall = await rtcRoom.joinCall({
       application_slot_id: APPLICATION_SLOT_ID,
-      transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
+      transport: { kind: 'publish', url: OWN_FOCUS },
     });
     const memberId = rtcCall.memberId;
     // The sticky set as the server echoes it: ourselves plus one peer.
@@ -161,7 +161,8 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     expect(instances).toHaveLength(1);
     const room = instances[0];
     expect(room.url).toBe('wss://sfu.example.org');
-    expect(room.token).toBe('the-jwt');
+    // The homeserver's `get_token` (spec 038 R20).
+    expect(room.token).toBe('jwt-for-wss://sfu.example.org');
     // The room's encryption is off, so the media is not (spec 038 R11).
     expect(room.options.e2ee).toBeUndefined();
 
@@ -217,7 +218,7 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     const rtcRoom = await client.room(ROOM_ID, undefined);
     const rtcCall = await rtcRoom.joinCall({
       application_slot_id: APPLICATION_SLOT_ID,
-      transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
+      transport: { kind: 'publish', url: OWN_FOCUS },
     });
     host._sink(ROOM_ID).onStickyEvents([
       memberEventIn({

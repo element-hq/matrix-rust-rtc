@@ -83,7 +83,7 @@ fn member_event(
 
 fn join_params() -> JoinSessionParams {
     JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-        LiveKitTransport::service("https://sfu.example.org".to_owned()),
+        LiveKitTransport::sfu("wss://sfu.example.org"),
     ))
 }
 

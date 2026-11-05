@@ -1280,7 +1280,7 @@ mod tests {
         };
 
         let joined = match event
-            .try_into_membership_event()
+            .try_into_membership_event_in(crate::compat::MembershipFormat::RoomState)
             .expect("converts to a membership event")
         {
             RtcMembershipEvent::Joined(joined) => joined,

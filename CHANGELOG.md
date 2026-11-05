@@ -17,6 +17,7 @@ log only.
 - An MSC room drops a media key shorter than 32 bytes (room-state rooms still take 16), and the web `connect` config no longer takes `keyRingSize` (038).
 
 - `ConnectionContext` carries `e2ee`, and the web delegate's `connect` request an `e2ee` flag that, not the page's `roomOptions.e2ee`, decides frame encryption (038).
+- In the MSC format a call publishes on the homeserver's first `m.livekit` transport, written `{type: "m.livekit", url}`, and counts a peer's media only on `m.livekit` with a `url`, every token coming from the homeserver; `transports::choose`/`resolve` and `transport_to_json` take the room's format (038).
 
 ### Fixed
 

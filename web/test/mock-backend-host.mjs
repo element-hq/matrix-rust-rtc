@@ -38,8 +38,8 @@ export function memberEventIn({ sender, deviceId, memberId, slotId, focus, event
       application: { type: 'm.call' },
       member: { id: memberId, membership: 'join' },
       transports: {
-        published: [{ type: 'livekit', livekit_service_url: focus }],
-        can_subscribe: ['livekit'],
+        published: [{ type: 'm.livekit', url: focus }],
+        can_subscribe: ['m.livekit'],
       },
     },
     encryption: { kind: 'encrypted', sender_device_id: deviceId, sender_confirmed: true },

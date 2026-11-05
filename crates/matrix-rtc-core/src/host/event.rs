@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::compat::MembershipFormat;
 use crate::session::{
     ApplicationInfo, JoinedMembership, LeaveReason, LeftMembership, MemberInfo, Membership,
     RtcMembershipEvent,
@@ -300,6 +301,15 @@ impl RawStickyEvent {
     /// still being joined to the room, and the event still being sticky) depend
     /// on state this layer does not see; they are applied by the session.
     pub fn try_into_membership_event(self) -> Result<RtcMembershipEvent, EventConversionError> {
+        self.try_into_membership_event_in(MembershipFormat::Msc)
+    }
+
+    /// [`Self::try_into_membership_event`], reading the member's transports
+    /// the way a room in `format` does ([`crate::RawRtcTransport::into_typed_in`]).
+    pub fn try_into_membership_event_in(
+        self,
+        format: MembershipFormat,
+    ) -> Result<RtcMembershipEvent, EventConversionError> {
         self.check_convertible()?;
 
         let member_id = self.content.member.id.clone();
@@ -342,7 +352,7 @@ impl RawStickyEvent {
             transports: transports
                 .published
                 .into_iter()
-                .map(|t| t.into_typed())
+                .map(|t| t.into_typed_in(format))
                 .collect(),
             can_subscribe: transports.can_subscribe,
         }))
@@ -441,9 +451,9 @@ mod tests {
         "application": { "type": "m.call", "m.call.voice_only": true },
         "transports": {
             "published": [
-                { "type": "livekit", "livekit_service_url": "https://sfu.example.com/jwt" }
+                { "type": "m.livekit", "url": "wss://sfu.example.com" }
             ],
-            "can_subscribe": ["livekit"]
+            "can_subscribe": ["m.livekit"]
         },
         "msc4354_sticky_key": "xyzABCDEF0123"
     }"#;
@@ -506,14 +516,11 @@ mod tests {
                     joined.application.extra.get("m.call.voice_only"),
                     Some(&serde_json::json!(true)),
                 );
-                assert_eq!(joined.can_subscribe, vec!["livekit".to_owned()]);
+                assert_eq!(joined.can_subscribe, vec!["m.livekit".to_owned()]);
                 assert_eq!(joined.origin.sender_device_id(), Some("DEVICEID"));
                 match &joined.transports[..] {
                     [RtcTransport::LiveKit(livekit)] => {
-                        assert_eq!(
-                            livekit.livekit_service_url(),
-                            Some("https://sfu.example.com/jwt")
-                        );
+                        assert_eq!(livekit.url(), Some("wss://sfu.example.com"));
                     }
                     other => panic!("expected one livekit transport, got {other:?}"),
                 }

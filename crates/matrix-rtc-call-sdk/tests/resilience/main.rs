@@ -209,7 +209,8 @@ async fn own_sfu_loss_with_fallback() {
     let republished = call.sticky_sends().last().cloned().unwrap();
     assert_eq!(
         republished["transports"]["published"],
-        json!([{ "type": "livekit", "livekit_service_url": SFU_B }])
+        // Named with the server of the member whose SFU it is (R23).
+        json!([{ "type": "m.livekit", "url": SFU_B, "server_name": "example.org" }])
     );
     assert_eq!(republished["member"], member, "same member id");
 

@@ -22,8 +22,8 @@ const APPLICATION_SLOT_ID = 'call';
 const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@me:example.org';
 const DEVICE_ID = 'MYDEVICE';
-const OWN_FOCUS = 'https://rtc.example.org/livekit/jwt';
-const PEER_FOCUS = 'https://rtc.othersite.org/livekit/jwt';
+const OWN_FOCUS = 'wss://sfu.example.org';
+const PEER_FOCUS = 'wss://sfu.othersite.org';
 
 // Stands in for the livekit-js half: resolves token fetches with a canned SFU
 // token, records connects and hands their sinks back to the test, and counts
@@ -84,8 +84,8 @@ async function waitFor(probe, description, attempts = 100) {
   throw new Error(`timed out waiting for ${description}`);
 }
 
-// The pool's key for a focus reached through the legacy JWT service.
-const sfuGetKey = (serviceUrl) => JSON.stringify({ flow: 'sfu_get', service_url: serviceUrl });
+// The pool's key for an SFU reached through the homeserver's `get_token`.
+const csApiKey = (url, serverName) => JSON.stringify({ flow: 'cs_api', url, server_name: serverName });
 
 describe('web media roster over a fake transport delegate', () => {
   it('reconciles memberships, foci, and sink events into the roster', async () => {
@@ -107,7 +107,7 @@ describe('web media roster over a fake transport delegate', () => {
     // ourselves, plus one peer on our focus and one on a second focus.
     const call = await room.joinCall({
       application_slot_id: APPLICATION_SLOT_ID,
-      transport: { kind: 'publish', livekit_service_url: OWN_FOCUS },
+      transport: { kind: 'publish', url: OWN_FOCUS },
     });
     const memberId = call.memberId;
     host._sink(ROOM_ID).onStickyEvents([
@@ -135,31 +135,31 @@ describe('web media roster over a fake transport delegate', () => {
     // the delegate fetched. (No ordering with the pooled connect below: the
     // engine starts reconciling the moment it exists.)
     // `connectMedia` does not wait for it (034 R24).
+    const ownKey = csApiKey(OWN_FOCUS, 'example.org');
     const ownConnect = await waitFor(
-      () => log.connects.find((c) => c.connectionKey === sfuGetKey(OWN_FOCUS)),
+      () => log.connects.find((c) => c.connectionKey === ownKey),
       'the own focus connected',
     );
+    // Every token comes from the homeserver's `get_token` (spec 038 R20).
     expect(ownConnect).toEqual({
-      connectionKey: sfuGetKey(OWN_FOCUS),
-      sfuUrl: 'wss://sfu.example.org',
-      jwt: 'the-jwt',
+      connectionKey: ownKey,
+      sfuUrl: OWN_FOCUS,
+      jwt: `jwt-for-${OWN_FOCUS}`,
       // A clear room: no frame encryption (spec 038 R11).
       e2ee: false,
     });
-    // A transport naming the JWT service gets its token from `/sfu/get`.
-    const ownTokenRequest = log.tokenRequests.find((r) => r.url === `${OWN_FOCUS}/sfu/get`);
-    expect(ownTokenRequest.body.device_id).toBe(DEVICE_ID);
+    expect(log.tokenRequests).toEqual([]);
 
     // The second focus is the engine's to open: one pooled connection for the
-    // far member, keyed by its livekit_service_url.
+    // far member, keyed by its SFU and that SFU's server (R21).
     await waitFor(
-      () => log.connects.some((c) => c.connectionKey === sfuGetKey(PEER_FOCUS)),
+      () => log.connects.some((c) => c.connectionKey === csApiKey(PEER_FOCUS, 'othersite.org')),
       'the peer-focus connection',
     );
     expect(log.connects.length).toBe(2);
 
-    // Roster: signalling truth, each entry carrying the identity `/sfu/get`
-    // minted for it.
+    // Roster: signalling truth, each entry carrying the MSC4195 identity
+    // `hash([sender, member.id])` (spec 038 R22).
     const roster = await waitFor(() => {
       const participants = session.participants();
       return participants.length === 3 ? participants : null;
@@ -171,8 +171,9 @@ describe('web media roster over a fake transport delegate', () => {
     expect(peer.is_local).toBe(false);
     expect(peer.connection).toBe('connected');
     expect(peer.unable_to_decrypt ?? null).toBe(null);
-    expect(peer.rtc_identity).toBe('@peer:example.org:PEERDEVICE');
-    expect(me.rtc_identity).toBe(`${USER_ID}:${DEVICE_ID}`);
+    expect(peer.rtc_identity).not.toBe('@peer:example.org:PEERDEVICE');
+    expect(peer.rtc_identity).toMatch(/^[A-Za-z0-9+/]{43}$/);
+    expect(me.rtc_identity).toMatch(/^[A-Za-z0-9+/]{43}$/);
 
     // Media arriving through the sink attaches to the signalled entry.
     const sink = log.sinks[0];

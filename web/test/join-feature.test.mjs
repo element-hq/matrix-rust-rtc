@@ -16,7 +16,7 @@ const APPLICATION_SLOT_ID = 'test';
 const SLOT_ID = `m.call#${APPLICATION_SLOT_ID}`;
 const USER_ID = '@alice:example.org';
 const DEVICE_ID = 'device123';
-const SFU = 'https://example.com/livekit/jwt';
+const SFU = 'wss://sfu.example.com';
 
 // Helper function to get values from wasm-bindgen serialized content (Map, string, or object)
 function getContentValue(content, key) {
@@ -32,7 +32,7 @@ function getContentValue(content, key) {
 
 const joinParams = {
   application_slot_id: APPLICATION_SLOT_ID,
-  transport: { kind: 'publish', livekit_service_url: SFU },
+  transport: { kind: 'publish', url: SFU },
 };
 
 describe('WASM bindings with a mock backend host', () => {
@@ -49,7 +49,7 @@ describe('WASM bindings with a mock backend host', () => {
       userId: USER_ID,
       deviceId: DEVICE_ID,
       slots: [openSlotEvent(SLOT_ID)],
-      transports: [{ type: 'livekit', livekit_service_url: SFU }],
+      transports: [{ type: 'm.livekit', url: SFU }],
     });
   });
 
@@ -96,7 +96,7 @@ describe('WASM bindings with a mock backend host', () => {
       expect(getContentValue(getContentValue(content, 'member'), 'membership')).toBe('join');
       // The transport came from the backend.
       const transports = getContentValue(content, 'transports');
-      expect(getContentValue(getContentValue(transports, 'published')[0], 'livekit_service_url')).toBe(SFU);
+      expect(getContentValue(transports, 'published')[0]).toEqual({ type: 'm.livekit', url: SFU });
 
       // The dead man's switch, armed by the join.
       const delayedEvents = host._getDelayedEvents();

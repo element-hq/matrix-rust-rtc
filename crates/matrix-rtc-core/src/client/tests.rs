@@ -79,7 +79,7 @@ fn mock() -> Arc<MockBackend> {
 /// Who joins is the backend's account; the transport is the host's choice.
 fn join_params() -> JoinSessionParams {
     JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-        LiveKitTransport::service("https://sfu.example.org".to_owned()),
+        LiveKitTransport::sfu("wss://sfu.example.org"),
     ))
 }
 

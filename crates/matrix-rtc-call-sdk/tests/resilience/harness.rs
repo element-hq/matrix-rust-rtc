@@ -25,9 +25,9 @@ use tokio::sync::broadcast;
 pub const ROOM: &str = "!room:example.org";
 pub const SLOT: &str = "m.call#room";
 /// Our own SFU.
-pub const SFU_A: &str = "https://sfu-a.example.org";
+pub const SFU_A: &str = "wss://sfu-a.example.org";
 /// Another member's SFU.
-pub const SFU_B: &str = "https://sfu-b.example.org";
+pub const SFU_B: &str = "wss://sfu-b.example.org";
 
 /// Another member of the call.
 #[derive(Clone, Copy)]
@@ -81,8 +81,7 @@ pub struct Call {
 /// homeserver echoes it.
 pub async fn start(peers: &[Peer], own_sfu_down: bool, sfu_fallback: bool) -> Call {
     let mock = Arc::new(MockBackend::new());
-    *mock.transports.lock().unwrap() =
-        Ok(json!([{ "type": "livekit", "livekit_service_url": SFU_A }]));
+    *mock.transports.lock().unwrap() = Ok(json!([{ "type": "m.livekit", "url": SFU_A }]));
     // Every deadline of the join is read from this clock: paused time moves it.
     let origin = tokio::time::Instant::now();
     let client = RtcClient::with_outbox(
@@ -269,8 +268,8 @@ fn peer_event(entry: &Entry, ts: u64) -> EventIn {
                 "member": { "id": peer.member_id, "membership": "join" },
                 "application": { "type": "m.call" },
                 "transports": {
-                    "published": [{ "type": "livekit", "livekit_service_url": peer.focus }],
-                    "can_subscribe": ["livekit"],
+                    "published": [{ "type": "m.livekit", "url": peer.focus }],
+                    "can_subscribe": ["m.livekit"],
                 },
             }),
         ),

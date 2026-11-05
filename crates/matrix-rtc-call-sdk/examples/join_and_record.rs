@@ -187,7 +187,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         &room,
         LiveKitCallOptions {
             slot_id,
-            livekit_transport: Some(LiveKitTransport::service(livekit_service_url)),
+            // Pinned in room-state only: MSC publishes on the homeserver's
+            // `m.livekit` SFU, never a JWT service (spec 038 R17).
+            livekit_transport: (format == MembershipFormat::RoomState)
+                .then(|| LiveKitTransport::service(livekit_service_url)),
             http: Some(http),
             format,
             ..LiveKitCallOptions::default()

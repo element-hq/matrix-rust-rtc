@@ -24,8 +24,8 @@ use matrix_rtc_transport::{ConnectionEvent, FrameKeyRing, TransportConnection};
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "m.call#room";
 const BOB: &str = "@bob:example.org";
-const FOCUS: &str = "https://sfu.example.org";
-const PEER_FOCUS: &str = "https://sfu-b.example.org";
+const FOCUS: &str = "wss://sfu.example.org";
+const PEER_FOCUS: &str = "wss://sfu-b.example.org";
 
 /// Not the default derivation, so a key imported under the raw `member_id`
 /// fallback (the mapper installed too late) shows.
@@ -171,7 +171,7 @@ impl MediaTransport for FakeTransport {
 
     fn connection_key(&self, transport: &RtcTransport, _publisher_user_id: &str) -> Option<String> {
         match transport {
-            RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(str::to_owned),
+            RtcTransport::LiveKit(livekit) => livekit.url().map(str::to_owned),
             RtcTransport::Unsupported(_) => None,
         }
     }
@@ -269,7 +269,7 @@ async fn open_with_bob_on(
             "msc4354_sticky_key": "bob-1",
             "member": { "id": "bob-1", "membership": "join" },
             "application": { "type": "m.call" },
-            "transports": { "published": [{ "type": "livekit", "livekit_service_url": bob_focus }] },
+            "transports": { "published": [{ "type": "m.livekit", "url": bob_focus }] },
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
     }]);
@@ -292,8 +292,7 @@ fn bob_key() -> ToDeviceMessageIn {
 
 fn mock() -> Arc<MockBackend> {
     let mock = Arc::new(MockBackend::new());
-    *mock.transports.lock().unwrap() =
-        Ok(json!([{ "type": "livekit", "livekit_service_url": FOCUS }]));
+    *mock.transports.lock().unwrap() = Ok(json!([{ "type": "m.livekit", "url": FOCUS }]));
     mock
 }
 
@@ -643,7 +642,7 @@ async fn own_sfu_loss_with_fallback_republishes_our_membership_on_the_peer_focus
     let (_, _, content, _) = mock.last_sticky_event().expect("republished");
     assert_eq!(
         content["transports"]["published"],
-        json!([{ "type": "livekit", "livekit_service_url": PEER_FOCUS }])
+        json!([{ "type": "m.livekit", "url": PEER_FOCUS, "server_name": "example.org" }])
     );
     assert_eq!(content["member"]["id"], json!(member_id));
     assert_eq!(content["member"]["membership"], "join");

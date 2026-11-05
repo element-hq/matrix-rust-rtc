@@ -29,7 +29,12 @@ fn offline() -> MockOutcome {
 fn mock() -> Arc<MockBackend> {
     let mock = Arc::new(MockBackend::new());
     *mock.transports.lock().unwrap() =
-        Ok(json!([{ "type": "livekit", "livekit_service_url": "https://sfu.example.org" }]));
+        // A homeserver in transition: the MSC transport, and the legacy one
+        // the room-state format publishes on.
+        Ok(json!([
+            { "type": "m.livekit", "url": "wss://sfu.example.org" },
+            { "type": "livekit", "livekit_service_url": "https://sfu.example.org" },
+        ]));
     mock
 }
 
@@ -820,7 +825,7 @@ async fn a_call_knows_the_transport_its_join_resolved() {
     assert!(matches!(
         call.transport(),
         TransportIntent::Publish(matrix_rtc_core::RtcTransport::LiveKit(livekit))
-            if livekit.livekit_service_url() == Some("https://sfu.example.org")
+            if livekit.url() == Some("wss://sfu.example.org")
     ));
     call.leave(LeaveSessionParams::new()).await.expect("leave");
 

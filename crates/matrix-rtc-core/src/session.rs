@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
+use crate::compat::MembershipFormat;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
@@ -26,7 +27,7 @@ use crate::membership_listener::MembershipScope;
 use crate::outbox::Outbox;
 use crate::own_membership::{MembershipTimings, OwnEntry, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
-use crate::transport::{MemberTransports, RtcTransport};
+use crate::transport::{LiveKitTransport, MemberTransports, RtcTransport};
 use crate::upkeep::{self, SessionUpkeep};
 
 #[allow(unused_imports)]
@@ -178,6 +179,8 @@ pub struct SlotSession<T: MatrixBackend> {
     /// Whether the room is encrypted, which decides whether member events are
     /// required to be encrypted.
     room_encryption: RoomEncryption,
+    /// How our membership is written: its transport's type and fields.
+    format: MembershipFormat,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Announces every leave this session makes without the host asking. See
     /// [`SlotSession::subscribe_auto_leaves`].
@@ -218,6 +221,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             slot: self.slot.clone(),
             room_members: self.room_members.clone(),
             room_encryption: self.room_encryption,
+            format: self.format,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             auto_leaves_tx: self.auto_leaves_tx.clone(),
             backend: self.backend.clone(),
@@ -255,6 +259,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             slot: SlotKnowledge::default(),
             room_members: None,
             room_encryption: RoomEncryption::default(),
+            format: MembershipFormat::Msc,
             membership_snapshots_tx,
             auto_leaves_tx: broadcast::channel(AUTO_LEAVES_CAPACITY).0,
             backend,
@@ -458,10 +463,35 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         let membership_id = params.membership_id();
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();
-        let transport = params
+        let transport = match params
             .transport
             .clone()
-            .expect("validate() refuses a join without a transport");
+            .expect("validate() refuses a join without a transport")
+        {
+            // MSC publishes on an SFU `url`, and every token for it comes from
+            // the homeserver: a `livekit_service_url` alongside is not ours to
+            // use (spec 038 R17, R20, R22).
+            TransportIntent::Publish(RtcTransport::LiveKit(livekit))
+                if self.format == MembershipFormat::Msc =>
+            {
+                let Some(url) = livekit.url() else {
+                    log::warn!(
+                        "[{}] the MSC format publishes on an SFU `url`, and {livekit:?} names none",
+                        self.log_tag,
+                    );
+                    return Err(JoinError::InvalidTransport);
+                };
+                TransportIntent::Publish(RtcTransport::LiveKit(
+                    LiveKitTransport::new(
+                        Some(url.to_owned()),
+                        None,
+                        livekit.server_name().map(str::to_owned),
+                    )
+                    .expect("a url names an SFU"),
+                ))
+            }
+            other => other,
+        };
 
         // Check if already joined with this membership
         if self
@@ -480,7 +510,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         let transports = match &transport {
             TransportIntent::Publish(transport) => MemberTransports::publishing(
-                serde_json::from_value(transport_to_json(transport))
+                serde_json::from_value(transport_to_json(transport, self.format))
                     .expect("a transport always serializes to an object with a type"),
             ),
             TransportIntent::ReceiveOnly { can_subscribe } => MemberTransports {
@@ -760,7 +790,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         transport: RtcTransport,
     ) -> Option<impl Future<Output = ()> + use<T>> {
         let machine = self.own_membership_machine.clone()?;
-        Some(async move { machine.republish_transports(&transport).await })
+        let transport = transport_to_json(&transport, self.format);
+        Some(async move { machine.republish_transports(transport).await })
     }
 
     /// Follows [`Self::own_membership_event_id`] for this join, which moves on
@@ -1371,6 +1402,11 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     pub(crate) fn seed_room_members(&mut self, room_members: HashSet<String>) {
         debug_assert!(self.candidates.is_empty(), "seeding a populated session");
         self.room_members = Some(room_members);
+    }
+
+    /// Sets the format our membership is written in.
+    pub(crate) fn set_format(&mut self, format: MembershipFormat) {
+        self.format = format;
     }
 
     /// Sets the room encryption state on a session that has no members yet.

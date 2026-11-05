@@ -526,6 +526,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             &self.outbox,
             &self.room_id,
             chosen,
+            self.format(),
             deadline,
         )
         .await?)
