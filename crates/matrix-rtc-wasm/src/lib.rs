@@ -903,7 +903,8 @@ mod tests {
         set(
             "rtcTransports",
             "",
-            "return Promise.resolve([{ type: 'livekit', livekit_service_url: 'https://sfu.example.org' }]);",
+            "return Promise.resolve([{ type: 'm.livekit', url: 'wss://sfu.example.org' }, \
+                 { type: 'livekit', livekit_service_url: 'https://jwt.example.org' }]);",
         );
         host.into()
     }
