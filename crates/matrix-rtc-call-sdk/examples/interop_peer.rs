@@ -581,9 +581,12 @@ async fn join_call(
         room,
         LiveKitCallOptions {
             slot_id: cfg.slot_id.clone(),
+            // Pinned in room-state only: MSC publishes on the homeserver's
+            // `m.livekit` SFU (spec 038 R17).
             livekit_transport: cfg
                 .livekit_service_url
                 .clone()
+                .filter(|_| cfg.compat == MembershipFormat::RoomState)
                 .map(LiveKitTransport::service),
             http: Some(http.clone()),
             format: cfg.compat,

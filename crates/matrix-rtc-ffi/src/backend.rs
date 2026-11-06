@@ -821,6 +821,9 @@ pub(crate) mod test_support {
         pub room_sinks: Mutex<HashMap<String, (FfiRoomSubjects, Arc<RoomSink>)>>,
         pub to_device_sink: Mutex<Option<(Vec<String>, Arc<ToDeviceSink>)>>,
         pub transports_json: Mutex<String>,
+        /// Model a homeserver that cannot be reached for SFU tokens: every
+        /// `get_token` fails transiently, so no SFU is ever connected.
+        pub unreachable_tokens: AtomicBool,
         pub relations_answers: Mutex<HashMap<String, Vec<FfiEventIn>>>,
         /// Every subscription handed out, room and to-device, in order.
         pub subscriptions: Mutex<Vec<Arc<MockSubscription>>>,
@@ -1124,6 +1127,15 @@ pub(crate) mod test_support {
             &self,
             request: FfiLiveKitTokenRequest,
         ) -> Result<String, FfiBackendError> {
+            if self.unreachable_tokens.load(Ordering::SeqCst) {
+                return Err(FfiBackendError::Failed {
+                    errcode: None,
+                    status: None,
+                    retry_after_ms: None,
+                    permanent: false,
+                    reason: "homeserver unreachable".to_owned(),
+                });
+            }
             Ok(format!("jwt-for-{}", request.url))
         }
 

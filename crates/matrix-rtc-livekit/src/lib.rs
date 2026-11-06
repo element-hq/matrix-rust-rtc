@@ -111,9 +111,19 @@ pub(crate) async fn acquire_token(
                 config.room_id,
                 config.slot_id
             );
-            let jwt = backend.livekit_token(&request).await.inspect_err(|error| {
-                log::warn!("homeserver SFU token request for {url} failed: {error}");
-            })?;
+            let jwt = backend
+                .livekit_token(&request)
+                .await
+                .inspect_err(|error| {
+                    log::warn!("homeserver SFU token request for {url} failed: {error}");
+                })
+                .map_err(|error| {
+                    if error.is_unrecognized_endpoint() {
+                        Error::TokenEndpointUnsupported(error)
+                    } else {
+                        Error::Backend(error)
+                    }
+                })?;
             Ok(SfuToken {
                 jwt,
                 url: url.clone(),
@@ -156,15 +166,16 @@ pub async fn connect_e2ee(
     let sfu_token = acquire_token(http, config, backend).await?;
     LiveKitSession::connect_with_options(
         &sfu_token,
-        e2ee_room_options(key_provider, auto_subscribe),
+        room_options(Some(key_provider), auto_subscribe),
     )
     .await
 }
 
-/// The room options of an E2EE connection: GCM frame encryption through
-/// `key_provider`, dynacast, and `auto_subscribe` as given.
-pub(crate) fn e2ee_room_options(
-    key_provider: livekit::e2ee::key_provider::KeyProvider,
+/// The room options of a connection: GCM frame encryption through
+/// `key_provider` when there is one (none in a room whose encryption is off,
+/// spec 038 R11), dynacast, and `auto_subscribe` as given.
+pub(crate) fn room_options(
+    key_provider: Option<livekit::e2ee::key_provider::KeyProvider>,
     auto_subscribe: bool,
 ) -> livekit::RoomOptions {
     use livekit::RoomOptions;
@@ -172,7 +183,7 @@ pub(crate) fn e2ee_room_options(
 
     // RoomOptions is #[non_exhaustive]; mutate a default instance.
     let mut options = RoomOptions::default();
-    options.encryption = Some(E2eeOptions {
+    options.encryption = key_provider.map(|key_provider| E2eeOptions {
         encryption_type: EncryptionType::Gcm,
         key_provider,
     });
@@ -203,6 +214,10 @@ pub enum Error {
     /// token.
     #[error(transparent)]
     Backend(#[from] matrix_rtc_core::BackendError),
+
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token: {0}")]
+    TokenEndpointUnsupported(matrix_rtc_core::BackendError),
 
     /// Connecting to or operating the LiveKit SFU room failed.
     #[error("LiveKit room error: {0}")]

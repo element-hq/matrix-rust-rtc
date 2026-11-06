@@ -145,8 +145,10 @@ export class WebPeerApp {
     });
 
     this.rtcCall = await this.rtcRoom.joinCall({
-      // The demo pins the focus it discovered; omit to take the homeserver's.
-      transport: { kind: 'publish', livekit_service_url: focusUrl },
+      // Room-state pins the JWT service it discovered; MSC takes the
+      // homeserver's `m.livekit` SFU (spec 038 R17).
+      transport:
+        compat === 'msc' ? undefined : { kind: 'publish', livekit_service_url: focusUrl },
     });
     const memberId = this.rtcCall.memberId;
     this.memberId = memberId;

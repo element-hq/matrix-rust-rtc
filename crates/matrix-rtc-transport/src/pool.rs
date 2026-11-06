@@ -151,6 +151,9 @@ pub enum OwnConnectionLoss {
     Refused,
     /// Never established within the budget from the connect request.
     NeverConnected,
+    /// Our homeserver lacks MSC4195's `get_token`, so no SFU can be
+    /// connected at all (spec 038 R44).
+    TokenEndpointUnsupported,
 }
 
 /// What the pool reports, keyed by `member_id`.
@@ -1183,6 +1186,11 @@ impl MediaPool {
                 self.clear_degraded(key);
                 self.peer_up(key);
             }
+            // About our homeserver, not this SFU: no connection can be had,
+            // so retrying this one is pointless and the call is over (R44).
+            Err(TransportError::TokenEndpointUnsupported(message)) => {
+                self.token_endpoint_unsupported(message);
+            }
             Err(error) => {
                 log::warn!("connecting to {key} failed (attempt {attempt}): {error}");
                 self.mark_degraded(key);
@@ -1541,6 +1549,9 @@ impl MediaPool {
                 self.clear_degraded(&key);
                 self.reapply_connection_constraints(&key);
             }
+            Err(TransportError::TokenEndpointUnsupported(message)) => {
+                self.token_endpoint_unsupported(message);
+            }
             Err(error) if own.budget_spent => {
                 log::warn!("the last attempt at our own focus failed: {error}");
                 if let TransportError::TokenRejected(message) | TransportError::Refused(message) =
@@ -1649,6 +1660,22 @@ impl MediaPool {
     }
 
     /// Our own focus is given up: the call ends (034 R24, R26).
+    /// Our homeserver cannot issue SFU tokens: our own focus is given up, and
+    /// a call publishing nothing is told so too, since none of its
+    /// subscriptions can connect either (spec 038 R44).
+    fn token_endpoint_unsupported(&mut self, message: String) {
+        log::warn!("the homeserver cannot issue SFU tokens: {message}");
+        if self.own_connection_key.is_some() {
+            self.give_up_own(OwnConnectionLoss::TokenEndpointUnsupported, message);
+        } else if !self.own_lost {
+            self.own_lost = true;
+            self.out.push(PoolEvent::OwnConnectionLost {
+                reason: OwnConnectionLoss::TokenEndpointUnsupported,
+                message,
+            });
+        }
+    }
+
     fn give_up_own(&mut self, reason: OwnConnectionLoss, message: String) {
         let Some(key) = self.own_connection_key.clone() else {
             return;

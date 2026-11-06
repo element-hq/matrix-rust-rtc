@@ -62,6 +62,12 @@ const EVENT_CHANNEL_CAPACITY: usize = 256;
 /// barely past it would flash the state for a split second.
 pub const KEY_GRACE: Duration = Duration::from_secs(4);
 
+/// How long a participant may be on an SFU without a membership we have
+/// received, while our signalling is healthy, before it is listed as
+/// unverified (spec 038 R25). Long enough for a membership that is only
+/// propagating, of the same order as 034's fallback grace.
+pub const UNVERIFIED_GRACE: Duration = Duration::from_secs(10);
+
 /// What a member's video stream is asked for while we cannot decrypt it: kept
 /// flowing at the lowest layer even when the host says it is not visible. A
 /// host hides the video exactly when it shows the key error, and a paused
@@ -262,6 +268,9 @@ enum ActorMessage {
     },
     /// A member's key grace may have run out; the turn's sync reads it.
     KeyGrace,
+    /// A participant's unverified grace may have run out; the turn's sync
+    /// reads it (spec 038 R25).
+    UnverifiedGrace,
     /// The coalesce window closed; publish the new order if it is still the
     /// current window (R11).
     FlushReorder {
@@ -314,6 +323,7 @@ pub struct CallEngine {
     tiles_rx: watch::Receiver<TileRoster>,
     local_rx: watch::Receiver<Option<LocalState>>,
     interruptions_rx: watch::Receiver<Interruptions>,
+    unverified_rx: watch::Receiver<Vec<String>>,
     tracks: RemoteTracks,
     task: rt::JoinHandle<()>,
 }
@@ -351,6 +361,7 @@ impl CallEngine {
         });
         let tracks = pool.remote_tracks();
         // Present from the first value: our own SFU before our tile exists.
+        let (unverified_tx, unverified_rx) = watch::channel(Vec::new());
         let (interruptions_tx, interruptions_rx) = watch::channel(Interruptions {
             own_media: pool.own_connection_state(),
             ..Interruptions::default()
@@ -366,6 +377,7 @@ impl CallEngine {
             tiles_tx,
             local_tx,
             interruptions_tx,
+            unverified_tx,
             signalling: SignallingHealth::Reachable,
             core_lapsed: false,
             observed_lapse: false,
@@ -382,6 +394,7 @@ impl CallEngine {
             local_tracks: HashMap::new(),
             encryption_states: HashMap::new(),
             undecryptable_since: HashMap::new(),
+            unmapped_since: HashMap::new(),
             host_constraints: HashMap::new(),
             sent_in_clear: HashSet::new(),
             installed_keys: HashMap::new(),
@@ -410,6 +423,7 @@ impl CallEngine {
             tiles_rx,
             local_rx,
             interruptions_rx,
+            unverified_rx,
             tracks,
             task,
         }
@@ -481,6 +495,21 @@ impl CallEngine {
     /// those already agreeing with it.
     pub fn subscribe_interruptions(&self) -> watch::Receiver<Interruptions> {
         self.interruptions_rx.clone()
+    }
+
+    /// Participants on an SFU whose membership we have not received, by
+    /// transport identity, sorted (spec 038 R25): each one unmapped for
+    /// [`UNVERIFIED_GRACE`] while our signalling is healthy. Kept apart from
+    /// [`Self::interruptions`], which a healthy call leaves empty; while
+    /// signalling is not healthy, they are an interruption cause instead
+    /// (034 R16) and this is empty.
+    pub fn unverified_participants(&self) -> Vec<String> {
+        self.unverified_rx.borrow().clone()
+    }
+
+    /// Watch [`Self::unverified_participants`].
+    pub fn subscribe_unverified_participants(&self) -> watch::Receiver<Vec<String>> {
+        self.unverified_rx.clone()
     }
 
     /// Declare which tiles get full records: ranks `[offset, offset + len)`
@@ -713,6 +742,8 @@ struct Actor {
     tiles_tx: watch::Sender<TileRoster>,
     local_tx: watch::Sender<Option<LocalState>>,
     interruptions_tx: watch::Sender<Interruptions>,
+    /// See [`CallEngine::unverified_participants`].
+    unverified_tx: watch::Sender<Vec<String>>,
     /// Copied into the interruptions record.
     signalling: SignallingHealth,
     /// The core's prediction that our membership has lapsed (034 R17).
@@ -751,6 +782,9 @@ struct Actor {
     /// Since when each member's frames have failed without a break; shown
     /// unable to decrypt once that is `stability.key_grace` old.
     undecryptable_since: HashMap<String, rt::Instant>,
+    /// When each transport identity mapping to no membership was first seen
+    /// so (spec 038 R25).
+    unmapped_since: HashMap<String, rt::Instant>,
     /// The constraints the host last set per stream, before
     /// [`probe_undecryptable`] adjusts them for a member we cannot decrypt.
     host_constraints: HashMap<(String, MediaStreamKind), MediaConstraints>,
@@ -1016,8 +1050,9 @@ impl Actor {
                 .filter(|p| p.unable_to_decrypt.is_some())
                 .map(|p| p.member_id.clone())
                 .collect(),
-            unmappable: self.pool.unmappable(),
+            unmappable: Vec::new(),
         };
+        let unverified = self.split_unmapped(&mut record);
         record.members_reconnecting.sort();
         record.members_unreachable.sort();
         record.unable_to_decrypt.sort();
@@ -1029,6 +1064,48 @@ impl Actor {
             *current = record;
             true
         });
+        self.unverified_tx.send_if_modified(|current| {
+            if *current == unverified {
+                return false;
+            }
+            log::info!("unverified participants: {unverified:?}");
+            *current = unverified;
+            true
+        });
+    }
+
+    /// Splits the participants mapping to no membership (spec 038 R25):
+    /// while signalling is healthy, those unmapped for [`UNVERIFIED_GRACE`]
+    /// are returned as unverified and the interruption record holds none;
+    /// otherwise every one is an interruption cause (034 R16) and none is
+    /// unverified. Arms a wake-up for each newly unmapped participant.
+    fn split_unmapped(&mut self, record: &mut Interruptions) -> Vec<String> {
+        let unmapped = self.pool.unmappable();
+        let now = rt::Instant::now();
+        self.unmapped_since
+            .retain(|identity, _| unmapped.contains(identity));
+        for identity in &unmapped {
+            if !self.unmapped_since.contains_key(identity) {
+                self.unmapped_since.insert(identity.clone(), now);
+                let messages = self.messages_tx.clone();
+                rt::spawn(async move {
+                    rt::sleep(UNVERIFIED_GRACE).await;
+                    let _ = messages.send(ActorMessage::UnverifiedGrace);
+                });
+            }
+        }
+        if self.signalling != SignallingHealth::Reachable {
+            record.unmappable = unmapped;
+            return Vec::new();
+        }
+        unmapped
+            .into_iter()
+            .filter(|identity| {
+                self.unmapped_since
+                    .get(identity)
+                    .is_some_and(|since| now.duration_since(*since) >= UNVERIFIED_GRACE)
+            })
+            .collect()
     }
 
     /// While our membership has lapsed, every publication is muted at the
@@ -1234,7 +1311,7 @@ impl Actor {
                 }
             }
             // Nothing to do here: the sync after every message applies it.
-            ActorMessage::KeyGrace => {}
+            ActorMessage::KeyGrace | ActorMessage::UnverifiedGrace => {}
             ActorMessage::FlushReorder { generation } => {
                 if self.pending_reorder != Some(generation) {
                     return;
@@ -1405,6 +1482,9 @@ impl Actor {
                                 OwnConnectionLoss::Refused => ConnectionLossReason::Refused,
                                 OwnConnectionLoss::NeverConnected => {
                                     ConnectionLossReason::NeverConnected
+                                }
+                                OwnConnectionLoss::TokenEndpointUnsupported => {
+                                    ConnectionLossReason::TokenEndpointUnsupported
                                 }
                             },
                             message,
@@ -2359,6 +2439,7 @@ mod tests {
                         user_id: "@alice:example.org".to_owned(),
                         device_id: "DEVICE".to_owned(),
                     },
+                    e2ee: true,
                 },
                 own_connection_key: Some(OWN_FOCUS.to_owned()),
                 raised_hands: Some(raised_hands_rx),
@@ -5476,10 +5557,14 @@ mod tests {
 
             fx.signalling.send(SignallingHealth::Reachable).unwrap();
             wait_until(|| record(&fx).signalling == SignallingHealth::Reachable).await;
+            // Spec 038 R25: with signalling healthy, a participant with no
+            // membership is no interruption; it is listed apart once its
+            // grace has run.
             assert_eq!(
                 record(&fx),
                 Interruptions {
                     signalling: SignallingHealth::Reachable,
+                    unmappable: Vec::new(),
                     ..all
                 }
             );
@@ -5502,10 +5587,11 @@ mod tests {
             assert_eq!(tile(&fx, "bob").connection, ConnectionState::Reconnecting);
         }
 
-        /// R16: an identity on an SFU with no membership is listed until it
-        /// maps or leaves.
-        #[tokio::test]
-        async fn an_unmappable_participant_is_reported_until_it_maps_or_leaves() {
+        /// Spec 038 R25: with signalling healthy, an identity on an SFU with
+        /// no membership is listed as unverified once it has been so for
+        /// the grace, apart from the interruptions, until it maps or leaves.
+        #[tokio::test(start_paused = true)]
+        async fn an_unmapped_participant_is_unverified_after_the_grace_until_it_maps_or_leaves() {
             let fx = fixture();
             in_call(&fx).await;
             let own = adopt(&fx);
@@ -5515,7 +5601,22 @@ mod tests {
                 })
                 .unwrap();
             }
-            wait_until(|| record(&fx).unmappable == ["id-dave", "id-erin"]).await;
+            tokio::time::sleep(UNVERIFIED_GRACE - Duration::from_secs(1)).await;
+            assert!(
+                fx.engine.unverified_participants().is_empty(),
+                "inside the grace"
+            );
+            assert!(
+                record(&fx).unmappable.is_empty(),
+                "never an interruption here"
+            );
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            wait_until(|| fx.engine.unverified_participants() == ["id-dave", "id-erin"]).await;
+            assert!(
+                record(&fx).is_empty(),
+                "a healthy call shows no interruption"
+            );
 
             fx.memberships
                 .send(vec![
@@ -5523,12 +5624,33 @@ mod tests {
                     member("dave", "@dave:example.org"),
                 ])
                 .unwrap();
-            wait_until(|| record(&fx).unmappable == ["id-erin"]).await;
+            wait_until(|| fx.engine.unverified_participants() == ["id-erin"]).await;
             own.send(ConnectionEvent::RemoteLeft {
                 identity: "id-erin".to_owned(),
             })
             .unwrap();
-            wait_until(|| record(&fx).unmappable.is_empty()).await;
+            wait_until(|| fx.engine.unverified_participants().is_empty()).await;
+        }
+
+        /// 034 R16, as 038 R25 narrows it: while signalling is unhealthy, an
+        /// unmapped participant is an interruption cause at once, and nobody
+        /// is listed unverified.
+        #[tokio::test(start_paused = true)]
+        async fn with_signalling_unhealthy_an_unmapped_participant_is_an_interruption() {
+            let fx = fixture();
+            in_call(&fx).await;
+            let own = adopt(&fx);
+            fx.signalling
+                .send(SignallingHealth::Unreachable { since_ms: 5 })
+                .unwrap();
+            own.send(ConnectionEvent::RemoteJoined {
+                identity: "id-dave".to_owned(),
+            })
+            .unwrap();
+            wait_until(|| record(&fx).unmappable == ["id-dave"]).await;
+            tokio::time::sleep(UNVERIFIED_GRACE * 2).await;
+            assert!(fx.engine.unverified_participants().is_empty());
+            assert_eq!(record(&fx).unmappable, ["id-dave"]);
         }
 
         /// R31: a peer's focus down for an hour never ends the call.

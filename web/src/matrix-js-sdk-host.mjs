@@ -166,12 +166,51 @@ export class MatrixHost {
   }
 
   /**
-   * Not wired to matrix-js-sdk yet: a plain delayed event would fire without ending the
-   * sticky membership, so this says it cannot, and the library joins without a dead man's
-   * switch, on a shorter membership lifetime.
+   * The delayed leave: a sticky delayed event, so it ends the sticky membership when it
+   * fires (spec 038 R13). A matrix-js-sdk without the call, or a homeserver without
+   * MSC4140 or MSC4354, answers `M_UNRECOGNIZED`: the library then joins without a dead
+   * man's switch, on a shorter membership lifetime (R43).
    */
-  sendDelayedStickyEvent() {
-    return Promise.reject(Object.assign(new Error('no delayed sticky events'), { errcode: 'M_UNRECOGNIZED' }));
+  async sendDelayedStickyEvent(roomId, eventType, content, stickyDurationMs, delayMs) {
+    const unsupported = (message) =>
+      Object.assign(new Error(message), { errcode: 'M_UNRECOGNIZED' });
+    if (typeof this.client._unstable_sendStickyDelayedEvent !== 'function') {
+      throw unsupported('this matrix-js-sdk cannot send delayed sticky events');
+    }
+    let response;
+    try {
+      response = await this.client._unstable_sendStickyDelayedEvent(
+        roomId,
+        stickyDurationMs,
+        { delay: delayMs },
+        null,
+        eventType,
+        content,
+      );
+    } catch (error) {
+      // js-sdk checks `/versions` first and throws these, with no errcode.
+      if (
+        error?.name === 'UnsupportedDelayedEventsEndpointError' ||
+        error?.name === 'UnsupportedStickyEventsEndpointError'
+      ) {
+        throw unsupported(error.message);
+      }
+      throw error;
+    }
+    // The library expects the bare MSC4140 delay id.
+    return response.delay_id;
+  }
+
+  /**
+   * The homeserver's `unstable_features` that are on, for the library's
+   * `mscSupport` (spec 038 R45). Not part of the backend contract: the page
+   * calls it.
+   */
+  async serverFeatures() {
+    const versions = await this.client.getVersions();
+    return Object.entries(versions.unstable_features ?? {})
+      .filter(([, on]) => on === true)
+      .map(([feature]) => feature);
   }
 
   restartDelayedEvent(_roomId, delayId) {

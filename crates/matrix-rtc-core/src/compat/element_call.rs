@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-//! Reading the 2025 Element Call wire format, and the legacy key and
-//! notification shapes the pre-sticky generation shares with it.
+//! Element Call's own wire shapes, for the room-state format: its 2025 sticky
+//! member content, and the key and notification shapes it shares with its
+//! room-state generation.
 //!
-//! We no longer *write* the 2025 format: its outbound dialect went with the
-//! `Sticky2025` membership format, once Element Call moved on. What stays is
-//! the permissive inbound normalisation (a spec-shaped event passes through
-//! untouched) and the legacy key/notification shapes
-//! [`RoomStateDialect`](super::RoomStateDialect) still speaks.
+//! We no longer *write* the 2025 sticky content: its outbound dialect went with
+//! the `Sticky2025` membership format. What stays is its inbound normalisation,
+//! which only the room-state format runs (Element Call writes sticky
+//! memberships beside its state events), and the legacy key/notification shapes
+//! [`RoomStateDialect`](super::RoomStateDialect) still speaks. The MSC format
+//! reads none of it.
 //!
 //! Deliberately depends on nothing but `serde_json`: no `matrix-sdk` type, no
 //! `matrix-rtc-core` type. Everything is a plain JSON-in/JSON-out function, so
@@ -58,10 +60,7 @@ pub const LEGACY_KEY_EVENT_TYPE: &str = "io.element.call.encryption_keys";
 const MEMBER_EVENT_TYPE: &str = "m.rtc.member";
 
 /// The event types the core may hand us for a media key, stable and unstable.
-const KEY_EVENT_TYPES: [&str; 2] = [
-    "m.rtc.encryption_key",
-    "org.matrix.msc4143.rtc.encryption_key",
-];
+const KEY_EVENT_TYPES: [&str; 2] = ["m.rtc.encryption_key", LEGACY_KEY_EVENT_TYPE];
 
 /// The room-wide `application_slot_id` as the JS SDK spells it. MSC4143 spells
 /// it [`crate::ROOM_APPLICATION_SLOT_ID`], and slot ids compare exactly, so the
@@ -377,7 +376,8 @@ pub fn rewrite_key_message(
 
     let media_key = content.get("media_key")?;
     let index = media_key.get("index")?;
-    let key = media_key.get("key")?;
+    // MSC4143's key is unpadded; Element Call has always been sent it padded.
+    let key = padded_base64(media_key.get("key")?.as_str()?);
     let (application, call_id) = legacy_session(slot_id);
 
     let legacy = json!({
@@ -402,6 +402,12 @@ pub fn rewrite_key_message(
     });
 
     Some((LEGACY_KEY_EVENT_TYPE.to_owned(), legacy))
+}
+
+/// `b64` with the `=` padding standard base64 ends in.
+fn padded_base64(b64: &str) -> String {
+    let unpadded = b64.trim_end_matches('=');
+    format!("{unpadded}{}", "=".repeat((4 - unpadded.len() % 4) % 4))
 }
 
 /// Flatten an MSC4075 notification into the shape Element Call sends and reads.
@@ -806,22 +812,23 @@ mod tests {
         );
     }
 
-    /// The unstable id is what the core actually sends today.
+    /// The wire spelling is rewritten too, and the key is handed to Element
+    /// Call padded, as it has always been, though MSC4143's is unpadded.
     #[test]
-    fn the_unstable_key_type_is_rewritten_too() {
+    fn the_wire_key_type_is_rewritten_too_with_a_padded_key() {
         let content = json!({
             "room_id": "!room:example.io",
             "member_id": "our-member-id",
-            "media_key": { "index": 0, "key": "aaaa" }
+            "media_key": { "index": 0, "key": "AAECAwQ" }
         });
+        let (_, legacy) =
+            rewrite_key_message("BOBDEVICE", "m.call#room", LEGACY_KEY_EVENT_TYPE, &content)
+                .expect("rewritten");
+        assert_eq!(legacy.pointer("/keys/key"), Some(&json!("AAECAwQ=")));
+        assert_eq!(padded_base64("AAECAw=="), "AAECAw==");
         assert!(
-            rewrite_key_message(
-                "BOBDEVICE",
-                "m.call#room",
-                "org.matrix.msc4143.rtc.encryption_key",
-                &content
-            )
-            .is_some()
+            rewrite_key_message("BOBDEVICE", "m.call#room", "m.rtc.encryption_key", &content)
+                .is_some()
         );
     }
 

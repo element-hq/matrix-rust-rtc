@@ -8,7 +8,8 @@ development:
   (sticky events), MSC4140 (delayed events) and MSC4143 (`/rtc/transports`,
   advertising an `m.livekit` and a legacy `livekit` transport) enabled, rate
   limits disabled, open registration for throwaway test users.
-- **lk-jwt-service** (`ghcr.io/element-hq/lk-jwt-service:0.8.0`) — the
+- **lk-jwt-service** (`ghcr.io/element-hq/lk-jwt-service:sha-0c75df2`, its `main`
+  until a release lets federated users publish) — the
   MatrixRTC authorisation service (MSC4195). One instance serves both: the
   legacy endpoints clients call directly (`/sfu/get`, `/get_token`, which
   every instance serves) and — because this one is registered with Synapse as
@@ -19,12 +20,15 @@ development:
   lk-jwt-service's `/sfu_webhook` — delegated delayed leaves are sent when the
   SFU reports a participant gone.
 
-`auth-service2` is a second instance of the same image for the second SFU
-(`livekit2`), not registered as an application service — Synapse proxies
-`rtc/livekit` to one application service, and one lk-jwt-service serves one
-SFU — so only its legacy endpoints are reachable.
+A second SFU pair (`livekit2`, `auth-service2`) comes with a second
+homeserver, **`synapse2`** (C-S API on `localhost:8009`), federated with the
+first. Synapse proxies `rtc/livekit` to one application service, and one
+lk-jwt-service serves one SFU, so in MSC the second SFU's tokens come from
+`synapse2`: `auth-service2` is its application service, and a `synapse` user's
+request for that SFU is relayed to it over federation. `auth-service2`'s legacy
+endpoints keep serving `synapse` users for the room-state runs.
 
-No nginx, no TLS on the client side, no federation pair — this is the minimal
+No nginx, no TLS on the client side — this is the minimal
 subset of [Element Call's dev backend](https://github.com/element-hq/element-call)
 that the Rust e2e flow needs. Synapse's state (sqlite DB, media, signing key)
 lives in a docker **named volume** — a bind mount corrupts sqlite on
@@ -76,17 +80,19 @@ cargo test -p matrix-rtc-call-sdk --features matrix-sdk,testing --test e2e_call 
 
 See [`crates/matrix-rtc-call-sdk/tests/E2E_CALL.md`](../../crates/matrix-rtc-call-sdk/tests/E2E_CALL.md).
 
-## Why auth-service shares the LiveKit container's network namespace
+## Why auth-service shares the SFU's network namespace
 
 lk-jwt uses `LIVEKIT_URL` both as the SFU URL it returns to clients in
 `/get_token` responses **and** as its own RoomService endpoint for creating the
 room on the SFU, so a single URL has to work from the host and from inside the
-container. `network_mode: "service:livekit"` makes `ws://localhost:7880` do
-both: in-container it loops back to the SFU directly, on the host it goes
-through the published port. That is also why the `6080` port mapping lives on
-the `livekit` service. (Element Call's dev stack solves the same problem with
-an nginx hostname that resolves on both sides — that arrives here with the
-future TLS overlay.)
+container. Both join the network namespace of `sfu-net`, a container that
+only holds it, which makes `ws://localhost:7880` do both: in-container it loops
+back to the SFU directly, on the host it goes through the published port. That
+is also why the port mappings, and the `livekit` hostname, live on `sfu-net`.
+Holding the namespace apart lets the resilience tests stop the SFU while its
+auth-service keeps relaying tokens. (Element Call's dev stack solves the same
+problem with an nginx hostname that resolves on both sides — that arrives here
+with the future TLS overlay.) `sfu2-net` does the same for the second pair.
 
 ## Why Synapse has a TLS listener (and why you never see it)
 
@@ -97,7 +103,9 @@ HTTPS only — `LIVEKIT_INSECURE_SKIP_VERIFY_TLS` skips certificate
 self-signed cert (into `./data/tls/`, generated not committed) and Synapse
 serves federation over TLS on 8448. `server_name` is `synapse` — the compose
 service name — so gomatrixserverlib's discovery fallback (`synapse:8448`)
-resolves inside the compose network. The port is not published to the host;
+resolves inside the compose network. `synapse2` does the same with its own
+cert; the two homeservers federate without verifying certificates and allow
+the compose network's private addresses. The port is not published to the host;
 everything client-facing stays plain HTTP.
 
 ## Registering users and a room by hand

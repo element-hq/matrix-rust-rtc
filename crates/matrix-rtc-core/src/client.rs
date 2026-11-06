@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
 use tokio::sync::{Mutex, watch};
 
 use crate::compat::ingest::{member_id, outbound_dialect};
-use crate::compat::{DialectBackend, LEGACY_KEY_EVENT_TYPE, MembershipFormat};
+use crate::compat::{DialectBackend, MembershipFormat};
 use crate::executor::{self, AbortOnDrop, JoinHandleExt};
 use crate::feeder::{RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomRegistry, ToDeviceFeeder};
 use crate::outbox::{Outbox, SignallingHealth};
@@ -181,6 +181,8 @@ where
         let format = options.format;
         let shared = &self.shared;
         let _opening = shared.opening.lock().await;
+        // Before the feed: memberships are read, and ours written, in it.
+        room.lock().await.rtc().set_format(format);
 
         let needs_to_device = {
             let to_device = shared.to_device();
@@ -199,14 +201,11 @@ where
         log::info!("client: [{room_id}] opening in the {format:?} format");
 
         if needs_to_device {
-            // The legacy key type whatever the formats: the current one reads
-            // it too, from 2025 peers.
-            let (feeder, run) = ToDeviceFeeder::start(
-                shared.backend.clone(),
-                shared.registry.clone(),
-                vec![LEGACY_KEY_EVENT_TYPE.to_owned()],
-            )
-            .await?;
+            // Both formats' keys travel under the spec's types; each room's
+            // dialect reads its own body.
+            let (feeder, run) =
+                ToDeviceFeeder::start(shared.backend.clone(), shared.registry.clone(), Vec::new())
+                    .await?;
             *shared.to_device() = Some(ToDeviceRunning {
                 feeder,
                 _task: executor::spawn(run.run()).abort_on_drop(),

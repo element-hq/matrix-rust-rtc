@@ -30,8 +30,13 @@ pub fn wire_event_type(event_type: &str) -> &str {
     match event_type {
         "m.rtc.member" => "org.matrix.msc4143.rtc.member",
         "m.rtc.slot" => "org.matrix.msc4143.rtc.slot",
-        "m.rtc.encryption_key" => "org.matrix.msc4143.rtc.encryption_key",
-        "m.rtc.notification" => "org.matrix.msc4075.rtc.notification",
+        // MSC4143 names Element Call's key type as the unstable id, so the
+        // room-state format's legacy key shape travels under the same type.
+        "m.rtc.encryption_key" => "io.element.call.encryption_keys",
+        // The room-state format's notification and the MSC format's invite
+        // both travel under MSC4075's unstable id; only the content differs.
+        "m.rtc.notification" | "m.rtc.invite" => "org.matrix.msc4075.rtc.notification",
+        "m.rtc.decline" => "org.matrix.msc4310.rtc.decline",
         other => other,
     }
 }
@@ -56,8 +61,19 @@ mod tests {
             wire_event_type("m.rtc.notification"),
             "org.matrix.msc4075.rtc.notification"
         );
-        // Already unstable in the core; must survive a round through the table.
-        assert_eq!(wire_event_type(KEY_MESSAGE_TYPE), KEY_MESSAGE_TYPE);
+        assert_eq!(
+            wire_event_type(KEY_MESSAGE_TYPE),
+            "io.element.call.encryption_keys"
+        );
+        // Spec 038 R26.
+        assert_eq!(
+            wire_event_type("m.rtc.invite"),
+            "org.matrix.msc4075.rtc.notification"
+        );
+        assert_eq!(
+            wire_event_type("m.rtc.decline"),
+            "org.matrix.msc4310.rtc.decline"
+        );
     }
 
     #[test]
@@ -72,6 +88,8 @@ mod tests {
             SLOT_EVENT_TYPE,
             KEY_MESSAGE_TYPE,
             "m.rtc.notification",
+            "m.rtc.invite",
+            "m.rtc.decline",
         ] {
             let once = wire_event_type(stable);
             assert_eq!(wire_event_type(once), once);

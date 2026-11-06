@@ -33,23 +33,20 @@ pub use matrix_rtc_transport::keys::{
 /// here.
 pub type MediaKeyBridge = MediaKeyHandler;
 
-/// Largest key ring the native frame cryptor allocates.
+/// The native frame cryptor's key ring: every MSC4143 key index, 0 to 255
+/// (spec 038 R38).
 ///
-/// A `key_ring_size` above 255 is accepted by [`KeyProviderOptions`] but not
-/// allocated, and `set_key`/`get_key` with an index at or past the allocated
-/// size aborts the process (fatal assertion in `ParticipantKeyHandler`)
-/// instead of returning an error. Observed with `livekit` 0.7.48 /
-/// `libwebrtc` 0.3.38. The `m.rtc.encryption_keys` `index` field is a `u8`,
-/// so index 255 cannot be represented and must be rejected before the FFI
-/// boundary — which is exactly what [`FrameKeyRing::ring_size`] exists for.
-pub const NATIVE_KEY_RING_MAX: i32 = 255;
+/// With `livekit` 0.9.7 a ring of 256 stores and returns index 255. An index
+/// past the ring is not an error there: `set_key` reports success and
+/// `get_key` returns nothing, so [`FrameKeyRing::ring_size`] still guards it.
+pub const NATIVE_KEY_RING_MAX: i32 = 256;
 
 /// [`KeyProviderOptions`] for MSC4195 per-participant mode.
 ///
 /// MSC4195 specifies that per-participant keys are "imported as the byte array
 /// input to the LiveKit key derivation function (which uses HKDF)" and that the
 /// `index` field of `m.rtc.encryption_keys` is used as the key index. The ring
-/// is sized to [`NATIVE_KEY_RING_MAX`], the widest the native layer allows.
+/// is sized to [`NATIVE_KEY_RING_MAX`], one slot per index.
 pub fn msc4195_key_provider_options() -> KeyProviderOptions {
     KeyProviderOptions {
         key_derivation_algorithm: KeyDerivationAlgorithm::HKDF,
@@ -191,24 +188,20 @@ mod tests {
         let provider = msc4195_key_provider();
         let identity = ParticipantIdentity::from("participant-abc".to_owned());
 
-        // The full addressable range of the native ring (see
-        // NATIVE_KEY_RING_MAX for why index 255 is excluded).
+        // Every index the `u8` field can carry, 255 included (R38).
         assert!(provider.set_key(&identity, 0, vec![1u8; 32]));
-        assert!(provider.set_key(&identity, NATIVE_KEY_RING_MAX - 1, vec![2u8; 32]));
+        assert!(provider.set_key(&identity, 255, vec![2u8; 32]));
         assert!(provider.get_key(&identity, 0).is_some());
-        assert!(
-            provider
-                .get_key(&identity, NATIVE_KEY_RING_MAX - 1)
-                .is_some()
-        );
+        assert_eq!(provider.get_key(&identity, 255), Some(vec![2u8; 32]));
     }
 
     #[tokio::test]
-    async fn bridge_rejects_unrepresentable_key_index() {
-        let bridge = msc4195_media_key_bridge(Msc4195KeyProviders::new());
+    async fn bridge_installs_key_index_255() {
+        let providers = Msc4195KeyProviders::new();
+        let connection = providers.connection_provider();
+        let provider = connection.provider().clone();
+        let bridge = msc4195_media_key_bridge(providers);
 
-        // Index 255 cannot be stored in the native ring; forwarding it would
-        // abort the process. The bridge must survive it and still record.
         bridge
             .on_new_key_material(KeyMaterialSignal {
                 key: vec![4u8; 32],
@@ -219,6 +212,8 @@ mod tests {
             .await;
 
         assert_eq!(bridge.key_for("participant-p2").unwrap().key_index, u8::MAX);
+        let identity = ParticipantIdentity::from("participant-p2".to_owned());
+        assert_eq!(provider.get_key(&identity, 255), Some(vec![4u8; 32]));
     }
 
     #[tokio::test]
@@ -270,16 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn room_options_accept_msc4195_e2ee() {
-        use livekit::RoomOptions;
-        use livekit::e2ee::{E2eeOptions, EncryptionType};
+    fn room_options_encrypt_exactly_when_given_a_key_provider() {
+        use livekit::e2ee::EncryptionType;
 
-        // RoomOptions is #[non_exhaustive]: mutate a default instance.
-        let mut options = RoomOptions::default();
-        options.encryption = Some(E2eeOptions {
-            encryption_type: EncryptionType::Gcm,
-            key_provider: msc4195_key_provider(),
-        });
-        assert!(options.encryption.is_some());
+        let encrypted = crate::room_options(Some(msc4195_key_provider()), true);
+        assert_eq!(
+            encrypted.encryption.map(|e2ee| e2ee.encryption_type),
+            Some(EncryptionType::Gcm)
+        );
+        // Spec 038 R11: a room whose encryption is off connects in the clear.
+        assert!(crate::room_options(None, true).encryption.is_none());
     }
 }

@@ -229,6 +229,7 @@ impl Fixture {
                     user_id: "@own:example.org".to_owned(),
                     device_id: "DEVICE".to_owned(),
                 },
+                e2ee: true,
             },
             own_connection_key: Some(OWN_FOCUS.to_owned()),
             own_reconnect_budget: OWN_RECONNECT_BUDGET,

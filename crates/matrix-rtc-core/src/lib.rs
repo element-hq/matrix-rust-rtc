@@ -24,6 +24,7 @@ pub mod outbox;
 mod own_membership;
 mod session;
 mod slot;
+mod support;
 mod transport;
 mod upkeep;
 mod wire;
@@ -56,7 +57,7 @@ pub use host::event::{
 pub use join::{
     DEFAULT_JOIN_BUDGET_MS, DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
     JoinSessionParams, LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent,
-    generate_member_id,
+    generate_member_id, slot_id_of,
 };
 pub use maybe_send::MaybeSend;
 pub use membership_listener::MembershipListener;
@@ -70,12 +71,13 @@ pub use session::{
     MemberInfo, Membership, PendingLeave, RtcMembershipEvent, SlotSession,
 };
 pub use slot::{
-    EncryptionMechanism, OpenSlot, RawSlotEvent, RawSlotEventContent, RoomEncryption,
-    SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus,
+    EncryptionMechanism, MAX_SLOT_ID_BYTES, OpenSlot, RawSlotEvent, RawSlotEventContent,
+    RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus, validate_slot_id,
 };
+pub use support::{MscRequirement, MscSupport, msc_support};
 pub use transport::{
-    LiveKitAuthFlow, LiveKitTransport, MemberTransports, RawRtcTransport, RtcTransport,
-    UnsupportedTransport, server_name_of,
+    LEGACY_LIVEKIT_TYPE, LiveKitAuthFlow, LiveKitTransport, MIN_MEDIA_KEY_LEN, MSC_LIVEKIT_TYPE,
+    MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport, server_name_of,
 };
 pub use wire::wire_event_type;
 
@@ -109,7 +111,7 @@ mod tests {
             room_id: ROOM_ID.to_owned(),
             event_id: None,
             sender: sender.to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: EVENT_TYPE_RTC_MEMBER.to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {
@@ -197,7 +199,7 @@ mod tests {
         member_id: &str,
     ) -> String {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://example.com/jwt".to_owned()),
+            LiveKitTransport::sfu("wss://sfu.example.com"),
         ));
         params.membership_id = Some(member_id.to_owned());
         room.join(params).await.expect("join should succeed")
@@ -715,19 +717,19 @@ mod tests {
             let on = |focus: &str, event_id: &str| {
                 let mut event = member("@bob:x", "bob", event_id);
                 event.content.transports = Some(MemberTransports::publishing(RawRtcTransport {
-                    transport_type: "livekit".to_owned(),
-                    extra_fields: [("livekit_service_url".to_owned(), focus.into())].into(),
+                    transport_type: "m.livekit".to_owned(),
+                    extra_fields: [("url".to_owned(), focus.into())].into(),
                 }));
                 event
             };
             let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
-            room.set_current_sticky_state(vec![on("https://a", "$b1")])
+            room.set_current_sticky_state(vec![on("wss://a", "$b1")])
                 .await
                 .unwrap();
             let mut snapshots = room.subscribe_membership_snapshots(SLOT).unwrap();
             snapshots.mark_unchanged();
 
-            room.set_current_sticky_state(vec![on("https://b", "$b2")])
+            room.set_current_sticky_state(vec![on("wss://b", "$b2")])
                 .await
                 .unwrap();
             let snapshot = snapshots.borrow_and_update().clone();
@@ -735,9 +737,7 @@ mod tests {
             assert_eq!(snapshot[0].member_id, "bob");
             assert_eq!(
                 snapshot[0].transports,
-                [RtcTransport::LiveKit(LiveKitTransport::service(
-                    "https://b".to_owned()
-                ))]
+                [RtcTransport::LiveKit(LiveKitTransport::sfu("wss://b"))]
             );
             assert_eq!(room.hold_expires_at(), None, "nothing held");
         }
@@ -1104,18 +1104,18 @@ mod tests {
     async fn a_slot_missing_from_the_current_state_is_cleared_too() {
         let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
         let in_call = joined_event("@alice:example.org", "m.call#room", "alice-a");
-        let in_other = joined_event("@bob:example.org", "m.call#OTHER", "bob-a");
+        let in_other = joined_event("@bob:example.org", "m.call#other", "bob-a");
 
         room.set_current_sticky_state(vec![in_call.clone(), in_other])
             .await
             .unwrap();
-        assert_eq!(room.member_count("m.call#OTHER"), Some(1));
+        assert_eq!(room.member_count("m.call#other"), Some(1));
 
         // Only the first slot is represented now; the second must empty.
         room.set_current_sticky_state(vec![in_call]).await.unwrap();
         assert_eq!(room.member_count("m.call#room"), Some(1));
         assert_eq!(
-            room.member_count("m.call#OTHER"),
+            room.member_count("m.call#other"),
             Some(0),
             "a slot absent from the current state is empty, not untouched"
         );
@@ -1261,7 +1261,7 @@ mod tests {
         join_as(&mut room, "alice-a").await;
 
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://example.com/jwt".to_owned()),
+            LiveKitTransport::sfu("wss://sfu.example.com"),
         ));
         params.membership_id = Some("alice-b".to_owned());
 
@@ -1539,11 +1539,11 @@ mod tests {
         // inheriting the forgotten "no slots".
         room.set_current_sticky_state(vec![
             joined_event("@alice:example.org", "m.call#room", "alice-a"),
-            joined_event("@bob:example.org", "m.call#OTHER", "bob-a"),
+            joined_event("@bob:example.org", "m.call#other", "bob-a"),
         ])
         .await
         .unwrap();
-        assert_eq!(room.member_count("m.call#OTHER"), Some(1));
+        assert_eq!(room.member_count("m.call#other"), Some(1));
     }
 
     /// Slot state naming another room is dropped, and says nothing about the
@@ -1628,6 +1628,137 @@ mod tests {
 
         room.on_encryption_received(true).await;
         assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R6: in an encrypted room a member's device is the one that
+    /// encrypted their member event. A cleartext event, or one decryption
+    /// attributed to no device, is not joined. A claimed device (room-state
+    /// format only) still is.
+    #[tokio::test]
+    async fn only_an_attributed_encrypted_member_is_joined_in_an_encrypted_room() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+
+        let attributed = RawStickyEvent {
+            origin: EventOrigin::encrypted(Some("ALICEDEV".to_owned())),
+            ..joined_event("@alice:example.org", "m.call#room", "alice-a")
+        };
+        let no_device = RawStickyEvent {
+            origin: EventOrigin::encrypted(None),
+            ..joined_event("@bob:example.org", "m.call#room", "bob-a")
+        };
+        let cleartext = RawStickyEvent {
+            origin: EventOrigin::Cleartext,
+            ..joined_event("@carol:example.org", "m.call#room", "carol-a")
+        };
+        let claimed = RawStickyEvent {
+            origin: EventOrigin::claimed("DANDEV"),
+            ..joined_event("@dan:example.org", "m.call#room", "dan-a")
+        };
+
+        room.set_current_sticky_state(vec![attributed, no_device, cleartext, claimed])
+            .await
+            .unwrap();
+        room.on_encryption_received(true).await;
+
+        let mut joined: Vec<_> = room
+            .subscribe_membership_snapshots("m.call#room")
+            .expect("the session should exist")
+            .borrow()
+            .iter()
+            .map(|m| m.member_id.clone())
+            .collect();
+        joined.sort();
+        assert_eq!(joined, ["alice-a", "dan-a"]);
+    }
+
+    /// Spec 038 R9: a redacted member event makes the member leave. Redaction
+    /// empties the content under the same sticky key, and the host's sticky
+    /// map hands that back in its next snapshot.
+    #[tokio::test]
+    async fn a_redacted_member_event_makes_the_member_leave() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+        let bob = joined_event("@bob:example.org", "m.call#room", "bob-a");
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            bob.clone(),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(room.member_count("m.call#room"), Some(2));
+
+        let redacted: RawStickyEventContent = serde_json::from_value(serde_json::json!({
+            "slot_id": "m.call#room",
+            "sticky_key": "bob-a",
+        }))
+        .expect("a redacted member content keeps only what redaction preserves");
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            RawStickyEvent {
+                content: redacted,
+                ..bob
+            },
+        ])
+        .await
+        .unwrap();
+        assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R41: a membership whose stickiness lapsed is gone from the
+    /// host's sticky map, and so from the next snapshot; the member leaves.
+    #[tokio::test]
+    async fn a_member_missing_from_the_sticky_snapshot_has_left() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            joined_event("@bob:example.org", "m.call#room", "bob-a"),
+        ])
+        .await
+        .unwrap();
+        room.set_current_sticky_state(vec![joined_event(
+            "@alice:example.org",
+            "m.call#room",
+            "alice-a",
+        )])
+        .await
+        .unwrap();
+        assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R7: a member is joined only to a slot of its own application.
+    #[tokio::test]
+    async fn a_member_of_another_application_is_not_joined_to_the_slot() {
+        let mut room: BaseRtcRoom<NoopBackend> = BaseRtcRoom::new(ROOM_ID);
+        room.on_slots_received(vec![open_call_slot()]).await;
+
+        let mut other = joined_event("@bob:example.org", "m.call#room", "bob-a");
+        other.content.application = "org.example.board".into();
+        room.set_current_sticky_state(vec![
+            joined_event("@alice:example.org", "m.call#room", "alice-a"),
+            other,
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(room.member_count("m.call#room"), Some(1));
+    }
+
+    /// Spec 038 R8: a slot id that breaks MSC4143's grammar fails the join
+    /// before anything is sent.
+    #[tokio::test]
+    async fn a_join_with_an_invalid_slot_id_is_refused() {
+        let backend = alice_backend();
+        let mut room = BaseRtcRoom::with_backend(ROOM_ID, backend.clone());
+        let params = JoinSessionParams::application("m.call")
+            .slot("ROOM")
+            .transport(RtcTransport::LiveKit(LiveKitTransport::sfu(
+                "wss://sfu.example.com",
+            )));
+
+        assert!(matches!(
+            room.join(params).await,
+            Err(JoinError::InvalidSlotId { .. })
+        ));
+        assert!(backend.sticky_events.lock().unwrap().is_empty());
     }
 
     /// An unencrypted room imposes no such requirement.
@@ -1741,6 +1872,27 @@ mod tests {
         );
     }
 
+    /// Spec 038 R11, with no slot to negotiate from (the room-state format
+    /// reads none): the room's encryption alone decides, over the caller's
+    /// preference, and decides the media too.
+    #[tokio::test]
+    async fn without_a_slot_the_room_decides_whether_media_is_encrypted() {
+        for (room_encrypted, expected) in [(false, false), (true, true)] {
+            let sender = alice_backend();
+            let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
+            room.on_encryption_received(room_encrypted).await;
+
+            join_and_admit_a_peer(&mut room, !room_encrypted).await;
+
+            assert_eq!(room.encrypts_media("m.call#room"), Some(expected));
+            assert_eq!(
+                !sender.to_device_messages.lock().unwrap().is_empty(),
+                expected,
+                "keys go out exactly when the room is encrypted (encrypted={room_encrypted})"
+            );
+        }
+    }
+
     /// Joins as alice with `local_manage_media_keys` as the caller's own
     /// preference, then lets bob in so a membership change triggers key
     /// distribution (if it is enabled at all).
@@ -1749,7 +1901,7 @@ mod tests {
         local_manage_media_keys: bool,
     ) {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://example.com/jwt".to_owned()),
+            LiveKitTransport::sfu("wss://sfu.example.com"),
         ));
         params.membership_id = Some("alice-a".to_owned());
         params.encryption_config = Some(EncryptionConfig {
@@ -1824,24 +1976,26 @@ mod tests {
         let sender = alice_backend();
         let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
 
+        // Both fields advertised: MSC publishes by the `url` alone (spec 038
+        // R17).
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport::service("https://sfu.example.com/jwt".to_owned()),
+            LiveKitTransport::new(
+                Some("wss://sfu.example.com".to_owned()),
+                Some("https://sfu.example.com/jwt".to_owned()),
+                None,
+            )
+            .unwrap(),
         ));
         room.join(params).await.expect("join should succeed");
 
         let sticky = sender.sticky_events.lock().unwrap();
         let (_, _, content, _) = sticky.first().expect("a join should have been sent");
         assert_eq!(
-            content
-                .pointer("/transports/published/0/livekit_service_url")
-                .and_then(|v| v.as_str()),
-            Some("https://sfu.example.com/jwt")
-        );
-        assert_eq!(
-            content
-                .pointer("/transports/can_subscribe/0")
-                .and_then(|v| v.as_str()),
-            Some("livekit")
+            content["transports"],
+            serde_json::json!({
+                "published": [{ "type": "m.livekit", "url": "wss://sfu.example.com" }],
+                "can_subscribe": ["m.livekit"],
+            })
         );
     }
 
@@ -1852,15 +2006,15 @@ mod tests {
 
         let mut extra_fields = BTreeMap::new();
         extra_fields.insert(
-            "livekit_service_url".to_owned(),
-            serde_json::Value::String("https://example.com/livekit/jwt".to_owned()),
+            "url".to_owned(),
+            serde_json::Value::String("wss://sfu.example.com".to_owned()),
         );
 
         let event = RawStickyEvent {
             room_id: ROOM_ID.to_owned(),
             event_id: None,
             sender: "@alice:example.org".to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: "m.rtc.member".to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {
@@ -1875,7 +2029,7 @@ mod tests {
                     membership: Some(Membership::Join),
                 },
                 transports: Some(MemberTransports::publishing(RawRtcTransport {
-                    transport_type: "livekit".to_owned(),
+                    transport_type: "m.livekit".to_owned(),
                     extra_fields,
                 })),
                 leave_reason: None,
@@ -1890,10 +2044,7 @@ mod tests {
                 assert_eq!(joined.transports.len(), 1);
                 match &joined.transports[0] {
                     RtcTransport::LiveKit(livekit) => {
-                        assert_eq!(
-                            livekit.livekit_service_url(),
-                            Some("https://example.com/livekit/jwt")
-                        );
+                        assert_eq!(livekit.url(), Some("wss://sfu.example.com"));
                     }
                     RtcTransport::Unsupported(_) => panic!("Expected LiveKit transport"),
                 }
@@ -1917,7 +2068,7 @@ mod tests {
             room_id: ROOM_ID.to_owned(),
             event_id: None,
             sender: "@alice:example.org".to_owned(),
-            origin: EventOrigin::default(),
+            origin: EventOrigin::Cleartext,
             event_type: "m.rtc.member".to_owned(),
             origin_server_ts: None,
             content: RawStickyEventContent {
@@ -2038,6 +2189,32 @@ mod tests {
         assert_eq!(sender.cancelled_events.lock().unwrap().len(), 1);
         tokio::time::sleep(TICK * 3).await;
         assert_eq!(restarts(&sender), 0, "nothing kept alive after the leave");
+    }
+
+    /// Spec 038 R37: a join made in the clear leaves the moment the room's
+    /// encryption turns on, even though the slot (already declaring a
+    /// mechanism) stays open: its media was set up unencrypted.
+    #[tokio::test(start_paused = true)]
+    async fn encryption_turning_on_leaves_a_clear_join() {
+        let sender = alice_backend();
+        let mut room = BaseRtcRoom::with_backend(ROOM_ID, sender.clone());
+        room.on_encryption_received(false).await;
+        room.on_slots_received(vec![encrypted_call_slot()]).await;
+        join_as(&mut room, "alice-a").await;
+        assert_eq!(room.encrypts_media("m.call#room"), Some(false));
+        let mut auto_leaves = room
+            .subscribe_auto_leaves("m.call#room")
+            .expect("joined session");
+
+        room.on_encryption_received(true).await;
+
+        assert_eq!(
+            auto_leaves.try_recv().expect("an auto-leave").code,
+            LeaveCode::SlotClosed
+        );
+        assert_eq!(room.own_member_id("m.call#room"), None);
+        let (_, _, leave, _) = sender.last_sticky_event().expect("a leave was sent");
+        assert_eq!(leave["leave_reason"]["code"], "slot_closed", "{leave}");
     }
 
     /// A leave that fails to send still ends our join and is announced, so the

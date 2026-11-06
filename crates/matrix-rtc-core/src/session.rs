@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
+use crate::compat::MembershipFormat;
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
@@ -26,7 +27,7 @@ use crate::membership_listener::MembershipScope;
 use crate::outbox::Outbox;
 use crate::own_membership::{MembershipTimings, OwnEntry, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
-use crate::transport::{MemberTransports, RtcTransport};
+use crate::transport::{LiveKitTransport, MemberTransports, RtcTransport};
 use crate::upkeep::{self, SessionUpkeep};
 
 #[allow(unused_imports)]
@@ -90,9 +91,16 @@ pub(crate) enum JoinCondition {
     Joined,
     /// The slot is closed, so nobody is joined to it.
     SlotClosed,
+    /// The member's `application.type` is not the one the open slot is for
+    /// (spec 038 R7).
+    ApplicationMismatch,
     /// MSC4143 requires `m.rtc.member` to be encrypted in an encrypted room,
     /// and one that is not "MUST be considered left".
     UnencryptedInEncryptedRoom,
+    /// Encrypted, but decryption named no sending device. In an encrypted room
+    /// MSC4143 identifies a member's device by the device that encrypted their
+    /// member event, so without one the member cannot be joined.
+    NoSendingDevice,
     /// The sender is no longer joined to the room.
     SenderNotInRoom,
     /// A previous participation of *this* device, still sticky under an older
@@ -171,6 +179,8 @@ pub struct SlotSession<T: MatrixBackend> {
     /// Whether the room is encrypted, which decides whether member events are
     /// required to be encrypted.
     room_encryption: RoomEncryption,
+    /// How our membership is written: its transport's type and fields.
+    format: MembershipFormat,
     membership_snapshots_tx: watch::Sender<Vec<JoinedMembership>>,
     /// Announces every leave this session makes without the host asking. See
     /// [`SlotSession::subscribe_auto_leaves`].
@@ -211,6 +221,7 @@ impl<T: MatrixBackend> Clone for SlotSession<T> {
             slot: self.slot.clone(),
             room_members: self.room_members.clone(),
             room_encryption: self.room_encryption,
+            format: self.format,
             membership_snapshots_tx: self.membership_snapshots_tx.clone(),
             auto_leaves_tx: self.auto_leaves_tx.clone(),
             backend: self.backend.clone(),
@@ -248,6 +259,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             slot: SlotKnowledge::default(),
             room_members: None,
             room_encryption: RoomEncryption::default(),
+            format: MembershipFormat::Msc,
             membership_snapshots_tx,
             auto_leaves_tx: broadcast::channel(AUTO_LEAVES_CAPACITY).0,
             backend,
@@ -295,6 +307,15 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             }
             None => false,
         }
+    }
+
+    /// Whether this join encrypts its media, as decided when it joined;
+    /// `None` when not joined. Media connects with frame encryption exactly
+    /// when this is `Some(true)` (spec 038 R11).
+    pub fn encrypts_media(&self) -> Option<bool> {
+        self.encryption_manager
+            .as_ref()
+            .map(EncryptionManager::manages_media_keys)
     }
 
     /// Re-signals every key already held to the installed signal handler.
@@ -417,6 +438,18 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             log::warn!("[{}] join rejected: missing {missing}", self.log_tag);
             JoinError::MissingParameter(missing)
         })?;
+        let application_type = params.application.application_type().unwrap_or_default();
+        crate::slot::validate_slot_id(&params.slot_id, application_type).map_err(|reason| {
+            log::warn!(
+                "[{}] join rejected: slot id '{}' is invalid: {reason}",
+                self.log_tag,
+                params.slot_id
+            );
+            JoinError::InvalidSlotId {
+                slot_id: params.slot_id.clone(),
+                reason,
+            }
+        })?;
 
         let backend = self.backend.as_ref().ok_or_else(|| {
             log::warn!(
@@ -430,10 +463,35 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         let membership_id = params.membership_id();
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();
-        let transport = params
+        let transport = match params
             .transport
             .clone()
-            .expect("validate() refuses a join without a transport");
+            .expect("validate() refuses a join without a transport")
+        {
+            // MSC publishes on an SFU `url`, and every token for it comes from
+            // the homeserver: a `livekit_service_url` alongside is not ours to
+            // use (spec 038 R17, R20, R22).
+            TransportIntent::Publish(RtcTransport::LiveKit(livekit))
+                if self.format == MembershipFormat::Msc =>
+            {
+                let Some(url) = livekit.url() else {
+                    log::warn!(
+                        "[{}] the MSC format publishes on an SFU `url`, and {livekit:?} names none",
+                        self.log_tag,
+                    );
+                    return Err(JoinError::InvalidTransport);
+                };
+                TransportIntent::Publish(RtcTransport::LiveKit(
+                    LiveKitTransport::new(
+                        Some(url.to_owned()),
+                        None,
+                        livekit.server_name().map(str::to_owned),
+                    )
+                    .expect("a url names an SFU"),
+                ))
+            }
+            other => other,
+        };
 
         // Check if already joined with this membership
         if self
@@ -452,7 +510,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
         let transports = match &transport {
             TransportIntent::Publish(transport) => MemberTransports::publishing(
-                serde_json::from_value(transport_to_json(transport))
+                serde_json::from_value(transport_to_json(transport, self.format))
                     .expect("a transport always serializes to an object with a type"),
             ),
             TransportIntent::ReceiveOnly { can_subscribe } => MemberTransports {
@@ -732,7 +790,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         transport: RtcTransport,
     ) -> Option<impl Future<Output = ()> + use<T>> {
         let machine = self.own_membership_machine.clone()?;
-        Some(async move { machine.republish_transports(&transport).await })
+        let transport = transport_to_json(&transport, self.format);
+        Some(async move { machine.republish_transports(transport).await })
     }
 
     /// Follows [`Self::own_membership_event_id`] for this join, which moves on
@@ -1109,17 +1168,35 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             // Nothing has told us about the slot, so this condition cannot be
             // evaluated; enforcing it would drop every member.
             SlotKnowledge::Unsupplied => {}
-            SlotKnowledge::Known(state) if state.is_open() => {}
+            SlotKnowledge::Known(SlotState::Open(open)) => {
+                if candidate.application.application_type() != Some(open.application_type.as_str())
+                {
+                    return JoinCondition::ApplicationMismatch;
+                }
+            }
             SlotKnowledge::Known(_) => return JoinCondition::SlotClosed,
         }
 
         // MSC4143: in an encrypted room `m.rtc.member` events MUST be
-        // encrypted, and one that is not "MUST be considered left". An event
-        // whose encryption the host did not report is not judged.
-        if self.room_encryption == RoomEncryption::Encrypted
-            && candidate.origin.was_encrypted() == Some(false)
-        {
-            return JoinCondition::UnencryptedInEncryptedRoom;
+        // encrypted, and one that is not "MUST be considered left". The member's
+        // device is the one that encrypted the event, never one the content
+        // claims.
+        //
+        // `Claimed` is the one exception, and it only ever comes from the
+        // room-state format: Element Call's state events cannot be encrypted at
+        // all, and that format exists to interoperate with it (spec 038 R32).
+        // The MSC format never produces it.
+        if self.room_encryption == RoomEncryption::Encrypted {
+            match &candidate.origin {
+                EventOrigin::Encrypted {
+                    sender_device_id: Some(_),
+                }
+                | EventOrigin::Claimed { .. } => {}
+                EventOrigin::Encrypted {
+                    sender_device_id: None,
+                } => return JoinCondition::NoSendingDevice,
+                EventOrigin::Cleartext => return JoinCondition::UnencryptedInEncryptedRoom,
+            }
         }
 
         // A previous participation of this very device is us, one call ago —
@@ -1327,6 +1404,11 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         self.room_members = Some(room_members);
     }
 
+    /// Sets the format our membership is written in.
+    pub(crate) fn set_format(&mut self, format: MembershipFormat) {
+        self.format = format;
+    }
+
     /// Sets the room encryption state on a session that has no members yet.
     pub(crate) fn seed_room_encryption(&mut self, room_encryption: RoomEncryption) {
         debug_assert!(self.candidates.is_empty(), "seeding a populated session");
@@ -1336,7 +1418,10 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// Sets whether the room is encrypted.
     ///
     /// In an encrypted room, members whose `m.rtc.member` event arrived in the
-    /// clear stop counting as joined.
+    /// clear stop counting as joined. A join whose media is in the clear
+    /// leaves at once with [`LeaveCode::SlotClosed`] when the room's
+    /// encryption turns on (spec 038 R37): its connections and tracks were set
+    /// up unencrypted, so the application rejoins to encrypt.
     pub async fn set_room_encryption(&mut self, room_encryption: RoomEncryption) {
         if self.room_encryption == room_encryption {
             return;
@@ -1347,7 +1432,15 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             self.room_encryption,
         );
         self.room_encryption = room_encryption;
-        self.refresh().await;
+        if room_encryption == RoomEncryption::Encrypted
+            && self.own_membership_machine.is_some()
+            && self.encrypts_media() == Some(false)
+        {
+            self.auto_leave(LeaveReason::new(LeaveCode::SlotClosed))
+                .await;
+        } else {
+            self.refresh().await;
+        }
     }
 
     /// Whether RTC data should be encrypted, per the slot and the room.
@@ -1364,7 +1457,14 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// key distribution.
     pub fn negotiated_encryption(&self) -> Option<bool> {
         let SlotKnowledge::Known(state) = &self.slot else {
-            return None;
+            // No slot to read a mechanism from (the room-state format reads
+            // none): the room alone decides, as it does for Element Call
+            // (spec 038 R11).
+            return match self.room_encryption {
+                RoomEncryption::Encrypted => Some(true),
+                RoomEncryption::Unencrypted => Some(false),
+                RoomEncryption::Unknown => None,
+            };
         };
 
         Some(

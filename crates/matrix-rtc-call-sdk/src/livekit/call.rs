@@ -167,8 +167,8 @@ pub struct LiveKitCallOptions {
     /// and the token comes from the pre-MSC4195 `/sfu/get` endpoint. Nothing
     /// about such a call is visible to a spec-current peer.
     ///
-    /// Reading the 2025 sticky dialect needs no flag and is always on. See
-    /// [`matrix_rtc_core::compat`].
+    /// Element Call's 2025 sticky dialect is read in the room-state format
+    /// only. See [`matrix_rtc_core::compat`].
     pub format: MembershipFormat,
     /// A group call, with or without a notification, or a DM call, with or
     /// without a ring. The default is a quiet group join.

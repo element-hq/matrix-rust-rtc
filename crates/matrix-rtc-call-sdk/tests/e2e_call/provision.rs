@@ -16,6 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct Credentials {
     pub user: String,
     pub password: String,
+    /// The C-S API URL of the homeserver the user lives on.
+    pub homeserver: String,
 }
 
 /// A suffix unique per test run, so reruns against a long-lived stack never
@@ -61,5 +63,9 @@ pub async fn register_user(
     }
 
     println!("[provision] registered {user}");
-    Ok(Credentials { user, password })
+    Ok(Credentials {
+        user,
+        password,
+        homeserver: homeserver.to_owned(),
+    })
 }

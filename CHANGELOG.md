@@ -8,6 +8,31 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- In the MSC format a member event is read exactly as MSC4143 states it: Element Call's 2025 sticky content and self-claimed devices are only read in the room-state format (038).
+- In an encrypted room a member is joined only if decryption names the device that sent their member event; `EventOrigin::Unknown` is removed (038).
+- A join whose slot id breaks MSC4143's grammar or 255-byte limit fails with `JoinError::InvalidSlotId`, and a member of another application is not joined to a slot (038).
+- MSC media keys go out as `io.element.call.encryption_keys` with exactly `room_id`, `member_id` and an unpadded `media_key`, and each room reads only its own format's key body (038).
+- An MSC room drops a media key shorter than 32 bytes (room-state rooms still take 16), and the web `connect` config no longer takes `keyRingSize` (038).
+- `ConnectionContext` carries `e2ee`, and the web delegate's `connect` request an `e2ee` flag that, not the page's `roomOptions.e2ee`, decides frame encryption (038).
+- In the MSC format a call publishes on the homeserver's first `m.livekit` transport, written `{type: "m.livekit", url}`, and counts a peer's media only on `m.livekit` with a `url`, every token coming from the homeserver; `transports::choose`/`resolve` and `transport_to_json` take the room's format (038).
+- A join on a homeserver advertising no LiveKit transport of the room's format fails with `JoinError::NoLiveKitTransport`, and a homeserver without MSC4195's `get_token` ends the call at once with the new loss reason `token_endpoint_unsupported` instead of retrying (038).
+- A participant on an SFU with no membership is no longer an interruption while signalling is healthy: after 10 s it is listed by the new `unverified_participants` (engine, FFI and web media sessions) (038).
+- In the MSC format, starting or ringing a call sends an MSC4075 `m.rtc.invite` (`slot_id`, `sender_ts`, `lifetime`, `m.mentions`, sticky key) without waiting for our membership, withdrawn when we leave alone or the slot closes; an invite targeting nobody is refused with `RtcError::InviteTargetsNobody`; room-state keeps today's notification (038).
+
+### Added
+
+- `msc_support` (core, `RtcClient`, FFI, web `mscSupport`) names what a homeserver lacks for the MSC format, from its `/versions` features (host helpers `server_features`/`serverFeatures`) and its transports, without choosing the format (038).
+
+### Fixed
+
+- The matrix-js-sdk host sends the delayed leave as a sticky delayed event, so a crashed web client's membership ends when it fires; without SDK or server support it still joins without one (038).
+- A call in a room whose encryption is off sends no media keys and connects without frame encryption, natively and on the web (038).
+- On the web an unencrypted track in an encrypted call is refused whatever the page's options (038).
+- A call joined in the clear leaves with `slot_closed` when the room's encryption turns on, rather than staying unencrypted (038).
+- Every key index, 0 to 255, is usable natively and on the web; native dropped index 255 and the web anything past 15 (038).
+
 ### Added
 
 - A join follows the call's voice/video intent from the memberships already in it and publishes it in ours; read it from `RtcCall::call_intent` to start the camera, and pass `intent` only to start a call (030).

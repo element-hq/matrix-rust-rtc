@@ -20,10 +20,14 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc, watch};
 
+use base64::Engine as _;
+
+use crate::encryption::MEDIA_KEY_BASE64;
 use crate::{
     ApplicationIntake, BackendError, EventEncryption, EventIn, EventOrigin, KEY_MESSAGE_TYPE,
-    KeyOrigin, MatrixBackend, RawSlotEvent, RawTimelineEvent, ReceivedEncryptionKey, RoomSink,
-    RoomSubjects, SLOT_EVENT_TYPE, Subscription, ToDeviceMessageIn, ToDeviceSink,
+    KeyOrigin, MIN_MEDIA_KEY_LEN, MatrixBackend, RawSlotEvent, RawTimelineEvent,
+    ReceivedEncryptionKey, RoomSink, RoomSubjects, SLOT_EVENT_TYPE, Subscription,
+    ToDeviceMessageIn, ToDeviceSink,
 };
 
 mod dialect;
@@ -34,7 +38,10 @@ pub use dialect::IngestDialect;
 
 const MEMBER_EVENT_TYPES: [&str; 2] = ["m.rtc.member", "org.matrix.msc4143.rtc.member"];
 const SLOT_EVENT_TYPES: [&str; 2] = [SLOT_EVENT_TYPE, "org.matrix.msc4143.rtc.slot"];
-const KEY_EVENT_TYPES: [&str; 2] = ["m.rtc.encryption_key", KEY_MESSAGE_TYPE];
+/// The media key types, stable and as MSC4143's unstable id. Element Call's
+/// legacy key shape travels under the same unstable type, so a message's type
+/// never says which body it carries: the dialect of the room it names does.
+const KEY_EVENT_TYPES: [&str; 2] = [KEY_MESSAGE_TYPE, "io.element.call.encryption_keys"];
 
 /// How long an unseeded room waits on a delivery before the feeder names what
 /// it is still waiting on; repeated while nothing arrives. A host that never
@@ -643,8 +650,7 @@ where
 
 // ---- To-device keys ----
 
-/// The MSC4143 `m.rtc.encryption_key` content. `format` is not read: the key
-/// is always base64.
+/// The MSC4143 `m.rtc.encryption_key` content. Anything else in it is ignored.
 #[derive(Deserialize)]
 struct KeyMessageContent {
     room_id: String,
@@ -658,41 +664,58 @@ struct MediaKey {
     key: String,
 }
 
-/// A media key from a to-device message, or `None` with the reason logged. A
-/// type beyond the spec's is read by the dialect of the room its content
-/// names.
+/// A media key from a to-device message, or `None` with the reason logged.
+///
+/// Read by the dialect of the room the content names, whatever the type: the
+/// MSC body and Element Call's legacy body share a type on the wire, so only
+/// the room's format can say which one to expect (spec 038 R14, R35).
 pub fn parse_key_message(
     dialect_of: impl Fn(&str) -> Option<Arc<dyn IngestDialect>>,
     message: ToDeviceMessageIn,
 ) -> Option<ReceivedEncryptionKey> {
-    if !KEY_EVENT_TYPES.contains(&message.event_type.as_str()) {
-        let room_id = message
-            .content
-            .get("room_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let Some(dialect) = dialect_of(room_id) else {
-            log::debug!(
-                "[{room_id}] dropping a {} for a room that is not open",
-                message.event_type
-            );
-            return None;
-        };
-        return dialect.parse_key(&message);
-    }
+    let room_id = message
+        .content
+        .get("room_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some(dialect) = dialect_of(room_id) else {
+        log::debug!(
+            "[{room_id}] dropping a {} for a room that is not open",
+            message.event_type
+        );
+        return None;
+    };
+    dialect.parse_key(&message)
+}
 
-    let origin = key_origin(&message.encryption, &message.sender);
-    let content: KeyMessageContent = serde_json::from_value(message.content)
+/// A media key in MSC4143's body (`room_id`, `member_id`, `media_key`), the
+/// default every [`IngestDialect`] reads.
+pub fn parse_msc_key(message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
+    let content: KeyMessageContent = serde_json::from_value(message.content.clone())
         .inspect_err(|error| {
             log::warn!(
-                "ignoring a {} from {} whose content does not parse: {error}",
+                "ignoring a {} from {} whose content is not an MSC4143 key: {error}",
                 message.event_type,
                 message.sender,
             );
         })
         .ok()?;
+    // LiveKit needs 32 bytes (spec 038 R16). Only an MSC room is this strict:
+    // Element Call's room-state keys, read by its own parser, may be 16.
+    let key_len = MEDIA_KEY_BASE64
+        .decode(&content.media_key.key)
+        .map(|key| key.len())
+        .unwrap_or(0);
+    if key_len < MIN_MEDIA_KEY_LEN {
+        log::warn!(
+            "ignoring a {} from {}: its media key is {key_len} bytes, under {MIN_MEDIA_KEY_LEN}",
+            message.event_type,
+            message.sender,
+        );
+        return None;
+    }
     Some(ReceivedEncryptionKey {
-        origin,
+        origin: key_origin(&message.encryption, &message.sender),
         room_id: content.room_id,
         member_id: content.member_id,
         key_b64: content.media_key.key,
