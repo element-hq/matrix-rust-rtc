@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- A join follows the call's voice/video intent from the memberships already in it and publishes it in ours; read it from `RtcCall::call_intent` to start the camera, and pass `intent` only to start a call (030).
+
 ## v0.5.0-rc.9 - 2026-11-04
 
 ### Breaking

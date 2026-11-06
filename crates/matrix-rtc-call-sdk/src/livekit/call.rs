@@ -312,6 +312,9 @@ impl LiveKitCall {
                 join,
                 kind: options.kind.clone(),
                 reactions: options.reactions.clone(),
+                // Follows the call's voice or video intent; video when it
+                // starts one.
+                intent: None,
             })
             .await?,
         );

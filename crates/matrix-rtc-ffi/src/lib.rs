@@ -39,8 +39,8 @@ pub use logging::{
     setup_logging,
 };
 pub use params::{
-    FfiCallKind, FfiEncryptionConfig, FfiGroupNotify, FfiJoinSessionParams, FfiJoinTransport,
-    FfiLeaveSessionParams, FfiReactionsConfig, FfiRingConfig,
+    FfiCallIntent, FfiCallKind, FfiEncryptionConfig, FfiGroupNotify, FfiJoinSessionParams,
+    FfiJoinTransport, FfiLeaveSessionParams, FfiReactionsConfig, FfiRingConfig,
 };
 
 /// Participants with observable frame streams, publishing, and constraints —
@@ -496,6 +496,18 @@ impl RtcRoom {
         })
     }
 
+    /// The intent a join into `slot_id` would settle on, without joining: the
+    /// one its members agree on, else `requested`, else video. For a lobby
+    /// that previews the camera the join will start with.
+    pub async fn call_intent(
+        &self,
+        slot_id: String,
+        requested: Option<FfiCallIntent>,
+    ) -> Result<FfiCallIntent, MatrixRtcFfiError> {
+        let consensus = self.open().await?.call_intent_consensus(&slot_id).await;
+        Ok(consensus.resolve(requested.map(Into::into)).into())
+    }
+
     /// How many members are joined to a slot, without joining it.
     pub async fn member_count(&self, slot_id: String) -> Result<u64, MatrixRtcFfiError> {
         Ok(self.open().await?.member_count(&slot_id).await as u64)
@@ -621,6 +633,12 @@ impl RtcCall {
 
     pub async fn member_count(&self) -> u64 {
         self.call.member_count().await as u64
+    }
+
+    /// Whether this is a voice or a video call, as the join settled it. Start
+    /// the camera for [`FfiCallIntent::Video`] only.
+    pub fn call_intent(&self) -> FfiCallIntent {
+        self.call.intent().into()
     }
 
     /// The slot's joined roster as it changes; see
@@ -1148,6 +1166,7 @@ mod tests {
             encryption_config: None,
             kind: FfiCallKind::Group { notify: None },
             reactions: None,
+            intent: None,
         }
     }
 

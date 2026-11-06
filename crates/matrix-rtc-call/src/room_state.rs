@@ -5,7 +5,8 @@
 
 //! [`CallRoomState`]: one room's core [`BaseRtcRoom`] plus the call application's
 //! state in it — reactions and raised hands per slot, the ring and a DM call's
-//! lifecycle ([`crate::direct_call`]) on join. It wraps the two core
+//! lifecycle ([`crate::direct_call`]) and the call's intent
+//! ([`crate::intent`]) on join. It wraps the two core
 //! operations the call acts around (join, leave) and follows each slot's joined
 //! memberships through a core
 //! [`MembershipListener`](matrix_rtc_core::MembershipListener) registered on
@@ -31,6 +32,7 @@ use tokio::sync::{broadcast, watch};
 use crate::direct_call::{
     CallKind, DECLINE_EVENT_TYPES, DirectCall, DirectCallEnd, DirectCallState, RingJob, callee_of,
 };
+use crate::intent::{CALL_INTENT_KEY, CallIntent, CallIntentConsensus};
 use crate::notification::{NotifyConfig, is_own_participation, notify_session_started};
 use crate::reactions::{
     ANNOTATION_EVENT_TYPE, ANNOTATION_RELATION_TYPE, Clock, HandRequests, HandSend,
@@ -55,6 +57,10 @@ pub(crate) struct CallJoinParams {
     /// `None` — the default — is [`ReactionsConfig::default`]: enabled, with
     /// Element Call's three-second window. See [`crate::reactions`].
     pub reactions: Option<ReactionsConfig>,
+
+    /// The intent the host asks for, used when the call has none of its own
+    /// to follow; see [`CallIntentConsensus::resolve`].
+    pub intent: Option<CallIntent>,
 }
 
 impl CallJoinParams {
@@ -64,6 +70,7 @@ impl CallJoinParams {
             rtc,
             kind: CallKind::default(),
             reactions: None,
+            intent: None,
         }
     }
 
@@ -251,6 +258,8 @@ pub(crate) struct CallJoined {
     /// The ring to send, once the room's lock is released.
     pub ring: Option<RingJob>,
     pub status: Arc<CallStatusCell>,
+    /// The intent our membership states, as the join resolved it.
+    pub intent: CallIntent,
 }
 
 /// What the core does not already report about our own participation.
@@ -839,8 +848,20 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         deadline: Option<executor::Instant>,
     ) -> Result<CallJoined, JoinError> {
         let reactions = params.reactions();
-        let CallJoinParams { rtc, kind, .. } = params;
+        let CallJoinParams {
+            mut rtc,
+            mut kind,
+            intent,
+            ..
+        } = params;
         let slot_id = rtc.slot_id.clone();
+        let intent = self.resolve_intent(&slot_id, intent.or_else(|| requested_by(&kind)));
+        // Our membership states it, so the next to join follows it too; the
+        // notification states it when the host did not.
+        rtc.application = rtc
+            .application
+            .with_extra(CALL_INTENT_KEY, intent.as_str().into());
+        fill_intent(&mut kind, intent);
 
         let member_event_id = self.rtc.join_within(rtc.clone(), deadline).await?;
         // The join succeeded, so the room has a backend.
@@ -861,6 +882,7 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             direct: None,
             ring: None,
             status: CallStatusCell::new(clock),
+            intent,
         };
         match kind {
             CallKind::Group { notify: None } => {}
@@ -875,6 +897,38 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
             }
         }
         Ok(joined)
+    }
+
+    /// The intent a join into `slot_id` uses: the one the members already in
+    /// it agree on, otherwise `requested`, otherwise video. Read before our
+    /// membership is sent, and without our own device's, which may be a
+    /// membership from before a crash that has not expired yet.
+    fn resolve_intent(&self, slot_id: &str, requested: Option<CallIntent>) -> CallIntent {
+        let consensus = self.intent_consensus(slot_id);
+        let intent = consensus.resolve(requested);
+        log::info!(
+            "[{}/{slot_id}] joining as a {} call ({consensus:?}, requested {requested:?})",
+            self.room_id(),
+            intent.as_str(),
+        );
+        intent
+    }
+
+    /// What the members of `slot_id` other than this device agree on.
+    pub(crate) fn intent_consensus(&self, slot_id: &str) -> CallIntentConsensus {
+        let members = self
+            .rtc
+            .subscribe_membership_snapshots(slot_id)
+            .map(|snapshots| snapshots.borrow().clone())
+            .unwrap_or_default();
+        match self.backend() {
+            Ok(backend) => CallIntentConsensus::of_others(
+                &members,
+                &backend.own_user_id(),
+                &backend.own_device_id(),
+            ),
+            Err(_) => CallIntentConsensus::of(&members),
+        }
     }
 
     /// A DM call (spec 030): who the callee is, and where the call starts.
@@ -1060,6 +1114,27 @@ impl<T: MatrixBackend + 'static> ApplicationIntake<T> for CallRoomState<T> {
 
     fn on_relations_received(&mut self, target_event_id: &str, events: &[RawTimelineEvent]) {
         CallRoomState::on_relations_received(self, target_event_id, events);
+    }
+}
+
+/// The intent the host stated on the notification or ring, for a host that
+/// states it only there.
+fn requested_by(kind: &CallKind) -> Option<CallIntent> {
+    let stated = match kind {
+        CallKind::Group { notify } => notify.as_ref().and_then(|n| n.intent.as_deref()),
+        CallKind::Direct { ring } => ring.as_ref().and_then(|r| r.intent.as_deref()),
+    };
+    stated.and_then(CallIntent::parse)
+}
+
+/// States `intent` on the notification or ring when the host stated none.
+fn fill_intent(kind: &mut CallKind, intent: CallIntent) {
+    let stated = match kind {
+        CallKind::Group { notify } => notify.as_mut().map(|n| &mut n.intent),
+        CallKind::Direct { ring } => ring.as_mut().map(|r| &mut r.intent),
+    };
+    if let Some(stated) = stated {
+        stated.get_or_insert_with(|| intent.as_str().to_owned());
     }
 }
 

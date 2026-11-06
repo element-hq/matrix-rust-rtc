@@ -847,6 +847,7 @@ mod tests {
                     encryption_config: None,
                     kind: crate::FfiCallKind::Group { notify: None },
                     reactions: None,
+                    intent: None,
                 })
                 .await
                 .expect("joins");

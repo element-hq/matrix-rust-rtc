@@ -87,6 +87,7 @@ fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoo
                 encryption_config: None,
                 kind: crate::FfiCallKind::Group { notify: None },
                 reactions: None,
+                intent: None,
             })
             .await
             .unwrap();

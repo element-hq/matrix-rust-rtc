@@ -186,6 +186,20 @@ impl WasmRtcRoom {
         Ok(self.open().await?.debug_snapshot().await.to_string())
     }
 
+    /// `"audio"` or `"video"`: the intent a join into `slotId` would settle
+    /// on, without joining — the one its members agree on, else `requested`,
+    /// else video. For a lobby that previews the camera.
+    #[wasm_bindgen(js_name = callIntent)]
+    pub async fn call_intent(
+        &self,
+        slot_id: String,
+        requested: Option<String>,
+    ) -> Result<String, JsError> {
+        let requested = requested.as_deref().map(parse_intent).transpose()?;
+        let consensus = self.open().await?.call_intent_consensus(&slot_id).await;
+        Ok(consensus.resolve(requested).as_str().to_owned())
+    }
+
     /// How many members are joined to a slot, without joining it.
     #[wasm_bindgen(js_name = memberCount)]
     pub async fn member_count(&self, slot_id: String) -> Result<u32, JsError> {
@@ -205,6 +219,8 @@ impl WasmRtcRoom {
     ///   - `keep_alive_timeout_ms` (default 30000), `sticky_duration_ms`
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
+    ///   - `intent`: `"audio"` or `"video"`, to start a call with; a call in
+    ///     progress keeps its own
     ///
     /// The call keeps itself alive, and performs its key rotations when they
     /// fall due, until it leaves or is freed. The SDK generates the
@@ -358,6 +374,13 @@ impl WasmRtcCall {
     #[wasm_bindgen(getter, js_name = memberId)]
     pub fn member_id(&self) -> String {
         self.call.member_id().to_owned()
+    }
+
+    /// `"audio"` or `"video"`, as the join settled it. Start the camera for
+    /// `"video"` only.
+    #[wasm_bindgen(getter, js_name = callIntent)]
+    pub fn call_intent(&self) -> String {
+        self.call.intent().as_str().to_owned()
     }
 
     /// `false` once left, or once the room is closed.
@@ -538,6 +561,17 @@ pub struct WasmJoinSessionParams {
     /// Omitted is enabled with Element Call's three-second window.
     #[serde(default)]
     pub reactions: Option<WasmReactionsConfig>,
+    /// `"audio"` or `"video"`: the intent to start a call with. A call in
+    /// progress keeps its own; omitted with no call to follow is video. Read
+    /// the outcome from `callIntent` on the call.
+    #[serde(default)]
+    pub intent: Option<String>,
+}
+
+/// `"audio"` or `"video"`, or an error naming what was passed.
+fn parse_intent(intent: &str) -> Result<matrix_rtc_call::CallIntent, JsError> {
+    matrix_rtc_call::CallIntent::parse(intent)
+        .ok_or_else(|| JsError::new(&format!("unknown call intent {intent:?}")))
 }
 
 /// WASM-friendly reactions configuration (mirrors the core's
@@ -674,6 +708,7 @@ impl WasmJoinSessionParams {
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         };
         options.reactions = self.reactions.map(Into::into);
+        options.intent = self.intent.as_deref().map(parse_intent).transpose()?;
         Ok(options)
     }
 }

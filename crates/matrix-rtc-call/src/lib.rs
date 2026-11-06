@@ -18,6 +18,7 @@ mod client;
 pub mod direct_call;
 #[cfg(test)]
 mod feeder_tests;
+pub mod intent;
 pub mod notification;
 pub mod reactions;
 mod status;
@@ -31,6 +32,7 @@ pub use client::{
     CallJoinOptions, JOIN_BUDGET, JoinOptions, RtcCall, RtcClient, RtcError, RtcRoom, RtcSession,
 };
 pub use direct_call::{CallKind, DECLINE_EVENT_TYPES, GroupNotify, RING_SEND_DEADLINE, RingConfig};
+pub use intent::{CALL_INTENT_KEY, CallIntent, CallIntentConsensus};
 pub use matrix_rtc_core::SignallingHealth;
 pub use notification::{
     DEFAULT_RING_LIFETIME_MS, MAX_RING_LIFETIME_MS, Mentions, NOTIFICATION_EVENT_TYPE,
