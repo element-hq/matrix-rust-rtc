@@ -35,6 +35,7 @@ use matrix_rtc_core::{
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::direct_call::{CallKind, DirectCall, DirectCallEnd, DirectCallState};
+use crate::intent::{CallIntent, CallIntentConsensus};
 use crate::reactions::{
     HandRequests, RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction,
 };
@@ -176,6 +177,9 @@ pub struct CallJoinOptions {
     pub kind: CallKind,
     /// `None` is [`ReactionsConfig::default`].
     pub reactions: Option<ReactionsConfig>,
+    /// The intent to start a call with. A call in progress keeps its own; see
+    /// [`CallIntentConsensus::resolve`].
+    pub intent: Option<CallIntent>,
 }
 
 impl CallJoinOptions {
@@ -186,6 +190,7 @@ impl CallJoinOptions {
             join: JoinOptions::application(CALL_APPLICATION),
             kind: CallKind::default(),
             reactions: None,
+            intent: None,
         }
     }
 
@@ -209,6 +214,12 @@ impl CallJoinOptions {
 
     pub fn reactions(mut self, reactions: ReactionsConfig) -> Self {
         self.reactions = Some(reactions);
+        self
+    }
+
+    /// See [`Self::intent`](CallJoinOptions#structfield.intent).
+    pub fn intent(mut self, intent: CallIntent) -> Self {
+        self.intent = Some(intent);
         self
     }
 }
@@ -329,6 +340,13 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         self.mode
     }
 
+    /// Whether the call in `slot_id` is a voice or a video call, by what the
+    /// members other than this device state: for a lobby to preview the
+    /// camera a join would start with ([`CallIntentConsensus::resolve`]).
+    pub async fn call_intent_consensus(&self, slot_id: &str) -> CallIntentConsensus {
+        self.state.lock().await.intent_consensus(slot_id)
+    }
+
     /// The host's backend behind the dialect wrapper.
     pub fn backend(&self) -> &Arc<DialectBackend<B>> {
         &self.backend
@@ -423,6 +441,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             join,
             kind,
             reactions,
+            intent,
         } = options;
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone(), deadline).await?;
@@ -437,6 +456,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                     rtc,
                     kind,
                     reactions,
+                    intent,
                 },
                 Some(deadline),
             )
@@ -471,6 +491,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                 self.follow_hand(slot_id, moves, requests, outbox, session.end.clone())
             }),
             status: joined.status,
+            intent: joined.intent,
             _ring: ring,
             _follow_direct: follow_direct,
             session,
@@ -1089,6 +1110,8 @@ pub struct RtcCall<B: MatrixBackend + 'static> {
     /// Ends the call when its media gives our own connection up.
     _follow_media_loss: AbortOnDrop<()>,
     status: Arc<CallStatusCell>,
+    /// The intent our membership states.
+    intent: CallIntent,
     /// Sends the ring and times it.
     _ring: Option<AbortOnDrop<()>>,
     /// Leaves when the lifecycle ends the call.
@@ -1098,6 +1121,13 @@ pub struct RtcCall<B: MatrixBackend + 'static> {
 impl<B: MatrixBackend + 'static> RtcCall<B> {
     pub fn session(&self) -> &RtcSession<B> {
         &self.session
+    }
+
+    /// Whether this is a voice or a video call, as the join settled it: the
+    /// call's own intent when it had one, else the one asked for. The host
+    /// starts with the camera on for [`CallIntent::Video`] only.
+    pub fn intent(&self) -> CallIntent {
+        self.intent
     }
 
     /// Sends an emoji reaction relating to our membership. Only the first

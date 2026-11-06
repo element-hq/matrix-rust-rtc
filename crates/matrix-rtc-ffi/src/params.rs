@@ -24,6 +24,31 @@ pub enum FfiJoinTransport {
     ReceiveOnly,
 }
 
+/// MSC4196 `m.call.intent`: a voice or a video call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCallIntent {
+    Audio,
+    Video,
+}
+
+impl From<FfiCallIntent> for matrix_rtc_call::CallIntent {
+    fn from(value: FfiCallIntent) -> Self {
+        match value {
+            FfiCallIntent::Audio => Self::Audio,
+            FfiCallIntent::Video => Self::Video,
+        }
+    }
+}
+
+impl From<matrix_rtc_call::CallIntent> for FfiCallIntent {
+    fn from(value: matrix_rtc_call::CallIntent) -> Self {
+        match value {
+            matrix_rtc_call::CallIntent::Audio => Self::Audio,
+            matrix_rtc_call::CallIntent::Video => Self::Video,
+        }
+    }
+}
+
 /// FFI-friendly encryption configuration.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiEncryptionConfig {
@@ -162,6 +187,12 @@ pub struct FfiJoinSessionParams {
     /// Unset is enabled with Element Call's three-second window.
     #[uniffi(default = None)]
     pub reactions: Option<FfiReactionsConfig>,
+    /// The intent to start a call with, from the button the user pressed.
+    /// A call in progress keeps its own, so answering or joining one needs
+    /// none; unset with no call to follow is video. Read the outcome from
+    /// [`crate::RtcCall::call_intent`].
+    #[uniffi(default = None)]
+    pub intent: Option<FfiCallIntent>,
 }
 
 /// FFI-friendly reactions configuration (mirrors
@@ -300,6 +331,7 @@ impl FfiJoinSessionParams {
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
         options.kind = self.kind.into();
         options.reactions = self.reactions.map(Into::into);
+        options.intent = self.intent.map(Into::into);
         Ok(options)
     }
 }

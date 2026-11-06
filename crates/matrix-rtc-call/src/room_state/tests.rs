@@ -22,6 +22,7 @@ use tokio::sync::broadcast::error::TryRecvError;
 
 use super::*;
 use crate::direct_call::{GroupNotify, RingConfig};
+use crate::intent::{CALL_INTENT_KEY, CallIntent};
 use crate::notification::{DEFAULT_RING_LIFETIME_MS, NOTIFICATION_EVENT_TYPE};
 use crate::reactions::ReactionSound;
 
@@ -1411,4 +1412,108 @@ async fn leaving_while_it_rings_ends_the_lifecycle_and_its_timer() {
     assert_eq!(state(&joined), ended(DirectCallEnd::Left));
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(ring.is_finished(), "the timer stopped with the ringing");
+}
+
+/// Bob's membership in the room-wide call, stating `intent`.
+fn bob_in_a_call(intent: &str) -> RawStickyEvent {
+    let mut event = member_event(BOB, Some("BOBDEV"), "bob-a", "$bob");
+    event.content.application =
+        ApplicationInfo::new("m.call").with_extra(CALL_INTENT_KEY, json!(intent));
+    event
+}
+
+/// The `m.call.intent` of the membership our join sent.
+fn published_intent(sender: &MockBackend) -> Value {
+    sender
+        .sticky_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, event_type, _, _)| event_type == wire_event_type("m.rtc.member"))
+        .and_then(|(_, _, content, _)| content.pointer("/application/m.call.intent").cloned())
+        .expect("the join sends a membership stating an intent")
+}
+
+/// Joins as alice, asking for `intent` and `notify`.
+async fn join_asking(
+    call: &mut Call,
+    intent: Option<CallIntent>,
+    notify: Option<GroupNotify>,
+) -> CallJoined {
+    let mut rtc = join_params();
+    rtc.membership_id = Some("alice-a".to_owned());
+    let params = CallJoinParams {
+        kind: CallKind::Group { notify },
+        intent,
+        ..rtc.into()
+    };
+    let joined = call.join(params).await.expect("join succeeds");
+    let_detached_sends_run().await;
+    joined
+}
+
+/// The bug this exists for: a join that did not say "voice" (a room header's
+/// button) into a voice call in progress joins it as a voice call.
+#[tokio::test]
+async fn joining_a_voice_call_in_progress_follows_it() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+    set_roster(&mut call, vec![bob_in_a_call("audio")]).await;
+
+    let joined = join_asking(&mut call, Some(CallIntent::Video), None).await;
+
+    assert_eq!(joined.intent, CallIntent::Audio);
+    assert_eq!(published_intent(&sender), "audio");
+}
+
+/// Starting a call is the host's choice, and the notification says the same
+/// as our membership even when the host stated it only on the join.
+#[tokio::test]
+async fn starting_a_call_uses_the_intent_asked_for() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+
+    let joined = join_asking(
+        &mut call,
+        Some(CallIntent::Audio),
+        Some(GroupNotify::default()),
+    )
+    .await;
+
+    assert_eq!(joined.intent, CallIntent::Audio);
+    assert_eq!(published_intent(&sender), "audio");
+    let sent = notifications_sent(&sender);
+    assert_eq!(
+        sent[0].0.pointer("/application/m.call.intent").unwrap(),
+        "audio"
+    );
+}
+
+/// A host that states the intent only on the notification, as before this
+/// existed, still starts the call it asked for.
+#[tokio::test]
+async fn an_intent_stated_only_on_the_notification_is_the_request() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+
+    let notify = GroupNotify {
+        intent: Some("audio".to_owned()),
+        ..GroupNotify::default()
+    };
+    let joined = join_asking(&mut call, None, Some(notify)).await;
+
+    assert_eq!(joined.intent, CallIntent::Audio);
+    assert_eq!(published_intent(&sender), "audio");
+}
+
+/// Nothing asked for and nobody to follow is a video call.
+#[tokio::test]
+async fn starting_a_call_without_an_intent_is_video() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+
+    let joined = join_asking(&mut call, None, None).await;
+
+    assert_eq!(joined.intent, CallIntent::Video);
+    assert_eq!(published_intent(&sender), "video");
 }
