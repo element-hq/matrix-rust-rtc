@@ -37,6 +37,12 @@ listeners:
 tls_certificate_path: /data/tls/synapse.crt
 tls_private_key_path: /data/tls/synapse.key
 
+# Federation with the stack's second homeserver (synapse2, for MSC multi-SFU
+# runs): both serve self-signed certs and live on the compose network's
+# private addresses, which Synapse refuses by default.
+federation_verify_certificates: false
+ip_range_blacklist: []
+
 database:
   name: sqlite3
   args:

@@ -13,6 +13,7 @@ volumes:
   # Synapse state (sqlite DB, media, signing key). See the synapse service's
   # volumes comment for why this must not be a bind mount.
   synapse-data:
+  synapse2-data:
 
 services:
   # One-shot, idempotent: mints the self-signed cert Synapse's federation
@@ -27,9 +28,11 @@ services:
     command:
       - -c
       - |
-        [ -f /certs/synapse.key ] || openssl req -x509 -newkey rsa:2048 -nodes \
-          -keyout /certs/synapse.key -out /certs/synapse.crt -days 3650 \
-          -subj "/CN=synapse" -addext "subjectAltName=DNS:synapse"
+        for name in synapse synapse2; do
+          [ -f /certs/$$name.key ] || openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /certs/$$name.key -out /certs/$$name.crt -days 3650 \
+            -subj "/CN=$$name" -addext "subjectAltName=DNS:$$name" || exit 1
+        done
     volumes:
       - ./data/tls:/certs
 
@@ -80,15 +83,18 @@ services:
   # synapse/lk-jwt-appservice.yaml — the C-S endpoints Synapse proxies to it
   # (`/_matrix/client/…/rtc/livekit/{get_token,delegate_delayed_leave}`).
   auth-service:
-    image: ghcr.io/element-hq/lk-jwt-service:0.8.0
+    # An image of lk-jwt-service's main (0c75df2): no release yet lets a user
+    # relayed over federation publish (#251), which the MSC SFU fallback to
+    # another homeserver's SFU needs. Move to the first release that does.
+    image: ghcr.io/element-hq/lk-jwt-service:sha-0c75df2
     # lk-jwt uses LIVEKIT_URL for two things at once: the URL it hands back to
     # clients in /get_token responses, AND its own RoomService endpoint for
     # creating the room on the SFU (full-access path). One URL must therefore
     # work from the host and from inside this container. Sharing the SFU's
     # network namespace makes `localhost:7880` mean the SFU in both places
     # (host side via the published port). DNS for `synapse` still resolves —
-    # the shared namespace is livekit's, which sits on the compose network.
-    network_mode: "service:livekit"
+    # the shared namespace is sfu-net's, which sits on the compose network.
+    network_mode: "service:sfu-net"
     environment:
       LIVEKIT_JWT_BIND: ":6080"
       LIVEKIT_URL: "${LIVEKIT_WS_URL:-ws://localhost:7880}"
@@ -122,16 +128,30 @@ services:
       timeout: 5s
       retries: 20
 
-  livekit:
-    image: livekit/livekit-server:v1.10.1
-    command: --config /etc/livekit.yaml
-    volumes:
-      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+  # Owns the network namespace (and the published ports) the first SFU and its
+  # auth-service share, so either can be stopped without taking the other's
+  # network down: the resilience runs stop an SFU while its homeserver still
+  # relays tokens through the auth-service. Carries the `livekit` name, which
+  # the namespace's members cannot hold themselves.
+  sfu-net:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    init: true
+    networks:
+      default:
+        aliases: [livekit]
     ports:
       - "7880:7880/tcp" # signalling WebSocket + HTTP
       - "7881:7881/tcp" # ICE over TCP (fallback when UDP is blocked)
       - "50100-50200:50100-50200/udp" # WebRTC media (keep the range small: one iptables entry per port)
-      - "6080:6080/tcp" # auth-service (it shares this network namespace, see above)
+      - "6080:6080/tcp" # auth-service
+
+  livekit:
+    image: livekit/livekit-server:v1.10.1
+    command: --config /etc/livekit.yaml
+    network_mode: "service:sfu-net"
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
     # Same probe the official livekit-helm chart uses; the alpine base ships
     # busybox wget.
     healthcheck:
@@ -146,22 +166,57 @@ services:
   # pattern as the first pair; every published port is shifted, and the UDP
   # media ranges must never overlap between the two SFUs.
 
-  # Legacy endpoints only. A homeserver proxies `rtc/livekit` to exactly one
-  # application service and one lk-jwt-service serves one SFU, so a second
-  # focus on the C-S API means a second (federated) homeserver.
+  # A homeserver proxies `rtc/livekit` to exactly one application service and
+  # one lk-jwt-service serves one SFU, so a second focus on the C-S API means a
+  # second homeserver, federated with the first. MSC tokens for this SFU come
+  # from synapse2; a synapse user's request is relayed to it over federation.
+  synapse2:
+    image: ghcr.io/element-hq/synapse:v1.161.0
+    environment:
+      SYNAPSE_CONFIG_PATH: /cfg/homeserver.yaml
+      UID: "0"
+      GID: "0"
+    volumes:
+      - ./synapse/homeserver2.yaml:/cfg/homeserver.yaml:ro
+      - ./synapse/log.config:/cfg/log.config:ro
+      - ./synapse/lk-jwt-appservice2.yaml:/cfg/lk-jwt-appservice2.yaml:ro
+      # A named volume, as synapse's.
+      - synapse2-data:/data
+      - ./data/tls:/data/tls:ro
+    ports:
+      - "8009:8008"
+    depends_on:
+      init-certs:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-fSs", "http://localhost:8008/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  # As auth-service, for the second SFU and synapse2. The legacy endpoints
+  # keep serving synapse users, as the room-state multi-SFU runs need.
   auth-service2:
-    image: ghcr.io/element-hq/lk-jwt-service:0.8.0
-    network_mode: "service:livekit2"
+    image: ghcr.io/element-hq/lk-jwt-service:sha-0c75df2
+    network_mode: "service:sfu2-net"
     environment:
       LIVEKIT_JWT_BIND: ":6081"
       LIVEKIT_URL: "${LIVEKIT_WS_URL_2:-ws://localhost:7890}"
       LIVEKIT_KEY: devkey
       LIVEKIT_SECRET: secret
       LIVEKIT_FULL_ACCESS_HOMESERVERS: synapse
+      LIVEKIT_AS_REGISTRATION_FILE: /etc/lk-jwt-service/appservice.yaml
+      LIVEKIT_HS_SERVER_NAME: synapse2
+      LIVEKIT_CS_API_URL_OVERRIDES: "synapse2=http://synapse2:8008"
       LIVEKIT_INSECURE_SKIP_VERIFY_TLS: YES_I_KNOW_WHAT_I_AM_DOING
       LIVEKIT_LOG_LEVEL: debug
+    volumes:
+      - ./synapse/lk-jwt-appservice2.yaml:/etc/lk-jwt-service/appservice.yaml:ro
     depends_on:
       synapse:
+        condition: service_healthy
+      synapse2:
         condition: service_healthy
       livekit2:
         condition: service_healthy
@@ -172,16 +227,26 @@ services:
       timeout: 5s
       retries: 20
 
-  livekit2:
-    image: livekit/livekit-server:v1.10.1
-    command: --config /etc/livekit.yaml
-    volumes:
-      - ./livekit/livekit2.yaml:/etc/livekit.yaml:ro
+  # As sfu-net, for the second pair.
+  sfu2-net:
+    image: alpine:3.20
+    command: ["sleep", "infinity"]
+    init: true
+    networks:
+      default:
+        aliases: [livekit2]
     ports:
       - "7890:7890/tcp" # signalling WebSocket + HTTP
       - "7891:7891/tcp" # ICE over TCP
       - "50300-50400:50300-50400/udp" # WebRTC media (distinct from SFU 1's range)
-      - "6081:6081/tcp" # auth-service2 (shares this network namespace)
+      - "6081:6081/tcp" # auth-service2
+
+  livekit2:
+    image: livekit/livekit-server:v1.10.1
+    command: --config /etc/livekit.yaml
+    network_mode: "service:sfu2-net"
+    volumes:
+      - ./livekit/livekit2.yaml:/etc/livekit.yaml:ro
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:7890/"]
       interval: 3s

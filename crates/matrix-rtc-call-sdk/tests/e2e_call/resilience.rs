@@ -32,7 +32,7 @@ use matrix_rtc_core::{LiveKitTransport, SignallingHealth, SlotEncryption};
 use matrix_rtc_transport::{AudioFrame, AudioSourceConfig, PublishOptions};
 
 use super::{
-    Config, Participant, create_encrypted_room, credentials, login_and_sync, open_slot,
+    Config, Participant, Sfu, create_encrypted_room, credentials, login_and_sync, open_slot,
     record_peer_tone, run_to_completion, wait_for_joined_members, wait_for_members, wait_for_room,
 };
 
@@ -90,11 +90,11 @@ async fn compose_async(args: &'static [&'static str]) -> Result<(), Box<dyn Erro
 /// stack whole for the next one.
 struct Restore(&'static [&'static str]);
 
-/// Each SFU with the token service living in its network namespace
-/// (`network_mode: service:…`): a token service left running across its
-/// SFU's restart keeps the dead namespace and never answers again.
-const LIVEKIT: &[&str] = &["livekit", "auth-service"];
-const BOTH_LIVEKITS: &[&str] = &["livekit", "auth-service", "livekit2", "auth-service2"];
+/// The SFUs alone: their token services keep running, as in a deployment, so
+/// a homeserver still relays a token request for the other SFU (the stack
+/// holds each pair's network namespace apart, in `sfu-net`/`sfu2-net`).
+const LIVEKIT: &[&str] = &["livekit"];
+const BOTH_LIVEKITS: &[&str] = &["livekit", "livekit2"];
 
 /// Stops `services` (SFUs with their token services), returning what starts
 /// them again.
@@ -158,16 +158,18 @@ async fn publish_tone(
     }))
 }
 
-/// Alice and bob in an open slot of a fresh encrypted room, alice publishing
-/// on `alice_url` (with the fallback when `alice_fallback`) and bob on
-/// `bob_url`, each seeing the other.
+/// Alice and bob in an open slot of a fresh encrypted MSC room, alice
+/// publishing on `alice_sfu` (with the fallback when `alice_fallback`) and
+/// bob on `bob_sfu`, each seeing the other. Bob lives on the homeserver that
+/// mints his SFU's tokens.
 async fn two_in_a_call(
     cfg: &Config,
-    alice_url: &str,
-    bob_url: &str,
+    alice_sfu: Sfu,
+    bob_sfu: Sfu,
     alice_fallback: bool,
 ) -> Result<(Participant, Participant), Box<dyn Error>> {
-    let (alice_creds, bob_creds) = credentials(cfg).await?;
+    let format = MembershipFormat::Msc;
+    let (alice_creds, bob_creds) = credentials(cfg, cfg.homeserver_for(format, bob_sfu)).await?;
     let alice = login_and_sync(cfg, &alice_creds).await?;
     let bob = login_and_sync(cfg, &bob_creds).await?;
     let bob_id = bob.client.user_id().ok_or("bob has no user id")?.to_owned();
@@ -189,7 +191,7 @@ async fn two_in_a_call(
     )
     .await?;
 
-    let join = |room: matrix_sdk::Room, url: String, fallback: bool| {
+    let join = |room: matrix_sdk::Room, transport: LiveKitTransport, fallback: bool| {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(cfg.insecure_tls)
             .build();
@@ -199,9 +201,9 @@ async fn two_in_a_call(
                 &room,
                 LiveKitCallOptions {
                     slot_id,
-                    livekit_transport: Some(LiveKitTransport::service(url)),
+                    livekit_transport: Some(transport),
                     http: Some(http?),
-                    format: MembershipFormat::Msc,
+                    format,
                     sfu_fallback: fallback,
                     ..LiveKitCallOptions::default()
                 },
@@ -211,11 +213,11 @@ async fn two_in_a_call(
         }
     };
     let alice = Participant {
-        call: join(alice_room, alice_url.to_owned(), alice_fallback).await?,
+        call: join(alice_room, cfg.transport(format, alice_sfu), alice_fallback).await?,
         _sync: alice.sync,
     };
     let bob = Participant {
-        call: join(bob_room, bob_url.to_owned(), false).await?,
+        call: join(bob_room, cfg.transport(format, bob_sfu), false).await?,
         _sync: bob.sync,
     };
     if !(wait_for_members(&alice.call, 2, "alice").await
@@ -297,8 +299,7 @@ async fn react_during_outage(call: &LiveKitCall) {
 /// alice leave — the delayed leave Synapse may fire on its way back up is
 /// absorbed by the hold.
 async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
-    let url = cfg.livekit_service_url.clone();
-    let (alice, bob) = two_in_a_call(&cfg, &url, &url, false).await?;
+    let (alice, bob) = two_in_a_call(&cfg, Sfu::First, Sfu::First, false).await?;
     let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let alice_member = alice.call.membership_id().to_owned();
@@ -363,8 +364,7 @@ async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
 /// reconnects behind the same handle with the same member id, and the call
 /// never ends.
 async fn own_sfu_back_in_time(cfg: Config) -> Result<(), Box<dyn Error>> {
-    let url = cfg.livekit_service_url.clone();
-    let (alice, bob) = two_in_a_call(&cfg, &url, &url, false).await?;
+    let (alice, bob) = two_in_a_call(&cfg, Sfu::First, Sfu::First, false).await?;
     let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let member = alice.call.membership_id().to_owned();
@@ -399,13 +399,7 @@ async fn own_sfu_back_in_time(cfg: Config) -> Result<(), Box<dyn Error>> {
 /// to bob's SFU, whose token service accepts us, and bob hears us again
 /// through it; the call outlives the budget.
 async fn own_sfu_fallback(cfg: Config) -> Result<(), Box<dyn Error>> {
-    let (alice, bob) = two_in_a_call(
-        &cfg,
-        &cfg.livekit_service_url,
-        &cfg.livekit_service_url_2,
-        true,
-    )
-    .await?;
+    let (alice, bob) = two_in_a_call(&cfg, Sfu::First, Sfu::Second, true).await?;
     let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let member = alice.call.membership_id().to_owned();
@@ -432,13 +426,7 @@ async fn own_sfu_fallback(cfg: Config) -> Result<(), Box<dyn Error>> {
 /// fallback; at the end of the budget our leave goes out and the call ends
 /// with the budget as its reason.
 async fn every_sfu_down(cfg: Config) -> Result<(), Box<dyn Error>> {
-    let (alice, bob) = two_in_a_call(
-        &cfg,
-        &cfg.livekit_service_url,
-        &cfg.livekit_service_url_2,
-        true,
-    )
-    .await?;
+    let (alice, bob) = two_in_a_call(&cfg, Sfu::First, Sfu::Second, true).await?;
     let mut status = alice.call.subscribe_status();
 
     // From the loss as our media reports it: LiveKit drops its connections

@@ -70,7 +70,7 @@ services:
 
   # What lk-jwt hands back to clients in /get_token (and its own RoomService
   # endpoint) has to be a URL the *browser* can open, so it goes through nginx.
-  # Resolvable in here too: this container shares livekit's network namespace,
+  # Resolvable in here too: this container shares sfu-net's network namespace,
   # which sits on the compose network where the alias lives.
   auth-service:
     environment:

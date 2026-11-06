@@ -33,27 +33,34 @@ probe() {
   return 1
 }
 
-probe "synapse" "http://localhost:8008/health"
 # MSC4195's C-S endpoints are proxied by Synapse to lk-jwt-service (as an
 # application service). Unauthenticated, a served endpoint answers 401 and a
-# missing one 404 — the check Element Call makes.
-for _ in $(seq 1 60); do
-  status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
-    http://localhost:8008/_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave || true)
-  [ "$status" = "401" ] && break
-  sleep 2
-done
-if [ "$status" != "401" ]; then
-  echo "[wait-ready] ERROR: synapse has no /rtc/livekit route for lk-jwt-service (HTTP $status)" >&2
-  exit 1
-fi
-# A 401 shows the route is registered; Synapse answers it before contacting
-# the app service, so lk-jwt-service itself is probed below.
-echo "[wait-ready] rtc/livekit C-S route registered (HTTP 401 unauthenticated)"
+# missing one 404 — the check Element Call makes. A 401 shows the route is
+# registered; Synapse answers it before contacting the app service, so
+# lk-jwt-service itself is probed below.
+probe_rtc_route() {
+  local name="$1" homeserver="$2" status=""
+  for _ in $(seq 1 60); do
+    status=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+      "$homeserver/_matrix/client/unstable/io.element.msc4195/rtc/livekit/delegate_delayed_leave" || true)
+    [ "$status" = "401" ] && break
+    sleep 2
+  done
+  if [ "$status" != "401" ]; then
+    echo "[wait-ready] ERROR: $name has no /rtc/livekit route for lk-jwt-service (HTTP $status)" >&2
+    exit 1
+  fi
+  echo "[wait-ready] $name rtc/livekit C-S route registered (HTTP 401 unauthenticated)"
+}
+
+probe "synapse" "http://localhost:8008/health"
+probe_rtc_route "synapse" "http://localhost:8008"
 probe "lk-jwt-service" "http://localhost:6080/healthz"
 probe "livekit" "http://localhost:7880/"
 probe "lk-jwt-service-2" "http://localhost:6081/healthz"
 probe "livekit-2" "http://localhost:7890/"
+probe "synapse2" "http://localhost:8009/health"
+probe_rtc_route "synapse2" "http://localhost:8009"
 
 if [ "$INTEROP" = "1" ]; then
   # -k: the stack's CA is minted at up time, and whether the *host* trusts it
