@@ -62,8 +62,7 @@ use matrix_rtc_transport::{
 
 use crate::session::LiveKitSession;
 use crate::{
-    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
-    identity_mapper,
+    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, identity_mapper, room_options,
 };
 
 /// Sample rate remote audio is resampled to before crossing the transport
@@ -190,6 +189,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     http: self.http.clone(),
                     backend: self.backend.clone(),
                     key_provider: self.key_providers.connection_provider(),
+                    e2ee: ctx.e2ee,
                     auto_subscribe: self.auto_subscribe,
                     config: Mutex::new(config),
                     token: Mutex::new(None),
@@ -296,6 +296,9 @@ struct Connector {
     backend: Arc<dyn MatrixBackend>,
     /// This connection's own: a reconnect sets the SFU's trailer on it again.
     key_provider: crate::ConnectionKeyProvider,
+    /// Whether frames are encrypted (spec 038 R11); when they are, a track
+    /// declared unencrypted is refused (R12).
+    e2ee: bool,
     auto_subscribe: bool,
     /// The focus connects go to; a take-over moves it (034 R25).
     config: Mutex<LiveKitTransportConfig>,
@@ -318,11 +321,15 @@ impl Connector {
     }
 }
 
-/// A token failure: a 4xx from the JWT service, a 4xx other than a rate limit
-/// from the homeserver (a 404 there: it lacks MSC4195), or a host refusal, is a
-/// refusal; anything else may pass.
+/// A token failure: a homeserver without MSC4195's `get_token` ends the call
+/// (spec 038 R44); a 4xx from the JWT service, another 4xx other than a rate
+/// limit from the homeserver, or a host refusal, is a refusal; anything else
+/// may pass.
 fn classify_token_error(error: crate::Error) -> TransportError {
     match &error {
+        crate::Error::TokenEndpointUnsupported(_) => {
+            TransportError::TokenEndpointUnsupported(error.to_string())
+        }
         crate::Error::Service(TokenServiceError::Rejected { status, .. })
             if (400..500).contains(status) =>
         {
@@ -473,8 +480,10 @@ impl TransportConnection for LiveKitTransportConnection {
         let token = connector.token(fresh_token).await?;
         let connection = LiveKitSession::connect_with_options(
             &token,
-            e2ee_room_options(
-                connector.key_provider.provider().clone(),
+            room_options(
+                connector
+                    .e2ee
+                    .then(|| connector.key_provider.provider().clone()),
                 connector.auto_subscribe,
             ),
         )
@@ -1012,6 +1021,7 @@ async fn translate_room_events(
     owner: LiveKitTransportConnection,
     session: std::sync::Weak<LiveKitSession>,
 ) {
+    let e2ee = owner.shared.connector.e2ee;
     while let Some(event) = events.recv().await {
         let translated = match event {
             RoomEvent::ParticipantConnected(participant) => Some(ConnectionEvent::RemoteJoined {
@@ -1026,11 +1036,11 @@ async fn translate_room_events(
                 participant,
             } => {
                 let kind = stream_kind(publication.source(), publication.kind());
-                // Our rooms are always encrypted, and livekit attaches no frame
-                // cryptor to a track declared unencrypted: its frames would be
-                // played as they come. The SFU relays that declaration, so it
-                // could also inject frames of its own under this name.
-                if publication.encryption_type() == EncryptionType::None {
+                // In an encrypted call livekit attaches no frame cryptor to a
+                // track declared unencrypted: its frames would be played as
+                // they come. The SFU relays that declaration, so it could also
+                // inject frames of its own under this name (spec 038 R12).
+                if e2ee && publication.encryption_type() == EncryptionType::None {
                     publication.set_subscribed(false);
                     Some(ConnectionEvent::TrackNotEncrypted {
                         identity: participant.identity().to_string(),
@@ -1046,7 +1056,7 @@ async fn translate_room_events(
             }
             // A track refused as unencrypted was never added.
             RoomEvent::TrackUnsubscribed { publication, .. }
-                if publication.encryption_type() == EncryptionType::None =>
+                if e2ee && publication.encryption_type() == EncryptionType::None =>
             {
                 None
             }
@@ -1466,22 +1476,34 @@ mod tests {
         );
     }
 
-    /// A homeserver without MSC4195 refuses for good; a rate limit may pass.
+    /// A homeserver without MSC4195 ends the call (spec 038 R44); another
+    /// refusal is one; a rate limit or a server error may pass.
     #[tokio::test]
-    async fn a_homeserver_without_the_endpoint_is_a_refusal() {
+    async fn a_homeserver_without_the_endpoint_is_told_from_a_refusal() {
         let backend = matrix_rtc_core::testing::MockBackend::new();
-        for (status, refused) in [(404, true), (403, true), (429, false), (502, false)] {
-            *backend.livekit_token_answer.lock().unwrap() = Err(
-                matrix_rtc_core::BackendError::with_matrix_error(None, Some(status), "no"),
-            );
+        for (errcode, status, expected) in [
+            (None, 404, "unsupported"),
+            (Some("M_UNRECOGNIZED"), 404, "unsupported"),
+            (Some("M_FORBIDDEN"), 403, "refused"),
+            (None, 429, "connect"),
+            (None, 502, "connect"),
+        ] {
+            *backend.livekit_token_answer.lock().unwrap() =
+                Err(matrix_rtc_core::BackendError::with_matrix_error(
+                    errcode.map(str::to_owned),
+                    Some(status),
+                    "no",
+                ));
             let error = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
                 .await
                 .expect_err("no token");
-            assert_eq!(
-                matches!(classify_token_error(error), TransportError::Refused(_)),
-                refused,
-                "status {status}"
-            );
+            let kind = match classify_token_error(error) {
+                TransportError::TokenEndpointUnsupported(_) => "unsupported",
+                TransportError::Refused(_) => "refused",
+                TransportError::Connect(_) => "connect",
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(kind, expected, "{errcode:?} / {status}");
         }
     }
 }

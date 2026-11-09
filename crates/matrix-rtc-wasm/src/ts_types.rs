@@ -118,6 +118,15 @@ export interface MatrixBackendHost {
     rtcTransports(): Promise<unknown[]>;
 }
 
+/** One thing the MSC format relies on (spec 038 R45). */
+export type MscRequirement = "matrix_rtc" | "sticky_events" | "delayed_events" | "livekit_transport";
+
+/** `mscSupport`'s answer: `missing` stops an MSC call, `warnings` makes it worse. */
+export interface MscSupport {
+    missing: MscRequirement[];
+    warnings: MscRequirement[];
+}
+
 /** Whether the homeserver is answering the library's sends; distinct from the media `degraded` flag. */
 export type RtcSignallingHealth =
     | { type: "reachable" }
@@ -208,13 +217,11 @@ export type RtcCallStatus =
     /** `loss_reason` and `message` (the transport's, for logs) are for `connection_closed` only. */
     | { type: "ended";
         reason: "left" | "declined" | "unanswered" | "ring_not_sent" | "others_left" | "empty" | "slot_closed" | "connection_closed";
-        loss_reason: "budget" | "refused" | "never_connected" | null;
+        loss_reason: "budget" | "refused" | "never_connected" | "token_endpoint_unsupported" | null;
         message: string | null };
 
 /** `connectMedia`'s tuning. The room, slot, own focus and account are the call's. */
 export interface MediaSessionConfigIn {
-    /** livekit-js key-provider ring size when configured away from its default of 16. */
-    key_ring_size?: number;
     /** Cross-check only: the mode comes from the room. */
     format?: MembershipFormatMode;
     /** How much the tile order is damped; omitted fields take the defaults. */
@@ -244,7 +251,7 @@ export interface MediaDelegate {
     /** POST `body` as JSON to `url`; resolve with the HTTP status and raw response text. */
     fetchJson(url: string, body: Record<string, unknown>): Promise<{ status: number; body: string }>;
     /** Connect a livekit-js Room and register the RoomEvent translation onto `sink`. */
-    connect(request: { connectionKey: string; sfuUrl: string; jwt: string }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown> }>;
+    connect(request: { connectionKey: string; sfuUrl: string; jwt: string; e2ee: boolean }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown> }>;
     /** Install a media key in livekit-js's key provider (per participant, HKDF material). */
     setKey(identity: string, index: number, key: Uint8Array): Promise<boolean | void>;
     /** Move the local sender onto a rotated key index. */
@@ -281,7 +288,14 @@ export interface JoinParamsIn {
         manage_media_keys?: boolean;
         require_confirmed_sender?: boolean;
     };
-    notify?: { notification_type?: string; mentions?: Record<string, unknown>; lifetime_ms?: number };
+    /** A group call's notification, sent by the member who starts the call; one targeting nobody is refused. */
+    notify?: {
+        notification_type: "notification";
+        intent?: string;
+        lifetime_ms?: number;
+        mention_user_ids?: string[];
+        mention_room?: boolean;
+    };
     /** Element Call reactions and raised hand; omitted is enabled with the 3 s window. */
     reactions?: {
         enabled?: boolean;

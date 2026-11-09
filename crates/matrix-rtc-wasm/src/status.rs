@@ -89,6 +89,9 @@ impl From<CallStatus> for WasmCallStatus {
                             ConnectionLossReason::Budget => "budget",
                             ConnectionLossReason::Refused => "refused",
                             ConnectionLossReason::NeverConnected => "never_connected",
+                            ConnectionLossReason::TokenEndpointUnsupported => {
+                                "token_endpoint_unsupported"
+                            }
                         }),
                         Some(message),
                     ),

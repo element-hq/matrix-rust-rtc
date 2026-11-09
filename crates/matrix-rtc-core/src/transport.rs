@@ -10,6 +10,8 @@
 //! transport that names the legacy JWT service, the SFU, or both.
 
 use serde::{Deserialize, Serialize};
+
+use crate::compat::MembershipFormat;
 use std::collections::BTreeMap;
 
 /// A single RTC transport specification from an m.rtc.member event.
@@ -139,7 +141,21 @@ impl LiveKitTransport {
     }
 }
 
+/// The shortest media key any transport takes: LiveKit's 32 bytes (spec 038
+/// R16). Our keys are never shorter, and an MSC room drops a shorter one; a
+/// room-state room takes Element Call's 16-byte keys.
+pub const MIN_MEDIA_KEY_LEN: usize = 32;
+
 impl RtcTransport {
+    /// The media key length, in bytes, this transport needs from a member
+    /// publishing on it; `None` for a transport we do not understand.
+    pub fn required_key_len(&self) -> Option<usize> {
+        match self {
+            RtcTransport::LiveKit(_) => Some(MIN_MEDIA_KEY_LEN),
+            RtcTransport::Unsupported(_) => None,
+        }
+    }
+
     /// This transport as we would publish it after moving our media onto it
     /// from `publisher_user_id`'s membership (034 R25): an SFU the publisher's
     /// homeserver operates is named with that server, since peers would
@@ -249,8 +265,42 @@ impl MemberTransports {
     }
 }
 
+/// The MSC4195 transport type, which the MSC format reads and writes.
+pub const MSC_LIVEKIT_TYPE: &str = "m.livekit";
+/// The transport type implementations wrote before MSC4195 settled, which the
+/// room-state format reads and writes, as Element Call web does.
+pub const LEGACY_LIVEKIT_TYPE: &str = "livekit";
+
 impl RawRtcTransport {
-    /// Convert into a typed RtcTransport.
+    /// Converts into a typed transport the way a room in `format` reads it.
+    ///
+    /// In MSC only an `m.livekit` entry with a `url` is LiveKit, read by that
+    /// `url` alone, so every token comes from the homeserver (spec 038 R19,
+    /// R20); anything else is unsupported. Room-state takes either type with
+    /// either field, as Element Call web does ([`Self::into_typed`]).
+    pub fn into_typed_in(self, format: MembershipFormat) -> RtcTransport {
+        if format == MembershipFormat::RoomState {
+            return self.into_typed();
+        }
+        let field = |name: &str| {
+            self.extra_fields
+                .get(name)
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        };
+        let msc = (self.transport_type == MSC_LIVEKIT_TYPE)
+            .then(|| LiveKitTransport::new(Some(field("url")?), None, field("server_name")))
+            .flatten();
+        match msc {
+            Some(livekit) => RtcTransport::LiveKit(livekit),
+            None => RtcTransport::Unsupported(UnsupportedTransport {
+                transport_type: self.transport_type,
+                extra_fields: self.extra_fields,
+            }),
+        }
+    }
+
+    /// Convert into a typed RtcTransport, as the room-state format reads it.
     /// Known transport types are parsed into their specific variants,
     /// while unknown types become UnsupportedTransport.
     pub fn into_typed(self) -> RtcTransport {
@@ -349,21 +399,105 @@ mod tests {
         ));
     }
 
-    /// Peers read our token flow off the fields we publish, so they go out
-    /// exactly as advertised, under the type implementations write.
+    /// Spec 038 R16: a LiveKit member needs 32-byte keys; an unknown transport
+    /// asks for nothing, leaving the floor to decide.
     #[test]
-    fn a_transport_is_published_with_exactly_its_fields() {
+    fn livekit_needs_32_byte_keys() {
+        let livekit = typed(json!({ "type": "livekit", "url": "wss://sfu" }));
+        assert_eq!(livekit.required_key_len(), Some(MIN_MEDIA_KEY_LEN));
+        assert_eq!(MIN_MEDIA_KEY_LEN, 32);
+        let other = typed(json!({ "type": "whip", "url": "https://whip" }));
+        assert_eq!(other.required_key_len(), None);
+    }
+
+    /// Room-state peers read our token flow off the fields we publish, so
+    /// they go out exactly as advertised, under Element Call's `livekit`
+    /// (spec 038 R39).
+    #[test]
+    fn room_state_publishes_a_transport_with_exactly_its_fields() {
         for advertised in [
             json!({ "type": "livekit", "livekit_service_url": "https://jwt" }),
             json!({ "type": "livekit", "url": "wss://sfu", "livekit_service_url": "https://jwt" }),
             json!({ "type": "livekit", "url": "wss://sfu", "server_name": "other.org" }),
         ] {
-            assert_eq!(transport_to_json(&typed(advertised.clone())), advertised);
+            assert_eq!(
+                transport_to_json(&typed(advertised.clone()), MembershipFormat::RoomState),
+                advertised
+            );
         }
         assert_eq!(
-            transport_to_json(&typed(json!({ "type": "m.livekit", "url": "wss://sfu" }))),
+            transport_to_json(
+                &typed(json!({ "type": "m.livekit", "url": "wss://sfu" })),
+                MembershipFormat::RoomState
+            ),
             json!({ "type": "livekit", "url": "wss://sfu" })
         );
+    }
+
+    /// MSC writes `{type: "m.livekit", url}`, with the `server_name` of an SFU
+    /// that is not ours (spec 038 R17, R23).
+    #[test]
+    fn msc_publishes_m_livekit_by_its_url() {
+        assert_eq!(
+            transport_to_json(
+                &typed(json!({ "type": "livekit", "url": "wss://sfu" })),
+                MembershipFormat::Msc
+            ),
+            json!({ "type": "m.livekit", "url": "wss://sfu" })
+        );
+        assert_eq!(
+            transport_to_json(
+                &typed(
+                    json!({ "type": "m.livekit", "url": "wss://sfu", "server_name": "other.org" })
+                ),
+                MembershipFormat::Msc
+            ),
+            json!({ "type": "m.livekit", "url": "wss://sfu", "server_name": "other.org" })
+        );
+    }
+
+    /// Spec 038 R19, R20: in MSC only `m.livekit` with a `url` is LiveKit,
+    /// read by the `url` alone; room-state reads either type with either
+    /// field.
+    #[test]
+    fn each_format_reads_its_own_livekit_transports() {
+        let read = |value: serde_json::Value, format| {
+            serde_json::from_value::<RawRtcTransport>(value)
+                .unwrap()
+                .into_typed_in(format)
+        };
+        let both = json!({ "type": "m.livekit", "url": "wss://sfu", "livekit_service_url": "https://jwt" });
+        let RtcTransport::LiveKit(msc) = read(both.clone(), MembershipFormat::Msc) else {
+            panic!("an m.livekit url is LiveKit in MSC");
+        };
+        assert_eq!(msc.auth_flow(), LiveKitAuthFlow::CsApi { url: "wss://sfu" });
+        let RtcTransport::LiveKit(legacy) = read(both, MembershipFormat::RoomState) else {
+            panic!("LiveKit in room-state");
+        };
+        assert_eq!(
+            legacy.auth_flow(),
+            LiveKitAuthFlow::SfuGet {
+                service_url: "https://jwt"
+            }
+        );
+
+        for unsupported in [
+            json!({ "type": "livekit", "url": "wss://sfu" }),
+            json!({ "type": "livekit", "livekit_service_url": "https://jwt" }),
+            json!({ "type": "m.livekit", "livekit_service_url": "https://jwt" }),
+        ] {
+            assert!(
+                matches!(
+                    read(unsupported.clone(), MembershipFormat::Msc),
+                    RtcTransport::Unsupported(_)
+                ),
+                "{unsupported}"
+            );
+            assert!(matches!(
+                read(unsupported, MembershipFormat::RoomState),
+                RtcTransport::LiveKit(_)
+            ));
+        }
     }
 
     #[test]

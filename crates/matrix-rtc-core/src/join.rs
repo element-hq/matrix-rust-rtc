@@ -76,7 +76,7 @@ pub const DEFAULT_DEGRADED_LIFETIME_MS: u64 = 5 * 60 * 1000;
 pub const ROOM_APPLICATION_SLOT_ID: &str = "room";
 
 /// `{application_type}#{application_slot_id}`, MSC4143's slot id.
-fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
+pub fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
     format!(
         "{}#{application_slot_id}",
         application.application_type().unwrap_or_default()

@@ -153,6 +153,7 @@ where
             user_id: options.own_user_id.clone(),
             device_id: options.own_device_id.clone(),
         },
+        e2ee: call.encrypts_media().await,
     };
     let pooled: Arc<dyn MediaTransport> = transport.clone();
     let engine = CallEngine::new(

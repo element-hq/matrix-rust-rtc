@@ -176,3 +176,56 @@ describe('MatrixHost room subscription', () => {
     expect(client.room.listenerCount(sdk.RoomStickyEventsEvent.Update)).toBe(0);
   });
 });
+
+describe('MatrixHost delayed leave', () => {
+  it('sends a sticky delayed event and answers its delay id (038 R13)', async () => {
+    const sent = [];
+    const client = {
+      _unstable_sendStickyDelayedEvent: (...args) => {
+        sent.push(args);
+        return Promise.resolve({ delay_id: 'delay-1' });
+      },
+    };
+    const host = new MatrixHost({ sdk, client });
+
+    const delayId = await host.sendDelayedStickyEvent(ROOM, 'm.rtc.member', { a: 1 }, 3_600_000, 8_000);
+
+    expect(delayId).toBe('delay-1');
+    expect(sent).toEqual([[ROOM, 3_600_000, { delay: 8_000 }, null, 'm.rtc.member', { a: 1 }]]);
+  });
+
+  it('answers M_UNRECOGNIZED when the SDK or the server cannot', async () => {
+    const without = new MatrixHost({ sdk, client: {} });
+    await expect(without.sendDelayedStickyEvent(ROOM, 't', {}, 1, 1)).rejects.toMatchObject({
+      errcode: 'M_UNRECOGNIZED',
+    });
+
+    const refusing = new MatrixHost({
+      sdk,
+      client: {
+        _unstable_sendStickyDelayedEvent: () =>
+          Promise.reject(Object.assign(new Error('no'), { name: 'UnsupportedDelayedEventsEndpointError' })),
+      },
+    });
+    await expect(refusing.sendDelayedStickyEvent(ROOM, 't', {}, 1, 1)).rejects.toMatchObject({
+      errcode: 'M_UNRECOGNIZED',
+    });
+  });
+});
+
+describe('MatrixHost server features', () => {
+  it('lists the unstable features that are on (038 R45)', async () => {
+    const host = new MatrixHost({
+      sdk,
+      client: {
+        getVersions: () =>
+          Promise.resolve({
+            versions: ['v1.12'],
+            unstable_features: { 'org.matrix.msc4143': true, 'org.matrix.msc4354': false },
+          }),
+      },
+    });
+    expect(await host.serverFeatures()).toEqual(['org.matrix.msc4143']);
+  });
+});
+

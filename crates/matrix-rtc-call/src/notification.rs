@@ -24,7 +24,7 @@
 //!
 //! [`CallJoinOptions::kind`]: crate::CallJoinOptions::kind
 
-use matrix_rtc_core::compat::DialectBackend;
+use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use std::time::Duration;
 
 use matrix_rtc_core::{
@@ -39,10 +39,13 @@ use serde_json::{Map, Value, json};
 /// host-layer concern (see [`matrix_rtc_core::wire_event_type`]).
 pub const NOTIFICATION_EVENT_TYPE: &str = "m.rtc.notification";
 
-/// Default `lifetime` for a ring, in milliseconds: Element Call web's, so a
-/// call rings for as long whichever client places it (spec 030 R6). MSC4075
-/// recommends 30 s, which made a native caller ring a third as long as a web
-/// one.
+/// Event type of an MSC4075 invite, what the MSC format rings with (spec 038
+/// R26). [`NOTIFICATION_EVENT_TYPE`] stays the room-state format's.
+pub const INVITE_EVENT_TYPE: &str = "m.rtc.invite";
+
+/// Default `lifetime` for a ring, in milliseconds: MSC4075's recommendation
+/// and Element Call web's, so a call rings for as long whichever client
+/// places it (spec 030 R6, spec 038 R27).
 pub const DEFAULT_RING_LIFETIME_MS: u64 = 90_000;
 
 /// The longest `lifetime` MSC4075 says a ring SHOULD carry (2 minutes).
@@ -78,6 +81,14 @@ pub struct Mentions {
     /// Whether the whole room is targeted. Note that `notifications.room` in
     /// the room's power levels may gate this.
     pub room: bool,
+}
+
+impl Mentions {
+    /// Whether nobody is targeted: no user named and not the room (spec 038
+    /// R28). Such an invite is refused.
+    pub fn targets_nobody(&self) -> bool {
+        self.user_ids.is_empty() && !self.room
+    }
 }
 
 impl Default for Mentions {
@@ -159,6 +170,69 @@ impl NotifyConfig {
 /// there when it does.
 pub fn notification_sticky_duration_ms(lifetime_ms: u64) -> u64 {
     lifetime_ms.saturating_mul(2)
+}
+
+/// Builds content for an MSC4075 `m.rtc.invite`: exactly `slot_id`,
+/// `sender_ts`, `lifetime`, `m.mentions` and the sticky key, which is the
+/// slot id (spec 038 R26). It relates to no member event, so it needs nothing
+/// from our membership send (R29).
+pub fn build_invite_content(
+    slot_id: &str,
+    mentions: &Mentions,
+    lifetime_ms: u64,
+    sender_ts_ms: u64,
+) -> Value {
+    json!({
+        "slot_id": slot_id,
+        "sender_ts": sender_ts_ms,
+        "lifetime": lifetime_ms,
+        "m.mentions": { "user_ids": mentions.user_ids, "room": mentions.room },
+        "msc4354_sticky_key": slot_id,
+    })
+}
+
+/// Builds the content withdrawing our invite to `slot_id`: the sticky key
+/// alone, replacing the invite in the sticky map (spec 038 R30, R31).
+pub fn build_invite_withdrawal(slot_id: &str) -> Value {
+    json!({ "msc4354_sticky_key": slot_id })
+}
+
+/// What ringing or notifying sends in `format`, as its event type and
+/// content, stamped `sender_ts_ms`: an `m.rtc.invite` in MSC (spec 038 R26),
+/// today's `m.rtc.notification` in room-state (R36).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ring_event(
+    format: MembershipFormat,
+    config: &NotifyConfig,
+    slot_id: &str,
+    application_type: &str,
+    sender: &str,
+    device_id: &str,
+    member_event_id: &str,
+    sender_ts_ms: u64,
+) -> (&'static str, Value) {
+    match format {
+        MembershipFormat::Msc => (
+            INVITE_EVENT_TYPE,
+            build_invite_content(
+                slot_id,
+                &config.mentions,
+                config.lifetime_ms(),
+                sender_ts_ms,
+            ),
+        ),
+        MembershipFormat::RoomState => (
+            NOTIFICATION_EVENT_TYPE,
+            build_notification_content(
+                config,
+                application_type,
+                sender,
+                device_id,
+                member_event_id,
+                sender_ts_ms,
+            ),
+        ),
+    }
 }
 
 /// Builds content for an `m.rtc.notification` event.
@@ -255,6 +329,15 @@ pub(crate) fn is_own_participation(
             .is_none_or(|device_id| device_id == own_device_id)
 }
 
+/// How many members other than this device's own participations are joined:
+/// see [`notify_session_started`] for why ours are counted out widely.
+pub(crate) fn others_joined(members: &[JoinedMembership], user_id: &str, device_id: &str) -> usize {
+    members
+        .iter()
+        .filter(|member| !is_own_participation(member, user_id, device_id))
+        .count()
+}
+
 /// Sends the MSC4075 notification that summons the room to this session.
 ///
 /// Called at the tail of a join, with the session's roster as it stands after
@@ -268,11 +351,16 @@ pub(crate) fn is_own_participation(
 /// `deadline` — the join's, so the notification never holds a join past its
 /// budget (R6) — or, without one, for as long as the notification lives.
 /// Keyed by the join's scope, so the join's leave cancels it.
+///
+/// `format` decides what goes out: an `m.rtc.invite` in MSC, which relates
+/// to nothing, or today's notification, which relates to `member_event_id`
+/// (spec 038 R26, R36). An invite that targets nobody is not sent (R28).
 #[allow(clippy::too_many_arguments)]
 pub async fn notify_session_started<B: MatrixBackend + 'static>(
     backend: &DialectBackend<B>,
     outbox: &Outbox,
     room_id: &str,
+    format: MembershipFormat,
     notify: &NotifyConfig,
     params: &JoinSessionParams,
     members: &[JoinedMembership],
@@ -282,6 +370,10 @@ pub async fn notify_session_started<B: MatrixBackend + 'static>(
     let user_id = backend.own_user_id();
     let device_id = backend.own_device_id();
     let tag = format!("{room_id}/{}/{device_id}", params.slot_id);
+    if notify.mentions.targets_nobody() {
+        log::warn!("[{tag}] not notifying: the notification targets nobody");
+        return;
+    }
 
     // MSC4075 leaves who sends the notification open, but every joiner
     // sending one would ring the room once per participant. Only the member
@@ -302,10 +394,7 @@ pub async fn notify_session_started<B: MatrixBackend + 'static>(
     // purpose: it can only misfire on another device of our own user in an
     // unencrypted room, where the cost is one extra ring — against a silent
     // failure to ring at all, which is the bug this replaced.
-    let others = members
-        .iter()
-        .filter(|member| !is_own_participation(member, &user_id, &device_id))
-        .count();
+    let others = others_joined(members, &user_id, &device_id);
     if others > 0 {
         log::info!(
             "[{tag}] not notifying: {others} member(s) were already in the session, so \
@@ -314,8 +403,10 @@ pub async fn notify_session_started<B: MatrixBackend + 'static>(
         return;
     }
 
-    let content = build_notification_content(
+    let (event_type, content) = ring_event(
+        format,
         notify,
+        &params.slot_id,
         params.application.application_type().unwrap_or_default(),
         &user_id,
         &device_id,
@@ -339,7 +430,7 @@ pub async fn notify_session_started<B: MatrixBackend + 'static>(
         .send(key, SendPolicy::new().deadline(budget), || {
             backend.send_sticky_event(
                 room_id.to_owned(),
-                NOTIFICATION_EVENT_TYPE.to_owned(),
+                event_type.to_owned(),
                 content.clone(),
                 notification_sticky_duration_ms(notify.lifetime_ms()),
             )

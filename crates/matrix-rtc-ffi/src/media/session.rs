@@ -244,6 +244,13 @@ impl MediaSession {
         self.engine.interruptions().into()
     }
 
+    /// Participants on an SFU whose membership we have not received, by
+    /// transport identity (spec 038 R25): listed once unmapped for 10 s
+    /// while signalling is healthy, apart from [`Self::interruptions`].
+    pub fn unverified_participants(&self) -> Vec<String> {
+        self.engine.unverified_participants()
+    }
+
     /// The next interruptions record. Suspends until it changes; `None`
     /// means the session is over. Latest-value-wins, as
     /// [`Self::next_roster`]; for any one change it comes after the roster

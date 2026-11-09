@@ -23,11 +23,11 @@ use matrix_rtc_core::{JoinedMembership, MatrixBackend, RawTimelineEvent, executo
 use tokio::sync::watch;
 
 use crate::notification::{
-    Mentions, NOTIFICATION_EVENT_TYPE, NotificationType, NotifyConfig, build_notification_content,
-    notification_sticky_duration_ms,
+    Mentions, NotificationType, NotifyConfig, notification_sticky_duration_ms, ring_event,
 };
 use crate::reactions::Clock;
 use crate::status::CallStatusCell;
+use matrix_rtc_core::compat::MembershipFormat;
 
 /// MSC4310's decline, under both spellings: hosts deliver the type as it was
 /// sent, and clients send either.
@@ -403,7 +403,12 @@ pub(crate) struct RingJob {
     pub room_id: String,
     pub notify: NotifyConfig,
     pub application_type: String,
-    /// What the ring relates to (MSC4075).
+    /// The slot the ring invites to: an MSC invite names it (spec 038 R26).
+    pub slot_id: String,
+    /// What the ring is sent as: an invite in MSC, a notification in
+    /// room-state.
+    pub format: MembershipFormat,
+    /// What a room-state notification relates to.
     pub member_event_id: String,
     pub clock: Clock,
 }
@@ -428,8 +433,10 @@ impl RingJob {
         let event_id = loop {
             // Stamped per attempt: receivers count the lifetime from it, and a
             // retried ring with the first attempt's stamp rings short.
-            let content = build_notification_content(
+            let (event_type, content) = ring_event(
+                self.format,
                 &self.notify,
+                &self.slot_id,
                 &self.application_type,
                 &user_id,
                 &device_id,
@@ -438,7 +445,7 @@ impl RingJob {
             );
             let send = backend.send_sticky_event(
                 self.room_id.clone(),
-                NOTIFICATION_EVENT_TYPE.to_owned(),
+                event_type.to_owned(),
                 content,
                 notification_sticky_duration_ms(lifetime_ms),
             );

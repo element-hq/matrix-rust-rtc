@@ -594,7 +594,11 @@ impl Fleet {
                 LiveKitCallOptions {
                     slot_id: args.slot_id.clone(),
                     application: args.application.clone(),
-                    livekit_transport: Some(LiveKitTransport::service(args.livekit_url.clone())),
+                    // Pinned in room-state only: MSC publishes on the
+                    // homeserver's `m.livekit` SFU (spec 038 R17).
+                    livekit_transport: (MembershipFormat::from(args.format)
+                        == MembershipFormat::RoomState)
+                        .then(|| LiveKitTransport::service(args.livekit_url.clone())),
                     http: Some(http.clone()),
                     auto_subscribe: args.subscribe,
                     format: args.format.into(),

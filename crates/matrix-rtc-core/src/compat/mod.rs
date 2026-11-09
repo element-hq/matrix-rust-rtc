@@ -19,8 +19,10 @@
 //!
 //! There are two, and they disagree about more than field names:
 //!
-//! - [`sticky_2025`] — the 2025 format. Already MSC4354 sticky-based; only the
-//!   fields inside the member content differ. We only read it now.
+//! - [`element_call`] — Element Call's own shapes: its 2025 sticky member
+//!   content (already MSC4354 sticky-based; only the fields inside differ) and
+//!   its legacy key and notification shapes. Read and written only in the
+//!   room-state format.
 //! - [`room_state`] — the format before MSC4354, when membership was
 //!   `org.matrix.msc3401.call.member` **room state**. A different carrier, a
 //!   different SFU participant identity, and a different token endpoint.
@@ -36,18 +38,16 @@
 //! this module and the feeder's [`IngestDialect`](crate::feeder::IngestDialect)
 //! seam, as JSON funnels at the very edge:
 //!
-//! - **Inbound for the sticky dialect**
-//!   ([`sticky_2025::normalize_member_content`],
-//!   [`sticky_2025::parse_key_message`]) is *permissive and always on*. Every
-//!   rule is of the form "the modern field is absent and the legacy one is
-//!   present", so a spec-shaped event passes through byte-identical and no flag
-//!   is needed to protect it. Being always on is deliberate: a legacy path that
-//!   only compiles under a flag is a legacy path that rots.
+//! - **Inbound for Element Call's sticky dialect**
+//!   ([`element_call::normalize_member_content`],
+//!   [`element_call::parse_key_message`]) runs in the room-state format only.
+//!   Element Call writes sticky memberships beside its state events during the
+//!   transition, and those must still read as its members. In MSC nothing is
+//!   normalised: a member event that is not MSC4143-shaped is not a member.
 //! - **Everything about the state dialect** is *opt-in*, in both directions.
 //!   Reading it is not normalisation — it is a second membership source, in a
 //!   different part of the room, with a lifetime the content states rather than
-//!   the homeserver enforcing. See [`room_state`] for why that cannot be
-//!   always-on the way its sibling is.
+//!   the homeserver enforcing. See [`room_state`].
 //! - **Outbound** ([`OutboundDialect`]) is opt-in for both, because it is the
 //!   half that changes what other clients see.
 //!
@@ -70,8 +70,8 @@
 //! In this crate:
 //!
 //! 1. `ingest` — the inbound half for every host: the `IngestDialect` the
-//!    feeder reads a room through, which normalises `m.rtc.member` content,
-//!    reads state-carried membership in `RoomState`, and parses legacy
+//!    feeder reads a room through, which normalises `m.rtc.member` content in
+//!    `RoomState` (and reads it strictly in `Msc`), reads state-carried membership in `RoomState`, and parses legacy
 //!    to-device keys, all in the format the room was opened in.
 //! 2. `dialect_backend::DialectBackend` — the outbound half for every host:
 //!    routes and rewrites the sends of the one `MatrixBackend` wrapper the
@@ -94,24 +94,23 @@ use std::borrow::Cow;
 use serde_json::Value;
 
 pub mod dialect_backend;
+pub mod element_call;
 #[cfg(test)]
 mod feeder_tests;
 pub mod ingest;
 pub mod room_state;
-pub mod sticky_2025;
 
 pub use dialect_backend::{DialectBackend, DialectHold};
+pub use element_call::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent};
 pub use room_state::{
     RoomStateDialect, STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
 };
-pub use sticky_2025::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent};
 
 /// Which MatrixRTC membership format a room is read and written in.
 ///
 /// Mutually exclusive by construction, because the generations disagree about
-/// the *carrier* of a membership, not just its fields. Reading the 2025 sticky
-/// dialect needs no flag and is always on regardless of this setting; see the
-/// module docs.
+/// the *carrier* of a membership, not just its fields. Element Call's sticky
+/// dialect is read in the room-state format only; see the module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MembershipFormat {
     /// Current MSC4143 + MSC4354 only. The default, and the only mode that
@@ -142,7 +141,7 @@ impl MembershipFormat {
     pub fn token_slot_id(self, slot_id: &str) -> Cow<'_, str> {
         match self {
             Self::Msc => Cow::Borrowed(slot_id),
-            Self::RoomState => sticky_2025::legacy_room_slot_id(slot_id),
+            Self::RoomState => element_call::legacy_room_slot_id(slot_id),
         }
     }
 }
@@ -204,7 +203,7 @@ impl OutboundDialect {
         content: Value,
         lifetime_ms: Option<u64>,
     ) -> MemberEventRoute {
-        if !sticky_2025::is_member_event(&event_type) {
+        if !element_call::is_member_event(&event_type) {
             return match self {
                 Self::State(_) => MemberEventRoute::Room {
                     event_type,
@@ -243,7 +242,7 @@ impl OutboundDialect {
     pub fn rewrite_notification(&self, event_type: &str, content: Value) -> Value {
         let flattened = match self {
             Self::None => None,
-            Self::State(_) => sticky_2025::flatten_notification_content(event_type, &content),
+            Self::State(_) => element_call::flatten_notification_content(event_type, &content),
         };
         flattened.unwrap_or(content)
     }
@@ -261,7 +260,7 @@ impl OutboundDialect {
     ) -> Option<(String, Value)> {
         match self {
             Self::None => None,
-            Self::State(dialect) => sticky_2025::rewrite_key_message(
+            Self::State(dialect) => element_call::rewrite_key_message(
                 dialect.own_device_id(),
                 dialect.slot_id(),
                 message_type,

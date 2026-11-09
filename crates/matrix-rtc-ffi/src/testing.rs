@@ -648,7 +648,8 @@ impl ScriptedMediaTransport {
         })
     }
 
-    /// The transport reconnecting to `focus` (a `livekit_service_url`).
+    /// The transport reconnecting to `focus` (a `livekit_service_url`, else
+    /// the SFU's `url`).
     pub fn interrupt(&self, focus: String) {
         self.inner.interrupt(&focus);
     }
@@ -790,7 +791,7 @@ mod tests {
     };
 
     const ROOM: &str = "!room:example.org";
-    const FOCUS: &str = "https://sfu.example.org";
+    const FOCUS: &str = "wss://sfu.example.org";
 
     fn cleartext() -> crate::backend::FfiEventEncryption {
         FfiEventEncryption {
@@ -838,8 +839,8 @@ mod tests {
                 .join_call(FfiJoinSessionParams {
                     application_slot_id: None,
                     transport: FfiJoinTransport::Publish {
-                        url: None,
-                        livekit_service_url: Some(FOCUS.to_owned()),
+                        url: Some(FOCUS.to_owned()),
+                        livekit_service_url: None,
                     },
                     keep_alive_timeout_ms: None,
                     sticky_duration_ms: None,

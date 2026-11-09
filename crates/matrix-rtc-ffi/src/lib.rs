@@ -85,6 +85,13 @@ pub enum MatrixRtcFfiError {
         errcode: Option<String>,
         reason: String,
     },
+    /// The homeserver advertises no LiveKit transport of the room's format
+    /// to publish on (spec 038 R18).
+    #[error("the homeserver advertises no usable {transport_type} transport")]
+    NoLiveKitTransport { transport_type: String },
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token")]
+    TokenEndpointUnsupported,
 }
 
 impl From<matrix_rtc_call::ReactionError> for MatrixRtcFfiError {
@@ -104,6 +111,12 @@ impl From<RtcError> for MatrixRtcFfiError {
                 Self::SlotClosed(slot_id)
             }
             RtcError::Join(matrix_rtc_core::JoinError::TimedOut) => Self::JoinTimedOut,
+            RtcError::Join(matrix_rtc_core::JoinError::NoLiveKitTransport { transport_type }) => {
+                Self::NoLiveKitTransport { transport_type }
+            }
+            RtcError::Join(matrix_rtc_core::JoinError::TokenEndpointUnsupported) => {
+                Self::TokenEndpointUnsupported
+            }
             RtcError::Join(matrix_rtc_core::JoinError::Refused { errcode, message }) => {
                 Self::JoinRefused {
                     errcode,
@@ -343,6 +356,18 @@ impl RtcClient {
     /// a host that never reports leaves the library to its own sends.
     pub fn report_connectivity(&self, online: bool) {
         self.client.report_connectivity(online);
+    }
+
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45). `server_features` are the `unstable_features` of `/versions`
+    /// that are on, which the host reads from its SDK; the transports are
+    /// asked of the backend. Names each missing piece; never picks the
+    /// format.
+    pub async fn msc_support(
+        &self,
+        server_features: Vec<String>,
+    ) -> Result<FfiMscSupport, MatrixRtcFfiError> {
+        Ok(self.client.msc_support(&server_features).await?.into())
     }
 
     /// Opens a room: the library subscribes to what the room needs in the
@@ -778,6 +803,49 @@ pub enum FfiCallEnd {
     },
 }
 
+/// One thing the MSC format relies on (spec 038 R45).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMscRequirement {
+    /// MatrixRTC (MSC4143).
+    MatrixRtc,
+    /// Sticky events (MSC4354).
+    StickyEvents,
+    /// Delayed events (MSC4140): without them a call works on a 5 minute
+    /// membership lifetime.
+    DelayedEvents,
+    /// An `m.livekit` transport with an SFU `url`.
+    LiveKitTransport,
+}
+
+/// What the MSC support check found missing.
+#[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
+pub struct FfiMscSupport {
+    /// Without these an MSC call cannot work.
+    pub missing: Vec<FfiMscRequirement>,
+    /// Without these an MSC call works, worse.
+    pub warnings: Vec<FfiMscRequirement>,
+}
+
+impl From<matrix_rtc_core::MscRequirement> for FfiMscRequirement {
+    fn from(value: matrix_rtc_core::MscRequirement) -> Self {
+        match value {
+            matrix_rtc_core::MscRequirement::MatrixRtc => Self::MatrixRtc,
+            matrix_rtc_core::MscRequirement::StickyEvents => Self::StickyEvents,
+            matrix_rtc_core::MscRequirement::DelayedEvents => Self::DelayedEvents,
+            matrix_rtc_core::MscRequirement::LiveKitTransport => Self::LiveKitTransport,
+        }
+    }
+}
+
+impl From<matrix_rtc_core::MscSupport> for FfiMscSupport {
+    fn from(value: matrix_rtc_core::MscSupport) -> Self {
+        Self {
+            missing: value.missing.into_iter().map(Into::into).collect(),
+            warnings: value.warnings.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 /// Why our own SFU connection was given up. Contract C10.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum FfiConnectionLossReason {
@@ -787,6 +855,8 @@ pub enum FfiConnectionLossReason {
     Refused,
     /// Never established within the budget from the connect request.
     NeverConnected,
+    /// Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+    TokenEndpointUnsupported,
 }
 
 impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
@@ -795,6 +865,7 @@ impl From<call::ConnectionLossReason> for FfiConnectionLossReason {
             call::ConnectionLossReason::Budget => Self::Budget,
             call::ConnectionLossReason::Refused => Self::Refused,
             call::ConnectionLossReason::NeverConnected => Self::NeverConnected,
+            call::ConnectionLossReason::TokenEndpointUnsupported => Self::TokenEndpointUnsupported,
         }
     }
 }
@@ -1043,7 +1114,10 @@ mod tests {
 
     const ROOM: &str = "!room:example.org";
     const SLOT: &str = "m.call#room";
+    /// The legacy JWT service the room-state format publishes on.
     const SFU: &str = "https://sfu.example.org";
+    /// The SFU the MSC format publishes on (`m.livekit`).
+    const SFU_URL: &str = "wss://sfu.example.org";
 
     fn cleartext() -> FfiEventEncryption {
         FfiEventEncryption {
@@ -1091,8 +1165,8 @@ mod tests {
                 "application": { "type": "m.call" },
                 "member": { "id": member_id, "membership": "join" },
                 "transports": {
-                    "published": [{ "type": "livekit", "livekit_service_url": SFU }],
-                    "can_subscribe": ["livekit"],
+                    "published": [{ "type": "m.livekit", "url": SFU_URL }],
+                    "can_subscribe": ["m.livekit"],
                 },
             })
             .to_string(),
@@ -1157,8 +1231,8 @@ mod tests {
         FfiJoinSessionParams {
             application_slot_id: None,
             transport: FfiJoinTransport::Publish {
-                url: None,
-                livekit_service_url: Some(SFU.to_owned()),
+                url: Some(SFU_URL.to_owned()),
+                livekit_service_url: None,
             },
             keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
@@ -1309,12 +1383,12 @@ mod tests {
         assert_eq!(
             joined[0].transports,
             vec![FfiRtcTransport::LiveKit {
-                url: None,
-                livekit_service_url: Some(SFU.to_owned()),
+                url: Some(SFU_URL.to_owned()),
+                livekit_service_url: None,
                 server_name: None,
             }]
         );
-        assert_eq!(joined[0].can_subscribe, vec!["livekit".to_owned()]);
+        assert_eq!(joined[0].can_subscribe, vec!["m.livekit".to_owned()]);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), subscription.next())
                 .await
@@ -1465,7 +1539,7 @@ mod tests {
         assert!(
             joined
                 .iter()
-                .all(|member| member.transports.len() == 1 && member.can_subscribe == ["livekit"]),
+                .all(|member| member.transports.len() == 1 && member.can_subscribe.len() == 1),
             "every generation's SFU must survive the translation: {joined:?}",
         );
     }
@@ -1476,7 +1550,7 @@ mod tests {
     async fn every_join_gets_a_fresh_member_id_and_the_advertised_transport() {
         let mock = MockHost::new();
         *mock.transports_json.lock().unwrap() =
-            serde_json::json!([{ "type": "livekit", "livekit_service_url": SFU }]).to_string();
+            serde_json::json!([{ "type": "m.livekit", "url": SFU_URL }]).to_string();
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
 
@@ -1498,9 +1572,9 @@ mod tests {
         assert_eq!(
             membership
                 .content
-                .pointer("/transports/published/0/livekit_service_url")
+                .pointer("/transports/published/0/url")
                 .unwrap(),
-            &serde_json::json!(SFU),
+            &serde_json::json!(SFU_URL),
         );
 
         first.leave(no_reason()).await.expect("leave");
@@ -1540,7 +1614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_receive_only_join_publishes_nothing_and_subscribes_to_livekit() {
+    async fn a_receive_only_join_publishes_nothing_and_subscribes_to_m_livekit() {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let room = open_call_room(&client, &mock).await;
@@ -1560,7 +1634,8 @@ mod tests {
             .expect("the membership went out");
         assert_eq!(
             membership.content.pointer("/transports").unwrap(),
-            &serde_json::json!({ "can_subscribe": ["livekit"] }),
+            // The MSC format's type (spec 038 R17).
+            &serde_json::json!({ "can_subscribe": ["m.livekit"] }),
         );
     }
 
@@ -1569,7 +1644,7 @@ mod tests {
         let mock = MockHost::new();
         let client = RtcClient::new(mock.clone());
         let slot = FfiEventIn {
-            state_key: Some("m.call#TEST".to_owned()),
+            state_key: Some("m.call#test".to_owned()),
             ..open_slot(None)
         };
         let room = open(&client, &mock, None, false, vec![slot], Vec::new()).await;
@@ -1577,12 +1652,12 @@ mod tests {
         let call = room
             .clone()
             .join_call(FfiJoinSessionParams {
-                application_slot_id: Some("TEST".to_owned()),
+                application_slot_id: Some("test".to_owned()),
                 ..join_params()
             })
             .await
             .expect("join");
-        assert_eq!(call.slot_id(), "m.call#TEST");
+        assert_eq!(call.slot_id(), "m.call#test");
     }
 
     #[tokio::test]

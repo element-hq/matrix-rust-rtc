@@ -254,15 +254,24 @@ use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
-use crate::transport::RtcTransport;
+use crate::transport::{MIN_MEDIA_KEY_LEN, RtcTransport};
 
 /// Message type for to-device encryption key distribution (MSC4143).
 ///
-/// - Stable: `m.rtc.encryption_key`
-/// - Unstable: `org.matrix.msc4143.rtc.encryption_key`
-///
-/// We use the unstable prefix for now as MSC4143 is still in draft.
-pub const KEY_MESSAGE_TYPE: &str = "org.matrix.msc4143.rtc.encryption_key";
+/// The stable id, as the core speaks everywhere; [`crate::wire_event_type`]
+/// maps it to the unstable `io.element.call.encryption_keys` MSC4143 names, the
+/// same type Element Call's legacy key shape travels under.
+pub const KEY_MESSAGE_TYPE: &str = "m.rtc.encryption_key";
+
+/// The engine for `media_key.key`: MSC4143 says unpadded base64, so we encode
+/// without padding, and decode with or without it.
+pub(crate) const MEDIA_KEY_BASE64: general_purpose::GeneralPurpose =
+    general_purpose::GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        general_purpose::GeneralPurposeConfig::new()
+            .with_encode_padding(false)
+            .with_decode_padding_mode(base64::engine::DecodePaddingMode::Indifferent),
+    );
 
 /// Trait for handlers that receive key material signals.
 ///
@@ -687,6 +696,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.identity_mapper = Some(mapper);
     }
 
+    /// Whether this manager sends and installs media keys at all: `false` in
+    /// a room whose encryption is off.
+    pub fn manages_media_keys(&self) -> bool {
+        self.config.manage_media_keys
+    }
+
     /// Sets the transports we publish on, from which the mapper derives our
     /// own identity. Empty for a receive-only participation.
     pub fn set_own_transports(&mut self, transports: Vec<RtcTransport>) {
@@ -726,14 +741,23 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         (self.clock)()
     }
 
-    /// Generates a new secure random 32-byte key.
+    /// The length of the keys we send: the longest any transport we publish
+    /// on needs, and never under [`MIN_MEDIA_KEY_LEN`] (spec 038 R16).
+    fn own_key_len(&self) -> usize {
+        self.own_transports
+            .iter()
+            .filter_map(RtcTransport::required_key_len)
+            .fold(MIN_MEDIA_KEY_LEN, usize::max)
+    }
+
+    /// Generates a new secure random key, as long as our transports need.
     ///
     /// Uses cryptographically secure random number generation via `OsRng`.
     pub fn generate_random_key(&self) -> Vec<u8> {
         use rand::RngCore;
         use rand_core::OsRng;
 
-        let mut key = vec![0u8; 32];
+        let mut key = vec![0u8; self.own_key_len()];
         OsRng.fill_bytes(&mut key);
         key
     }
@@ -1257,7 +1281,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // the key and never re-sent to — they could not decrypt us for the rest
         // of the call. Recording only the served recipients makes the next
         // rollout see the rest as newly joined and try again.
-        let key_b64 = general_purpose::STANDARD.encode(&outbound_key_to_use.key);
+        let key_b64 = MEDIA_KEY_BASE64.encode(&outbound_key_to_use.key);
         let served = self
             .send_key_to_participants(&key_b64, outbound_key_to_use.key_index, &to_distribute_to)
             .await;
@@ -1450,7 +1474,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         let served = self
             .deliver_key(
-                &general_purpose::STANDARD.encode(&key),
+                &MEDIA_KEY_BASE64.encode(&key),
                 owed.key_index,
                 std::slice::from_ref(&owed.target),
             )
@@ -1626,8 +1650,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 "index": index,
                 "key": key_b64
             },
-            // MSC4143 `format`: 0 means the raw key bytes, unpadded-base64 encoded.
-            "format": 0
         });
 
         let memberships = (self.get_memberships.lock().unwrap())();
@@ -1802,11 +1824,6 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             // names a device its author cannot send as.
             EventOrigin::Claimed { device_id } => device_id.as_str(),
 
-            // The host never said how the member event arrived, so there is
-            // nothing to check against and nothing to accuse it of — the same
-            // stance the rest of the design takes on unreported facts.
-            EventOrigin::Unknown => return Ok(()),
-
             // Either the member event was encrypted but could not be attributed
             // to a device — which should not happen, since Olm messages carry
             // the sender's device keys — or it arrived in the clear. Both leave
@@ -1853,7 +1870,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// Receives an encryption key from a to-device message.
     ///
     /// This is called when we receive a to-device message with type
-    /// `org.matrix.msc4143.rtc.encryption_key`.
+    /// `m.rtc.encryption_key` (on the wire, `io.element.call.encryption_keys`).
     ///
     /// Keys that fail the MSC4143 checks are discarded, and keys whose member
     /// event has not arrived yet are buffered together with their provenance so
@@ -1904,15 +1921,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             return Ok(());
         }
 
-        let key_bytes = general_purpose::STANDARD
-            .decode(&received.key_b64)
-            .map_err(|e| {
-                CommandError::SerializationError(format!("Failed to decode key: {}", e))
-            })?;
+        let key_bytes = MEDIA_KEY_BASE64.decode(&received.key_b64).map_err(|e| {
+            CommandError::SerializationError(format!("Failed to decode key: {}", e))
+        })?;
 
-        if key_bytes.len() != 32 {
+        // Only a room-state key can be short here: an MSC room's parser drops
+        // one under 32 bytes (R16), while Element Call's room-state keys were
+        // 16 bytes until js-sdk #5649 and are taken as they come.
+        if key_bytes.len() < MIN_MEDIA_KEY_LEN {
             log::warn!(
-                "[{}/{}] Received key with unexpected length: {} (expected 32)",
+                "[{}/{}] Received a key of {} bytes, shorter than LiveKit needs",
                 self.room_id,
                 self.slot_id,
                 key_bytes.len()
@@ -3474,31 +3492,6 @@ mod tests {
         assert_discarded(&claimed("someOtherDevice"), bob_key(vec![1u8; 32], 0)).await;
     }
 
-    /// But an unreported origin is not an accusation: hosts that do not supply
-    /// decryption metadata keep working, as everywhere else in the design.
-    #[tokio::test]
-    async fn key_is_accepted_when_the_member_events_origin_is_unreported() {
-        let unreported = JoinedMembership {
-            origin: EventOrigin::Unknown,
-            ..bob_membership()
-        };
-        let manager = EncryptionManager::new(
-            Arc::new(NoopBackend),
-            USER_ID.to_string(),
-            DEVICE_ID.to_string(),
-            MEMBER_ID.to_string(),
-            ROOM_ID.to_string(),
-            SLOT_ID.to_string(),
-            create_mock_get_memberships(vec![unreported]),
-        );
-
-        manager
-            .receive_key(bob_key(vec![1u8; 32], 0))
-            .await
-            .expect("should succeed");
-        assert_eq!(manager.get_inbound_keys("bob-device456-uuid").len(), 1);
-    }
-
     /// MSC4153: keys from devices that are not cross-signed are discarded when
     /// the client is configured to exclude insecure devices.
     #[tokio::test]
@@ -3612,7 +3605,7 @@ mod tests {
     /// The to-device payload states its encoding in `format`, which MSC4143
     /// defines as a number; `0` is raw bytes, base64 encoded.
     #[tokio::test]
-    async fn distributed_key_declares_msc4143_format() {
+    async fn distributed_key_has_exactly_the_msc_fields_and_an_unpadded_key() {
         let sender = Arc::new(MockBackend::new());
         let manager = EncryptionManager::new(
             sender.clone(),
@@ -3628,9 +3621,19 @@ mod tests {
         manager.on_memberships_update().await.unwrap();
 
         let messages = sender.to_device_messages.lock().unwrap();
-        let (_, _, _, content) = messages.first().expect("a key should have been sent");
-        assert_eq!(content.get("format").and_then(|v| v.as_u64()), Some(0));
-        assert!(content.get("version").is_none());
+        let (_, _, message_type, content) = messages.first().expect("a key should have been sent");
+        assert_eq!(message_type, KEY_MESSAGE_TYPE);
+        let mut fields: Vec<&str> = content
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort();
+        assert_eq!(fields, ["media_key", "member_id", "room_id"]);
+        let key = content.pointer("/media_key/key").unwrap().as_str().unwrap();
+        assert!(!key.ends_with('='), "MSC4143 media keys are unpadded");
+        assert_eq!(MEDIA_KEY_BASE64.decode(key).unwrap().len(), 32);
     }
 
     #[tokio::test]

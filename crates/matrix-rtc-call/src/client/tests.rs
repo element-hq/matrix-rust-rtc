@@ -29,7 +29,12 @@ fn offline() -> MockOutcome {
 fn mock() -> Arc<MockBackend> {
     let mock = Arc::new(MockBackend::new());
     *mock.transports.lock().unwrap() =
-        Ok(json!([{ "type": "livekit", "livekit_service_url": "https://sfu.example.org" }]));
+        // A homeserver in transition: the MSC transport, and the legacy one
+        // the room-state format publishes on.
+        Ok(json!([
+            { "type": "m.livekit", "url": "wss://sfu.example.org" },
+            { "type": "livekit", "livekit_service_url": "https://sfu.example.org" },
+        ]));
     mock
 }
 
@@ -115,7 +120,7 @@ fn bob_key(room_id: &str) -> ToDeviceMessageIn {
         content: json!({
             "room_id": room_id,
             "member_id": "bob-1",
-            "media_key": { "index": 0, "key": "AAECAwQFBgcICQoLDA0ODw==" },
+            "media_key": { "index": 0, "key": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8" },
         }),
         encryption: EventEncryption::encrypted(Some("BOBDEV".to_owned()), Some(true)),
     }
@@ -262,6 +267,62 @@ async fn a_closed_slot_ends_the_session_and_says_why() {
         call.leave(LeaveSessionParams::new()).await,
         Err(RtcError::SessionOver)
     ));
+}
+
+/// Spec 038 R31: the slot closing withdraws the invite we sent to it.
+#[tokio::test]
+async fn a_closed_slot_withdraws_our_invite() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let sink = mock
+        .room_subscription(ROOM)
+        .expect("subscribed")
+        .sink
+        .clone();
+    // Nobody in the call yet: our join starts it, and invites.
+    sink.on_sticky_events(Vec::new());
+    settle().await;
+    let call = room
+        .join_call(CallJoinOptions::new().kind(crate::CallKind::Group {
+            notify: Some(crate::GroupNotify::default()),
+        }))
+        .await
+        .expect("join");
+    settle().await;
+    let invites = || {
+        mock.sticky_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, event_type, _, _)| {
+                event_type == matrix_rtc_core::wire_event_type("m.rtc.invite")
+            })
+            .map(|(_, _, content, _)| content.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(invites().len(), 1, "the call starter invites");
+
+    sink.on_state_events(
+        SLOT_EVENT_TYPE.to_owned(),
+        vec![EventIn {
+            event_id: "$closed".to_owned(),
+            sender: BOB.to_owned(),
+            event_type: SLOT_EVENT_TYPE.to_owned(),
+            state_key: Some(SLOT.to_owned()),
+            origin_server_ts: 3,
+            content: json!({ "status": "closed" }),
+            encryption: EventEncryption::Cleartext,
+        }],
+    );
+    settle().await;
+
+    assert!(!call.is_live());
+    assert_eq!(
+        invites().last(),
+        Some(&json!({ "msc4354_sticky_key": SLOT })),
+        "withdrawn"
+    );
 }
 
 /// A leave that fails to send still ends the session, so media stops
@@ -501,7 +562,9 @@ async fn a_slot_id_of_another_application_is_refused() {
             ..JoinOptions::application("org.example.whiteboard")
         })
         .await,
-        Err(RtcError::Command(_))
+        Err(RtcError::Join(
+            matrix_rtc_core::JoinError::InvalidSlotId { .. }
+        ))
     ));
 }
 
@@ -701,7 +764,9 @@ async fn an_expired_key_is_rotated_at_its_deadline_with_nobody_ticking() {
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, _, event_type, _)| event_type == KEY_MESSAGE_TYPE)
+            .filter(|(_, _, event_type, _)| {
+                event_type == matrix_rtc_core::wire_event_type(KEY_MESSAGE_TYPE)
+            })
             .count()
     };
     let mock = mock();
@@ -816,7 +881,7 @@ async fn a_call_knows_the_transport_its_join_resolved() {
     assert!(matches!(
         call.transport(),
         TransportIntent::Publish(matrix_rtc_core::RtcTransport::LiveKit(livekit))
-            if livekit.livekit_service_url() == Some("https://sfu.example.org")
+            if livekit.url() == Some("wss://sfu.example.org")
     ));
     call.leave(LeaveSessionParams::new()).await.expect("leave");
 

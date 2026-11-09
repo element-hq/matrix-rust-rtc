@@ -75,6 +75,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use crate::compat::MembershipFormat;
 use crate::encryption::RtcClock;
 use crate::error::{CommandError, JoinError};
 use crate::executor;
@@ -82,7 +83,7 @@ use crate::host::backend::MatrixBackend;
 use crate::host::event::RawStickyEventContent;
 use crate::outbox::{Outbox, PendingSend, SendFailure, SendKind, SendPolicy, SlotKey};
 use crate::session::{ApplicationInfo, LeaveCode, LeaveReason};
-use crate::transport::{MemberTransports, RtcTransport};
+use crate::transport::{LEGACY_LIVEKIT_TYPE, MSC_LIVEKIT_TYPE, MemberTransports, RtcTransport};
 
 /// The `leave_reason.code` of the leave that ends a previous participation of
 /// this device (MSC4143 leaves application codes open).
@@ -121,16 +122,27 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Converts an RtcTransport to a JSON value for event content.
-pub fn transport_to_json(transport: &RtcTransport) -> Value {
+/// Converts an RtcTransport to a JSON value for event content, as a room in
+/// `format` writes it.
+pub fn transport_to_json(transport: &RtcTransport, format: MembershipFormat) -> Value {
     match transport {
-        // Exactly the fields advertised, under the type every implementation
-        // still writes (not the MSC's `m.livekit`): which of `url` and
-        // `livekit_service_url` is present tells peers how we got our token.
+        // MSC: `{type: "m.livekit", url}`, plus the `server_name` of an SFU
+        // that is not our homeserver's (spec 038 R17, R23). A transport with
+        // no `url` cannot be written; the join refuses it before this.
+        RtcTransport::LiveKit(livekit) if format == MembershipFormat::Msc => {
+            let mut obj = json!({ "type": MSC_LIVEKIT_TYPE, "url": livekit.url() });
+            if let Some(server_name) = livekit.server_name() {
+                obj["server_name"] = json!(server_name);
+            }
+            obj
+        }
+        // Room-state: exactly the fields advertised, under the type Element
+        // Call web writes: which of `url` and `livekit_service_url` is present
+        // tells peers how we got our token (R39).
         RtcTransport::LiveKit(livekit) => {
             let mut obj = serde_json::to_value(livekit)
                 .expect("a LiveKit transport always serializes to an object");
-            obj["type"] = json!("livekit");
+            obj["type"] = json!(LEGACY_LIVEKIT_TYPE);
             obj
         }
         RtcTransport::Unsupported(unsupported) => {
@@ -1269,7 +1281,7 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// key, so the same member id, and peers see an update rather than a
     /// leave and a join. Retried like [`Self::republish`], and what refreshes
     /// from then on.
-    pub async fn republish_transports(&self, transport: &RtcTransport) {
+    pub async fn republish_transports(&self, transport: Value) {
         {
             let mut guard = self.last_sticky.lock().unwrap();
             let Some(sticky) = guard.as_mut() else {
@@ -1286,10 +1298,10 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 );
                 return;
             };
-            *published = vec![transport_to_json(transport)];
+            *published = vec![transport.clone()];
         }
         log::info!(
-            "[{}] our media moved to {transport:?}; republishing our membership",
+            "[{}] our media moved to {transport}; republishing our membership",
             self.room_id
         );
         self.republish().await;
@@ -2059,9 +2071,10 @@ mod tests {
             let joined = mock.last_sticky_event().unwrap().2;
 
             machine
-                .republish_transports(&RtcTransport::LiveKit(LiveKitTransport::service(
-                    "https://b".to_owned(),
-                )))
+                .republish_transports(transport_to_json(
+                    &RtcTransport::LiveKit(LiveKitTransport::service("https://b".to_owned())),
+                    MembershipFormat::RoomState,
+                ))
                 .await;
 
             let moved = mock.last_sticky_event().unwrap().2;

@@ -336,7 +336,7 @@ impl MatrixBackend for PeerSender {
             .pointer("/media_key/index")
             .and_then(Value::as_u64)
             .expect("a key message carries an index") as u8;
-        let key = general_purpose::STANDARD
+        let key = general_purpose::STANDARD_NO_PAD
             .decode(
                 content
                     .pointer("/media_key/key")
@@ -687,7 +687,7 @@ impl Call {
                 },
                 room_id: ROOM_ID.to_owned(),
                 member_id: message.from_member_id.clone(),
-                key_b64: general_purpose::STANDARD.encode(&message.key),
+                key_b64: general_purpose::STANDARD_NO_PAD.encode(&message.key),
                 key_index: message.index,
             })
             .await

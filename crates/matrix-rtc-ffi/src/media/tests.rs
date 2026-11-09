@@ -24,9 +24,18 @@ use super::types::{
 };
 use super::{MediaFfiError, runtime};
 
-/// TCP port 9 (discard) is reliably closed on dev machines: connections are
-/// refused immediately, keeping the failure path fast.
-const DEAD_SFU_URL: &str = "http://127.0.0.1:9";
+/// An SFU nobody reaches: the mock homeserver's tokens for it never come
+/// ([`dead_sfu_host`]), so no connection to it is ever attempted.
+const DEAD_SFU_URL: &str = "ws://127.0.0.1:9";
+
+/// A host whose homeserver cannot be reached for SFU tokens: every focus is
+/// dead, and the failure stays before any WebRTC is set up.
+fn dead_sfu_host() -> Arc<MockHost> {
+    let mock = MockHost::new();
+    mock.unreachable_tokens
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    mock
+}
 
 fn config() -> MediaSessionConfig {
     MediaSessionConfig::default()
@@ -34,8 +43,8 @@ fn config() -> MediaSessionConfig {
 
 fn dead_sfu() -> FfiJoinTransport {
     FfiJoinTransport::Publish {
-        url: None,
-        livekit_service_url: Some(DEAD_SFU_URL.to_owned()),
+        url: Some(DEAD_SFU_URL.to_owned()),
+        livekit_service_url: None,
     }
 }
 
@@ -159,14 +168,14 @@ fn a_dead_own_focus_is_given_up_at_the_end_of_the_budget(
 
 #[test]
 fn wiring_reaches_the_transport_and_gives_a_dead_sfu_up() {
-    a_dead_own_focus_is_given_up_at_the_end_of_the_budget(dead_sfu(), MockHost::new());
+    a_dead_own_focus_is_given_up_at_the_end_of_the_budget(dead_sfu(), dead_sfu_host());
 }
 
 #[test]
 fn an_advertised_join_connects_to_the_advertised_focus() {
-    let mock = MockHost::new();
+    let mock = dead_sfu_host();
     *mock.transports_json.lock().unwrap() =
-        serde_json::json!([{ "type": "livekit", "livekit_service_url": DEAD_SFU_URL }]).to_string();
+        serde_json::json!([{ "type": "m.livekit", "url": DEAD_SFU_URL }]).to_string();
     // The host passed no focus: trying the dead one means it came from the call.
     a_dead_own_focus_is_given_up_at_the_end_of_the_budget(FfiJoinTransport::Advertised, mock);
 }

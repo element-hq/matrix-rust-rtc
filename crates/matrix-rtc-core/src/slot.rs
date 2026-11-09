@@ -175,6 +175,57 @@ impl SlotState {
     }
 }
 
+/// The longest slot id MSC4143 allows: the maximum length of a `state_key`.
+pub const MAX_SLOT_ID_BYTES: usize = 255;
+
+/// Checks a slot id we are about to join against MSC4143.
+///
+/// The id is `{application_type}#{application_slot_id}`, at most
+/// [`MAX_SLOT_ID_BYTES`] long, with both halves following the Common Namespaced
+/// Identifier Grammar (so neither contains `#`), and its first half must be the
+/// application we join as. This only rejects: MSC4143 forbids reading meaning
+/// from a slot id's parts, and nothing here does (spec 038 R8).
+///
+/// Returns why the id is invalid.
+pub fn validate_slot_id(slot_id: &str, application_type: &str) -> Result<(), String> {
+    if slot_id.len() > MAX_SLOT_ID_BYTES {
+        return Err(format!(
+            "{} bytes, more than the {MAX_SLOT_ID_BYTES} a state key allows",
+            slot_id.len()
+        ));
+    }
+    let Some(application_slot_id) = slot_id
+        .strip_prefix(application_type)
+        .and_then(|rest| rest.strip_prefix('#'))
+    else {
+        return Err(format!(
+            "it does not start with '{application_type}#', the application joining it"
+        ));
+    };
+    for (half, value) in [
+        ("application type", application_type),
+        ("application slot id", application_slot_id),
+    ] {
+        if !is_namespaced_identifier(value) {
+            return Err(format!(
+                "its {half} '{value}' is not a Common Namespaced Identifier: one or more of \
+                 [a-z0-9-_.], starting with [a-z]"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The Common Namespaced Identifier Grammar's character rules: 1–255 characters
+/// from `[a-z0-9-_.]`, starting with `[a-z]`. Namespacing is a convention for
+/// the application type and is not checked.
+fn is_namespaced_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some('a'..='z'))
+        && value.len() <= MAX_SLOT_ID_BYTES
+        && chars.all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_' | '.'))
+}
+
 impl RawSlotEvent {
     /// Resolves the event into a slot state.
     ///
@@ -315,6 +366,29 @@ impl RawSlotEventContent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Spec 038 R8: MSC4143's grammar and length limit, and the slot belonging
+    /// to the application joining it.
+    #[test]
+    fn slot_ids_follow_the_msc_grammar() {
+        assert!(validate_slot_id("m.call#room", "m.call").is_ok());
+        assert!(validate_slot_id("org.example.board#b-1_x.y", "org.example.board").is_ok());
+
+        // Another application's slot, or none at all.
+        assert!(validate_slot_id("m.call#room", "org.example.board").is_err());
+        assert!(validate_slot_id("m.call", "m.call").is_err());
+        // An empty half, a `#` inside a half, characters outside the grammar.
+        assert!(validate_slot_id("m.call#", "m.call").is_err());
+        assert!(validate_slot_id("m.call#a#b", "m.call").is_err());
+        assert!(validate_slot_id("m.call#ROOM", "m.call").is_err());
+        assert!(validate_slot_id("m.call#1room", "m.call").is_err());
+
+        // 255 bytes is the limit, inclusive.
+        let at_limit = format!("m.call#r{}", "x".repeat(MAX_SLOT_ID_BYTES - 8));
+        assert_eq!(at_limit.len(), MAX_SLOT_ID_BYTES);
+        assert!(validate_slot_id(&at_limit, "m.call").is_ok());
+        assert!(validate_slot_id(&format!("{at_limit}x"), "m.call").is_err());
+    }
 
     fn slot(json: &str) -> SlotState {
         slot_in(json, RoomEncryption::Unknown)

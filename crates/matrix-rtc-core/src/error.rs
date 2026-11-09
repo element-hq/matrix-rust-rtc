@@ -80,6 +80,22 @@ pub enum JoinError {
     #[error("slot '{slot_id}' is not open in this room")]
     SlotClosed { slot_id: String },
 
+    /// The slot id breaks MSC4143's grammar or length limit, or belongs to
+    /// another application (spec 038 R8).
+    #[error("slot id '{slot_id}' is invalid: {reason}")]
+    InvalidSlotId { slot_id: String, reason: String },
+
+    /// The homeserver advertises no LiveKit transport of the room's format to
+    /// publish on: `m.livekit` with a `url` in MSC, `livekit` in room-state
+    /// (spec 038 R18). A receive-only join never asks.
+    #[error("the homeserver advertises no usable {transport_type} transport")]
+    NoLiveKitTransport { transport_type: String },
+
+    /// Our homeserver lacks MSC4195's `get_token`, so no SFU token can be
+    /// had (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token")]
+    TokenEndpointUnsupported,
+
     /// The join did not complete within its budget: every step kept failing
     /// transiently, or did not answer (034 R6).
     #[error("the join did not complete within its budget")]
@@ -253,6 +269,27 @@ mod tests {
         }
         let worded_like_a_refusal = BackendError::new("M_FORBIDDEN: you shall not pass");
         assert!(!worded_like_a_refusal.is_permanent());
+    }
+
+    /// Spec 038 R44: an endpoint the homeserver lacks answers `M_UNRECOGNIZED`,
+    /// or a bare 404; a 404 naming another code is about something else.
+    #[test]
+    fn an_unrecognized_endpoint_is_told_from_other_failures() {
+        for (errcode, status, unrecognized) in [
+            (Some("M_UNRECOGNIZED"), Some(404), true),
+            (Some("M_UNRECOGNIZED"), Some(400), true),
+            (None, Some(404), true),
+            (Some("M_NOT_FOUND"), Some(404), false),
+            (Some("M_FORBIDDEN"), Some(403), false),
+            (None, Some(502), false),
+            (None, None, false),
+        ] {
+            assert_eq!(
+                error(errcode, status).is_unrecognized_endpoint(),
+                unrecognized,
+                "{errcode:?} / {status:?}",
+            );
+        }
     }
 
     /// R3: the host's mark is final; a status on its own never is.

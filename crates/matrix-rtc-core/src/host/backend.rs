@@ -123,6 +123,16 @@ impl BackendError {
         self
     }
 
+    /// Whether the homeserver does not have the endpoint at all: an
+    /// `M_UNRECOGNIZED`, or a 404 with no error code, as servers answer an
+    /// unknown path (spec 038 R44).
+    pub fn is_unrecognized_endpoint(&self) -> bool {
+        match self.errcode.as_deref() {
+            Some(errcode) => errcode == "M_UNRECOGNIZED",
+            None => self.status == Some(404),
+        }
+    }
+
     /// Whether retrying cannot help (R3): the host marked it final, or it
     /// carries a Matrix error code that denotes refusal. A rate limit, an
     /// `M_UNKNOWN`, a code on a 5xx and no code at all are transient; the
