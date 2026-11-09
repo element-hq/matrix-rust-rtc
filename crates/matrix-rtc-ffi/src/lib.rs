@@ -521,8 +521,8 @@ impl RtcRoom {
         })
     }
 
-    /// The intent a join into `slot_id` would settle on, without joining: the
-    /// one its members agree on, else `requested`, else video. For a lobby
+    /// The intent a join into `slot_id` would settle on, without joining:
+    /// `requested`, else the one its members agree on, else video. For a lobby
     /// that previews the camera the join will start with.
     pub async fn call_intent(
         &self,

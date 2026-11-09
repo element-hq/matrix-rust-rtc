@@ -61,8 +61,8 @@ pub(crate) struct CallJoinParams {
     /// Element Call's three-second window. See [`crate::reactions`].
     pub reactions: Option<ReactionsConfig>,
 
-    /// The intent the host asks for, used when the call has none of its own
-    /// to follow; see [`CallIntentConsensus::resolve`].
+    /// The user's explicit choice, which wins over the call's own; `None`
+    /// follows the call. See [`CallIntentConsensus::resolve`].
     pub intent: Option<CallIntent>,
 }
 
@@ -956,8 +956,8 @@ impl<B: MatrixBackend + 'static> CallRoomState<DialectBackend<B>> {
         Ok(joined)
     }
 
-    /// The intent a join into `slot_id` uses: the one the members already in
-    /// it agree on, otherwise `requested`, otherwise video. Read before our
+    /// The intent a join into `slot_id` uses: `requested`, otherwise the one
+    /// the members already in it agree on, otherwise video. Read before our
     /// membership is sent, and without our own device's, which may be a
     /// membership from before a crash that has not expired yet.
     fn resolve_intent(&self, slot_id: &str, requested: Option<CallIntent>) -> CallIntent {

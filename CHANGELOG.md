@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Breaking
+
+- A join's `intent` is the user's explicit choice and wins over the call in progress; a join without one follows the call, so a room's call button passes none (030).
+
 ### Added
 
 - A web delegate's room handle may implement `setWanted(identities)` to subscribe only to the participants the core asks for, as the bundled `matrix-rtc-call.mjs` now does with `autoSubscribe: false`.
