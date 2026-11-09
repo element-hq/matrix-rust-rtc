@@ -45,6 +45,8 @@ pub use interruptions::Interruptions;
 pub use livekit::{LiveKitAttachOptions, LiveKitAttachment, attach_livekit};
 #[cfg(feature = "matrix-sdk")]
 pub use livekit::{LiveKitCall, LiveKitCallError, LiveKitCallOptions, close_slot, open_slot};
+#[cfg(feature = "livekit")]
+pub use matrix_rtc_livekit::supported_video_codecs;
 pub use matrix_rtc_transport::ConnectionState;
 pub use participant::{Participant, StreamState, UnableToDecrypt};
 pub use tile::{

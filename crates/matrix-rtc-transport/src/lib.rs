@@ -51,6 +51,9 @@ pub use keys::{
     FrameKeyRing, KeyDiscardListener, KeyImportListener, LocalKeyIndexHook, MediaKeyHandler,
     ParticipantKey, SwitchCompleteListener,
 };
-pub use local::{AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoSourceConfig};
+pub use local::{
+    AudioSourceConfig, LocalTrackHandle, PublishOptions, VideoCodecPreference, VideoEncodingLimits,
+    VideoSourceConfig,
+};
 pub use stats::{QualityLimitation, ReceiveStats, SendLayerStats, SendStats};
 pub use stream::MediaStreamKind;

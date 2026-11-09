@@ -43,6 +43,35 @@ pub struct VideoSourceConfig {
     pub height: u32,
 }
 
+/// Video codec a publisher asks the transport to encode with.
+///
+/// A preference, not a guarantee: a transport that cannot encode the codec on
+/// this platform publishes with its default instead (LiveKit's is VP8). Which
+/// codecs are available depends on the platform and on how the media stack was
+/// built, so a host offering a choice should ask the transport first. Decode
+/// support varies too: not every receiver can decode H.264.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum VideoCodecPreference {
+    /// The transport's default.
+    #[default]
+    Auto,
+    Vp8,
+    H264,
+    Vp9,
+    Av1,
+}
+
+/// Caps on a video publication's encoder.
+///
+/// A field left `None` is computed by the transport from the source
+/// resolution, as when no limit is given at all. With simulcast, the caps
+/// apply to the top layer; the transport derives the lower layers from it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VideoEncodingLimits {
+    pub max_bitrate_bps: Option<u64>,
+    pub max_framerate: Option<u32>,
+}
+
 /// What to publish.
 #[derive(Clone, Debug)]
 pub struct PublishOptions {
@@ -65,6 +94,10 @@ pub struct PublishOptions {
     /// at the SFU, which for a microphone is a hot mic. The mute travels in the
     /// same request that announces the track, so there is no such window.
     pub muted: bool,
+    /// Codec to encode with, for video kinds; see [`VideoCodecPreference`].
+    pub video_codec: VideoCodecPreference,
+    /// Encoder caps, for video kinds; see [`VideoEncodingLimits`].
+    pub video_encoding: VideoEncodingLimits,
 }
 
 impl PublishOptions {
@@ -76,6 +109,8 @@ impl PublishOptions {
             video: None,
             simulcast: false,
             muted: false,
+            video_codec: VideoCodecPreference::Auto,
+            video_encoding: VideoEncodingLimits::default(),
         }
     }
 
@@ -87,6 +122,8 @@ impl PublishOptions {
             video: Some(video),
             simulcast: true,
             muted: false,
+            video_codec: VideoCodecPreference::Auto,
+            video_encoding: VideoEncodingLimits::default(),
         }
     }
 
@@ -98,12 +135,26 @@ impl PublishOptions {
             video: Some(video),
             simulcast: true,
             muted: false,
+            video_codec: VideoCodecPreference::Auto,
+            video_encoding: VideoEncodingLimits::default(),
         }
     }
 
     /// Publish already muted; see [`PublishOptions::muted`].
     pub fn muted(mut self) -> Self {
         self.muted = true;
+        self
+    }
+
+    /// Encode with `codec`; see [`VideoCodecPreference`].
+    pub fn with_video_codec(mut self, codec: VideoCodecPreference) -> Self {
+        self.video_codec = codec;
+        self
+    }
+
+    /// Cap the encoder; see [`VideoEncodingLimits`].
+    pub fn with_video_encoding(mut self, limits: VideoEncodingLimits) -> Self {
+        self.video_encoding = limits;
         self
     }
 }

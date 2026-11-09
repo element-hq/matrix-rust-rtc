@@ -79,6 +79,10 @@ testing = ["matrix-rtc-livekit?/testing", "matrix-sdk?/testing"]
 # behind it); the `#[ignore]` inside keeps `--all-features` runs from executing
 # it without the demo/backend stack.
 [[test]]
+name = "video_codecs"
+required-features = ["livekit"]
+
+[[test]]
 name = "e2e_call"
 path = "tests/e2e_call/main.rs"
 required-features = ["matrix-sdk", "testing"]

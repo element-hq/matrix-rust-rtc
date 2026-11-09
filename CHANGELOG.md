@@ -15,6 +15,7 @@ log only.
 ### Added
 
 - A web delegate's room handle may implement `setWanted(identities)` to subscribe only to the participants the core asks for, as the bundled `matrix-rtc-call.mjs` now does with `autoSubscribe: false`.
+- `PublishOptions` takes a video codec and bitrate/framerate caps (`with_video_codec`, `with_video_encoding`), and `supported_video_codecs()` lists what this platform can encode; also on FFI.
 
 ### Fixed
 
