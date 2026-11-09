@@ -603,6 +603,7 @@ impl MediaPool {
                 idle_generation: 0,
             },
         );
+        self.push_wanted(&key);
         self.spawn_forwarder(key, generation, events);
     }
 
@@ -623,7 +624,7 @@ impl MediaPool {
             budget_spent: false,
         });
         self.pool.insert(
-            key,
+            key.clone(),
             ManagedConnection {
                 backend: None,
                 members,
@@ -633,6 +634,7 @@ impl MediaPool {
                 idle_generation: 0,
             },
         );
+        self.push_wanted(&key);
         self.start_own_loss();
         self.spawn_own_attempt(0);
         std::mem::take(&mut self.out)
@@ -1082,6 +1084,36 @@ impl MediaPool {
             );
             self.start_connect(&key, 0);
         }
+
+        let keys: Vec<String> = self.pool.keys().cloned().collect();
+        for key in keys {
+            self.push_wanted(&key);
+        }
+    }
+
+    /// Tells the connection on `key` whom to receive: the identities of the
+    /// members it serves, never ours. A peer connection still connecting is
+    /// told once it is up; our own handle takes it at any time and keeps it
+    /// across reconnects.
+    fn push_wanted(&self, key: &str) {
+        let Some(entry) = self.pool.get(key) else {
+            return;
+        };
+        let connection = match &entry.state {
+            ConnState::Up { connection } => connection.clone(),
+            _ if entry.is_own => match &self.own {
+                Some(own) => own.connection.clone(),
+                None => return,
+            },
+            _ => return,
+        };
+        let mut identities: Vec<String> = entry
+            .members
+            .iter()
+            .filter_map(|member_id| self.member_identities.get(member_id).cloned())
+            .collect();
+        identities.sort();
+        connection.set_wanted(&identities);
     }
 
     /// Spawn a connect attempt for an existing pool entry.
@@ -1182,6 +1214,7 @@ impl MediaPool {
                     connection: Arc::from(connection),
                 };
                 log::info!("media connection up: {key}");
+                self.push_wanted(key);
                 self.spawn_forwarder(key.to_owned(), generation, events);
                 self.clear_degraded(key);
                 self.peer_up(key);

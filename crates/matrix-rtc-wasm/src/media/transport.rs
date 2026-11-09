@@ -488,6 +488,7 @@ impl OwnFocusTransport for JsMediaTransport {
             connection_key: connection_key.to_owned(),
             handle: Rc::new(RefCell::new(None)),
             token: Rc::new(RefCell::new(None)),
+            wanted: Rc::new(RefCell::new(Vec::new())),
             ctx: ctx.clone(),
             connector: self.connector.clone(),
         }
@@ -553,6 +554,9 @@ pub(crate) struct JsTransportConnection {
     handle: Rc<RefCell<Option<JsValue>>>,
     /// The token the last connect used, reused until it is refused.
     token: Rc<RefCell<Option<SfuToken>>>,
+    /// Who this connection receives ([`TransportConnection::set_wanted`]),
+    /// handed to every room it connects.
+    wanted: Rc<RefCell<Vec<String>>>,
     ctx: ConnectionContext,
     connector: Rc<JsConnector>,
 }
@@ -584,6 +588,15 @@ impl TransportConnection for JsTransportConnection {
         }
     }
 
+    /// Through the room handle's `setWanted(identities)`, now and on every
+    /// later room. A handle without it receives what its room subscribes to.
+    fn set_wanted(&self, identities: &[String]) {
+        *self.wanted.borrow_mut() = identities.to_vec();
+        if let Some(handle) = self.handle.borrow().as_ref() {
+            hand_wanted(handle, identities);
+        }
+    }
+
     /// A new livekit-js room through the delegate, with the token of the
     /// last connect or a fresh one; the previous room is closed.
     async fn reconnect(
@@ -606,6 +619,7 @@ impl TransportConnection for JsTransportConnection {
             .connector
             .connect(&self.connection_key, &token, self.ctx.e2ee)
             .await?;
+        hand_wanted(&handle, &self.wanted.borrow());
         let previous = self.handle.borrow_mut().replace(handle);
         if let Some(previous) = previous {
             wasm_bindgen_futures::spawn_local(async move {
@@ -623,6 +637,20 @@ impl TransportConnection for JsTransportConnection {
             Some(handle) => call_delegate(&handle, "close", &[]).await.map(|_| ()),
             None => Ok(()),
         }
+    }
+}
+
+/// Calls the room handle's optional `setWanted(identities)`.
+fn hand_wanted(handle: &JsValue, identities: &[String]) {
+    let method = Reflect::get(handle, &JsValue::from_str("setWanted"))
+        .ok()
+        .and_then(|method| method.dyn_into::<Function>().ok());
+    let Some(method) = method else {
+        return;
+    };
+    let list: Array = identities.iter().map(|id| JsValue::from_str(id)).collect();
+    if let Err(error) = method.call1(handle, &list) {
+        log::warn!("media: setWanted threw: {error:?}");
     }
 }
 

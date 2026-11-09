@@ -250,8 +250,8 @@ export interface StabilityConfigIn {
 export interface MediaDelegate {
     /** POST `body` as JSON to `url`; resolve with the HTTP status and raw response text. */
     fetchJson(url: string, body: Record<string, unknown>): Promise<{ status: number; body: string }>;
-    /** Connect a livekit-js Room and register the RoomEvent translation onto `sink`. */
-    connect(request: { connectionKey: string; sfuUrl: string; jwt: string; e2ee: boolean }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown> }>;
+    /** Connect a livekit-js Room and register the RoomEvent translation onto `sink`. With `setWanted`, the room subscribes only to the identities it is handed (connect it with `autoSubscribe: false`), on every call; without it, to whatever the room subscribes to. */
+    connect(request: { connectionKey: string; sfuUrl: string; jwt: string; e2ee: boolean }, sink: WasmConnectionEventSink): Promise<{ close(): Promise<unknown>; setWanted?(identities: string[]): void }>;
     /** Install a media key in livekit-js's key provider (per participant, HKDF material). */
     setKey(identity: string, index: number, key: Uint8Array): Promise<boolean | void>;
     /** Move the local sender onto a rotated key index. */
