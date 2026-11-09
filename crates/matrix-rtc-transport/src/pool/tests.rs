@@ -34,6 +34,8 @@ struct TransportState {
     reconnects: StdMutex<Vec<(tokio::time::Instant, bool)>>,
     /// Every connection key the own handle took over.
     takeovers: StdMutex<Vec<String>>,
+    /// The last wanted set each connection key was handed.
+    wanted: StdMutex<HashMap<String, Vec<String>>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +90,14 @@ struct FakeConnection {
 impl TransportConnection for FakeConnection {
     fn connection_key(&self) -> &str {
         &self.key
+    }
+
+    fn set_wanted(&self, identities: &[String]) {
+        self.state
+            .wanted
+            .lock()
+            .unwrap()
+            .insert(self.key.clone(), identities.to_vec());
     }
 
     async fn publish(
@@ -266,6 +276,10 @@ impl Fixture {
                 return events;
             }
         }
+    }
+
+    fn wanted(&self, key: &str) -> Option<Vec<String>> {
+        self.state.wanted.lock().unwrap().get(key).cloned()
     }
 
     fn connects(&self, key: &str) -> usize {
@@ -1671,4 +1685,49 @@ fn an_sfu_reached_through_both_token_flows_is_reported() {
     );
     assert!(split_flow_sfus(&[on("alice", both()), on("bob", both())]).is_empty());
     assert!(split_flow_sfus(&[on("alice", bare()), on("bob", bare())]).is_empty());
+}
+
+/// Each connection receives only the members it serves: a peer's once it is
+/// up, and as members come; ours the peers on our focus, never ourselves.
+#[tokio::test(start_paused = true)]
+async fn each_connection_is_told_to_receive_only_its_own_members() {
+    let mut fx = Fixture::new();
+    fx.adopt();
+    fx.pool.apply_snapshot(&[
+        member_on("own", OWN_FOCUS),
+        member_on("bob", OWN_FOCUS),
+        member_on("carol", PEER_FOCUS),
+    ]);
+    fx.drain().await;
+    assert_eq!(fx.wanted(OWN_FOCUS), Some(vec!["id-bob".to_owned()]));
+    assert_eq!(fx.wanted(PEER_FOCUS), Some(vec!["id-carol".to_owned()]));
+
+    fx.pool.apply_snapshot(&[
+        member_on("own", OWN_FOCUS),
+        member_on("bob", OWN_FOCUS),
+        member_on("carol", PEER_FOCUS),
+        member_on("dave", PEER_FOCUS),
+    ]);
+    fx.drain().await;
+    assert_eq!(
+        fx.wanted(PEER_FOCUS),
+        Some(vec!["id-carol".to_owned(), "id-dave".to_owned()])
+    );
+    assert_eq!(fx.wanted(OWN_FOCUS), Some(vec!["id-bob".to_owned()]));
+}
+
+/// A peer connection still connecting has no one to tell; it is told the
+/// moment it is up.
+#[tokio::test(start_paused = true)]
+async fn a_peer_connection_is_told_whom_to_receive_once_up() {
+    let mut fx = Fixture::new();
+    fx.adopt();
+    fx.state.fail_attempts.store(1, Ordering::SeqCst);
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("carol", PEER_FOCUS)]);
+    fx.drain().await;
+    assert_eq!(fx.wanted(PEER_FOCUS), None, "the first attempt failed");
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    fx.drain().await;
+    assert_eq!(fx.wanted(PEER_FOCUS), Some(vec!["id-carol".to_owned()]));
 }

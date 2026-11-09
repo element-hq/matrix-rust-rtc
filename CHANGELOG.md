@@ -8,6 +8,14 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- A web delegate's room handle may implement `setWanted(identities)` to subscribe only to the participants the core asks for, as the bundled `matrix-rtc-call.mjs` now does with `autoSubscribe: false`.
+
+### Fixed
+
+- Each SFU connection subscribes only to the members it serves, so a peer reached through two token flows no longer arrives twice and our own media no longer comes back to us.
+
 ## v0.5.0-rc.10 - 2026-11-09
 
 ### Breaking

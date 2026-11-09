@@ -194,6 +194,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     config: Mutex::new(config),
                     token: Mutex::new(None),
                 },
+                wanted: Mutex::new(Default::default()),
                 installs: Mutex::new(0),
             }),
         }
@@ -277,6 +278,9 @@ struct ConnectionShared {
     /// room. Weak: an unpublished or dropped one simply goes.
     local_tracks: Mutex<Vec<Weak<LiveKitLocalTrack>>>,
     connector: Connector,
+    /// The remote identities this connection subscribes to
+    /// ([`TransportConnection::set_wanted`]); nobody until the pool says.
+    wanted: Mutex<std::collections::HashSet<String>>,
     /// Bumped by every take-over, under which a connected room is installed:
     /// a reconnect that started before one is abandoned (034 R25).
     installs: Mutex<u64>,
@@ -299,6 +303,9 @@ struct Connector {
     /// Whether frames are encrypted (spec 038 R11); when they are, a track
     /// declared unencrypted is refused (R12).
     e2ee: bool,
+    /// Whether this connection receives at all; when it does, only the wanted
+    /// participants ([`ConnectionShared::wanted`]). The room itself never
+    /// auto-subscribes.
     auto_subscribe: bool,
     /// The focus connects go to; a take-over moves it (034 R25).
     config: Mutex<LiveKitTransportConfig>,
@@ -387,6 +394,41 @@ impl LiveKitTransportConnection {
         self.shared.session.borrow().clone()
     }
 
+    fn wants(&self, identity: &str) -> bool {
+        self.shared.connector.auto_subscribe
+            && self
+                .shared
+                .wanted
+                .lock()
+                .expect("wanted mutex poisoned")
+                .contains(identity)
+    }
+
+    /// Subscribes to the tracks of every wanted participant already in
+    /// `session`; later ones are subscribed as they are published.
+    ///
+    /// A participant leaving the set is not unsubscribed: it leaves the set
+    /// because its member left or moved, and so its participant leaves the
+    /// room. Unsubscribing would also risk a later resubscribe, which livekit
+    /// does not recover from (see `apply_constraints`).
+    fn subscribe_wanted(&self, session: &LiveKitSession) {
+        for (identity, participant) in session.room().remote_participants() {
+            if !self.wants(identity.as_str()) {
+                continue;
+            }
+            for publication in participant.track_publications().into_values() {
+                if !publication.is_desired() {
+                    log::debug!(
+                        "subscribing to {identity}'s {:?} on {}",
+                        publication.source(),
+                        self.connection_key
+                    );
+                    publication.set_subscribed(true);
+                }
+            }
+        }
+    }
+
     /// Re-assert the current index on our senders, for a track published after a
     /// rotation: its cryptor is new, and new cryptors start at index 0.
     fn reassert_local_key_index(&self) {
@@ -452,6 +494,19 @@ impl TransportConnection for LiveKitTransportConnection {
         &self.connection_key
     }
 
+    fn set_wanted(&self, identities: &[String]) {
+        let added = {
+            let mut wanted = self.shared.wanted.lock().expect("wanted mutex poisoned");
+            let added = identities.iter().any(|identity| !wanted.contains(identity));
+            *wanted = identities.iter().cloned().collect();
+            added
+        };
+        log::debug!("{} receives {identities:?}", self.connection_key);
+        if added && let Some(session) = self.current_session() {
+            self.subscribe_wanted(&session);
+        }
+    }
+
     /// Also remembered for tracks published later. The key provider's
     /// `set_key` only fills the key *ring*; the index a sender stamps lives on
     /// its frame cryptor and changes only here.
@@ -484,7 +539,8 @@ impl TransportConnection for LiveKitTransportConnection {
                 connector
                     .e2ee
                     .then(|| connector.key_provider.provider().clone()),
-                connector.auto_subscribe,
+                // Subscriptions are ours to make: see `subscribe_wanted`.
+                false,
             ),
         )
         .await
@@ -518,6 +574,7 @@ impl TransportConnection for LiveKitTransportConnection {
             self.clone(),
             Arc::downgrade(&session),
         ));
+        self.subscribe_wanted(&session);
         self.republish_local_tracks(&session).await;
         self.reassert_local_key_index();
         Ok(events_rx)
@@ -572,6 +629,8 @@ impl TransportConnection for LiveKitTransportConnection {
         if let Some(previous) = previous {
             close_room(previous);
         }
+        // The room was the other connection's, subscribed to its members.
+        self.subscribe_wanted(&session);
         let this = self.clone();
         tokio::spawn(async move {
             this.republish_local_tracks(&session).await;
@@ -1030,6 +1089,15 @@ async fn translate_room_events(
             RoomEvent::ParticipantDisconnected(participant) => Some(ConnectionEvent::RemoteLeft {
                 identity: participant.identity().to_string(),
             }),
+            RoomEvent::TrackPublished {
+                publication,
+                participant,
+            } => {
+                if owner.wants(participant.identity().as_str()) {
+                    publication.set_subscribed(true);
+                }
+                None
+            }
             RoomEvent::TrackSubscribed {
                 track,
                 publication,

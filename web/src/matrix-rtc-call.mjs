@@ -170,14 +170,33 @@ export class MatrixRtcCall {
       // peers show it with a "not encrypted" warning while it decodes fine.
       await room.setE2EEEnabled(true);
     }
+    // Only the participants the core asks for are subscribed (`setWanted`):
+    // a peer reached through two rooms, or our own publication seen from a
+    // second one, would otherwise arrive twice.
+    let wanted = new Set();
+    const subscribeWanted = (participant) => {
+      if (!wanted.has(participant.identity)) return;
+      for (const publication of participant.trackPublications.values()) {
+        if (!publication.isDesired) publication.setSubscribed(true);
+      }
+    };
+    room.on(this.livekit.RoomEvent.TrackPublished, (publication, participant) => {
+      if (wanted.has(participant.identity)) publication.setSubscribed(true);
+    });
     this.registerSink(room, sink, request.connectionKey, request.e2ee);
     this.onRoomCreated(room, request.connectionKey);
-    await room.connect(request.sfuUrl, request.jwt);
+    await room.connect(request.sfuUrl, request.jwt, { autoSubscribe: false });
     this.rooms.set(request.connectionKey, room);
     return {
       close: async () => {
         this.rooms.delete(request.connectionKey);
         await room.disconnect();
+      },
+      setWanted: (identities) => {
+        wanted = new Set(identities);
+        for (const participant of room.remoteParticipants.values()) {
+          subscribeWanted(participant);
+        }
       },
     };
   }
