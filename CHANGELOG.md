@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.10 - 2026-11-09
+
 ### Breaking
 
 - In the MSC format a member event is read exactly as MSC4143 states it: Element Call's 2025 sticky content and self-claimed devices are only read in the room-state format (038).
@@ -24,6 +26,7 @@ log only.
 ### Added
 
 - `msc_support` (core, `RtcClient`, FFI, web `mscSupport`) names what a homeserver lacks for the MSC format, from its `/versions` features (host helpers `server_features`/`serverFeatures`) and its transports, without choosing the format (038).
+- A join follows the call's voice/video intent from the memberships already in it and publishes it in ours; read it from `RtcCall::call_intent` to start the camera, and pass `intent` only to start a call (030).
 
 ### Fixed
 
@@ -32,10 +35,6 @@ log only.
 - On the web an unencrypted track in an encrypted call is refused whatever the page's options (038).
 - A call joined in the clear leaves with `slot_closed` when the room's encryption turns on, rather than staying unencrypted (038).
 - Every key index, 0 to 255, is usable natively and on the web; native dropped index 255 and the web anything past 15 (038).
-
-### Added
-
-- A join follows the call's voice/video intent from the memberships already in it and publishes it in ours; read it from `RtcCall::call_intent` to start the camera, and pass `intent` only to start a call (030).
 
 ## v0.5.0-rc.9 - 2026-11-04
 
