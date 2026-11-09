@@ -943,6 +943,76 @@ pub struct FfiVideoSourceConfig {
     pub height: u32,
 }
 
+/// Video codec to publish with (mirrors
+/// `matrix_rtc_transport::VideoCodecPreference`). A preference: a codec this
+/// platform cannot encode falls back to the default; see
+/// [`supported_video_codecs`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiVideoCodecPreference {
+    /// The transport's default (VP8).
+    Auto,
+    Vp8,
+    H264,
+    Vp9,
+    Av1,
+}
+
+impl From<FfiVideoCodecPreference> for matrix_rtc_transport::VideoCodecPreference {
+    fn from(codec: FfiVideoCodecPreference) -> Self {
+        match codec {
+            FfiVideoCodecPreference::Auto => Self::Auto,
+            FfiVideoCodecPreference::Vp8 => Self::Vp8,
+            FfiVideoCodecPreference::H264 => Self::H264,
+            FfiVideoCodecPreference::Vp9 => Self::Vp9,
+            FfiVideoCodecPreference::Av1 => Self::Av1,
+        }
+    }
+}
+
+impl From<matrix_rtc_transport::VideoCodecPreference> for FfiVideoCodecPreference {
+    fn from(codec: matrix_rtc_transport::VideoCodecPreference) -> Self {
+        use matrix_rtc_transport::VideoCodecPreference as Codec;
+        match codec {
+            Codec::Auto => Self::Auto,
+            Codec::Vp8 => Self::Vp8,
+            Codec::H264 => Self::H264,
+            Codec::Vp9 => Self::Vp9,
+            Codec::Av1 => Self::Av1,
+        }
+    }
+}
+
+/// The video codecs this device can encode, for a codec picker. Depends on
+/// the platform and its hardware encoders, so ask rather than assume.
+#[uniffi::export]
+pub fn supported_video_codecs() -> Vec<FfiVideoCodecPreference> {
+    matrix_rtc_livekit::supported_video_codecs()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Encoder caps of a video publication (mirrors
+/// `matrix_rtc_transport::VideoEncodingLimits`). A `None` field is computed
+/// from the source resolution; with simulcast, the caps apply to the top
+/// layer.
+#[derive(Clone, Copy, Debug, Default, uniffi::Record)]
+pub struct FfiVideoEncodingLimits {
+    #[uniffi(default = None)]
+    pub max_bitrate_bps: Option<u64>,
+    #[uniffi(default = None)]
+    pub max_framerate: Option<u32>,
+}
+
+impl From<FfiVideoEncodingLimits> for matrix_rtc_transport::VideoEncodingLimits {
+    fn from(limits: FfiVideoEncodingLimits) -> Self {
+        Self {
+            max_bitrate_bps: limits.max_bitrate_bps,
+            max_framerate: limits.max_framerate,
+        }
+    }
+}
+
 /// What to publish (mirrors `matrix_rtc_transport::PublishOptions`).
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiPublishOptions {
@@ -955,6 +1025,11 @@ pub struct FfiPublishOptions {
     pub simulcast: bool,
     /// Publish already muted, for a lobby that joins muted.
     pub muted: bool,
+    /// Codec to encode with (video only).
+    pub video_codec: FfiVideoCodecPreference,
+    /// Encoder caps (video only).
+    #[uniffi(default = None)]
+    pub video_encoding: Option<FfiVideoEncodingLimits>,
 }
 
 impl From<FfiPublishOptions> for matrix_rtc_transport::PublishOptions {
@@ -975,6 +1050,8 @@ impl From<FfiPublishOptions> for matrix_rtc_transport::PublishOptions {
                 }),
             simulcast: options.simulcast,
             muted: options.muted,
+            video_codec: options.video_codec.into(),
+            video_encoding: options.video_encoding.unwrap_or_default().into(),
         }
     }
 }

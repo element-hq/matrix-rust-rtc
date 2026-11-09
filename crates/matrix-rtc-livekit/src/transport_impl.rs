@@ -57,10 +57,11 @@ use matrix_rtc_transport::{
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
     QualityLimit, QualityLimitation, ReceiveStats, RemoteTrackHandle, ResolvedConstraints,
     SendLayerStats, SendStats, SpeakingParticipant, StreamDemand, TransportConnection,
-    TransportError, VideoDetail, VideoFrame, VideoRotation,
+    TransportError, VideoCodecPreference, VideoDetail, VideoFrame, VideoRotation,
 };
 
 use crate::session::LiveKitSession;
+use crate::video_encoding::{supported_video_codecs, video_publish_options};
 use crate::{
     LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, identity_mapper, room_options,
 };
@@ -663,6 +664,16 @@ impl TransportConnection for LiveKitTransportConnection {
                         "publishing video requires a VideoSourceConfig".into(),
                     )
                 })?;
+                // livekit falls back to its default without a word when the
+                // codec cannot be encoded here; say so, at least.
+                let mut codec = options.video_codec;
+                if codec != VideoCodecPreference::Auto && !supported_video_codecs().contains(&codec)
+                {
+                    log::warn!(
+                        "{codec:?} cannot be encoded on this platform; publishing {kind:?} with the default codec"
+                    );
+                    codec = VideoCodecPreference::Auto;
+                }
                 LocalSource::Video {
                     source: NativeVideoSource::new(
                         VideoResolution {
@@ -671,10 +682,17 @@ impl TransportConnection for LiveKitTransportConnection {
                         },
                         matches!(kind, MediaStreamKind::ScreenShare),
                     ),
-                    // Below 480px livekit computes a single simulcast encoding
-                    // (rid "q" only) — a degenerate shape the SFU delivered no
-                    // frames for in testing. One layer wants a plain encoding.
-                    simulcast: options.simulcast && u32::max(config.width, config.height) >= 480,
+                    options: video_publish_options(
+                        livekit_track_source(kind),
+                        config,
+                        // Below 480px livekit computes a single simulcast
+                        // encoding (rid "q" only) — a degenerate shape the SFU
+                        // delivered no frames for in testing. One layer wants
+                        // a plain encoding.
+                        options.simulcast && u32::max(config.width, config.height) >= 480,
+                        codec,
+                        options.video_encoding,
+                    ),
                 }
             }
             MediaStreamKind::Data => {
@@ -816,7 +834,8 @@ enum LocalSource {
     Audio(NativeAudioSource),
     Video {
         source: NativeVideoSource,
-        simulcast: bool,
+        /// Fixed at publish, so every later room encodes the same way.
+        options: TrackPublishOptions,
     },
 }
 
@@ -874,7 +893,7 @@ impl LiveKitLocalTrack {
                     },
                 )
             }
-            LocalSource::Video { source, simulcast } => {
+            LocalSource::Video { source, options } => {
                 let track = LocalVideoTrack::create_video_track(
                     "video",
                     RtcVideoSource::Native(source.clone()),
@@ -882,14 +901,7 @@ impl LiveKitLocalTrack {
                 if muted {
                     track.mute();
                 }
-                (
-                    LocalTrack::Video(track),
-                    TrackPublishOptions {
-                        source: source_kind,
-                        simulcast: *simulcast,
-                        ..Default::default()
-                    },
-                )
+                (LocalTrack::Video(track), options.clone())
             }
         };
         session

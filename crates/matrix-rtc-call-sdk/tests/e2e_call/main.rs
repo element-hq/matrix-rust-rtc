@@ -28,7 +28,8 @@
 //!
 //! - [`Scenario`] — the media topology: both on one SFU (`single_focus`),
 //!   each on their own (`two_foci`, MSC4195 multi-SFU), or one peer redialling
-//!   while the other stays (`rejoin`).
+//!   while the other stays (`rejoin`), or the camera published as H.264
+//!   (`h264_video`).
 //! - [`MembershipFormat`] — the wire dialect both peers speak: spec-current
 //!   (`msc`) or pre-sticky room state (`room_state`). In `room_state` step 4 is skipped (that
 //!   generation has no slot concept) and membership is
@@ -67,13 +68,15 @@ use matrix_sdk_ui::sync_service::SyncService;
 
 use matrix_rtc_call::{CallEnd, CallStatus};
 use matrix_rtc_call_sdk::{CallEvent, Participant as MediaParticipant};
-use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, close_slot, open_slot};
+use matrix_rtc_call_sdk::{
+    LiveKitCall, LiveKitCallOptions, close_slot, open_slot, supported_video_codecs,
+};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::media;
 use matrix_rtc_transport::{
-    I420Buffer, MediaConstraints, MediaStreamKind, PublishOptions, VideoFrame, VideoRotation,
-    VideoSourceConfig,
+    I420Buffer, MediaConstraints, MediaStreamKind, PublishOptions, VideoCodecPreference,
+    VideoEncodingLimits, VideoFrame, VideoRotation, VideoSourceConfig,
 };
 
 use provision::Credentials;
@@ -212,6 +215,10 @@ enum Scenario {
     /// (`CallEnd::SlotClosed`), after which `LiveKitCall::leave` still
     /// succeeds. Not run in `RoomState`, which has no slots.
     SlotClosed,
+    /// Single focus, and alice's camera is published as H.264 with the SIP
+    /// bridge's caps (2.5 Mbit/s, 30 fps, simulcast): bob must decrypt and
+    /// decode it. Proves a non-default codec survives frame E2EE end to end.
+    H264Video,
 }
 
 /// Alice on the first homeserver, bob on `bob_homeserver`.
@@ -521,6 +528,7 @@ e2e_tests! {
     e2e_call_rejoin_msc => (RejoinSameProcess, Msc),
     e2e_call_rejoin_room_state => (RejoinSameProcess, RoomState),
     e2e_call_slot_closed_msc => (SlotClosed, Msc),
+    e2e_call_h264_video_msc => (H264Video, Msc),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -571,7 +579,10 @@ async fn run(
 ) -> Result<(), Box<dyn Error>> {
     let bob_sfu = match scenario {
         Scenario::TwoFoci => Sfu::Second,
-        Scenario::SingleFocus | Scenario::RejoinSameProcess | Scenario::SlotClosed => Sfu::First,
+        Scenario::SingleFocus
+        | Scenario::RejoinSameProcess
+        | Scenario::SlotClosed
+        | Scenario::H264Video => Sfu::First,
     };
     let (alice_creds, bob_creds) = credentials(&cfg, cfg.homeserver_for(compat, bob_sfu)).await?;
 
@@ -675,6 +686,25 @@ async fn run(
             true,
             true,
         ),
+        Scenario::H264Video => {
+            let tone_ok = record_and_verify_tone(&mut bob.call, "first-call").await?;
+            // Without an H.264 encoder the publish would quietly fall back to
+            // VP8 and the check below would prove nothing.
+            let codecs = supported_video_codecs();
+            if !codecs.contains(&VideoCodecPreference::H264) {
+                return Err(format!("this platform cannot encode H.264 (only {codecs:?})").into());
+            }
+            println!("[alice] publishing pattern video as H.264");
+            let options = PublishOptions::camera(PATTERN)
+                .with_video_codec(VideoCodecPreference::H264)
+                .with_video_encoding(VideoEncodingLimits {
+                    max_bitrate_bps: Some(2_500_000),
+                    max_framerate: Some(30),
+                });
+            _alice_video = Some(publish_pattern(&alice.call, options).await?);
+            let video_ok = verify_video_pattern(&bob.call, "bob").await?;
+            (tone_ok, true, video_ok, true)
+        }
         Scenario::TwoFoci => {
             println!("[bob] publishing 660 Hz tone");
             _bob_tone = Some(media::publish_tone(&bob.call.session(), 660.0).await?);
@@ -808,6 +838,9 @@ async fn run(
         println!("tone bob->alice received + verified:    {reverse_tone_ok}");
         println!("video pattern alice->bob verified:      {video_ok}");
         println!("constraints pause/resume verified:      {constraints_ok}");
+    }
+    if scenario == Scenario::H264Video {
+        println!("H.264 video pattern alice->bob verified: {video_ok}");
     }
     if scenario == Scenario::RejoinSameProcess {
         println!("alice's key received on bob's redial:   {rejoin_key_ok}");

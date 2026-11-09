@@ -42,6 +42,7 @@ pub mod media;
 pub mod session;
 pub mod token;
 pub mod transport_impl;
+pub mod video_encoding;
 
 pub use keys::{
     ConnectionKeyProvider, KeyDiscardListener, KeyImportListener, LocalKeyIndexHook,
@@ -57,6 +58,7 @@ pub use token::SfuToken;
 // should not need a second dependency to do it.
 pub use matrix_rtc_core::{LiveKitTokenRequest, MatrixBackend, OpenIdToken};
 pub use transport_impl::{LiveKitMediaTransport, LiveKitTransportConnection};
+pub use video_encoding::supported_video_codecs;
 
 /// Android initialisation, re-exported so consumers (e.g. the FFI crate)
 /// don't need a direct `livekit`/`libwebrtc` dependency for it.
