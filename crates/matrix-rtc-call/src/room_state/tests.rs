@@ -1466,18 +1466,32 @@ async fn join_asking(
     joined
 }
 
-/// The bug this exists for: a join that did not say "voice" (a room header's
-/// button) into a voice call in progress joins it as a voice call.
+/// The bug this exists for: a join that states no intent (a room's call
+/// button, which cannot know) into a voice call in progress joins it as a voice
+/// call.
 #[tokio::test]
 async fn joining_a_voice_call_in_progress_follows_it() {
     let sender = alice_backend();
     let mut call = encrypted_call_manager(sender.clone()).await;
     set_roster(&mut call, vec![bob_in_a_call("audio")]).await;
 
-    let joined = join_asking(&mut call, Some(CallIntent::Video), None).await;
+    let joined = join_asking(&mut call, None, None).await;
 
     assert_eq!(joined.intent, CallIntent::Audio);
     assert_eq!(published_intent(&sender), "audio");
+}
+
+/// The user's explicit choice (answering a ring as video) wins over the call's.
+#[tokio::test]
+async fn an_explicit_intent_wins_over_the_call_in_progress() {
+    let sender = alice_backend();
+    let mut call = encrypted_call_manager(sender.clone()).await;
+    set_roster(&mut call, vec![bob_in_a_call("audio")]).await;
+
+    let joined = join_asking(&mut call, Some(CallIntent::Video), None).await;
+
+    assert_eq!(joined.intent, CallIntent::Video);
+    assert_eq!(published_intent(&sender), "video");
 }
 
 /// Starting a call is the host's choice.

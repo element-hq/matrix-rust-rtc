@@ -216,7 +216,7 @@ impl WasmRtcRoom {
     }
 
     /// `"audio"` or `"video"`: the intent a join into `slotId` would settle
-    /// on, without joining — the one its members agree on, else `requested`,
+    /// on, without joining — `requested`, else the one its members agree on,
     /// else video. For a lobby that previews the camera.
     #[wasm_bindgen(js_name = callIntent)]
     pub async fn call_intent(
@@ -248,8 +248,8 @@ impl WasmRtcRoom {
     ///   - `keep_alive_timeout_ms` (default 30000), `sticky_duration_ms`
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
-    ///   - `intent`: `"audio"` or `"video"`, to start a call with; a call in
-    ///     progress keeps its own
+    ///   - `intent`: `"audio"` or `"video"`, the user's explicit choice, which
+    ///     wins over a call in progress; omitted follows the call
     ///
     /// The call keeps itself alive, and performs its key rotations when they
     /// fall due, until it leaves or is freed. The SDK generates the
@@ -590,9 +590,9 @@ pub struct WasmJoinSessionParams {
     /// Omitted is enabled with Element Call's three-second window.
     #[serde(default)]
     pub reactions: Option<WasmReactionsConfig>,
-    /// `"audio"` or `"video"`: the intent to start a call with. A call in
-    /// progress keeps its own; omitted with no call to follow is video. Read
-    /// the outcome from `callIntent` on the call.
+    /// `"audio"` or `"video"`: the user's explicit choice, which wins over a
+    /// call in progress; omitted follows the call, and with no call to follow
+    /// is video. Read the outcome from `callIntent` on the call.
     #[serde(default)]
     pub intent: Option<String>,
 }

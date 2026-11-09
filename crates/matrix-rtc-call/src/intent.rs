@@ -6,9 +6,11 @@
 //! A call's MSC4196 `m.call.intent` (voice or video), read from the
 //! memberships already in the call and settled at join.
 //!
-//! A join that finds a call in progress follows the call's intent; a join that
-//! starts one uses the host's. The host turns the camera on from the result,
-//! so answering a voice call never opens the camera, whichever button joined.
+//! A join takes the intent the host states, the user's own choice (starting a
+//! call, or answering a ring that said voice or video); a join that states none
+//! (a room's call button) follows the call in progress, else video. The host
+//! turns the camera on from the result, so joining a voice call from a button
+//! that cannot know never opens the camera.
 //! The consensus is matrix-rust-sdk's `CallIntentConsensus`, over sticky and
 //! room-state memberships alike.
 
@@ -116,10 +118,11 @@ impl CallIntentConsensus {
         }
     }
 
-    /// The intent a join uses: the call's when it agrees on one, otherwise
-    /// `requested`, otherwise [`CallIntent::Video`].
+    /// The intent a join uses: `requested`, the user's explicit choice, when
+    /// there is one; otherwise the call's when it agrees on one; otherwise
+    /// [`CallIntent::Video`].
     pub fn resolve(self, requested: Option<CallIntent>) -> CallIntent {
-        self.intent().or(requested).unwrap_or_default()
+        requested.or(self.intent()).unwrap_or_default()
     }
 }
 
@@ -207,9 +210,10 @@ mod tests {
     }
 
     #[test]
-    fn the_call_wins_over_the_request_and_the_request_over_the_default() {
+    fn the_request_wins_over_the_call_and_the_call_over_the_default() {
         let audio = CallIntentConsensus::Full(CallIntent::Audio);
-        assert_eq!(audio.resolve(Some(CallIntent::Video)), CallIntent::Audio);
+        assert_eq!(audio.resolve(Some(CallIntent::Video)), CallIntent::Video);
+        assert_eq!(audio.resolve(None), CallIntent::Audio);
         let none = CallIntentConsensus::None;
         assert_eq!(none.resolve(Some(CallIntent::Audio)), CallIntent::Audio);
         assert_eq!(none.resolve(None), CallIntent::Video);

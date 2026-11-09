@@ -173,7 +173,9 @@ pub struct CallJoinOptions {
     pub kind: CallKind,
     /// `None` is [`ReactionsConfig::default`].
     pub reactions: Option<ReactionsConfig>,
-    /// The intent to start a call with. A call in progress keeps its own; see
+    /// The user's explicit voice or video choice, from starting a call or
+    /// answering a ring that said which. It wins over a call in progress;
+    /// `None` (a room's call button) follows the call. See
     /// [`CallIntentConsensus::resolve`].
     pub intent: Option<CallIntent>,
 }

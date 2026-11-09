@@ -304,6 +304,8 @@ export interface JoinParamsIn {
         /** Older received reactions (by our clock) are dropped as stale; default 10 s. */
         max_age_ms?: number;
     };
+    /** The user's explicit choice, which wins over a call in progress; omitted follows the call (else video). */
+    intent?: "audio" | "video";
 }
 
 /** `leave`'s parameters (`{}` is a plain hang-up). */
