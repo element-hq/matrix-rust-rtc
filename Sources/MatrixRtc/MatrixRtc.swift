@@ -4541,8 +4541,8 @@ public func FfiConverterTypeRtcLogSink_lower(_ value: RtcLogSink) -> UnsafeMutab
 public protocol RtcRoomProtocol: AnyObject, Sendable {
     
     /**
-     * The intent a join into `slot_id` would settle on, without joining: the
-     * one its members agree on, else `requested`, else video. For a lobby
+     * The intent a join into `slot_id` would settle on, without joining:
+     * `requested`, else the one its members agree on, else video. For a lobby
      * that previews the camera the join will start with.
      */
     func callIntent(slotId: String, requested: FfiCallIntent?) async throws  -> FfiCallIntent
@@ -4686,8 +4686,8 @@ open class RtcRoom: RtcRoomProtocol, @unchecked Sendable {
 
     
     /**
-     * The intent a join into `slot_id` would settle on, without joining: the
-     * one its members agree on, else `requested`, else video. For a lobby
+     * The intent a join into `slot_id` would settle on, without joining:
+     * `requested`, else the one its members agree on, else video. For a lobby
      * that previews the camera the join will start with.
      */
 open func callIntent(slotId: String, requested: FfiCallIntent?)async throws  -> FfiCallIntent  {
@@ -6722,9 +6722,10 @@ public struct FfiJoinSessionParams {
      */
     public var reactions: FfiReactionsConfig?
     /**
-     * The intent to start a call with, from the button the user pressed.
-     * A call in progress keeps its own, so answering or joining one needs
-     * none; unset with no call to follow is video. Read the outcome from
+     * The user's explicit voice or video choice: starting a call, or
+     * answering a ring that said which. It wins over a call in progress.
+     * Unset (a room's call button, which cannot know) follows the call, and
+     * with no call to follow is video. Read the outcome from
      * [`crate::RtcCall::call_intent`].
      */
     public var intent: FfiCallIntent?
@@ -6779,9 +6780,10 @@ public struct FfiJoinSessionParams {
          * Unset is enabled with Element Call's three-second window.
          */reactions: FfiReactionsConfig? = nil, 
         /**
-         * The intent to start a call with, from the button the user pressed.
-         * A call in progress keeps its own, so answering or joining one needs
-         * none; unset with no call to follow is video. Read the outcome from
+         * The user's explicit voice or video choice: starting a call, or
+         * answering a ring that said which. It wins over a call in progress.
+         * Unset (a room's call button, which cannot know) follows the call, and
+         * with no call to follow is video. Read the outcome from
          * [`crate::RtcCall::call_intent`].
          */intent: FfiCallIntent? = nil) {
         self.applicationSlotId = applicationSlotId
@@ -7705,6 +7707,14 @@ public struct FfiPublishOptions {
      * Publish already muted, for a lobby that joins muted.
      */
     public var muted: Bool
+    /**
+     * Codec to encode with (video only).
+     */
+    public var videoCodec: FfiVideoCodecPreference
+    /**
+     * Encoder caps (video only).
+     */
+    public var videoEncoding: FfiVideoEncodingLimits?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7720,12 +7730,20 @@ public struct FfiPublishOptions {
          */simulcast: Bool, 
         /**
          * Publish already muted, for a lobby that joins muted.
-         */muted: Bool) {
+         */muted: Bool, 
+        /**
+         * Codec to encode with (video only).
+         */videoCodec: FfiVideoCodecPreference, 
+        /**
+         * Encoder caps (video only).
+         */videoEncoding: FfiVideoEncodingLimits? = nil) {
         self.kind = kind
         self.audio = audio
         self.video = video
         self.simulcast = simulcast
         self.muted = muted
+        self.videoCodec = videoCodec
+        self.videoEncoding = videoEncoding
     }
 }
 
@@ -7751,6 +7769,12 @@ extension FfiPublishOptions: Equatable, Hashable {
         if lhs.muted != rhs.muted {
             return false
         }
+        if lhs.videoCodec != rhs.videoCodec {
+            return false
+        }
+        if lhs.videoEncoding != rhs.videoEncoding {
+            return false
+        }
         return true
     }
 
@@ -7760,6 +7784,8 @@ extension FfiPublishOptions: Equatable, Hashable {
         hasher.combine(video)
         hasher.combine(simulcast)
         hasher.combine(muted)
+        hasher.combine(videoCodec)
+        hasher.combine(videoEncoding)
     }
 }
 
@@ -7776,7 +7802,9 @@ public struct FfiConverterTypeFfiPublishOptions: FfiConverterRustBuffer {
                 audio: FfiConverterOptionTypeFfiAudioSourceConfig.read(from: &buf), 
                 video: FfiConverterOptionTypeFfiVideoSourceConfig.read(from: &buf), 
                 simulcast: FfiConverterBool.read(from: &buf), 
-                muted: FfiConverterBool.read(from: &buf)
+                muted: FfiConverterBool.read(from: &buf), 
+                videoCodec: FfiConverterTypeFfiVideoCodecPreference.read(from: &buf), 
+                videoEncoding: FfiConverterOptionTypeFfiVideoEncodingLimits.read(from: &buf)
         )
     }
 
@@ -7786,6 +7814,8 @@ public struct FfiConverterTypeFfiPublishOptions: FfiConverterRustBuffer {
         FfiConverterOptionTypeFfiVideoSourceConfig.write(value.video, into: &buf)
         FfiConverterBool.write(value.simulcast, into: &buf)
         FfiConverterBool.write(value.muted, into: &buf)
+        FfiConverterTypeFfiVideoCodecPreference.write(value.videoCodec, into: &buf)
+        FfiConverterOptionTypeFfiVideoEncodingLimits.write(value.videoEncoding, into: &buf)
     }
 }
 
@@ -9672,6 +9702,82 @@ public func FfiConverterTypeFfiToDeviceRecipient_lift(_ buf: RustBuffer) throws 
 #endif
 public func FfiConverterTypeFfiToDeviceRecipient_lower(_ value: FfiToDeviceRecipient) -> RustBuffer {
     return FfiConverterTypeFfiToDeviceRecipient.lower(value)
+}
+
+
+/**
+ * Encoder caps of a video publication (mirrors
+ * `matrix_rtc_transport::VideoEncodingLimits`). A `None` field is computed
+ * from the source resolution; with simulcast, the caps apply to the top
+ * layer.
+ */
+public struct FfiVideoEncodingLimits {
+    public var maxBitrateBps: UInt64?
+    public var maxFramerate: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(maxBitrateBps: UInt64? = nil, maxFramerate: UInt32? = nil) {
+        self.maxBitrateBps = maxBitrateBps
+        self.maxFramerate = maxFramerate
+    }
+}
+
+#if compiler(>=6)
+extension FfiVideoEncodingLimits: Sendable {}
+#endif
+
+
+extension FfiVideoEncodingLimits: Equatable, Hashable {
+    public static func ==(lhs: FfiVideoEncodingLimits, rhs: FfiVideoEncodingLimits) -> Bool {
+        if lhs.maxBitrateBps != rhs.maxBitrateBps {
+            return false
+        }
+        if lhs.maxFramerate != rhs.maxFramerate {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(maxBitrateBps)
+        hasher.combine(maxFramerate)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVideoEncodingLimits: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVideoEncodingLimits {
+        return
+            try FfiVideoEncodingLimits(
+                maxBitrateBps: FfiConverterOptionUInt64.read(from: &buf), 
+                maxFramerate: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiVideoEncodingLimits, into buf: inout [UInt8]) {
+        FfiConverterOptionUInt64.write(value.maxBitrateBps, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxFramerate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoEncodingLimits_lift(_ buf: RustBuffer) throws -> FfiVideoEncodingLimits {
+    return try FfiConverterTypeFfiVideoEncodingLimits.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoEncodingLimits_lower(_ value: FfiVideoEncodingLimits) -> RustBuffer {
+    return FfiConverterTypeFfiVideoEncodingLimits.lower(value)
 }
 
 
@@ -12896,6 +13002,106 @@ extension FfiUnableToDecrypt: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Video codec to publish with (mirrors
+ * `matrix_rtc_transport::VideoCodecPreference`). A preference: a codec this
+ * platform cannot encode falls back to the default; see
+ * [`supported_video_codecs`].
+ */
+
+public enum FfiVideoCodecPreference {
+    
+    /**
+     * The transport's default (VP8).
+     */
+    case auto
+    case vp8
+    case h264
+    case vp9
+    case av1
+}
+
+
+#if compiler(>=6)
+extension FfiVideoCodecPreference: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVideoCodecPreference: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVideoCodecPreference
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVideoCodecPreference {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .auto
+        
+        case 2: return .vp8
+        
+        case 3: return .h264
+        
+        case 4: return .vp9
+        
+        case 5: return .av1
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiVideoCodecPreference, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .auto:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .vp8:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .h264:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .vp9:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .av1:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoCodecPreference_lift(_ buf: RustBuffer) throws -> FfiVideoCodecPreference {
+    return try FfiConverterTypeFfiVideoCodecPreference.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoCodecPreference_lower(_ value: FfiVideoCodecPreference) -> RustBuffer {
+    return FfiConverterTypeFfiVideoCodecPreference.lower(value)
+}
+
+
+extension FfiVideoCodecPreference: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * How much detail to receive for a video stream; the variants are mutually
  * exclusive. Prefer `Dimensions` — the renderer knows its surface size, the
  * server knows the publisher's layer ladder.
@@ -14122,6 +14328,30 @@ fileprivate struct FfiConverterOptionTypeFfiTileRoster: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiVideoEncodingLimits: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVideoEncodingLimits?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiVideoEncodingLimits.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiVideoEncodingLimits.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiVideoSourceConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiVideoSourceConfig?
 
@@ -14784,6 +15014,31 @@ fileprivate struct FfiConverterSequenceTypeFfiRtcTransport: FfiConverterRustBuff
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiVideoCodecPreference: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiVideoCodecPreference]
+
+    public static func write(_ value: [FfiVideoCodecPreference], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiVideoCodecPreference.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiVideoCodecPreference] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiVideoCodecPreference]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiVideoCodecPreference.read(from: &buf))
+        }
+        return seq
+    }
+}
 private let UNIFFI_RUST_FUTURE_POLL_READY: Int8 = 0
 private let UNIFFI_RUST_FUTURE_POLL_MAYBE_READY: Int8 = 1
 
@@ -15011,6 +15266,16 @@ public func setupLogging(config: RtcLogConfig, sink: RtcLogSink?)throws   {try r
     )
 }
 }
+/**
+ * The video codecs this device can encode, for a codec picker. Depends on
+ * the platform and its hardware encoders, so ask rather than assume.
+ */
+public func supportedVideoCodecs() -> [FfiVideoCodecPreference]  {
+    return try!  FfiConverterSequenceTypeFfiVideoCodecPreference.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_func_supported_video_codecs($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -15046,6 +15311,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_func_setup_logging() != 17783) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_func_supported_video_codecs() != 58726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_audioframestream_next() != 33587) {
@@ -15270,7 +15538,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtclogsink_log() != 41057) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_call_intent() != 46778) {
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_call_intent() != 28250) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_close_slot() != 47104) {
