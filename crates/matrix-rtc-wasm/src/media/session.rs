@@ -409,6 +409,16 @@ impl WasmMediaSession {
         self.own_identity.clone()
     }
 
+    /// The connection key of the own-focus room, under which the delegate's
+    /// `connect` received it; `undefined` for a receive-only call. Opaque: it
+    /// identifies the token flow and its target, not just a URL.
+    #[wasm_bindgen(js_name = ownConnectionKey)]
+    pub fn own_connection_key(&self) -> Option<String> {
+        self.own_connection
+            .as_ref()
+            .map(|connection| connection.connection_key().to_owned())
+    }
+
     /// End the media session while staying joined. After leaving it is not
     /// needed, and would call the delegate's `close` a second time.
     pub async fn disconnect(&mut self) -> Result<(), JsError> {

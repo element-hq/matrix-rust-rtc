@@ -9,8 +9,9 @@
 #   1. `server_name` is a name a browser can reach over TLS, because Element
 #      Web derives user IDs and federation discovery from it.
 #   2. No TLS listener: nginx terminates both 443 and 8448 in front.
-#   3. `matrix_rtc` advertises only the legacy `livekit` transport, as Element
-#      Call's interop expects; there is no `m.livekit` entry.
+#   3. `matrix_rtc` lists the legacy `livekit` transport first, as Element
+#      Call's interop expects, and an `m.livekit` one after it for clients
+#      speaking the MSC format (which publishes only on `m.livekit`, 038 W6).
 # NOT for production: open registration, disabled rate limits, well-known dev
 # secrets.
 
@@ -85,17 +86,21 @@ experimental_features:
 app_service_config_files:
   - /cfg/lk-jwt-appservice.yaml
 
-# The MatrixRTC focus this homeserver advertises over `/rtc/transports`.
+# The MatrixRTC foci this homeserver advertises over `/rtc/transports`.
 #
-# Must stay identical to the `org.matrix.msc4143.rtc_foci` entry nginx serves
-# in /.well-known/matrix/client: the two are read by different clients — this
-# one by our Rust client, well-known by Element Call — and they have to name
-# the same authorisation service or the two halves of a call land on different
-# SFUs.
+# The `livekit` entry must stay identical to the `org.matrix.msc4143.rtc_foci`
+# entry nginx serves in /.well-known/matrix/client: the two are read by
+# different clients — this one by our Rust client, well-known by Element Call —
+# and they have to name the same authorisation service or the two halves of a
+# call land on different SFUs. The `m.livekit` entry names the same SFU, with
+# tokens from this homeserver's MSC4195 `get_token` (lk-jwt behind it as an
+# application service); MSC-format clients publish on it.
 matrix_rtc:
   transports:
     - type: livekit
       livekit_service_url: "https://matrix-rtc.m.localhost/livekit/jwt"
+    - type: m.livekit
+      url: "wss://matrix-rtc.m.localhost/livekit/sfu"
 
 # Rate limits effectively disabled so automated tests can log in, join, and
 # re-arm delayed events as fast as they like.

@@ -291,8 +291,9 @@ impl WasmConnectionEventSink {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectRequest<'a> {
-    /// The engine's grouping key for this connection — the
-    /// `livekit_service_url` of the focus.
+    /// The engine's grouping key for this connection: an opaque string naming
+    /// the token flow and its target (`LiveKitTarget::connection_key`), not a
+    /// URL. The own-focus one is the session's `ownConnectionKey()`.
     connection_key: &'a str,
     /// WebSocket URL of the SFU, from the token response.
     sfu_url: &'a str,

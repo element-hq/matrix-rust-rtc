@@ -16,10 +16,12 @@ log only.
 
 - A web delegate's room handle may implement `setWanted(identities)` to subscribe only to the participants the core asks for, as the bundled `matrix-rtc-call.mjs` now does with `autoSubscribe: false`.
 - `PublishOptions` takes a video codec and bitrate/framerate caps (`with_video_codec`, `with_video_encoding`), and `supported_video_codecs()` lists what this platform can encode; also on FFI.
+- Web: `MatrixRtcCall.ownRoom` is the own-focus livekit-js room to publish into, since `rooms` is keyed by opaque connection keys rather than focus URLs (`session.ownConnectionKey()`).
 
 ### Fixed
 
 - A native subscriber resuming a paused video with a quality request gets that quality, instead of sometimes staying on the size it asked before the pause: each constraint change now reaches the SFU as one settings update.
+- Web: `joinCall({ transport: undefined })` takes the advertised transport like an omitted key, instead of rejecting the params; `mention_user_ids: undefined` likewise reads as none.
 - Each SFU connection subscribes only to the members it serves, so a peer reached through two token flows no longer arrives twice and our own media no longer comes back to us.
 
 ## v0.5.0-rc.10 - 2026-11-09

@@ -251,6 +251,10 @@ describe('MatrixRtcCall over a mocked livekit-client', () => {
     await call.connect();
     await waitFor(() => instances.length === 1 || null, 'the own focus connected');
     const room = instances[0];
+    // Found under its opaque connection key, not the focus URL.
+    await waitFor(() => call.ownRoom, 'the own room to be connected');
+    expect(call.ownRoom).toBe(room);
+    expect(call.rooms.has(OWN_FOCUS)).toBe(false);
     expect(room.options.e2ee).toMatchObject({ worker: 'the-worker', keyProvider: call.keyProvider });
     expect(room.e2eeEnabled).toBe(true);
 
