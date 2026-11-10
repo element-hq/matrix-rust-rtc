@@ -26,8 +26,15 @@
 //! | hidden            | hidden            | nothing  | nothing    | nothing (all paused)     |
 //! | `Quality::Low`    | `Quality::High`   | 240x180  | 960x720    | 180, 360, 720            |
 //! | `Quality::Medium` | `Quality::Medium` | 480x360  | 480x360    | 180, 360 (720 paused)    |
+//! | 960x720           | 240x180           | 960x720  | 240x180    | 180, 360, 720            |
+//! | hidden            | hidden            | nothing  | nothing    | nothing (all paused)     |
+//! | `Quality::Low`    | `Quality::High`   | 240x180  | 960x720    | 180, 360, 720            |
 //! | screen 640x360    | screen 1280x720   | 640x360  | 1280x720   | 360 @ 3 fps, 720         |
 //! | screen 640x360    | screen 640x360    | 640x360  | 640x360    | 360 @ 3 fps (720 paused) |
+//!
+//! The three camera rows after `Quality::Medium` are [`RESUME_ROUND`], run
+//! [`RESUME_ROUNDS`] times: resuming hidden streams with a quality opposite to
+//! the size each asked before hiding.
 //!
 //! Dynacast pauses only the layers above the highest one anyone wants; the
 //! layers below stay on so the SFU can step a congested subscriber down. The
@@ -59,7 +66,8 @@ use super::{
     wait_for_remote_track, wait_for_room,
 };
 
-/// Three peers to set up, nine steps of up to [`STEP`] each, and teardown.
+/// Three peers to set up, eighteen steps of up to [`STEP`] each (a few
+/// seconds each when healthy), and teardown.
 const DEADLINE: Duration = Duration::from_secs(480);
 
 /// How long one step may take to settle: the SFU's bandwidth estimate ramps
@@ -114,6 +122,7 @@ impl Ask {
 /// One step in time: what bob and carol each ask, the frame height each must
 /// then receive (`None`: no frames), and alice's highest active layer
 /// (index into her layers, smallest first; `None`: every layer paused).
+#[derive(Clone, Copy)]
 struct Step {
     bob: Ask,
     carol: Ask,
@@ -163,7 +172,7 @@ const CAMERA_STEPS: &[Step] = &[
         carol_gets: None,
         top_active: None,
     },
-    // The quality hint, LiveKit's deprecated path, still selects layers.
+    // A quality selects a layer too.
     Step {
         bob: Ask::Quality(QualityLimit::Low),
         carol: Ask::Quality(QualityLimit::High),
@@ -179,6 +188,36 @@ const CAMERA_STEPS: &[Step] = &[
         top_active: Some(1),
     },
 ];
+
+/// Resuming a hidden stream with a quality, from a size asked before hiding
+/// that is the opposite of the quality: the transition that once left a
+/// subscriber pinned to the stale size, when the resume and the quality went
+/// to the SFU as two unordered messages. Run [`RESUME_ROUNDS`] times after
+/// [`CAMERA_STEPS`] so a race shows within one run.
+const RESUME_ROUND: &[Step] = &[
+    Step {
+        bob: Ask::Size(960, 720),
+        carol: Ask::Size(240, 180),
+        bob_gets: Some(720),
+        carol_gets: Some(180),
+        top_active: Some(2),
+    },
+    Step {
+        bob: Ask::Hidden,
+        carol: Ask::Hidden,
+        bob_gets: None,
+        carol_gets: None,
+        top_active: None,
+    },
+    Step {
+        bob: Ask::Quality(QualityLimit::Low),
+        carol: Ask::Quality(QualityLimit::High),
+        bob_gets: Some(180),
+        carol_gets: Some(720),
+        top_active: Some(2),
+    },
+];
+const RESUME_ROUNDS: usize = 3;
 
 const SCREEN_LAYERS: usize = 2;
 const SCREEN_STEPS: &[Step] = &[
@@ -270,6 +309,16 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
             PATTERN.width, PATTERN.height
         );
         let camera = publish_pattern(&alice.call, PublishOptions::camera(PATTERN)).await?;
+        let camera_steps: Vec<Step> = CAMERA_STEPS
+            .iter()
+            .chain(
+                RESUME_ROUND
+                    .iter()
+                    .cycle()
+                    .take(RESUME_ROUND.len() * RESUME_ROUNDS),
+            )
+            .copied()
+            .collect();
         let camera_ok = verify_layers(
             "camera",
             &camera.track,
@@ -277,7 +326,7 @@ async fn run(cfg: Config) -> Result<(), Box<dyn Error>> {
             [(&bob.call, "bob"), (&carol.call, "carol")],
             alice_member,
             MediaStreamKind::Camera,
-            CAMERA_STEPS,
+            &camera_steps,
         )
         .await?;
 
@@ -337,17 +386,29 @@ impl Subscriber<'_> {
     async fn expect_height(&mut self, height: u32, deadline: tokio::time::Instant) -> bool {
         let mut in_a_row = 0;
         let mut last = None;
+        // Every size received this step, in order of first sight: tells a
+        // stream stuck on one layer from one still ramping up through them.
+        let mut seen: Vec<((u32, u32), usize)> = Vec::new();
         while in_a_row < SETTLED_FRAMES {
             match tokio::time::timeout_at(deadline, self.frames.next()).await {
                 Ok(Some(frame)) => {
                     let size = (frame.buffer.width, frame.buffer.height);
                     in_a_row = if size.1 == height { in_a_row + 1 } else { 0 };
                     last = Some(size);
+                    match seen.iter_mut().find(|(seen_size, _)| *seen_size == size) {
+                        Some((_, count)) => *count += 1,
+                        None => seen.push((size, 1)),
+                    }
                 }
                 Ok(None) | Err(_) => {
+                    let seen: Vec<String> = seen
+                        .iter()
+                        .map(|((width, height), count)| format!("{width}x{height} x{count}"))
+                        .collect();
                     println!(
-                        "[{}] WARNING: wanted frames {height} tall, last frame was {last:?}",
-                        self.label
+                        "[{}] WARNING: wanted frames {height} tall, last frame was {last:?}; received [{}]",
+                        self.label,
+                        seen.join(", ")
                     );
                     return false;
                 }

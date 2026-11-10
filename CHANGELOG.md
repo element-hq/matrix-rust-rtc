@@ -19,6 +19,7 @@ log only.
 
 ### Fixed
 
+- A native subscriber resuming a paused video with a quality request gets that quality, instead of sometimes staying on the size it asked before the pause: each constraint change now reaches the SFU as one settings update.
 - Each SFU connection subscribes only to the members it serves, so a peer reached through two token flows no longer arrives twice and our own media no longer comes back to us.
 
 ## v0.5.0-rc.10 - 2026-11-09

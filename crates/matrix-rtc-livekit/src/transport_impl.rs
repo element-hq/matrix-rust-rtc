@@ -28,8 +28,8 @@ use livekit::e2ee::EncryptionType;
 use livekit::id::ParticipantIdentity;
 use livekit::options::TrackPublishOptions;
 use livekit::prelude::{
-    LocalAudioTrack, LocalTrack, LocalVideoTrack, Participant, RemoteTrack, RoomEvent,
-    RtcAudioSource, TrackDimension, TrackKind, TrackPublication, TrackSource,
+    LocalAudioTrack, LocalTrack, LocalVideoTrack, Participant, RemoteTrack, RemoteTrackPublication,
+    RoomEvent, RtcAudioSource, TrackDimension, TrackKind, TrackPublication, TrackSource,
 };
 use livekit::track::VideoQuality as LkVideoQuality;
 use livekit::webrtc::audio_source::AudioSourceOptions;
@@ -197,6 +197,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 },
                 wanted: Mutex::new(Default::default()),
                 installs: Mutex::new(0),
+                source_sizes: Mutex::new(Default::default()),
             }),
         }
     }
@@ -285,6 +286,11 @@ struct ConnectionShared {
     /// Bumped by every take-over, under which a connected room is installed:
     /// a reconnect that started before one is abandoned (034 R25).
     installs: Mutex<u64>,
+    /// Each remote video publication's full size, by track sid, as the
+    /// publisher announced it: livekit overwrites `dimension()` with the last
+    /// size we asked for, so it is read before our first request. One entry
+    /// per publication this connection was asked to constrain.
+    source_sizes: Mutex<std::collections::HashMap<String, (u32, u32)>>,
 }
 
 /// What [`TransportConnection::hand_over`] gives: the connected room and how
@@ -375,6 +381,25 @@ fn classify_room_error(error: crate::Error) -> TransportError {
 }
 
 impl LiveKitTransportConnection {
+    /// The full size `publication`'s publisher announced, cached on first
+    /// sight (see `ConnectionShared::source_sizes`); `None` while unknown.
+    fn source_size(&self, publication: &RemoteTrackPublication) -> Option<(u32, u32)> {
+        let mut sizes = self
+            .shared
+            .source_sizes
+            .lock()
+            .expect("source sizes mutex poisoned");
+        let sid = String::from(publication.sid());
+        if let Some(size) = sizes.get(&sid) {
+            return Some(*size);
+        }
+        let TrackDimension(width, height) = publication.dimension();
+        (width > 0 && height > 0).then(|| {
+            sizes.insert(sid, (width, height));
+            (width, height)
+        })
+    }
+
     /// The connected session, for the `LiveKitCall` facade's transition-period
     /// raw accessors; `None` before the first connect.
     pub fn session(&self) -> Option<Arc<LiveKitSession>> {
@@ -755,39 +780,47 @@ impl TransportConnection for LiveKitTransportConnection {
         // (observed against livekit-server v1.10.1). Until that works
         // upstream, `Off` maps to the pause path too: identical zero
         // bandwidth (dynacast even stops the publisher's encoder), only an
-        // idle decoder object is retained.
-        //
-        // `Paused`/`Off` keep the subscription: `set_enabled(false)` sets
-        // the `disabled` flag server-side — no data, instant resume.
-        publication.set_enabled(matches!(resolved.demand, StreamDemand::Active));
+        // idle decoder object is retained. `Paused`/`Off` keep the
+        // subscription and set the `disabled` flag server-side — no data,
+        // instant resume.
+        let active = matches!(resolved.demand, StreamDemand::Active);
+        if !matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
+            publication.set_enabled(active);
+            return Ok(());
+        }
 
-        // CAUTION: every SDK setter sends a full-replacement
-        // `UpdateTrackSettings`. `set_video_quality` in particular sends
-        // *only* the (protocol-deprecated) quality field — zeroed dimensions
-        // and `disabled: false` — so it must never follow a pause or carry a
-        // size hint alongside. `VideoDetail` being an exclusive enum plus the
-        // pause guard below keeps every combination consistent.
-        if matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
-            match resolved.detail {
-                VideoDetail::Auto => {}
-                VideoDetail::Dimensions(dimensions) => {
-                    // Sends {disabled, width, height}: consistent with the
-                    // pause state set above.
-                    publication.update_video_dimensions(TrackDimension(
-                        dimensions.width,
-                        dimensions.height,
-                    ));
-                }
-                VideoDetail::Quality(limit) => {
-                    if matches!(resolved.demand, StreamDemand::Active) {
-                        // No-op (with a livekit warning) on non-simulcast
-                        // tracks.
-                        publication.set_video_quality(match limit {
-                            QualityLimit::Low => LkVideoQuality::Low,
-                            QualityLimit::Medium => LkVideoQuality::Medium,
-                            QualityLimit::High => LkVideoQuality::High,
-                        });
+        // ONE `UpdateTrackSettings` per change. Every livekit setter spawns
+        // its own task sending a full-replacement message, and nothing orders
+        // two of them: `set_enabled` carries the size last asked for,
+        // `set_video_quality` none at all, so resuming with a quality could
+        // land as the stale size and pin the stream to an old layer. Instead
+        // the pause flag is flipped locally (`enable`/`disable` send nothing)
+        // and a single `update_video_dimensions` sends `{disabled, width,
+        // height}` as they stand. A quality becomes a size of the publisher's
+        // full one.
+        let source = self.source_size(&publication);
+        match requested_size(resolved.detail, source) {
+            Some((width, height)) => {
+                if let Some(track) = publication.track() {
+                    if active {
+                        track.enable();
+                    } else {
+                        track.disable();
                     }
+                }
+                publication.update_video_dimensions(TrackDimension(width, height));
+            }
+            None => {
+                publication.set_enabled(active);
+                // Only when the publisher's size is unknown. `set_video_quality`
+                // sends zeroed dimensions and `disabled: false`, so it must
+                // never follow a pause. A no-op on a non-simulcast track.
+                if let (VideoDetail::Quality(limit), true) = (resolved.detail, active) {
+                    publication.set_video_quality(match limit {
+                        QualityLimit::Low => LkVideoQuality::Low,
+                        QualityLimit::Medium => LkVideoQuality::Medium,
+                        QualityLimit::High => LkVideoQuality::High,
+                    });
                 }
             }
         }
@@ -1262,6 +1295,26 @@ fn livekit_track_source(kind: MediaStreamKind) -> TrackSource {
     }
 }
 
+/// The size to ask the SFU for under `detail`, given the publisher's full
+/// `source` size; `None` for `Auto`, or a quality while the source is unknown.
+/// A quality is a fraction of the source matching livekit's default simulcast
+/// layers (full, half, quarter): the SFU forwards the layer that fits.
+fn requested_size(detail: VideoDetail, source: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match detail {
+        VideoDetail::Auto => None,
+        VideoDetail::Dimensions(dimensions) => Some((dimensions.width, dimensions.height)),
+        VideoDetail::Quality(limit) => {
+            let (width, height) = source?;
+            let divisor = match limit {
+                QualityLimit::High => 1,
+                QualityLimit::Medium => 2,
+                QualityLimit::Low => 4,
+            };
+            Some(((width / divisor).max(1), (height / divisor).max(1)))
+        }
+    }
+}
+
 /// Map LiveKit's track source/kind pair onto the transport-neutral stream
 /// kind. `Unknown` sources fall back on the media kind.
 fn stream_kind(source: TrackSource, kind: TrackKind) -> MediaStreamKind {
@@ -1491,6 +1544,37 @@ fn copy_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quality_is_a_fraction_of_the_source_size() {
+        let source = Some((960, 720));
+        let quality = |limit| requested_size(VideoDetail::Quality(limit), source);
+        assert_eq!(quality(QualityLimit::High), Some((960, 720)));
+        assert_eq!(quality(QualityLimit::Medium), Some((480, 360)));
+        assert_eq!(quality(QualityLimit::Low), Some((240, 180)));
+    }
+
+    #[test]
+    fn a_size_is_asked_as_is_and_auto_asks_nothing() {
+        let dimensions = VideoDetail::Dimensions(matrix_rtc_transport::Dimensions {
+            width: 320,
+            height: 240,
+        });
+        assert_eq!(requested_size(dimensions, None), Some((320, 240)));
+        assert_eq!(requested_size(VideoDetail::Auto, Some((960, 720))), None);
+    }
+
+    #[test]
+    fn a_quality_without_a_known_source_asks_no_size() {
+        assert_eq!(
+            requested_size(VideoDetail::Quality(QualityLimit::High), None),
+            None
+        );
+        assert_eq!(
+            requested_size(VideoDetail::Quality(QualityLimit::Low), Some((2, 2))),
+            Some((1, 1))
+        );
+    }
 
     fn signal_client_error(status: u16) -> crate::Error {
         crate::Error::Room(livekit::RoomError::Engine(
