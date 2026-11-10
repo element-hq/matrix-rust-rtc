@@ -166,14 +166,19 @@ export class WebPeerApp {
       format: compat === 'msc' ? undefined : compat,
     });
 
-    await this.publishMedia(focusUrl, publish);
+    await this.publishMedia(publish);
     this.emit({ event: 'joined', member_id: memberId, identity: this.call.session.ownRtcIdentity() });
   }
 
   /** Publish into the own-focus room: synthetic tracks, or the real devices. */
-  async publishMedia(focusUrl, { pattern, tone, devices } = {}) {
-    const room = this.call.rooms.get(focusUrl);
-    if (!room) throw new Error('own-focus room missing after connect');
+  async publishMedia({ pattern, tone, devices } = {}) {
+    // The own focus connects after `connect` resolves (034 R24).
+    const deadline = Date.now() + 30_000;
+    let room;
+    while (!(room = this.call.ownRoom)) {
+      if (Date.now() > deadline) throw new Error('own-focus room not connected within 30s');
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
     // Every publication reports whether it went out frame-encrypted — the
     // signalled truth peers act on, and exactly what silently regressing to
     // cleartext would flip. The test driver asserts on it.

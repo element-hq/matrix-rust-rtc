@@ -110,6 +110,17 @@ export class MatrixRtcCall {
     return this.call.raisedHands();
   }
 
+  /**
+   * The own-focus livekit-js `Room` — the one to publish into — once it is
+   * connected; `undefined` before that and for a receive-only call. The own
+   * focus connects after `connect` resolves (034 R24), so wait for it.
+   * `rooms` is keyed by opaque connection keys, not focus URLs.
+   */
+  get ownRoom() {
+    const key = this.session?.ownConnectionKey();
+    return key === undefined ? undefined : this.rooms.get(key);
+  }
+
   /** The current roster, each entry with its `livekitParticipant` when live. */
   participants() {
     return this.withLivekitParticipants(this.session.participants());
