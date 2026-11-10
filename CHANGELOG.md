@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.11 - 2026-11-10
+
 ### Breaking
 
 - A join's `intent` is the user's explicit choice and wins over the call in progress; a join without one follows the call, so a room's call button passes none (030).
