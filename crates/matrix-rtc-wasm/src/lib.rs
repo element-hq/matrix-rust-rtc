@@ -568,9 +568,12 @@ pub struct WasmJoinSessionParams {
     /// room-wide call, `room`.
     #[serde(default)]
     pub application_slot_id: Option<String>,
-    /// What the join publishes on, if anything. Omitted is advertised.
+    /// What the join publishes on, if anything. Omitted or `undefined` is
+    /// advertised. An `Option` because `serde(default)` covers only a missing
+    /// key: an explicit `undefined` reaches serde as unit, which only an
+    /// `Option` reads as absent.
     #[serde(default)]
-    pub transport: WasmJoinTransport,
+    pub transport: Option<WasmJoinTransport>,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -652,9 +655,10 @@ pub struct WasmNotifyConfig {
     /// 90000, capped at 120000 because that is what receivers honour).
     #[serde(default)]
     pub lifetime_ms: Option<u64>,
-    /// Users named individually in `m.mentions`. Usually empty.
+    /// Users named individually in `m.mentions`. Usually empty. An `Option`
+    /// so an explicit `undefined` reads as empty, like a missing key.
     #[serde(default)]
-    pub mention_user_ids: Vec<String>,
+    pub mention_user_ids: Option<Vec<String>>,
     /// Whether the whole room is targeted (default: true).
     #[serde(default = "default_true")]
     pub mention_room: bool,
@@ -680,7 +684,7 @@ impl WasmNotifyConfig {
             intent: self.intent,
             lifetime_ms: self.lifetime_ms,
             mentions: Mentions {
-                user_ids: self.mention_user_ids,
+                user_ids: self.mention_user_ids.unwrap_or_default(),
                 room: self.mention_room,
             },
         })
@@ -728,7 +732,7 @@ impl WasmJoinSessionParams {
             options = options.slot(name);
         }
         let join = &mut options.join;
-        join.transport = self.transport.into();
+        join.transport = self.transport.unwrap_or_default().into();
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;

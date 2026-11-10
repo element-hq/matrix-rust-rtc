@@ -75,6 +75,20 @@ describe('WASM bindings with a mock backend host', () => {
       await expect(client.room(ROOM_ID, undefined)).rejects.toThrow(/already open/);
     });
 
+    it('joinCall() with transport: undefined takes the advertised one, like no key', async () => {
+      const client = new bindings.WasmRtcClient(host);
+      const room = await client.room(ROOM_ID, undefined);
+      host._clear();
+
+      // How a caller writes "advertised unless I pick one"; serde sees unit,
+      // not a missing key.
+      await room.joinCall({ ...joinParams, transport: undefined });
+
+      const content = host._getStickyEvents()[0].content;
+      const transports = getContentValue(content, 'transports');
+      expect(getContentValue(transports, 'published')[0]).toEqual({ type: 'm.livekit', url: SFU });
+    });
+
     it('joinCall() without a transport takes the advertised one and sends the membership', async () => {
       const client = new bindings.WasmRtcClient(host);
       const room = await client.room(ROOM_ID, undefined);
