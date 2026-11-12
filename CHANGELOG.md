@@ -8,6 +8,14 @@ log only.
 
 ## Unreleased
 
+## v0.5.0 - 2026-11-12
+
+The first stable release: the same code as v0.5.0-rc.11.
+
+### Added
+
+- The Android AAR is published to Maven Central as `io.element.android:matrix-rtc-android`, with a javadoc jar.
+
 ## v0.5.0-rc.11 - 2026-11-10
 
 ### Breaking
