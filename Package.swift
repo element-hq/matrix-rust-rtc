@@ -17,8 +17,8 @@ import PackageDescription
 // otherwise dead-stripped from the static archive). See mobile/PACKAGING.md.
 //
 // For a local build, copy mobile/ios/Debug-Package.swift over this file.
-let version = "0.5.0-rc.11"
-let checksum = "0703cad174cb58c5485191b8e8570f6d1f676521d6083d651e372e9f277121f1"
+let version = "0.5.0"
+let checksum = "295dc7a0d02eecffed8ca56f773b7b304e4903d67b7f9d4dff8a077ad66fb02a"
 let url = "https://github.com/element-hq/matrix-rust-rtc/releases/download/v\(version)/MatrixRtcFFI.xcframework.zip"
 
 // What the statically linked libwebrtc inside MatrixRtcFFI.xcframework needs
