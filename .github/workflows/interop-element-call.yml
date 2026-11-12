@@ -37,7 +37,7 @@ jobs:
     # of matrix-sdk alone is ~25-45 minutes.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Names the browser resolves on its own, but Node and the Rust client do
       # not. Must precede the stack coming up (wait-ready probes them).
@@ -61,7 +61,7 @@ jobs:
         run: test -r demo/backend/data/tls/local-ca.crt
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           # wasm32 for the web peer's bindings, alongside the host target.
           targets: wasm32-unknown-unknown
@@ -80,7 +80,7 @@ jobs:
       # Same key as the E2E Call workflow: identical tree, and the matrix-sdk
       # build dominates the job either way.
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: e2e-call
 
@@ -95,7 +95,7 @@ jobs:
       - name: Build the wasm bindings
         run: ./web/scripts/build-bindings.sh
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
@@ -121,7 +121,7 @@ jobs:
             >> "$GITHUB_ENV"
 
       - name: Cache Playwright browsers
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         id: playwright-cache
         with:
           path: ~/.cache/ms-playwright
@@ -151,7 +151,7 @@ jobs:
       # Traces, videos, the peer's log and the recorded audio all live here.
       - name: Upload the Playwright report
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: interop-playwright-report
           path: |
