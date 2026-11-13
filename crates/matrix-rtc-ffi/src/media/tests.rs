@@ -229,8 +229,10 @@ fn send_stats_dtos_keep_every_layer_in_order() {
     top.quality_limitation = QualityLimitation::Bandwidth;
     let stats: FfiSendStats = SendStats {
         layers: vec![layer("q", 180, true), layer("h", 360, true), top],
+        codec: Some("video/VP9".to_owned()),
     }
     .into();
+    assert_eq!(stats.codec.as_deref(), Some("video/VP9"));
 
     let shape: Vec<_> = stats
         .layers
