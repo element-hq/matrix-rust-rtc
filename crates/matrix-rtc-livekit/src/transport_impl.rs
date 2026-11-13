@@ -1078,6 +1078,16 @@ impl LocalTrackHandle for LiveKitLocalTrack {
         };
         // One `OutboundRtp` entry per simulcast encoding (RTX rides inside
         // its media stream's entry, unlike on the receive side).
+        // Every layer shares one codec; read it off an active layer, since a
+        // paused one may still name the codec it last used.
+        let codec = stats
+            .iter()
+            .filter_map(|entry| match entry {
+                RtcStats::OutboundRtp(outbound) => Some(outbound),
+                _ => None,
+            })
+            .max_by_key(|outbound| outbound.outbound.active)
+            .and_then(|outbound| codec_mime(&stats, &outbound.stream.codec_id));
         let mut layers: Vec<SendLayerStats> = stats
             .iter()
             .filter_map(|entry| match entry {
@@ -1110,7 +1120,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
             "f" => 2,
             _ => 3,
         });
-        Some(SendStats { layers })
+        Some(SendStats { layers, codec })
     }
 }
 
@@ -1330,6 +1340,20 @@ fn stream_kind(source: TrackSource, kind: TrackKind) -> MediaStreamKind {
     }
 }
 
+/// The MIME type of the codec entry `codec_id` refers to in the same stats
+/// report, if the report has one and names a type.
+fn codec_mime(stats: &[RtcStats], codec_id: &str) -> Option<String> {
+    if codec_id.is_empty() {
+        return None;
+    }
+    stats.iter().find_map(|entry| match entry {
+        RtcStats::Codec(codec) if codec.rtc.id == codec_id && !codec.codec.mime_type.is_empty() => {
+            Some(codec.codec.mime_type.clone())
+        }
+        _ => None,
+    })
+}
+
 /// Map the frame cryptor's state onto the transport-neutral vocabulary.
 ///
 /// `None` for the two states that carry no diagnostic value: `New` is the
@@ -1440,6 +1464,12 @@ impl RemoteTrackHandle for LiveKitRemoteTrack {
                 .map(|s| s.inbound.silent_concealed_samples)
                 .sum(),
             concealment_events: inbound.iter().map(|s| s.inbound.concealment_events).sum(),
+            // The media stream is the busiest one; RTX and FEC may name their
+            // own codec entries.
+            codec: inbound
+                .iter()
+                .max_by_key(|s| s.received.packets_received)
+                .and_then(|s| codec_mime(&stats, &s.stream.codec_id)),
         })
     }
 }
@@ -1544,6 +1574,26 @@ fn copy_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codec_entry(id: &str, mime_type: &str) -> RtcStats {
+        let mut codec = livekit::webrtc::stats::CodecStats::default();
+        codec.rtc.id = id.to_owned();
+        codec.codec.mime_type = mime_type.to_owned();
+        RtcStats::Codec(codec)
+    }
+
+    #[test]
+    fn a_codec_is_named_by_the_entry_its_id_refers_to() {
+        let stats = vec![
+            codec_entry("COT01_96", "video/VP8"),
+            codec_entry("CIT01_98", "video/VP9"),
+            codec_entry("CIT01_100", ""),
+        ];
+        assert_eq!(codec_mime(&stats, "CIT01_98").as_deref(), Some("video/VP9"));
+        assert_eq!(codec_mime(&stats, "CIT01_100"), None);
+        assert_eq!(codec_mime(&stats, "CIT01_102"), None);
+        assert_eq!(codec_mime(&stats, ""), None);
+    }
 
     #[test]
     fn a_quality_is_a_fraction_of_the_source_size() {

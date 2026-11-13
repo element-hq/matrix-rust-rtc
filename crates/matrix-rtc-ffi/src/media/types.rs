@@ -542,6 +542,9 @@ pub struct FfiReceiveStats {
     /// How many separate times concealment kicked in — a better gap counter
     /// than the sample totals, which one long outage inflates.
     pub concealment_events: u64,
+    /// The codec being decoded, as a MIME type (`video/VP9`, `audio/opus`).
+    /// `null` until a report names one.
+    pub codec: Option<String>,
 }
 
 impl From<matrix_rtc_transport::ReceiveStats> for FfiReceiveStats {
@@ -557,6 +560,7 @@ impl From<matrix_rtc_transport::ReceiveStats> for FfiReceiveStats {
             concealed_samples: stats.concealed_samples,
             silent_concealed_samples: stats.silent_concealed_samples,
             concealment_events: stats.concealment_events,
+            codec: stats.codec,
         }
     }
 }
@@ -610,6 +614,9 @@ pub struct FfiSendLayerStats {
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiSendStats {
     pub layers: Vec<FfiSendLayerStats>,
+    /// The codec being encoded, as a MIME type (`video/VP9`): the one
+    /// negotiated, which may not be the [`FfiVideoCodecPreference`] asked for.
+    pub codec: Option<String>,
 }
 
 impl From<matrix_rtc_transport::SendStats> for FfiSendStats {
@@ -629,6 +636,7 @@ impl From<matrix_rtc_transport::SendStats> for FfiSendStats {
                     quality_limitation: layer.quality_limitation.into(),
                 })
                 .collect(),
+            codec: stats.codec,
         }
     }
 }

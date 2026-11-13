@@ -34,6 +34,9 @@
 //! the SFU still wants it ([`SendLayerStats::active`] — dynacast pauses a layer
 //! no subscriber asks for), and why the encoder is cutting quality.
 //!
+//! Both sides also name the codec in use, so a host can check that a codec
+//! preference took effect.
+//!
 //! [`ConnectionEvent::EncryptionStateChanged`]: crate::ConnectionEvent::EncryptionStateChanged
 
 /// Cumulative receive-side counters for one subscribed track.
@@ -70,6 +73,9 @@ pub struct ReceiveStats {
     /// How many separate times concealment kicked in — a better gap counter
     /// than the sample totals, which one long outage inflates.
     pub concealment_events: u64,
+    /// The codec being decoded, as a MIME type (`video/VP9`, `audio/opus`).
+    /// `None` until a report names one.
+    pub codec: Option<String>,
 }
 
 /// Why the encoder is currently sending less than it was asked to.
@@ -110,4 +116,7 @@ pub struct SendLayerStats {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SendStats {
     pub layers: Vec<SendLayerStats>,
+    /// The codec being encoded, as a MIME type (`video/VP9`): the one the
+    /// session negotiated, which may not be the one asked for.
+    pub codec: Option<String>,
 }
