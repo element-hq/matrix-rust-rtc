@@ -16,7 +16,7 @@ use crate::{
 };
 use std::sync::Arc;
 
-use super::session::{MediaSessionConfig, connect_media_session};
+use super::session::{DISCONNECT_BUDGET, MediaSession, MediaSessionConfig, connect_media_session};
 use super::types::{
     FfiConnectionState, FfiInterruptions, FfiLocalState, FfiMediaConstraints, FfiQualityLimitation,
     FfiSendStats, FfiStreamKind, FfiStreamRef, FfiTileId, FfiTileRoster, FfiVideoDetail,
@@ -191,6 +191,103 @@ fn a_receive_only_call_connects_without_a_focus_of_its_own() {
     runtime()
         .block_on(session.disconnect())
         .expect("disconnect");
+}
+
+#[test]
+fn a_close_that_hangs_does_not_hold_the_disconnect() {
+    let (release, released) = std::sync::mpsc::channel();
+    let session = runtime().block_on(async {
+        let engine = idle_engine();
+        let events = engine.subscribe_events();
+        MediaSession::new(
+            matrix_rtc_call_sdk::MediaAttachment {
+                engine,
+                own_connection: Some(BlockingConnection {
+                    released: std::sync::Mutex::new(released),
+                }),
+                own_identity: "own".to_owned(),
+                events,
+            },
+            Arc::new(matrix_rtc_transport::MediaKeyHandler::new()),
+        )
+    });
+
+    let started = std::time::Instant::now();
+    runtime()
+        .block_on(session.disconnect())
+        .expect("a hung close is not a failed disconnect");
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= DISCONNECT_BUDGET,
+        "returned before the close gave up: {waited:?}"
+    );
+    assert!(
+        waited < DISCONNECT_BUDGET + std::time::Duration::from_secs(1),
+        "held past the budget: {waited:?}"
+    );
+    // Frees the runtime worker the close is still blocking.
+    release.send(()).expect("the close is still waiting");
+}
+
+/// An engine with no transports and nothing to follow.
+fn idle_engine() -> matrix_rtc_call_sdk::CallEngine {
+    let (_memberships, memberships_rx) = tokio::sync::watch::channel(Vec::new());
+    matrix_rtc_call_sdk::CallEngine::new(
+        matrix_rtc_call_sdk::EngineConfig {
+            transports: Vec::new(),
+            own_member_id: "own".to_owned(),
+            ctx: matrix_rtc_transport::ConnectionContext {
+                room_id: "!room:example.org".to_owned(),
+                slot_id: "m.call#room".to_owned(),
+                member: matrix_rtc_transport::OwnMemberClaims {
+                    member_id: "own".to_owned(),
+                    user_id: "@alice:example.org".to_owned(),
+                    device_id: "DEVICE".to_owned(),
+                },
+                e2ee: true,
+            },
+            own_connection_key: None,
+            raised_hands: None,
+            reactions: None,
+            ended: None,
+            media_status: None,
+            stability: Default::default(),
+            signalling: None,
+            own_membership_lapsed: None,
+            own_reconnect_budget: matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
+            sfu_fallback: false,
+        },
+        memberships_rx,
+    )
+}
+
+/// An own-focus connection whose close blocks its thread, the way a stuck
+/// synchronous libwebrtc call does, until the test releases it.
+struct BlockingConnection {
+    released: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[async_trait::async_trait]
+impl matrix_rtc_transport::TransportConnection for BlockingConnection {
+    fn connection_key(&self) -> &str {
+        "own"
+    }
+
+    async fn publish(
+        &self,
+        _options: matrix_rtc_transport::PublishOptions,
+    ) -> Result<Arc<dyn matrix_rtc_transport::LocalTrackHandle>, matrix_rtc_transport::TransportError>
+    {
+        Err(matrix_rtc_transport::TransportError::Unsupported(
+            "nothing is published here".into(),
+        ))
+    }
+
+    async fn close(&self) -> Result<(), matrix_rtc_transport::TransportError> {
+        let _ = self.released.lock().unwrap().recv();
+        Ok(())
+    }
 }
 
 #[test]
