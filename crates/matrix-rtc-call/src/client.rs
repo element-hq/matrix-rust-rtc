@@ -27,9 +27,9 @@ use std::time::Duration;
 use matrix_rtc_core::{
     ApplicationInfo, BackendError, BaseRtcClient, BaseRtcRoom, BaseRtcRoomHandle, CommandError,
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
-    LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError, Outbox,
-    ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SignallingHealth, SlotEncryption, SlotState,
-    TransportIntent,
+    LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, LiveKitFlows, MatrixBackend, OpenError,
+    Outbox, ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SignallingHealth, SlotEncryption,
+    SlotState, TransportIntent,
     executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
 };
 use tokio::sync::{Mutex, broadcast, watch};
@@ -107,6 +107,16 @@ pub struct JoinOptions {
     pub keep_alive_interval_ms: Option<u64>,
     pub sticky_duration_ms: Option<u64>,
     pub degraded_lifetime_ms: Option<u64>,
+    /// TEMPORARY (spec 049): lets us publish through the homeserver's
+    /// `get_token` on a transport announcing both `url` and
+    /// `livekit_service_url`, when [`Self::server_features`] say it is stable.
+    /// Read once, here (R12). Defaults to `false`: `/sfu/get`.
+    pub allow_livekit_get_token: bool,
+    /// TEMPORARY (spec 049): the `unstable_features` of our homeserver's
+    /// `/versions` that are on, as `RtcClient::msc_support` takes them. Only
+    /// `org.matrix.msc4195.stable` is read; empty keeps every LiveKit token
+    /// on `/sfu/get` where a transport still names it.
+    pub server_features: Vec<String>,
 }
 
 impl JoinOptions {
@@ -123,6 +133,8 @@ impl JoinOptions {
             keep_alive_interval_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
+            allow_livekit_get_token: false,
+            server_features: Vec::new(),
         }
     }
 
@@ -160,6 +172,18 @@ impl JoinOptions {
     pub fn degraded_lifetime_ms(mut self, lifetime_ms: u64) -> Self {
         self.degraded_lifetime_ms = Some(lifetime_ms);
         self
+    }
+
+    /// See [`Self::allow_livekit_get_token`](JoinOptions#structfield.allow_livekit_get_token).
+    pub fn livekit_get_token(mut self, allow: bool, server_features: Vec<String>) -> Self {
+        self.allow_livekit_get_token = allow;
+        self.server_features = server_features;
+        self
+    }
+
+    /// The LiveKit token flows this join settles on (spec 049).
+    fn livekit_flows(&self) -> LiveKitFlows {
+        LiveKitFlows::new(&self.server_features, self.allow_livekit_get_token)
     }
 }
 
@@ -427,6 +451,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let deadline = executor::Instant::now() + JOIN_BUDGET;
         let slot_id = options.slot_id.clone();
         let transport = self.transport(options.transport.clone(), deadline).await?;
+        let livekit_flows = options.livekit_flows();
         let mut state = self.state.lock().await;
         let params = self
             .prepare_join(&mut state, options, transport.clone())
@@ -436,7 +461,14 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
         drop(state);
-        Ok(self.session(slot_id, member_id, transport, upkeep, auto_leaves))
+        Ok(self.session(
+            slot_id,
+            member_id,
+            transport,
+            livekit_flows,
+            upkeep,
+            auto_leaves,
+        ))
     }
 
     /// Joins a call slot: the generic join, then the call layer — reactions
@@ -462,6 +494,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone(), deadline).await?;
+        let livekit_flows = join.livekit_flows();
         let mut state = self.state.lock().await;
         let rtc = self
             .prepare_join(&mut state, join, transport.clone())
@@ -484,7 +517,14 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let hand_requests = state.subscribe_hand_requests(&slot_id);
         let outbox = state.rtc().outbox().clone();
         drop(state);
-        let session = self.session(slot_id.clone(), member_id, transport, upkeep, auto_leaves);
+        let session = self.session(
+            slot_id.clone(),
+            member_id,
+            transport,
+            livekit_flows,
+            upkeep,
+            auto_leaves,
+        );
         session.end.report_to(joined.status.clone());
         // After the lock is released: the ring may be retried for seconds, and
         // a pickup or a decline must be able to arrive meanwhile.
@@ -576,6 +616,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             keep_alive_interval_ms,
             sticky_duration_ms,
             degraded_lifetime_ms,
+            // Settled by the caller, into the session.
+            allow_livekit_get_token: _,
+            server_features: _,
         } = options;
 
         // Before anything below acts on the slot: MSC4143's grammar, and the
@@ -643,6 +686,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         slot_id: String,
         member_id: String,
         transport: TransportIntent,
+        livekit_flows: LiveKitFlows,
         upkeep: Option<AbortHandle>,
         auto_leaves: Option<broadcast::Receiver<LeaveReason>>,
     ) -> RtcSession<B> {
@@ -656,6 +700,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             slot_id,
             member_id,
             transport,
+            livekit_flows,
             format: self.mode,
             state: self.state.clone(),
             end,
@@ -982,6 +1027,8 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     slot_id: String,
     member_id: String,
     transport: TransportIntent,
+    /// TEMPORARY (spec 049): settled at join (R12).
+    livekit_flows: LiveKitFlows,
     format: MembershipFormat,
     state: SharedState<B>,
     end: Arc<SessionEnd>,
@@ -1013,6 +1060,11 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     /// What this participation publishes on, as its join resolved it.
     pub fn transport(&self) -> &TransportIntent {
         &self.transport
+    }
+
+    /// TEMPORARY (spec 049): the LiveKit token flows this join settled on.
+    pub fn livekit_flows(&self) -> LiveKitFlows {
+        self.livekit_flows
     }
 
     pub fn is_live(&self) -> bool {
@@ -1077,14 +1129,19 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
                 .unwrap_or(false)
     }
 
-    pub async fn set_encryption_identity_mapper(&self, mapper: RtcIdentityMapper) -> bool {
+    /// See `SlotSession::set_encryption_identity_mapper`.
+    pub async fn set_encryption_identity_mapper(
+        &self,
+        mapper: RtcIdentityMapper,
+        own_identity: Option<String>,
+    ) -> bool {
         self.is_live()
             && self
                 .state
                 .lock()
                 .await
                 .rtc_mut()
-                .set_encryption_identity_mapper(&self.slot_id, mapper)
+                .set_encryption_identity_mapper(&self.slot_id, mapper, own_identity)
     }
 
     pub async fn replay_encryption_keys(&self) -> bool {

@@ -76,7 +76,7 @@ pub use slot::{
     EncryptionMechanism, MAX_SLOT_ID_BYTES, OpenSlot, RawSlotEvent, RawSlotEventContent,
     RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState, SlotStatus, validate_slot_id,
 };
-pub use support::{MscRequirement, MscSupport, msc_support};
+pub use support::{LiveKitFlows, MscRequirement, MscSupport, msc_support};
 pub use transport::{
     LEGACY_LIVEKIT_TYPE, LiveKitAuthFlow, LiveKitTransport, MIN_MEDIA_KEY_LEN, MSC_LIVEKIT_TYPE,
     MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport, server_name_of,

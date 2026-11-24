@@ -1241,6 +1241,8 @@ mod tests {
             kind: FfiCallKind::Group { notify: None },
             reactions: None,
             intent: None,
+            allow_livekit_get_token: false,
+            server_features: Vec::new(),
         }
     }
 

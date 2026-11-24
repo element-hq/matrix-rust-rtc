@@ -97,6 +97,8 @@ fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoo
                 kind: crate::FfiCallKind::Group { notify: None },
                 reactions: None,
                 intent: None,
+                allow_livekit_get_token: false,
+                server_features: Vec::new(),
             })
             .await
             .unwrap();

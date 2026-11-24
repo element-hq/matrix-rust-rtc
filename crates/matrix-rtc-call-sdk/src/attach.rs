@@ -136,7 +136,7 @@ where
     // replay below derives them too, so a handler installed first would import
     // peer keys under the raw `member_id` fallback — an identity the SFU never
     // uses, which is indistinguishable from importing nothing.
-    call.set_encryption_identity_mapper(options.identity_mapper.clone())
+    call.set_encryption_identity_mapper(options.identity_mapper.clone(), None)
         .await;
     if !call
         .set_encryption_signal_handler(key_handler.clone())

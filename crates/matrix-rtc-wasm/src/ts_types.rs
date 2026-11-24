@@ -283,6 +283,10 @@ export interface JoinParamsIn {
     keep_alive_timeout_ms?: number;
     sticky_duration_ms?: number;
     degraded_lifetime_ms?: number;
+    /** TEMPORARY (spec 049): publish through the homeserver's `get_token` rather than `/sfu/get` when our transport names both, if `server_features` say it is stable. Read once, at join. Default `false`. */
+    allow_livekit_get_token?: boolean;
+    /** TEMPORARY (spec 049): the `unstable_features` of our homeserver's `/versions` that are on, as `mscSupport` takes them. Omitted keeps every LiveKit token on `/sfu/get` where a transport still names it. */
+    server_features?: string[];
     encryption_config?: {
         delay_before_use_ms?: number;
         key_rotation_grace_period_ms?: number;

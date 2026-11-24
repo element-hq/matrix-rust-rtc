@@ -425,6 +425,8 @@ pub struct EncryptionManager<T: MatrixBackend> {
     identity_mapper: Option<RtcIdentityMapper>,
     /// The transports we publish on, from which our own identity derives.
     own_transports: Vec<RtcTransport>,
+    /// Ours as the media layer chose it, over the mapper's.
+    own_rtc_identity: Option<String>,
 
     /// Track if key distribution is in progress
     key_distribution_in_progress: Arc<Mutex<bool>>,
@@ -559,6 +561,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             signal_handler: None,
             identity_mapper: None,
             own_transports: Vec::new(),
+            own_rtc_identity: None,
             key_distribution_in_progress: Arc::new(Mutex::new(false)),
             need_new_distribution: Arc::new(Mutex::new(false)),
             next_key_index: Arc::new(Mutex::new(0)),
@@ -707,6 +710,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.config.manage_media_keys
     }
 
+    /// Sets our identity as the media layer chose it: the one minted by the
+    /// token flow we publish through. `None` derives it through the mapper.
+    pub fn set_own_rtc_identity(&mut self, identity: Option<String>) {
+        self.own_rtc_identity = identity;
+    }
+
     /// Sets the transports we publish on, from which the mapper derives our
     /// own identity. Empty for a receive-only participation.
     pub fn set_own_transports(&mut self, transports: Vec<RtcTransport>) {
@@ -717,6 +726,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     ///
     /// Always one identity: we know which token flow we use.
     fn own_rtc_identity(&self) -> String {
+        if let Some(identity) = &self.own_rtc_identity {
+            return identity.clone();
+        }
         let mapped = self.identity_mapper.as_ref().and_then(|mapper| {
             mapper(&IdentitySubject {
                 user_id: &self.own_user_id,
@@ -2174,6 +2186,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             signal_handler: self.signal_handler.clone(),
             identity_mapper: self.identity_mapper.clone(),
             own_transports: self.own_transports.clone(),
+            own_rtc_identity: self.own_rtc_identity.clone(),
             key_distribution_in_progress: self.key_distribution_in_progress.clone(),
             need_new_distribution: self.need_new_distribution.clone(),
             next_key_index: self.next_key_index.clone(),

@@ -555,10 +555,11 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         &mut self,
         slot_id: &str,
         mapper: RtcIdentityMapper,
+        own_identity: Option<String>,
     ) -> bool {
         self.sessions
             .get_mut(slot_id)
-            .is_some_and(|session| session.set_encryption_identity_mapper(mapper))
+            .is_some_and(|session| session.set_encryption_identity_mapper(mapper, own_identity))
     }
 
     /// Routes a media encryption key received from a peer into every slot
