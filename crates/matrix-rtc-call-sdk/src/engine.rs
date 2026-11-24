@@ -2190,6 +2190,14 @@ mod tests {
             &self,
             member: &JoinedMembership,
         ) -> Option<matrix_rtc_core::RtcIdentity> {
+            // A member whose id starts with `both-` stands for one publishing
+            // both LiveKit token flows (spec 049): `h-…` or `id-…` on the SFU.
+            if member.member_id.starts_with("both-") {
+                return Some(matrix_rtc_core::RtcIdentity::Transition {
+                    hashed: format!("h-{}", member.member_id),
+                    legacy: format!("id-{}", member.member_id),
+                });
+            }
             Some(format!("id-{}", member.member_id).into())
         }
 
@@ -3100,6 +3108,114 @@ mod tests {
             member_id: "bob".to_owned(),
             identity: "id-bob".to_owned(),
             key_index: 3,
+        }));
+    }
+
+    /// Spec 049 R3, R4: a member whose transport names both token flows is one
+    /// participant whichever identity its media comes under, even both at once
+    /// (an old and a new client of the same member).
+    #[tokio::test]
+    async fn a_member_naming_both_flows_is_one_participant_under_either_identity() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("both-bob", "@bob:example.org"),
+            ])
+            .unwrap();
+        rostered(&fx, &["own", "both-bob"]).await;
+        let connection = adopt(&fx);
+        let _ = next_event(&mut fx.events).await; // joined
+
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "id-both-bob".to_owned(),
+                kind: MediaStreamKind::Microphone,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Microphone)),
+            })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "both-bob".to_owned(),
+                kind: MediaStreamKind::Microphone,
+            }
+        );
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "h-both-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::StreamStarted {
+                member_id: "both-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+            }
+        );
+        fx.engine.notify_key_imported("h-both-bob", 0);
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::KeyImported {
+                member_id: "both-bob".to_owned(),
+                identity: "h-both-bob".to_owned(),
+                key_index: 0,
+            }
+        );
+
+        assert_eq!(fx.engine.participants().len(), 2, "us and bob, once");
+        for kind in [MediaStreamKind::Microphone, MediaStreamKind::Camera] {
+            assert!(fx.engine.remote_track("both-bob", kind).is_some());
+        }
+    }
+
+    /// Spec 049 R5: media and a key under the identity the member's flow
+    /// minted, arriving before its membership, wait for it.
+    #[tokio::test]
+    async fn early_media_under_either_identity_waits_for_its_membership() {
+        let mut fx = fixture();
+        in_call(&fx).await;
+        let connection = adopt(&fx);
+
+        connection
+            .send(ConnectionEvent::TrackAdded {
+                identity: "h-both-bob".to_owned(),
+                kind: MediaStreamKind::Camera,
+                track: Arc::new(FakeTrack::new(MediaStreamKind::Camera)),
+            })
+            .unwrap();
+        fx.engine.notify_key_imported("h-both-bob", 2);
+
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member("both-bob", "@bob:example.org"),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::ParticipantJoined {
+                member_id: "both-bob".to_owned(),
+                user_id: "@bob:example.org".to_owned(),
+                participant_count: 2,
+            }
+        );
+        let flushed = [
+            next_event(&mut fx.events).await,
+            next_event(&mut fx.events).await,
+        ];
+        assert!(flushed.contains(&CallEvent::StreamStarted {
+            member_id: "both-bob".to_owned(),
+            kind: MediaStreamKind::Camera,
+        }));
+        assert!(flushed.contains(&CallEvent::KeyImported {
+            member_id: "both-bob".to_owned(),
+            identity: "h-both-bob".to_owned(),
+            key_index: 2,
         }));
     }
 
