@@ -151,8 +151,6 @@ export class WebPeerApp {
       transport:
         transport ??
         (compat === 'msc' ? undefined : { kind: 'publish', livekit_service_url: focusUrl }),
-      // TEMPORARY (spec 049): the local flag.
-      allow_livekit_get_token: livekitGetToken,
     });
     const memberId = this.rtcCall.memberId;
     this.memberId = memberId;
@@ -168,6 +166,8 @@ export class WebPeerApp {
 
     await this.call.connect({
       format: compat === 'msc' ? undefined : compat,
+      // TEMPORARY (spec 049): the local flag.
+      allow_livekit_get_token: livekitGetToken,
     });
 
     await this.publishMedia(publish);

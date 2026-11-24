@@ -853,7 +853,6 @@ mod tests {
                     kind: crate::FfiCallKind::Group { notify: None },
                     reactions: None,
                     intent: None,
-                    allow_livekit_get_token: false,
                 })
                 .await
                 .expect("joins");

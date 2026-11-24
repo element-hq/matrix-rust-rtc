@@ -191,7 +191,8 @@ pub struct LiveKitCallOptions {
     /// [`AttachOptions::sfu_fallback`](crate::AttachOptions::sfu_fallback).
     /// Off by default.
     pub sfu_fallback: bool,
-    /// TEMPORARY (spec 049): see `JoinOptions::allow_livekit_get_token`.
+    /// TEMPORARY (spec 049): see
+    /// [`LiveKitAttachOptions::allow_livekit_get_token`](crate::livekit::LiveKitAttachOptions::allow_livekit_get_token).
     pub allow_livekit_get_token: bool,
 }
 
@@ -310,7 +311,6 @@ impl LiveKitCall {
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
         join.keep_alive_interval_ms = options.keep_alive_interval_ms;
-        join.allow_livekit_get_token = options.allow_livekit_get_token;
         let call = Arc::new(
             room.join_call(CallJoinOptions {
                 join,
@@ -340,6 +340,7 @@ impl LiveKitCall {
                 stability: options.stability.clone(),
                 own_reconnect_budget: None,
                 sfu_fallback: options.sfu_fallback,
+                allow_livekit_get_token: options.allow_livekit_get_token,
             },
         )
         .await;

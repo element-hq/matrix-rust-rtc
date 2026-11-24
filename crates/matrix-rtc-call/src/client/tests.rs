@@ -228,43 +228,6 @@ async fn a_left_session_is_over_and_a_rejoin_yields_a_new_one() {
     );
 }
 
-/// Spec 049 R8, R12, R13: the join settles the LiveKit token flows from the
-/// local flag and the homeserver's `/versions`, through the backend.
-#[tokio::test]
-async fn the_join_settles_the_livekit_flows_from_the_flag_and_the_homeserver() {
-    let mock = mock();
-    let client = RtcClient::new(mock.clone());
-    let room = open(&client, &mock, ROOM).await;
-    let allowed = || {
-        let mut options = CallJoinOptions::new();
-        options.join = options.join.allow_livekit_get_token(true);
-        options
-    };
-
-    let call = room.join_call(allowed()).await.expect("join");
-    assert_eq!(
-        call.livekit_flows(),
-        LiveKitFlows::default(),
-        "not announced"
-    );
-    call.leave(LeaveSessionParams::new()).await.expect("leave");
-
-    *mock.unstable_features.lock().unwrap() = vec!["org.matrix.msc4195.stable".to_owned()];
-    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
-    assert_eq!(
-        call.livekit_flows(),
-        LiveKitFlows {
-            subscribe_get_token: true,
-            publish_get_token: false,
-        },
-        "subscribing does not wait for the flag"
-    );
-    call.leave(LeaveSessionParams::new()).await.expect("leave");
-
-    let call = room.join_call(allowed()).await.expect("join");
-    assert!(call.livekit_flows().publish_get_token);
-}
-
 /// The slot closing under a call ends it without the host asking: the core
 /// leaves, the session is over, and why is still readable afterwards.
 #[tokio::test]

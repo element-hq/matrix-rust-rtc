@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::{
-    IdentitySubject, MatrixBackend, RtcIdentity, RtcIdentityMapper, TransportIntent,
+    IdentitySubject, LiveKitFlows, MatrixBackend, RtcIdentity, RtcIdentityMapper, TransportIntent,
 };
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
@@ -273,6 +273,21 @@ where
         own_identity,
         events,
     })
+}
+
+/// TEMPORARY (spec 049): the LiveKit token flows a call's media takes, from
+/// the local flag and the homeserver's `/versions`, read once as media
+/// attaches (R12). A `/versions` that fails keeps every LiveKit token on
+/// `/sfu/get` where a transport still names it: never a reason to fail.
+pub async fn livekit_flows(backend: &dyn MatrixBackend, allow_get_token: bool) -> LiveKitFlows {
+    let features = backend
+        .unstable_features()
+        .await
+        .inspect_err(|error| {
+            log::warn!("reading the homeserver's unstable features failed: {error}");
+        })
+        .unwrap_or_default();
+    LiveKitFlows::new(&features, allow_get_token)
 }
 
 #[cfg(test)]

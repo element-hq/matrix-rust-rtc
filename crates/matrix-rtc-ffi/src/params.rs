@@ -194,13 +194,6 @@ pub struct FfiJoinSessionParams {
     /// [`crate::RtcCall::call_intent`].
     #[uniffi(default = None)]
     pub intent: Option<FfiCallIntent>,
-    /// TEMPORARY (spec 049): publish through the homeserver's `get_token`
-    /// rather than `/sfu/get` when our transport names both, if the
-    /// homeserver's `/versions` announces `org.matrix.msc4195.stable` (see
-    /// `unstable_features` on the backend). Read once, at join. Default
-    /// `false`.
-    #[uniffi(default = false)]
-    pub allow_livekit_get_token: bool,
 }
 
 /// FFI-friendly reactions configuration (mirrors
@@ -337,7 +330,6 @@ impl FfiJoinSessionParams {
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        join.allow_livekit_get_token = self.allow_livekit_get_token;
         options.kind = self.kind.into();
         options.reactions = self.reactions.map(Into::into);
         options.intent = self.intent.map(Into::into);

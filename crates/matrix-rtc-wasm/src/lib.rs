@@ -250,7 +250,6 @@ impl WasmRtcRoom {
     ///   - `encryption_config`, `notify`, `reactions`
     ///   - `intent`: `"audio"` or `"video"`, the user's explicit choice, which
     ///     wins over a call in progress; omitted follows the call
-    ///   - `allow_livekit_get_token`: temporary (spec 049), see `JoinParamsIn`
     ///
     /// The call keeps itself alive, and performs its key rotations when they
     /// fall due, until it leaves or is freed. The SDK generates the
@@ -599,12 +598,6 @@ pub struct WasmJoinSessionParams {
     /// is video. Read the outcome from `callIntent` on the call.
     #[serde(default)]
     pub intent: Option<String>,
-    /// TEMPORARY (spec 049): publish through the homeserver's `get_token`
-    /// rather than `/sfu/get` when our transport names both, if the host's
-    /// `unstableFeatures` announces `org.matrix.msc4195.stable`. Read once,
-    /// at join.
-    #[serde(default)]
-    pub allow_livekit_get_token: Option<bool>,
 }
 
 /// `"audio"` or `"video"`, or an error naming what was passed.
@@ -744,7 +737,6 @@ impl WasmJoinSessionParams {
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
-        join.allow_livekit_get_token = self.allow_livekit_get_token.unwrap_or(false);
         options.kind = CallKind::Group {
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         };

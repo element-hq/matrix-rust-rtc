@@ -13,7 +13,8 @@ use matrix_rtc_call::{
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     EventEncryption, EventIn, IdentitySubject, JoinedMembership, KEY_MESSAGE_TYPE,
-    LeaveSessionParams, RoomOptions, RtcIdentity, RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
+    LeaveSessionParams, LiveKitFlows, RoomOptions, RtcIdentity, RtcTransport, SLOT_EVENT_TYPE,
+    ToDeviceMessageIn,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -407,6 +408,23 @@ async fn our_identity_and_key_follow_the_flow_we_publish_through() {
         handler.key_for("hashed-us").is_some(),
         "our key is under it"
     );
+}
+
+/// Spec 049 R8, R13: the flag decides publishing only; the homeserver's
+/// `/versions` decides both.
+#[tokio::test]
+async fn the_livekit_flows_come_from_the_flag_and_the_homeserver() {
+    let mock = mock();
+    assert_eq!(
+        livekit_flows(mock.as_ref(), true).await,
+        LiveKitFlows::default()
+    );
+
+    *mock.unstable_features.lock().unwrap() = vec!["org.matrix.msc4195.stable".to_owned()];
+    let off = livekit_flows(mock.as_ref(), false).await;
+    assert!(off.subscribe_get_token && !off.publish_get_token);
+    let on = livekit_flows(mock.as_ref(), true).await;
+    assert!(on.subscribe_get_token && on.publish_get_token);
 }
 
 #[tokio::test]

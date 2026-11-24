@@ -232,6 +232,8 @@ export interface MediaSessionConfigIn {
     stability?: StabilityConfigIn;
     /** How long our own SFU may stay unreachable before the call ends; 60 000 when omitted. */
     own_reconnect_budget_ms?: number;
+    /** TEMPORARY (spec 049): publish through the homeserver's `get_token` rather than `/sfu/get` when our transport names both `url` and `livekit_service_url`, if the host's `unstableFeatures` announces `org.matrix.msc4195.stable`. Read once, here. Default `false`. */
+    allow_livekit_get_token?: boolean;
 }
 
 /**
@@ -285,8 +287,6 @@ export interface JoinParamsIn {
     keep_alive_timeout_ms?: number;
     sticky_duration_ms?: number;
     degraded_lifetime_ms?: number;
-    /** TEMPORARY (spec 049): publish through the homeserver's `get_token` rather than `/sfu/get` when our transport names both, if the host's `unstableFeatures` announces `org.matrix.msc4195.stable`. Read once, at join. Default `false`. */
-    allow_livekit_get_token?: boolean;
     encryption_config?: {
         delay_before_use_ms?: number;
         key_rotation_grace_period_ms?: number;
