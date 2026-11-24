@@ -12,6 +12,10 @@ log only.
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
 
+### Fixed
+
+- `MediaSession.disconnect()` returns within 2 s: the close it awaits (engine shutdown, then LiveKit's room close) is otherwise unbounded and could hold a hang-up forever.
+
 ## v0.5.0 - 2026-11-12
 
 The first stable release: the same code as v0.5.0-rc.11.

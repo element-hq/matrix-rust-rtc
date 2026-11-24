@@ -425,11 +425,39 @@ impl MediaSession {
 
     /// End the media session while staying joined. Not needed after leaving.
     ///
+    /// Returns within [`DISCONNECT_BUDGET`] whatever the SFU or libwebrtc do,
+    /// so a hang-up never waits on it (034 R8); a close still running then
+    /// finishes in the background.
+    ///
     /// (Named `disconnect` rather than `close`: uniffi already gives every
     /// Kotlin object an `AutoCloseable.close()` for handle disposal, and a
     /// suspend `close()` collides with it.)
-    pub async fn disconnect(&self) -> Result<(), MediaFfiError> {
+    pub async fn disconnect(self: Arc<Self>) -> Result<(), MediaFfiError> {
         log::info!("media: disconnecting");
+        // Its own task, not a timeout around the close in place: a close stuck
+        // in a blocking libwebrtc call never yields, so that timer would never fire.
+        let closing = runtime().spawn(async move { self.close_media().await });
+        match tokio::time::timeout(DISCONNECT_BUDGET, closing).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(MediaFfiError::Transport(format!(
+                "media close panicked: {error}"
+            ))),
+            Err(_) => {
+                log::warn!(
+                    "media: still closing after {DISCONNECT_BUDGET:?}; returning, the close carries on in the background"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+/// How long [`MediaSession::disconnect`] waits for the media to close. A clean
+/// close takes tens of milliseconds.
+pub(super) const DISCONNECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl MediaSession {
+    async fn close_media(&self) -> Result<(), MediaFfiError> {
         self.engine.shutdown().await;
         let Some(connection) = &self.connection else {
             return Ok(());
