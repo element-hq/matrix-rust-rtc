@@ -191,6 +191,9 @@ pub struct LiveKitCallOptions {
     /// [`AttachOptions::sfu_fallback`](crate::AttachOptions::sfu_fallback).
     /// Off by default.
     pub sfu_fallback: bool,
+    /// TEMPORARY (spec 049): see
+    /// [`LiveKitAttachOptions::allow_livekit_get_token`](crate::livekit::LiveKitAttachOptions::allow_livekit_get_token).
+    pub allow_livekit_get_token: bool,
 }
 
 impl Default for LiveKitCallOptions {
@@ -210,6 +213,7 @@ impl Default for LiveKitCallOptions {
             reactions: None,
             stability: StabilityConfig::default(),
             sfu_fallback: false,
+            allow_livekit_get_token: false,
         }
     }
 }
@@ -336,6 +340,7 @@ impl LiveKitCall {
                 stability: options.stability.clone(),
                 own_reconnect_budget: None,
                 sfu_fallback: options.sfu_fallback,
+                allow_livekit_get_token: options.allow_livekit_get_token,
             },
         )
         .await;

@@ -18,7 +18,8 @@ Please see LICENSE in the repository root for full details.
  *   every change, plus timeline events and redactions as they arrive;
  *   `subscribeToDevice` delivers decrypted to-device messages with their Olm
  *   decryption metadata and MSC4153 cross-signing status; `relations`,
- *   `getOpenIdToken`, `getLivekitToken` and `rtcTransports` answer on request.
+ *   `getOpenIdToken`, `getLivekitToken`, `rtcTransports` and `unstableFeatures`
+ *   answer on request.
  * The library parses every MatrixRTC content and applies the compatibility
  * dialects itself; this file hands events over verbatim.
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
@@ -202,11 +203,10 @@ export class MatrixHost {
   }
 
   /**
-   * The homeserver's `unstable_features` that are on, for the library's
-   * `mscSupport` (spec 038 R45). Not part of the backend contract: the page
-   * calls it.
+   * The homeserver's `unstable_features` that are on: what the library reads
+   * at join (spec 049), and what the page hands `mscSupport` (spec 038 R45).
    */
-  async serverFeatures() {
+  async unstableFeatures() {
     const versions = await this.client.getVersions();
     return Object.entries(versions.unstable_features ?? {})
       .filter(([, on]) => on === true)

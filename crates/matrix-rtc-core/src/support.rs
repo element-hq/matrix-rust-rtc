@@ -21,6 +21,9 @@ const MATRIX_RTC_FEATURES: [&str; 2] = ["org.matrix.msc4143", "org.matrix.msc414
 const STICKY_EVENTS_FEATURE: &str = "org.matrix.msc4354";
 /// Delayed events (MSC4140), which carry the delayed leave.
 const DELAYED_EVENTS_FEATURE: &str = "org.matrix.msc4140";
+/// MSC4195's `get_token` is stable on this homeserver: what the LiveKit
+/// transition checks before taking a token from it (spec 049 R8, R13).
+const LIVEKIT_GET_TOKEN_STABLE_FEATURE: &str = "org.matrix.msc4195.stable";
 
 /// One thing the MSC format relies on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,6 +88,33 @@ pub fn msc_support(server_features: &[String], rtc_transports: &Value) -> MscSup
     support
 }
 
+/// TEMPORARY (spec 049): which LiveKit token flows a joined call may use on
+/// transports announcing both `url` and `livekit_service_url`, read once at
+/// join (R12). The default keeps every such transport on `/sfu/get`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveKitFlows {
+    /// Our homeserver's `get_token` is stable: peers are subscribed through it
+    /// (R13).
+    pub subscribe_get_token: bool,
+    /// We publish through `get_token` too: the local flag is on and the
+    /// homeserver's `get_token` is stable (R8).
+    pub publish_get_token: bool,
+}
+
+impl LiveKitFlows {
+    /// From `server_features` (the `unstable_features` of `/versions` that are
+    /// on, as [`msc_support`] takes them) and the local flag.
+    pub fn new(server_features: &[String], allow_get_token: bool) -> Self {
+        let stable = server_features
+            .iter()
+            .any(|feature| feature == LIVEKIT_GET_TOKEN_STABLE_FEATURE);
+        Self {
+            subscribe_get_token: stable,
+            publish_get_token: stable && allow_get_token,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -125,6 +155,30 @@ mod tests {
         );
         assert_eq!(support.warnings, [MscRequirement::DelayedEvents]);
         assert!(!support.is_supported());
+    }
+
+    #[test]
+    fn get_token_needs_the_stable_feature_and_publishing_needs_the_flag() {
+        let stable = features(&["org.matrix.msc4195.stable"]);
+        assert_eq!(LiveKitFlows::new(&[], true), LiveKitFlows::default());
+        assert_eq!(
+            LiveKitFlows::new(&features(&["org.matrix.msc4195"]), true),
+            LiveKitFlows::default()
+        );
+        assert_eq!(
+            LiveKitFlows::new(&stable, false),
+            LiveKitFlows {
+                subscribe_get_token: true,
+                publish_get_token: false,
+            }
+        );
+        assert_eq!(
+            LiveKitFlows::new(&stable, true),
+            LiveKitFlows {
+                subscribe_get_token: true,
+                publish_get_token: true,
+            }
+        );
     }
 
     /// Delayed events only warn: R43 bounds a crash without them.

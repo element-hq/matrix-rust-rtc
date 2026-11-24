@@ -19,6 +19,7 @@ use js_sys::{Function, Reflect};
 use matrix_rtc_call_sdk::{
     AttachOptions, CallEngine, CallEvent, ConnectionState, FrameEncryptionDiagnostic,
     Interruptions, MediaAttachment, Participant, StabilityConfig, UnableToDecrypt, attach_media,
+    livekit_flows,
 };
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentity, RtcIdentityMapper};
@@ -58,6 +59,11 @@ struct WasmMediaSessionConfig {
     /// (034 R24); omitted takes 60 000.
     #[serde(default)]
     own_reconnect_budget_ms: Option<u64>,
+    /// TEMPORARY (spec 049): publish through the homeserver's `get_token`
+    /// when our transport names both flows and the homeserver announces it
+    /// stable. Omitted is off.
+    #[serde(default)]
+    allow_livekit_get_token: Option<bool>,
 }
 
 /// The tile-order damping a page can set (R10, R11). A product decision
@@ -115,7 +121,8 @@ impl WasmRtcCall {
     /// the own-focus livekit-js room. The `member.id` comes from the join —
     /// the page neither chooses nor passes it.
     ///
-    /// `config` is `{ format?, stability?, own_reconnect_budget_ms? }`, and may be
+    /// `config` is `{ format?, stability?, own_reconnect_budget_ms?,
+    /// allow_livekit_get_token? }`, and may be
     /// omitted; the focus is the one the join publishes on, none for a
     /// receive-only call;
     /// `delegate` is the object driving livekit-js (see the module docs of
@@ -179,6 +186,11 @@ impl WasmRtcCall {
             delegate.clone(),
             backend.clone(),
             mapper.clone(),
+            livekit_flows(
+                backend.as_ref(),
+                config.allow_livekit_get_token.unwrap_or(false),
+            )
+            .await,
         ));
         let memberships = self.inner().subscribe_memberships().await;
         let MediaAttachment {

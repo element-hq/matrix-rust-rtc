@@ -13,7 +13,8 @@ use matrix_rtc_call::{
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     EventEncryption, EventIn, IdentitySubject, JoinedMembership, KEY_MESSAGE_TYPE,
-    LeaveSessionParams, RoomOptions, RtcIdentity, RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
+    LeaveSessionParams, LiveKitFlows, RoomOptions, RtcIdentity, RtcTransport, SLOT_EVENT_TYPE,
+    ToDeviceMessageIn,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -134,6 +135,8 @@ impl TransportConnection for FakeConnection {
 #[derive(Default)]
 struct FakeTransport {
     own: Arc<OwnFocus>,
+    /// Our identity as the transport's flow mints it, over the mapper's.
+    flow_identity: Option<String>,
 }
 
 impl FakeTransport {
@@ -196,6 +199,10 @@ impl MediaTransport for FakeTransport {
 #[async_trait]
 impl OwnFocusTransport for FakeTransport {
     type Connection = FakeConnection;
+
+    fn own_identity(&self, _connection_key: &str, _member: &OwnMemberClaims) -> Option<String> {
+        self.flow_identity.clone()
+    }
 
     async fn connect_own(
         &self,
@@ -376,6 +383,48 @@ async fn our_sender_adopts_the_key_index_we_are_already_on() {
         *connection.local_key_indexes.lock().unwrap(),
         [own.key_index]
     );
+}
+
+/// Spec 049 R9: the flow we publish through decides our identity, and our key
+/// is filed under it.
+#[tokio::test]
+async fn our_identity_and_key_follow_the_flow_we_publish_through() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let handler = Arc::new(MediaKeyHandler::new());
+    let transport = FakeTransport {
+        flow_identity: Some("hashed-us".to_owned()),
+        ..FakeTransport::default()
+    };
+
+    let attached = attach_media(&call, Arc::new(transport), handler.clone(), options(&mock))
+        .await
+        .expect("attaches");
+
+    assert_eq!(attached.own_identity, "hashed-us");
+    assert!(
+        handler.key_for("hashed-us").is_some(),
+        "our key is under it"
+    );
+}
+
+/// Spec 049 R8, R13: the flag decides publishing only; the homeserver's
+/// `/versions` decides both.
+#[tokio::test]
+async fn the_livekit_flows_come_from_the_flag_and_the_homeserver() {
+    let mock = mock();
+    assert_eq!(
+        livekit_flows(mock.as_ref(), true).await,
+        LiveKitFlows::default()
+    );
+
+    *mock.unstable_features.lock().unwrap() = vec!["org.matrix.msc4195.stable".to_owned()];
+    let off = livekit_flows(mock.as_ref(), false).await;
+    assert!(off.subscribe_get_token && !off.publish_get_token);
+    let on = livekit_flows(mock.as_ref(), true).await;
+    assert!(on.subscribe_get_token && on.publish_get_token);
 }
 
 #[tokio::test]

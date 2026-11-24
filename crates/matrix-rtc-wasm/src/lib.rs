@@ -120,7 +120,7 @@ impl WasmRtcClient {
     /// R45), as `{ missing, warnings }`, each a list of `"matrix_rtc"`,
     /// `"sticky_events"`, `"delayed_events"` or `"livekit_transport"`.
     /// `serverFeatures` are the `unstable_features` of `/versions` that are
-    /// on (the host's `serverFeatures()`); the transports are asked of the
+    /// on (the host's `unstableFeatures()`); the transports are asked of the
     /// host. Never picks the format.
     #[wasm_bindgen(js_name = mscSupport, unchecked_return_type = "MscSupport")]
     pub async fn msc_support(&self, server_features: Vec<String>) -> Result<JsValue, JsError> {

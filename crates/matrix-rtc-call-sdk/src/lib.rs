@@ -37,7 +37,7 @@ pub mod livekit;
 pub mod participant;
 pub mod tile;
 
-pub use attach::{AttachError, AttachOptions, MediaAttachment, attach_media};
+pub use attach::{AttachError, AttachOptions, MediaAttachment, attach_media, livekit_flows};
 pub use engine::{CallEngine, EngineConfig, EngineHandle, KEY_GRACE, StabilityConfig};
 pub use event::{CallEvent, FrameEncryptionDiagnostic};
 pub use interruptions::Interruptions;

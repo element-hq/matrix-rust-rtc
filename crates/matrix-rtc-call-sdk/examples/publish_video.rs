@@ -68,6 +68,7 @@ async fn run_call(
             stability: Default::default(),
             own_reconnect_budget: None,
             sfu_fallback: false,
+            allow_livekit_get_token: false,
         },
     )
     .await?
