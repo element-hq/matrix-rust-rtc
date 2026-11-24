@@ -820,9 +820,10 @@ impl MediaPool {
             return;
         };
         log::debug!(
-            "member {} ({}) maps to transport identity {rtc_identity:?}",
+            "member {} ({}, origin {:?}) maps to transport identity {rtc_identity:?}",
             member.member_id,
             member.sender,
+            member.origin,
         );
         self.member_identities
             .insert(member.member_id.clone(), rtc_identity.clone());
