@@ -1242,7 +1242,6 @@ mod tests {
             reactions: None,
             intent: None,
             allow_livekit_get_token: false,
-            server_features: Vec::new(),
         }
     }
 

@@ -193,8 +193,6 @@ pub struct LiveKitCallOptions {
     pub sfu_fallback: bool,
     /// TEMPORARY (spec 049): see `JoinOptions::allow_livekit_get_token`.
     pub allow_livekit_get_token: bool,
-    /// TEMPORARY (spec 049): see `JoinOptions::server_features`.
-    pub server_features: Vec<String>,
 }
 
 impl Default for LiveKitCallOptions {
@@ -215,7 +213,6 @@ impl Default for LiveKitCallOptions {
             stability: StabilityConfig::default(),
             sfu_fallback: false,
             allow_livekit_get_token: false,
-            server_features: Vec::new(),
         }
     }
 }
@@ -314,7 +311,6 @@ impl LiveKitCall {
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
         join.keep_alive_interval_ms = options.keep_alive_interval_ms;
         join.allow_livekit_get_token = options.allow_livekit_get_token;
-        join.server_features = options.server_features.clone();
         let call = Arc::new(
             room.join_call(CallJoinOptions {
                 join,

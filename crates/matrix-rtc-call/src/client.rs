@@ -109,14 +109,10 @@ pub struct JoinOptions {
     pub degraded_lifetime_ms: Option<u64>,
     /// TEMPORARY (spec 049): lets us publish through the homeserver's
     /// `get_token` on a transport announcing both `url` and
-    /// `livekit_service_url`, when [`Self::server_features`] say it is stable.
-    /// Read once, here (R12). Defaults to `false`: `/sfu/get`.
+    /// `livekit_service_url`, when the homeserver's `/versions` announces
+    /// `org.matrix.msc4195.stable`. Read once, at join (R12). Defaults to
+    /// `false`: `/sfu/get`.
     pub allow_livekit_get_token: bool,
-    /// TEMPORARY (spec 049): the `unstable_features` of our homeserver's
-    /// `/versions` that are on, as `RtcClient::msc_support` takes them. Only
-    /// `org.matrix.msc4195.stable` is read; empty keeps every LiveKit token
-    /// on `/sfu/get` where a transport still names it.
-    pub server_features: Vec<String>,
 }
 
 impl JoinOptions {
@@ -134,7 +130,6 @@ impl JoinOptions {
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             allow_livekit_get_token: false,
-            server_features: Vec::new(),
         }
     }
 
@@ -175,15 +170,9 @@ impl JoinOptions {
     }
 
     /// See [`Self::allow_livekit_get_token`](JoinOptions#structfield.allow_livekit_get_token).
-    pub fn livekit_get_token(mut self, allow: bool, server_features: Vec<String>) -> Self {
+    pub fn allow_livekit_get_token(mut self, allow: bool) -> Self {
         self.allow_livekit_get_token = allow;
-        self.server_features = server_features;
         self
-    }
-
-    /// The LiveKit token flows this join settles on (spec 049).
-    fn livekit_flows(&self) -> LiveKitFlows {
-        LiveKitFlows::new(&self.server_features, self.allow_livekit_get_token)
     }
 }
 
@@ -451,7 +440,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let deadline = executor::Instant::now() + JOIN_BUDGET;
         let slot_id = options.slot_id.clone();
         let transport = self.transport(options.transport.clone(), deadline).await?;
-        let livekit_flows = options.livekit_flows();
+        let livekit_flows = self.livekit_flows(options.allow_livekit_get_token).await;
         let mut state = self.state.lock().await;
         let params = self
             .prepare_join(&mut state, options, transport.clone())
@@ -494,7 +483,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone(), deadline).await?;
-        let livekit_flows = join.livekit_flows();
+        let livekit_flows = self.livekit_flows(join.allow_livekit_get_token).await;
         let mut state = self.state.lock().await;
         let rtc = self
             .prepare_join(&mut state, join, transport.clone())
@@ -618,7 +607,6 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             degraded_lifetime_ms,
             // Settled by the caller, into the session.
             allow_livekit_get_token: _,
-            server_features: _,
         } = options;
 
         // Before anything below acts on the slot: MSC4143's grammar, and the
@@ -681,6 +669,22 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// core's, stopped when the session object goes; `auto_leaves` is the
     /// core's announcement of the leaves it makes on its own, subscribed under
     /// the same lock as the join so none can slip past.
+    /// TEMPORARY (spec 049): the LiveKit token flows a join settles on, from
+    /// the local flag and the homeserver's `/versions`. A `/versions` that
+    /// fails keeps every LiveKit token on `/sfu/get` where a transport still
+    /// names it: never a reason to fail the join.
+    async fn livekit_flows(&self, allow_get_token: bool) -> LiveKitFlows {
+        let features = self
+            .backend
+            .unstable_features()
+            .await
+            .inspect_err(|error| {
+                log::warn!("reading the homeserver's unstable features failed: {error}");
+            })
+            .unwrap_or_default();
+        LiveKitFlows::new(&features, allow_get_token)
+    }
+
     fn session(
         &self,
         slot_id: String,

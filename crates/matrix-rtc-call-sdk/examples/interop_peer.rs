@@ -54,7 +54,6 @@
 //! | `LIVEKIT_SERVICE_URL` | unset — only a fallback when the homeserver advertises no focus |
 //! | `LIVEKIT_SFU_URL` | unset — with `LIVEKIT_SERVICE_URL`, publish a transport naming both flows (spec 049; the MSC format reads only `url`) |
 //! | `LIVEKIT_GET_TOKEN` | unset — the local flag allowing `get_token` for our own join (spec 049) |
-//! | `MSC4195_STABLE` | unset — add `org.matrix.msc4195.stable` to the homeserver's `/versions`, which no homeserver announces yet (spec 049) |
 //! | `RECORD_SECS` | `3` |
 //! | `OUT_WAV` | unset — when set, the recorded peer audio is written there |
 //! | `MX_USER` / `MX_PASSWORD` | unset — register a throwaway user instead |
@@ -190,7 +189,6 @@ struct Config {
     livekit_service_url: Option<String>,
     livekit_sfu_url: Option<String>,
     livekit_get_token: bool,
-    msc4195_stable: bool,
     display_name: String,
     room_name: String,
     invite_user: String,
@@ -214,7 +212,6 @@ impl Config {
             livekit_service_url: env::var("LIVEKIT_SERVICE_URL").ok(),
             livekit_sfu_url: env::var("LIVEKIT_SFU_URL").ok(),
             livekit_get_token: env::var("LIVEKIT_GET_TOKEN").is_ok(),
-            msc4195_stable: env::var("MSC4195_STABLE").is_ok(),
             display_name: env::var("DISPLAY_NAME").unwrap_or_else(|_| "Rust Peer".to_owned()),
             room_name: env::var("ROOM_NAME").unwrap_or_else(|_| "Interop Call".to_owned()),
             invite_user: env::var("INVITE_USER")
@@ -597,16 +594,6 @@ async fn join_call(
             .filter(|_| cfg.compat == MembershipFormat::RoomState)
             .map(LiveKitTransport::service),
     };
-    let mut server_features: Vec<String> = client
-        .unstable_features()
-        .await?
-        .into_iter()
-        .map(|feature| feature.to_string())
-        .collect();
-    // TEMPORARY (spec 049): no homeserver announces it yet.
-    if cfg.msc4195_stable {
-        server_features.push("org.matrix.msc4195.stable".to_owned());
-    }
     let call = LiveKitCall::join(
         room,
         LiveKitCallOptions {
@@ -615,7 +602,6 @@ async fn join_call(
             http: Some(http.clone()),
             format: cfg.compat,
             allow_livekit_get_token: cfg.livekit_get_token,
-            server_features,
             ..LiveKitCallOptions::default()
         },
     )

@@ -225,7 +225,7 @@ describe('MatrixHost server features', () => {
           }),
       },
     });
-    expect(await host.serverFeatures()).toEqual(['org.matrix.msc4143']);
+    expect(await host.unstableFeatures()).toEqual(['org.matrix.msc4143']);
   });
 });
 

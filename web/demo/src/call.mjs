@@ -130,7 +130,7 @@ export class WebPeerApp {
    * Join the RTC slot and attach media: feed the room, publish the
    * membership, connect the SFU through the engine, publish tracks.
    */
-  async join({ roomId, compat, publish = {}, transport, livekitGetToken = false, msc4195Stable = false }) {
+  async join({ roomId, compat, publish = {}, transport, livekitGetToken = false }) {
     const focusUrl = await this.host.discoverFocus();
     this.roomId = roomId;
     this.slotId = DEFAULT_SLOT_ID;
@@ -151,14 +151,8 @@ export class WebPeerApp {
       transport:
         transport ??
         (compat === 'msc' ? undefined : { kind: 'publish', livekit_service_url: focusUrl }),
-      // TEMPORARY (spec 049): the local flag, and `/versions` with
-      // `org.matrix.msc4195.stable`, which no homeserver announces yet, added
-      // when the driver vouches for it.
+      // TEMPORARY (spec 049): the local flag.
       allow_livekit_get_token: livekitGetToken,
-      server_features: [
-        ...(await this.serverFeatures()),
-        ...(msc4195Stable ? ['org.matrix.msc4195.stable'] : []),
-      ],
     });
     const memberId = this.rtcCall.memberId;
     this.memberId = memberId;
@@ -178,14 +172,6 @@ export class WebPeerApp {
 
     await this.publishMedia(publish);
     this.emit({ event: 'joined', member_id: memberId, identity: this.call.session.ownRtcIdentity() });
-  }
-
-  /** The `unstable_features` of `/versions` that are on. */
-  async serverFeatures() {
-    const versions = await this.client.getVersions();
-    return Object.entries(versions.unstable_features ?? {})
-      .filter(([, on]) => on)
-      .map(([feature]) => feature);
   }
 
   /** Publish into the own-focus room: synthetic tracks, or the real devices. */

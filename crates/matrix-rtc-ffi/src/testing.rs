@@ -628,6 +628,10 @@ impl MatrixBackend for ScriptedMatrixBackend {
             .map(|transports| transports.to_string())
             .map_err(backend_failure)
     }
+
+    async fn unstable_features(&self) -> Result<Vec<String>, FfiBackendError> {
+        self.mock.unstable_features().await.map_err(backend_failure)
+    }
 }
 
 /// A media transport whose SFUs a test scripts: no media flows, but every
@@ -850,7 +854,6 @@ mod tests {
                     reactions: None,
                     intent: None,
                     allow_livekit_get_token: false,
-                    server_features: Vec::new(),
                 })
                 .await
                 .expect("joins");

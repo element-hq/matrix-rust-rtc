@@ -120,7 +120,7 @@ impl WasmRtcClient {
     /// R45), as `{ missing, warnings }`, each a list of `"matrix_rtc"`,
     /// `"sticky_events"`, `"delayed_events"` or `"livekit_transport"`.
     /// `serverFeatures` are the `unstable_features` of `/versions` that are
-    /// on (the host's `serverFeatures()`); the transports are asked of the
+    /// on (the host's `unstableFeatures()`); the transports are asked of the
     /// host. Never picks the format.
     #[wasm_bindgen(js_name = mscSupport, unchecked_return_type = "MscSupport")]
     pub async fn msc_support(&self, server_features: Vec<String>) -> Result<JsValue, JsError> {
@@ -250,8 +250,7 @@ impl WasmRtcRoom {
     ///   - `encryption_config`, `notify`, `reactions`
     ///   - `intent`: `"audio"` or `"video"`, the user's explicit choice, which
     ///     wins over a call in progress; omitted follows the call
-    ///   - `allow_livekit_get_token`, `server_features`: temporary (spec 049),
-    ///     see `JoinParamsIn`
+    ///   - `allow_livekit_get_token`: temporary (spec 049), see `JoinParamsIn`
     ///
     /// The call keeps itself alive, and performs its key rotations when they
     /// fall due, until it leaves or is freed. The SDK generates the
@@ -601,14 +600,11 @@ pub struct WasmJoinSessionParams {
     #[serde(default)]
     pub intent: Option<String>,
     /// TEMPORARY (spec 049): publish through the homeserver's `get_token`
-    /// rather than `/sfu/get` when our transport names both, if
-    /// `server_features` say it is stable. Read once, at join.
+    /// rather than `/sfu/get` when our transport names both, if the host's
+    /// `unstableFeatures` announces `org.matrix.msc4195.stable`. Read once,
+    /// at join.
     #[serde(default)]
     pub allow_livekit_get_token: Option<bool>,
-    /// TEMPORARY (spec 049): the `unstable_features` of our homeserver's
-    /// `/versions` that are on, as `mscSupport` takes them.
-    #[serde(default)]
-    pub server_features: Option<Vec<String>>,
 }
 
 /// `"audio"` or `"video"`, or an error naming what was passed.
@@ -749,7 +745,6 @@ impl WasmJoinSessionParams {
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
         join.allow_livekit_get_token = self.allow_livekit_get_token.unwrap_or(false);
-        join.server_features = self.server_features.unwrap_or_default();
         options.kind = CallKind::Group {
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         };

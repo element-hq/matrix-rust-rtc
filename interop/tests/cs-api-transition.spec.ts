@@ -58,7 +58,6 @@ for (const flags of SCENARIOS) {
       ROOM_NAME: `CS API transition ${Date.now().toString(16)}`,
       LIVEKIT_SFU_URL: SFU_URL,
       LIVEKIT_SERVICE_URL: SERVICE_URL,
-      MSC4195_STABLE: "1",
       ...(flags.rust ? { LIVEKIT_GET_TOKEN: "1" } : {}),
       OUT_WAV: testInfo.outputPath("web-peer-audio.wav"),
       RUST_LOG:
@@ -82,7 +81,6 @@ for (const flags of SCENARIOS) {
         compat: "room_state",
         transport: { kind: "publish", url: SFU_URL, livekit_service_url: SERVICE_URL },
         livekitGetToken: flags.web,
-        msc4195Stable: true,
         publish: { pattern: true, tone: true },
       });
       const webIdentity = (await web.waitFor("joined", { timeout: 120_000 }))
