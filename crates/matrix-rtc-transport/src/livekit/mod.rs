@@ -18,11 +18,13 @@
 
 pub mod identity;
 pub mod token;
+pub mod transition;
 
 pub use token::{SfuToken, TokenServiceError};
 
 use matrix_rtc_core::{
-    IdentitySubject, LiveKitAuthFlow, LiveKitTransport, RtcIdentityMapper, RtcTransport,
+    IdentitySubject, LiveKitAuthFlow, LiveKitTransport, RtcIdentity, RtcIdentityMapper,
+    RtcTransport,
 };
 use serde::{Deserialize, Serialize};
 
@@ -45,18 +47,22 @@ pub fn identity_mapper() -> RtcIdentityMapper {
 
 /// The identity a member holds on the SFU it publishes on: the one minted by
 /// the token flow its first LiveKit transport selects (the transport the pool
-/// subscribes to). `None` when it publishes no LiveKit transport, or when
-/// `/sfu/get` minted it and its device cannot be attributed.
-pub fn identity_for(subject: &IdentitySubject<'_>) -> Option<String> {
+/// subscribes to), or either of two while that transport names both flows
+/// ([`transition::identity_for_both`]). `None` when it publishes no LiveKit
+/// transport, or when `/sfu/get` minted it and its device cannot be
+/// attributed.
+pub fn identity_for(subject: &IdentitySubject<'_>) -> Option<RtcIdentity> {
     let livekit = first_livekit(subject.transports)?;
+    if let Some(both) = transition::identity_for_both(livekit, subject) {
+        return Some(both);
+    }
     match livekit.auth_flow() {
         LiveKitAuthFlow::SfuGet { .. } => subject
             .device_id
-            .map(|device_id| identity::legacy_identity(subject.user_id, device_id)),
-        LiveKitAuthFlow::CsApi { .. } => Some(identity::msc4195_identity(
-            subject.user_id,
-            subject.member_id,
-        )),
+            .map(|device_id| identity::legacy_identity(subject.user_id, device_id).into()),
+        LiveKitAuthFlow::CsApi { .. } => {
+            Some(identity::msc4195_identity(subject.user_id, subject.member_id).into())
+        }
     }
 }
 

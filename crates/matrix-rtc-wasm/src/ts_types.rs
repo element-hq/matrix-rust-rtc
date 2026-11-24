@@ -163,8 +163,10 @@ export interface RtcParticipant {
     connection: RtcConnectionState;
     /** Why their media cannot be shown, or null; always null for our own entry. Draw the avatar when set or not connected. */
     unable_to_decrypt: RtcUnableToDecrypt | null;
-    /** The livekit-js participant identity — the join key for `room.getParticipantByIdentity()`. */
+    /** The livekit-js participant identity — the join key for `room.getParticipantByIdentity()`. The first of `rtc_identities`. */
     rtc_identity: string | null;
+    /** Every identity the participant may hold on the SFU: two while their transport names both token flows (temporary, spec 049). Join on whichever the room has. */
+    rtc_identities: string[];
     streams: { kind: RtcStreamKind; muted: boolean }[];
     /** When the participant raised their hand (ms since the epoch); `null` while it is down. */
     hand_raised_at_ms: number | null;

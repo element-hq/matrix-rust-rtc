@@ -27,7 +27,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use matrix_rtc_core::{JoinedMembership, MaybeSend, RtcTransport};
+use matrix_rtc_core::{JoinedMembership, MaybeSend, RtcIdentity, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::constraints::ResolvedConstraints;
@@ -317,11 +317,11 @@ pub trait MediaTransport: MaybeSend {
         true
     }
 
-    /// The identity this member will have on the media plane, used to
-    /// reverse-map transport participants to memberships. `None` when the
-    /// membership lacks what the derivation needs (e.g. no attributable
+    /// The identity, or identities, this member may have on the media plane,
+    /// used to reverse-map transport participants to memberships. `None` when
+    /// the membership lacks what the derivation needs (e.g. no attributable
     /// sending device).
-    fn remote_identity(&self, member: &JoinedMembership) -> Option<String>;
+    fn remote_identity(&self, member: &JoinedMembership) -> Option<RtcIdentity>;
 
     /// Open the connection for `connection_key` and start translating its
     /// state into [`ConnectionEvent`]s. The returned receiver ends (after a

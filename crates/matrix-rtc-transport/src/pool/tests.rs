@@ -63,8 +63,16 @@ impl MediaTransport for FakeTransport {
         }
     }
 
-    fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        Some(format!("id-{}", member.member_id))
+    fn remote_identity(&self, member: &JoinedMembership) -> Option<matrix_rtc_core::RtcIdentity> {
+        // A member whose id starts with `both-` stands for one publishing both
+        // token flows (spec 049): `h-…` or `id-…` on the SFU.
+        if member.member_id.starts_with("both-") {
+            return Some(matrix_rtc_core::RtcIdentity::Transition {
+                hashed: format!("h-{}", member.member_id),
+                legacy: format!("id-{}", member.member_id),
+            });
+        }
+        Some(format!("id-{}", member.member_id).into())
     }
 
     async fn connect(&self, connection_key: &str, _ctx: &ConnectionContext) -> ConnectOutcome {
@@ -1730,4 +1738,83 @@ async fn a_peer_connection_is_told_whom_to_receive_once_up() {
     tokio::time::sleep(Duration::from_secs(30)).await;
     fx.drain().await;
     assert_eq!(fx.wanted(PEER_FOCUS), Some(vec!["id-carol".to_owned()]));
+}
+
+// Spec 049 R3, R5: a member publishing both token flows is found, and its
+// keys reported, under whichever identity it turns up with.
+#[tokio::test]
+async fn a_member_naming_both_flows_is_found_under_either_identity() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+
+    own.send(track_added("h-both-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+    assert!(fx.pool.key_imported("h-both-bob".into(), 0).is_empty());
+
+    let events = fx.pool.apply_snapshot(&[member_on("both-bob", OWN_FOCUS)]);
+    assert_eq!(
+        events,
+        vec![
+            PoolEvent::StreamAdded {
+                member_id: "both-bob".into(),
+                kind: MediaStreamKind::Microphone,
+            },
+            PoolEvent::KeyImported {
+                member_id: "both-bob".into(),
+                identity: "h-both-bob".into(),
+                key_index: 0,
+            },
+        ]
+    );
+    assert_eq!(
+        fx.pool.key_imported("id-both-bob".into(), 1),
+        vec![PoolEvent::KeyImported {
+            member_id: "both-bob".into(),
+            identity: "id-both-bob".into(),
+            key_index: 1,
+        }]
+    );
+    let mut wanted = fx.wanted(OWN_FOCUS).unwrap_or_default();
+    wanted.sort();
+    assert_eq!(wanted, ["h-both-bob", "id-both-bob"]);
+}
+
+// Spec 049 R4: present under both identities at once, the member is one
+// member, and one identity leaving does not take the other's media.
+#[tokio::test]
+async fn a_member_present_under_both_identities_keeps_the_other_s_media() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("both-bob", OWN_FOCUS)]);
+
+    own.send(track_added("id-both-bob", MediaStreamKind::Camera))
+        .unwrap();
+    own.send(track_added("h-both-bob", MediaStreamKind::Microphone))
+        .unwrap();
+    fx.drain().await;
+    let tracks = fx.pool.remote_tracks();
+    assert!(tracks.get("both-bob", MediaStreamKind::Camera).is_some());
+    assert!(
+        tracks
+            .get("both-bob", MediaStreamKind::Microphone)
+            .is_some()
+    );
+
+    // The legacy identity's camera is replaced by the hashed one's, then the
+    // legacy identity drops its camera: the hashed one's stays.
+    own.send(track_added("h-both-bob", MediaStreamKind::Camera))
+        .unwrap();
+    own.send(ConnectionEvent::TrackRemoved {
+        identity: "id-both-bob".into(),
+        kind: MediaStreamKind::Camera,
+    })
+    .unwrap();
+    fx.drain().await;
+    assert!(
+        fx.pool
+            .remote_tracks()
+            .get("both-bob", MediaStreamKind::Camera)
+            .is_some()
+    );
 }

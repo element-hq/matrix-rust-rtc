@@ -51,7 +51,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::sync::watch;
 
 use matrix_rtc_core::MatrixBackend;
-use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper, RtcTransport};
+use matrix_rtc_core::{
+    IdentitySubject, JoinedMembership, RtcIdentity, RtcIdentityMapper, RtcTransport,
+};
 use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
@@ -223,7 +225,7 @@ impl MediaTransport for LiveKitMediaTransport {
         }
     }
 
-    fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
+    fn remote_identity(&self, member: &JoinedMembership) -> Option<RtcIdentity> {
         // Through the mapper rather than a derivation of its own, so peers'
         // identities are derived exactly as the core addresses their keys.
         (self.identity_mapper)(&IdentitySubject {

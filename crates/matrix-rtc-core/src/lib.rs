@@ -17,6 +17,7 @@ mod error;
 pub mod executor;
 pub mod feeder;
 mod host;
+mod identity;
 mod join;
 mod maybe_send;
 mod membership_listener;
@@ -54,6 +55,7 @@ pub use host::event::{
     EventConversionError, EventOrigin, RawStickyEvent, RawStickyEventContent, RawStickyEventUpdate,
     RawTimelineEvent, RelationsRequest, StickyEventsUpdate,
 };
+pub use identity::RtcIdentity;
 pub use join::{
     DEFAULT_JOIN_BUDGET_MS, DEFAULT_KEEP_ALIVE_INTERVAL_MS, DEFAULT_KEEP_ALIVE_TIMEOUT_MS,
     JoinSessionParams, LeaveSessionParams, ROOM_APPLICATION_SLOT_ID, TransportIntent,
