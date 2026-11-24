@@ -137,36 +137,36 @@ where
         user_id: options.own_user_id.clone(),
         device_id: options.own_device_id.clone(),
     };
-    // Ours from the flow we publish through when the transport knows it,
-    // else as the core derives it for our own key: through the mapper from
-    // the transport we publish on, falling back the same way when nothing is
-    // published.
+    // The one place our identity is decided: the one the flow we publish
+    // through mints, when the transport knows it from our connection key;
+    // else the mapper's for the transport we publish on, when it names one
+    // identity; else `user:device`, as when nothing is published.
     let own_transports = match call.transport() {
         TransportIntent::Publish(published) => std::slice::from_ref(published),
         TransportIntent::ReceiveOnly { .. } => &[],
     };
-    let flow_identity = own_key
+    let own_identity = own_key
         .as_deref()
-        .and_then(|key| transport.own_identity(key, &own_claims));
-    let own_identity = flow_identity.clone().unwrap_or_else(|| {
-        (options.identity_mapper)(&IdentitySubject {
-            user_id: &options.own_user_id,
-            device_id: Some(&options.own_device_id),
-            member_id: &member_id,
-            transports: own_transports,
+        .and_then(|key| transport.own_identity(key, &own_claims))
+        .or_else(|| {
+            match (options.identity_mapper)(&IdentitySubject {
+                user_id: &options.own_user_id,
+                device_id: Some(&options.own_device_id),
+                member_id: &member_id,
+                transports: own_transports,
+            }) {
+                Some(RtcIdentity::Single(identity)) => Some(identity),
+                _ => None,
+            }
         })
-        .map_or_else(
-            || format!("{}:{}", options.own_user_id, options.own_device_id),
-            RtcIdentity::into_own,
-        )
-    });
+        .unwrap_or_else(|| format!("{}:{}", options.own_user_id, options.own_device_id));
 
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
     // peer keys under the raw `member_id` fallback — an identity the SFU never
     // uses, which is indistinguishable from importing nothing. Our own goes
     // with it, so our key is filed under the identity we publish as.
-    call.set_encryption_identity_mapper(options.identity_mapper.clone(), flow_identity)
+    call.set_encryption_identity_mapper(options.identity_mapper.clone(), own_identity.clone())
         .await;
     if !call
         .set_encryption_signal_handler(key_handler.clone())

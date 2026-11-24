@@ -372,15 +372,15 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// Installs the identity mapper used to derive the RTC-backend participant
     /// identity carried in signalled key material (see [`RtcIdentityMapper`]).
     ///
-    /// `own_identity`, when given, is ours, from the token flow the media
-    /// layer chose; `None` derives it through the mapper.
+    /// `own_identity` is ours, from the token flow the media layer chose: the
+    /// mapper only derives peers'.
     ///
     /// Returns `false` if the session has not joined yet. Call after
     /// [`SlotSession::join`].
     pub fn set_encryption_identity_mapper(
         &mut self,
         mapper: RtcIdentityMapper,
-        own_identity: Option<String>,
+        own_identity: String,
     ) -> bool {
         match &mut self.encryption_manager {
             Some(manager) => {

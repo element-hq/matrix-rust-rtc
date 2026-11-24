@@ -1081,7 +1081,7 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     pub async fn set_encryption_identity_mapper(
         &self,
         mapper: RtcIdentityMapper,
-        own_identity: Option<String>,
+        own_identity: String,
     ) -> bool {
         self.is_live()
             && self

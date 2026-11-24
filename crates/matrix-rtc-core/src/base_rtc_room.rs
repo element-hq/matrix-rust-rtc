@@ -555,7 +555,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         &mut self,
         slot_id: &str,
         mapper: RtcIdentityMapper,
-        own_identity: Option<String>,
+        own_identity: String,
     ) -> bool {
         self.sessions
             .get_mut(slot_id)

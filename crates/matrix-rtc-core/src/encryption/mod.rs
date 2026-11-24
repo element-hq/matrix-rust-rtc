@@ -425,7 +425,7 @@ pub struct EncryptionManager<T: MatrixBackend> {
     identity_mapper: Option<RtcIdentityMapper>,
     /// The transports we publish on, from which our own identity derives.
     own_transports: Vec<RtcTransport>,
-    /// Ours as the media layer chose it, over the mapper's.
+    /// Ours, as the media layer chose it; `None` is `user_id:device_id`.
     own_rtc_identity: Option<String>,
 
     /// Track if key distribution is in progress
@@ -710,37 +710,25 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         self.config.manage_media_keys
     }
 
-    /// Sets our identity as the media layer chose it: the one minted by the
-    /// token flow we publish through. `None` derives it through the mapper.
-    pub fn set_own_rtc_identity(&mut self, identity: Option<String>) {
-        self.own_rtc_identity = identity;
+    /// Sets our identity: the one minted by the token flow we publish
+    /// through, which only the media layer knows (`attach_media` sets it).
+    /// The only source of our identity; the mapper is for peers.
+    pub fn set_own_rtc_identity(&mut self, identity: String) {
+        self.own_rtc_identity = Some(identity);
     }
 
-    /// Sets the transports we publish on, from which the mapper derives our
-    /// own identity. Empty for a receive-only participation.
+    /// Sets the transports we publish on, from which our key length follows.
+    /// Empty for a receive-only participation.
     pub fn set_own_transports(&mut self, transports: Vec<RtcTransport>) {
         self.own_transports = transports;
     }
 
-    /// Our RTC backend identity: the mapper's, else `user_id:device_id`.
-    ///
-    /// Always one identity: we know which token flow we use.
+    /// Our RTC backend identity: the one set by
+    /// [`Self::set_own_rtc_identity`], else `user_id:device_id`.
     fn own_rtc_identity(&self) -> String {
-        if let Some(identity) = &self.own_rtc_identity {
-            return identity.clone();
-        }
-        let mapped = self.identity_mapper.as_ref().and_then(|mapper| {
-            mapper(&IdentitySubject {
-                user_id: &self.own_user_id,
-                device_id: Some(&self.own_device_id),
-                member_id: &self.own_member_id,
-                transports: &self.own_transports,
-            })
-        });
-        mapped.map_or_else(
-            || self.get_own_rtc_backend_identity(),
-            RtcIdentity::into_own,
-        )
+        self.own_rtc_identity
+            .clone()
+            .unwrap_or_else(|| self.get_own_rtc_backend_identity())
     }
 
     /// A peer's RTC backend identity: the mapper's, else their `member_id`.
@@ -3071,6 +3059,7 @@ mod tests {
 
     /// The identity is the whole point of the replay: importing a key under one
     /// the transport never uses is indistinguishable from not importing it.
+    /// Peers' come from the mapper; ours is the one the media layer set.
     #[tokio::test]
     async fn replayed_keys_use_the_installed_identity_mapper() {
         let mock_sender = Arc::new(NoopBackend);
@@ -3103,13 +3092,18 @@ mod tests {
                 .into(),
             )
         }));
+        manager.set_own_rtc_identity("ours".to_owned());
 
         manager.replay_keys_to_handler().await;
 
         let identities = handler.identities();
         assert!(
-            identities.contains(&format!("mapped:{USER_ID}/{DEVICE_ID}/{MEMBER_ID}")),
-            "our own key must replay under the mapped identity, got {identities:?}"
+            identities.contains(&"ours".to_owned()),
+            "our own key must replay under the identity set for us, got {identities:?}"
+        );
+        assert!(
+            !identities.contains(&format!("mapped:{USER_ID}/{DEVICE_ID}/{MEMBER_ID}")),
+            "the mapper never derives ours, got {identities:?}"
         );
         assert!(
             identities
@@ -3128,7 +3122,7 @@ mod tests {
     }
 
     /// Spec 049 R5: a peer that may hold either identity gets its key under
-    /// both, live and replayed; our own key goes out under one.
+    /// both, live and replayed; our own key goes out under the one set for us.
     #[tokio::test]
     async fn a_peer_naming_both_flows_gets_its_key_under_both_identities() {
         let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
@@ -3142,6 +3136,7 @@ mod tests {
             get_memberships,
         );
         manager.set_identity_mapper(transition_mapper());
+        manager.set_own_rtc_identity("ours".to_owned());
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
         manager.join().await.expect("join should succeed");
@@ -3167,13 +3162,12 @@ mod tests {
             identities.contains(&format!("legacy:{bob}")),
             "{identities:?}"
         );
+        assert!(identities.contains(&"ours".to_owned()), "{identities:?}");
         assert!(
-            identities.contains(&format!("legacy:{MEMBER_ID}")),
-            "{identities:?}"
-        );
-        assert!(
-            !identities.contains(&format!("hashed:{MEMBER_ID}")),
-            "{identities:?}"
+            !identities
+                .iter()
+                .any(|identity| identity.ends_with(MEMBER_ID)),
+            "the mapper never derives ours: {identities:?}"
         );
     }
 
