@@ -134,6 +134,8 @@ impl TransportConnection for FakeConnection {
 #[derive(Default)]
 struct FakeTransport {
     own: Arc<OwnFocus>,
+    /// Our identity as the transport's flow mints it, over the mapper's.
+    flow_identity: Option<String>,
 }
 
 impl FakeTransport {
@@ -196,6 +198,10 @@ impl MediaTransport for FakeTransport {
 #[async_trait]
 impl OwnFocusTransport for FakeTransport {
     type Connection = FakeConnection;
+
+    fn own_identity(&self, _connection_key: &str, _member: &OwnMemberClaims) -> Option<String> {
+        self.flow_identity.clone()
+    }
 
     async fn connect_own(
         &self,
@@ -375,6 +381,31 @@ async fn our_sender_adopts_the_key_index_we_are_already_on() {
     assert_eq!(
         *connection.local_key_indexes.lock().unwrap(),
         [own.key_index]
+    );
+}
+
+/// Spec 049 R9: the flow we publish through decides our identity, and our key
+/// is filed under it.
+#[tokio::test]
+async fn our_identity_and_key_follow_the_flow_we_publish_through() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let handler = Arc::new(MediaKeyHandler::new());
+    let transport = FakeTransport {
+        flow_identity: Some("hashed-us".to_owned()),
+        ..FakeTransport::default()
+    };
+
+    let attached = attach_media(&call, Arc::new(transport), handler.clone(), options(&mock))
+        .await
+        .expect("attaches");
+
+    assert_eq!(attached.own_identity, "hashed-us");
+    assert!(
+        handler.key_for("hashed-us").is_some(),
+        "our key is under it"
     );
 }
 

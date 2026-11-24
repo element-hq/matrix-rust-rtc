@@ -36,6 +36,10 @@ struct TransportState {
     takeovers: StdMutex<Vec<String>>,
     /// The last wanted set each connection key was handed.
     wanted: StdMutex<HashMap<String, Vec<String>>>,
+    /// Another key for a connection key's members once a subscription on it
+    /// failed, as the LiveKit transport falls back to `/sfu/get` (spec 049).
+    fallbacks: StdMutex<HashMap<String, String>>,
+    failed_over: StdMutex<HashSet<String>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,9 +62,29 @@ impl MediaTransport for FakeTransport {
 
     fn connection_key(&self, transport: &RtcTransport, _publisher_user_id: &str) -> Option<String> {
         match transport {
-            RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(str::to_owned),
+            RtcTransport::LiveKit(livekit) => livekit.livekit_service_url().map(|key| {
+                if self.0.failed_over.lock().unwrap().contains(key) {
+                    self.0.fallbacks.lock().unwrap()[key].clone()
+                } else {
+                    key.to_owned()
+                }
+            }),
             RtcTransport::Unsupported(_) => None,
         }
+    }
+
+    fn subscription_failed(&self, connection_key: &str) -> bool {
+        self.0
+            .fallbacks
+            .lock()
+            .unwrap()
+            .contains_key(connection_key)
+            && self
+                .0
+                .failed_over
+                .lock()
+                .unwrap()
+                .insert(connection_key.to_owned())
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<matrix_rtc_core::RtcIdentity> {
@@ -493,6 +517,32 @@ async fn a_failed_connect_backs_off_and_retries() {
         vec![PoolEvent::Degraded(false), connected(PEER_FOCUS)]
     );
     assert_eq!(fx.connects(PEER_FOCUS), 3);
+}
+
+/// Spec 049 R13: a subscription the transport can take another way moves its
+/// members there at once, and the failed connection is dropped.
+#[tokio::test(start_paused = true)]
+async fn a_failed_subscription_regroups_onto_the_fallback() {
+    const FALLBACK: &str = "https://sfu-b.example.org/sfu-get";
+    let mut fx = Fixture::new();
+    fx.state
+        .fallbacks
+        .lock()
+        .unwrap()
+        .insert(PEER_FOCUS.to_owned(), FALLBACK.to_owned());
+    fx.state.fail_attempts.store(1, Ordering::SeqCst);
+    fx.pool.apply_snapshot(&[member_on("carol", PEER_FOCUS)]);
+    fx.drain().await;
+    assert_eq!(fx.connects(FALLBACK), 1);
+    assert_eq!(
+        fx.pool.member_connection("carol"),
+        Some(ConnectionState::Connected)
+    );
+
+    tokio::time::sleep(IDLE_GRACE * 2).await;
+    fx.drain().await;
+    assert_eq!(fx.connects(PEER_FOCUS), 1);
+    assert!(!fx.pool.pool.contains_key(PEER_FOCUS));
 }
 
 #[tokio::test(start_paused = true)]

@@ -104,7 +104,7 @@ where
     let own_key = match call.transport() {
         TransportIntent::Publish(published) => Some(
             transport
-                .connection_key(published, &options.own_user_id)
+                .own_connection_key(published, &options.own_user_id)
                 .ok_or_else(|| {
                     AttachError::UnsupportedTransport(format!(
                         "the call publishes on {published:?}, which is not a {} transport",
@@ -132,11 +132,41 @@ where
     let signalling = call.subscribe_signalling_health().await;
     let own_membership_lapsed = call.subscribe_own_membership_lapsed().await;
 
+    let own_claims = OwnMemberClaims {
+        member_id: member_id.clone(),
+        user_id: options.own_user_id.clone(),
+        device_id: options.own_device_id.clone(),
+    };
+    // Ours from the flow we publish through when the transport knows it,
+    // else as the core derives it for our own key: through the mapper from
+    // the transport we publish on, falling back the same way when nothing is
+    // published.
+    let own_transports = match call.transport() {
+        TransportIntent::Publish(published) => std::slice::from_ref(published),
+        TransportIntent::ReceiveOnly { .. } => &[],
+    };
+    let flow_identity = own_key
+        .as_deref()
+        .and_then(|key| transport.own_identity(key, &own_claims));
+    let own_identity = flow_identity.clone().unwrap_or_else(|| {
+        (options.identity_mapper)(&IdentitySubject {
+            user_id: &options.own_user_id,
+            device_id: Some(&options.own_device_id),
+            member_id: &member_id,
+            transports: own_transports,
+        })
+        .map_or_else(
+            || format!("{}:{}", options.own_user_id, options.own_device_id),
+            RtcIdentity::into_own,
+        )
+    });
+
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
     // peer keys under the raw `member_id` fallback — an identity the SFU never
-    // uses, which is indistinguishable from importing nothing.
-    call.set_encryption_identity_mapper(options.identity_mapper.clone(), None)
+    // uses, which is indistinguishable from importing nothing. Our own goes
+    // with it, so our key is filed under the identity we publish as.
+    call.set_encryption_identity_mapper(options.identity_mapper.clone(), flow_identity)
         .await;
     if !call
         .set_encryption_signal_handler(key_handler.clone())
@@ -150,11 +180,7 @@ where
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
         slot_id: call.format().token_slot_id(&slot_id).into_owned(),
-        member: OwnMemberClaims {
-            member_id: member_id.clone(),
-            user_id: options.own_user_id.clone(),
-            device_id: options.own_device_id.clone(),
-        },
+        member: own_claims,
         e2ee: call.encrypts_media().await,
     };
     let pooled: Arc<dyn MediaTransport> = transport.clone();
@@ -204,22 +230,6 @@ where
         );
     }
 
-    // Derived as the core derives it for our own key: from the transport we
-    // publish on, falling back the same way when nothing is published.
-    let own_transports = match call.transport() {
-        TransportIntent::Publish(published) => std::slice::from_ref(published),
-        TransportIntent::ReceiveOnly { .. } => &[],
-    };
-    let own_identity = (options.identity_mapper)(&IdentitySubject {
-        user_id: &options.own_user_id,
-        device_id: Some(&options.own_device_id),
-        member_id: &member_id,
-        transports: own_transports,
-    })
-    .map_or_else(
-        || format!("{}:{}", options.own_user_id, options.own_device_id),
-        RtcIdentity::into_own,
-    );
     let own_connection = match &own_key {
         Some(own_key) => {
             // Not awaited: the join already has the user in the call, and our

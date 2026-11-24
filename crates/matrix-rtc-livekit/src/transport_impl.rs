@@ -52,14 +52,16 @@ use tokio::sync::watch;
 
 use matrix_rtc_core::MatrixBackend;
 use matrix_rtc_core::{
-    IdentitySubject, JoinedMembership, RtcIdentity, RtcIdentityMapper, RtcTransport,
+    IdentitySubject, JoinedMembership, LiveKitFlows, RtcIdentity, RtcIdentityMapper, RtcTransport,
 };
+use matrix_rtc_transport::livekit::transition::FlowChoice;
 use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
-    LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
-    QualityLimit, QualityLimitation, ReceiveStats, RemoteTrackHandle, ResolvedConstraints,
-    SendLayerStats, SendStats, SpeakingParticipant, StreamDemand, TransportConnection,
-    TransportError, VideoCodecPreference, VideoDetail, VideoFrame, VideoRotation,
+    LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, OwnMemberClaims,
+    PublishOptions, QualityLimit, QualityLimitation, ReceiveStats, RemoteTrackHandle,
+    ResolvedConstraints, SendLayerStats, SendStats, SpeakingParticipant, StreamDemand,
+    TransportConnection, TransportError, VideoCodecPreference, VideoDetail, VideoFrame,
+    VideoRotation,
 };
 
 use crate::session::LiveKitSession;
@@ -96,6 +98,9 @@ pub struct LiveKitMediaTransport {
     /// misses, so peers sit in the roster with no media and their keys are
     /// installed under an identity the SFU never assigned.
     identity_mapper: RtcIdentityMapper,
+    /// TEMPORARY (spec 049): which flow each connection takes on a transport
+    /// naming both.
+    flows: FlowChoice,
 }
 
 impl LiveKitMediaTransport {
@@ -112,7 +117,15 @@ impl LiveKitMediaTransport {
             key_providers,
             auto_subscribe: true,
             identity_mapper: identity_mapper(),
+            flows: FlowChoice::default(),
         }
+    }
+
+    /// TEMPORARY (spec 049): the token flows the call's join settled on.
+    /// Without it, transports naming both flows stay on `/sfu/get`.
+    pub fn with_livekit_flows(mut self, flows: LiveKitFlows) -> Self {
+        self.flows = FlowChoice::new(flows);
+        self
     }
 
     /// Make every connection of this transport publish-only: remote tracks are
@@ -140,6 +153,14 @@ impl LiveKitMediaTransport {
 #[async_trait]
 impl OwnFocusTransport for LiveKitMediaTransport {
     type Connection = LiveKitTransportConnection;
+
+    fn own_connection_key(&self, transport: &RtcTransport, own_user_id: &str) -> Option<String> {
+        matrix_rtc_transport::livekit::own_connection_key(&self.flows, transport, own_user_id)
+    }
+
+    fn own_identity(&self, connection_key: &str, member: &OwnMemberClaims) -> Option<String> {
+        matrix_rtc_transport::livekit::own_identity(connection_key, member)
+    }
 
     async fn connect_own(
         &self,
@@ -212,7 +233,11 @@ impl MediaTransport for LiveKitMediaTransport {
     }
 
     fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
-        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+        matrix_rtc_transport::livekit::connection_key(&self.flows, transport, publisher_user_id)
+    }
+
+    fn subscription_failed(&self, connection_key: &str) -> bool {
+        self.flows.subscription_failed(connection_key)
     }
 
     fn shares_identity(&self, a: &str, b: &str) -> bool {

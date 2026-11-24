@@ -76,9 +76,9 @@ pub mod android {
 /// homeserver's MSC4195 `get_token` through the host.
 ///
 /// The one place the flow is acted on, so the two `connect` entry points
-/// cannot drift apart. There is no fallback between the flows: each mints a
-/// different participant identity, and peers map us by the one our published
-/// transport implies.
+/// cannot drift apart. No fallback here: each flow mints a different identity.
+/// A subscription that fails through `get_token` is regrouped by the pool
+/// onto `/sfu/get` (spec 049 R13).
 pub(crate) async fn acquire_token(
     http: &reqwest::Client,
     config: &LiveKitTransportConfig,

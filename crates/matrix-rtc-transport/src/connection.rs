@@ -323,6 +323,14 @@ pub trait MediaTransport: MaybeSend {
     /// sending device).
     fn remote_identity(&self, member: &JoinedMembership) -> Option<RtcIdentity>;
 
+    /// A subscription on `connection_key` failed to connect. `true` when the
+    /// backend now keys some of its members differently, so the caller
+    /// regroups them; the default never does.
+    fn subscription_failed(&self, connection_key: &str) -> bool {
+        let _ = connection_key;
+        false
+    }
+
     /// Open the connection for `connection_key` and start translating its
     /// state into [`ConnectionEvent`]s. The returned receiver ends (after a
     /// final [`ConnectionEvent::Closed`], when the transport can tell) when
@@ -437,6 +445,19 @@ pub trait TransportConnection: MaybeSend {
 pub trait OwnFocusTransport: MediaTransport {
     /// A cheap clonable handle; one clone is handed to the engine.
     type Connection: TransportConnection + Clone + 'static;
+
+    /// The connection key we publish `transport` on: by default the one a
+    /// peer publishing it would be reached through.
+    fn own_connection_key(&self, transport: &RtcTransport, own_user_id: &str) -> Option<String> {
+        self.connection_key(transport, own_user_id)
+    }
+
+    /// Our identity on the connection `connection_key`, when the backend
+    /// knows it from the key; `None` leaves it to the identity mapper.
+    fn own_identity(&self, connection_key: &str, member: &OwnMemberClaims) -> Option<String> {
+        let _ = (connection_key, member);
+        None
+    }
 
     /// [`MediaTransport::connect`], returning the concrete connection.
     async fn connect_own(

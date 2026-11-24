@@ -8,8 +8,9 @@
 //! Everything a MatrixRTC client must *compute* to reach a LiveKit SFU, with
 //! none of the IO: the hash derivations ([`identity`]), the token requests'
 //! shapes ([`token`]), and the one rule tying them together: a transport's
-//! fields select the token flow ([`LiveKitAuthFlow`]), and the flow decides the
-//! participant identity ([`LiveKitTarget`], [`identity_for`]). The native
+//! fields select the token flow ([`LiveKitAuthFlow`], or [`transition`] while
+//! a transport names both), and the flow decides the participant identity
+//! ([`LiveKitTarget`], [`identity_for`]). The native
 //! transport (`matrix-rtc-livekit`, which owns libwebrtc and reqwest) builds on
 //! this; so does the web binding, where the browser does the fetching and
 //! livekit-js does the media — which is why this module must stay free of
@@ -144,15 +145,42 @@ impl LiveKitTarget {
     }
 }
 
-/// The connection key for `transport` as published by `publisher_user_id`,
-/// when it is a LiveKit one: shared by the native and web transports.
-pub fn connection_key(transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
+/// The connection key we subscribe to `transport` through, as published by
+/// `publisher_user_id`, when it is a LiveKit one: shared by the native and web
+/// transports.
+pub fn connection_key(
+    flows: &transition::FlowChoice,
+    transport: &RtcTransport,
+    publisher_user_id: &str,
+) -> Option<String> {
+    match transport {
+        RtcTransport::LiveKit(livekit) => Some(
+            flows
+                .subscribe_target(livekit, publisher_user_id)
+                .connection_key(),
+        ),
+        RtcTransport::Unsupported(_) => None,
+    }
+}
+
+/// The connection key we publish `transport` on, when it is a LiveKit one.
+pub fn own_connection_key(
+    flows: &transition::FlowChoice,
+    transport: &RtcTransport,
+    own_user_id: &str,
+) -> Option<String> {
     match transport {
         RtcTransport::LiveKit(livekit) => {
-            Some(LiveKitTarget::for_transport(livekit, publisher_user_id).connection_key())
+            Some(flows.own_target(livekit, own_user_id).connection_key())
         }
         RtcTransport::Unsupported(_) => None,
     }
+}
+
+/// Our identity on the connection `connection_key`: what its flow mints.
+pub fn own_identity(connection_key: &str, member: &crate::OwnMemberClaims) -> Option<String> {
+    LiveKitTarget::from_connection_key(connection_key)
+        .map(|target| target.own_identity(&member.user_id, &member.device_id, &member.member_id))
 }
 
 /// Configuration identifying the SFU and the MatrixRTC slot to connect to.

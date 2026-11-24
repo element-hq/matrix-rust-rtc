@@ -179,6 +179,7 @@ impl WasmRtcCall {
             delegate.clone(),
             backend.clone(),
             mapper.clone(),
+            self.inner().livekit_flows(),
         ));
         let memberships = self.inner().subscribe_memberships().await;
         let MediaAttachment {

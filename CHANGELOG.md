@@ -13,6 +13,7 @@ log only.
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
 - A member whose LiveKit transport has both `url` and `livekit_service_url` is found under either identity, hashed or `user:device`, with its keys under both (spec 049).
 - Join option `allow_livekit_get_token`, with the homeserver's `server_features`: temporary, lets us take LiveKit tokens from `get_token` when the homeserver announces both flows and `org.matrix.msc4195.stable` (spec 049).
+- On a homeserver whose `get_token` is stable, peers announcing both LiveKit flows are subscribed through it, falling back to `/sfu/get` per server on failure, and a subscription to our own SFU shares our connection (spec 049).
 
 ### Breaking
 

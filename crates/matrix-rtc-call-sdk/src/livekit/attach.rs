@@ -62,7 +62,8 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
     let transport = Arc::new(
         LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, providers)
             .with_auto_subscribe(options.auto_subscribe)
-            .with_identity_mapper(mapper.clone()),
+            .with_identity_mapper(mapper.clone())
+            .with_livekit_flows(call.livekit_flows()),
     );
     let media = attach_media(
         call,
