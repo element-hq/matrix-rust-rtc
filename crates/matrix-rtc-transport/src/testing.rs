@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper, RtcTransport};
+use matrix_rtc_core::{
+    IdentitySubject, JoinedMembership, RtcIdentity, RtcIdentityMapper, RtcTransport,
+};
 use tokio::sync::mpsc;
 
 use crate::livekit::identity_mapper;
@@ -233,7 +235,7 @@ impl MediaTransport for ScriptedTransport {
         }
     }
 
-    fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
+    fn remote_identity(&self, member: &JoinedMembership) -> Option<RtcIdentity> {
         let identity_mapper = self
             .identity_mapper
             .lock()

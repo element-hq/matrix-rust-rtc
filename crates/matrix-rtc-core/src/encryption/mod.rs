@@ -252,6 +252,7 @@ pub type RtcClock = Arc<dyn Fn() -> u64 + Send + Sync>;
 use crate::error::CommandError;
 use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
+use crate::identity::RtcIdentity;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
 use crate::transport::{MIN_MEDIA_KEY_LEN, RtcTransport};
@@ -359,8 +360,9 @@ pub struct IdentitySubject<'a> {
     pub transports: &'a [RtcTransport],
 }
 
-/// Maps a member to the RTC-backend participant identity that the media layer
-/// addresses keys by; `None` when the member lacks what the derivation needs.
+/// Maps a member to the RTC-backend participant identity, or identities
+/// ([`RtcIdentity`]), that the media layer addresses keys by; `None` when the
+/// member lacks what the derivation needs.
 ///
 /// `matrix-rtc-core` stays agnostic about how that identity is derived: a
 /// consumer (e.g. the LiveKit transport, whose identity follows the token flow
@@ -368,7 +370,7 @@ pub struct IdentitySubject<'a> {
 /// [`EncryptionManager::set_identity_mapper`]. When no mapper is set, the
 /// manager falls back to its default identity (`user_id:device_id` for the own
 /// key, `member_id` for inbound keys).
-pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<String> + Send + Sync>;
+pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<RtcIdentity> + Send + Sync>;
 
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
@@ -670,13 +672,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 log::debug!("not replaying keys for {member_id}: no derivable identity");
                 continue;
             };
-            for key in keys {
-                signals.push(KeyMaterialSignal {
-                    key: key.key.clone(),
-                    key_index: key.key_index,
-                    rtc_backend_identity: rtc_backend_identity.clone(),
-                    use_after_ms: 0,
-                });
+            // Under every identity the peer may hold (spec 049 R5).
+            for candidate in rtc_backend_identity.candidates() {
+                for key in &keys {
+                    signals.push(KeyMaterialSignal {
+                        key: key.key.clone(),
+                        key_index: key.key_index,
+                        rtc_backend_identity: candidate.to_owned(),
+                        use_after_ms: 0,
+                    });
+                }
             }
         }
 
@@ -709,22 +714,25 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     }
 
     /// Our RTC backend identity: the mapper's, else `user_id:device_id`.
+    ///
+    /// Always one identity: we know which token flow we use.
     fn own_rtc_identity(&self) -> String {
-        self.identity_mapper
-            .as_ref()
-            .and_then(|mapper| {
-                mapper(&IdentitySubject {
-                    user_id: &self.own_user_id,
-                    device_id: Some(&self.own_device_id),
-                    member_id: &self.own_member_id,
-                    transports: &self.own_transports,
-                })
+        let mapped = self.identity_mapper.as_ref().and_then(|mapper| {
+            mapper(&IdentitySubject {
+                user_id: &self.own_user_id,
+                device_id: Some(&self.own_device_id),
+                member_id: &self.own_member_id,
+                transports: &self.own_transports,
             })
-            .unwrap_or_else(|| self.get_own_rtc_backend_identity())
+        });
+        mapped.map_or_else(
+            || self.get_own_rtc_backend_identity(),
+            RtcIdentity::into_own,
+        )
     }
 
     /// A peer's RTC backend identity: the mapper's, else their `member_id`.
-    fn peer_rtc_identity(&self, membership: &JoinedMembership) -> Option<String> {
+    fn peer_rtc_identity(&self, membership: &JoinedMembership) -> Option<RtcIdentity> {
         match &self.identity_mapper {
             Some(mapper) => mapper(&IdentitySubject {
                 user_id: &membership.sender,
@@ -732,7 +740,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 member_id: &membership.member_id,
                 transports: &membership.transports,
             }),
-            None => Some(membership.member_id.clone()),
+            None => Some(RtcIdentity::Single(membership.member_id.clone())),
         }
     }
 
@@ -2095,7 +2103,13 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         // Signal to application
         match rtc_backend_id {
-            Some(rtc_backend_id) => self.signal_inbound_key_to_app(key, rtc_backend_id).await,
+            // Under every identity the peer may hold (spec 049 R5).
+            Some(rtc_backend_id) => {
+                for candidate in rtc_backend_id.candidates() {
+                    self.signal_inbound_key_to_app(key.clone(), candidate.to_owned())
+                        .await;
+                }
+            }
             None => log::debug!(
                 "[{}/{}] key from {} has no derivable participant identity; stored only",
                 self.room_id,
@@ -3066,12 +3080,15 @@ mod tests {
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
         manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
-            Some(format!(
-                "mapped:{}/{}/{}",
-                subject.user_id,
-                subject.device_id.unwrap_or_default(),
-                subject.member_id
-            ))
+            Some(
+                format!(
+                    "mapped:{}/{}/{}",
+                    subject.user_id,
+                    subject.device_id.unwrap_or_default(),
+                    subject.member_id
+                )
+                .into(),
+            )
         }));
 
         manager.replay_keys_to_handler().await;
@@ -3085,6 +3102,65 @@ mod tests {
             identities
                 .contains(&"mapped:@bob:example.org/device456/bob-device456-uuid".to_string()),
             "bob's key must replay under his mapped identity, not his member_id, got {identities:?}"
+        );
+    }
+
+    fn transition_mapper() -> RtcIdentityMapper {
+        Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(RtcIdentity::Transition {
+                hashed: format!("hashed:{}", subject.member_id),
+                legacy: format!("legacy:{}", subject.member_id),
+            })
+        })
+    }
+
+    /// Spec 049 R5: a peer that may hold either identity gets its key under
+    /// both, live and replayed; our own key goes out under one.
+    #[tokio::test]
+    async fn a_peer_naming_both_flows_gets_its_key_under_both_identities() {
+        let get_memberships = create_mock_get_memberships(vec![bob_membership()]);
+        let mut manager = EncryptionManager::new(
+            Arc::new(NoopBackend),
+            USER_ID.to_string(),
+            DEVICE_ID.to_string(),
+            MEMBER_ID.to_string(),
+            ROOM_ID.to_string(),
+            SLOT_ID.to_string(),
+            get_memberships,
+        );
+        manager.set_identity_mapper(transition_mapper());
+        let handler = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(handler.clone());
+        manager.join().await.expect("join should succeed");
+
+        manager
+            .receive_key(bob_key(vec![7u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+        let bob = "bob-device456-uuid";
+        let live = handler.identities();
+        assert!(live.contains(&format!("hashed:{bob}")), "{live:?}");
+        assert!(live.contains(&format!("legacy:{bob}")), "{live:?}");
+
+        let replayed = Arc::new(RecordingHandler::default());
+        manager.set_signal_handler(replayed.clone());
+        manager.replay_keys_to_handler().await;
+        let identities = replayed.identities();
+        assert!(
+            identities.contains(&format!("hashed:{bob}")),
+            "{identities:?}"
+        );
+        assert!(
+            identities.contains(&format!("legacy:{bob}")),
+            "{identities:?}"
+        );
+        assert!(
+            identities.contains(&format!("legacy:{MEMBER_ID}")),
+            "{identities:?}"
+        );
+        assert!(
+            !identities.contains(&format!("hashed:{MEMBER_ID}")),
+            "{identities:?}"
         );
     }
 

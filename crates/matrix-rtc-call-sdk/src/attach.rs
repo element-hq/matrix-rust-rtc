@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
-use matrix_rtc_core::{IdentitySubject, MatrixBackend, RtcIdentityMapper, TransportIntent};
+use matrix_rtc_core::{
+    IdentitySubject, MatrixBackend, RtcIdentity, RtcIdentityMapper, TransportIntent,
+};
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
     TransportConnection, TransportError,
@@ -214,7 +216,10 @@ where
         member_id: &member_id,
         transports: own_transports,
     })
-    .unwrap_or_else(|| format!("{}:{}", options.own_user_id, options.own_device_id));
+    .map_or_else(
+        || format!("{}:{}", options.own_user_id, options.own_device_id),
+        RtcIdentity::into_own,
+    );
     let own_connection = match &own_key {
         Some(own_key) => {
             // Not awaited: the join already has the user in the call, and our

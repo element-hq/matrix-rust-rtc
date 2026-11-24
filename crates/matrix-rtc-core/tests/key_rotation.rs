@@ -535,7 +535,7 @@ impl Call {
         });
         manager.set_signal_handler(media.clone());
         manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
-            Some(identity_of(subject.user_id, subject.device_id?))
+            Some(identity_of(subject.user_id, subject.device_id?).into())
         }));
         manager.join().await.expect("join should succeed");
 

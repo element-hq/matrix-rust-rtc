@@ -278,13 +278,13 @@ export class MatrixRtcCall {
     });
   }
 
-  /** Join roster entries to live livekit-js participants by rtc_identity. */
+  /** Join roster entries to live livekit-js participants by rtc_identities. */
   withLivekitParticipants(roster) {
     return roster.map((entry) => ({
       ...entry,
-      livekitParticipant: entry.rtc_identity
-        ? this.findParticipant(entry.rtc_identity)
-        : undefined,
+      livekitParticipant: (entry.rtc_identities ?? [])
+        .map((identity) => this.findParticipant(identity))
+        .find(Boolean),
     }));
   }
 

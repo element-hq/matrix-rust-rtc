@@ -52,7 +52,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use matrix_rtc_core::executor as rt;
-use matrix_rtc_core::{JoinedMembership, LiveKitAuthFlow, RtcTransport};
+use matrix_rtc_core::{JoinedMembership, LiveKitAuthFlow, RtcIdentity, RtcTransport};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -108,6 +108,9 @@ type TrackMap = Arc<Mutex<HashMap<(String, MediaStreamKind), PooledTrack>>>;
 #[derive(Clone)]
 struct PooledTrack {
     connection_key: String,
+    /// The transport identity that published it: a member may be present
+    /// under two (spec 049 R4), and only that one's removal removes it.
+    identity: String,
     track: Arc<dyn RemoteTrackHandle>,
 }
 
@@ -386,11 +389,12 @@ pub struct MediaPool {
     known_members: HashSet<String>,
     /// SFU URLs already reported as reached through both token flows.
     split_flow_sfus: HashSet<String>,
-    /// Transport identity → `member_id`.
+    /// Transport identity → `member_id`: one entry per candidate identity,
+    /// so a member that may hold either of two maps from both (spec 049).
     identity_map: HashMap<String, String>,
-    /// `member_id` → transport identity (the reverse of `identity_map`),
-    /// for pushing constraints at a member's connection.
-    member_identities: HashMap<String, String>,
+    /// `member_id` → its identity (the reverse of `identity_map`), for
+    /// pushing constraints at a member's connection.
+    member_identities: HashMap<String, RtcIdentity>,
     /// Latest constraints per stream, with a generation counter that
     /// invalidates superseded debounce timers.
     constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
@@ -805,7 +809,7 @@ impl MediaPool {
             .transports
             .iter()
             .find_map(|backend| backend.remote_identity(member));
-        let Some(identity) = identity else {
+        let Some(rtc_identity) = identity else {
             // Their media arrives under an identity nothing maps back, so it
             // will be buffered forever rather than surfacing as their stream.
             log::warn!(
@@ -816,15 +820,26 @@ impl MediaPool {
             return;
         };
         log::debug!(
-            "member {} ({}) maps to transport identity {identity}",
+            "member {} ({}) maps to transport identity {rtc_identity:?}",
             member.member_id,
             member.sender,
         );
+        self.member_identities
+            .insert(member.member_id.clone(), rtc_identity.clone());
+        // Every candidate maps to the member, so whichever one appears on the
+        // SFU, or both at once, is theirs (spec 049 R3, R4).
+        for identity in rtc_identity.candidates() {
+            self.map_identity(member, identity);
+        }
+    }
+
+    /// Map one concrete transport `identity` to `member`, flushing what
+    /// arrived under it before the membership.
+    fn map_identity(&mut self, member: &JoinedMembership, identity: &str) {
+        let identity = identity.to_owned();
         self.unmapped.remove(&identity);
         self.identity_map
             .insert(identity.clone(), member.member_id.clone());
-        self.member_identities
-            .insert(member.member_id.clone(), identity.clone());
 
         // Media and keys that arrived before this membership.
         if let Some(pending) = self.pending_tracks.remove(&identity) {
@@ -856,7 +871,9 @@ impl MediaPool {
         let identity = self.member_identities.remove(member_id);
         // A stale key index could otherwise resurface against the identity.
         if let Some(identity) = &identity {
-            self.pending_keys.remove(identity);
+            for candidate in identity.candidates() {
+                self.pending_keys.remove(candidate);
+            }
         }
         self.identity_map.retain(|_, mapped| mapped != member_id);
         // A rejoining member gets a fresh member_id, so their constraints
@@ -884,13 +901,11 @@ impl MediaPool {
                 })
                 .collect()
         };
-        if let Some(identity) = identity
-            && !departed.is_empty()
-        {
+        for (kind, pooled) in departed {
             self.pending_tracks
-                .entry(identity)
+                .entry(pooled.identity.clone())
                 .or_default()
-                .extend(departed);
+                .push((kind, pooled));
         }
     }
 
@@ -938,13 +953,22 @@ impl MediaPool {
 
     /// Removes a member's stream, if it came over `connection_key`: a removal
     /// the old connection reports after the member moved is not theirs.
-    fn remove_track(&mut self, member_id: &str, kind: MediaStreamKind, connection_key: &str) {
+    /// With `identity`, only if that identity published it: a member present
+    /// under two identities (spec 049 R4) keeps the other's stream.
+    fn remove_track(
+        &mut self,
+        member_id: &str,
+        kind: MediaStreamKind,
+        connection_key: &str,
+        identity: Option<&str>,
+    ) {
         let removed = {
             let mut tracks = self.tracks.lock().expect("track map mutex poisoned");
             let key = (member_id.to_owned(), kind);
-            let ours = tracks
-                .get(&key)
-                .is_some_and(|pooled| pooled.connection_key == connection_key);
+            let ours = tracks.get(&key).is_some_and(|pooled| {
+                pooled.connection_key == connection_key
+                    && identity.is_none_or(|identity| pooled.identity == identity)
+            });
             ours && tracks.remove(&key).is_some()
         };
         if removed {
@@ -977,12 +1001,13 @@ impl MediaPool {
         let Some(connection) = connection else {
             return;
         };
+        // Every candidate: the member is on the SFU under one of them, or
+        // both (spec 049).
         rt::spawn(async move {
-            if let Err(error) = connection
-                .apply_constraints(&identity, kind, resolved)
-                .await
-            {
-                log::warn!("applying constraints for {identity} ({kind:?}) failed: {error}");
+            for identity in identity.candidates() {
+                if let Err(error) = connection.apply_constraints(identity, kind, resolved).await {
+                    log::warn!("applying constraints for {identity} ({kind:?}) failed: {error}");
+                }
             }
         });
     }
@@ -1110,7 +1135,8 @@ impl MediaPool {
         let mut identities: Vec<String> = entry
             .members
             .iter()
-            .filter_map(|member_id| self.member_identities.get(member_id).cloned())
+            .filter_map(|member_id| self.member_identities.get(member_id))
+            .flat_map(|identity| identity.candidates().map(str::to_owned))
             .collect();
         identities.sort();
         connection.set_wanted(&identities);
@@ -1283,7 +1309,7 @@ impl MediaPool {
         // in a stable order.
         lost.sort();
         for (member_id, kind) in lost {
-            self.remove_track(&member_id, kind, key);
+            self.remove_track(&member_id, kind, key, None);
         }
         self.mark_degraded(key);
 
@@ -1381,6 +1407,7 @@ impl MediaPool {
             } => {
                 let pooled = PooledTrack {
                     connection_key: connection_key.to_owned(),
+                    identity: identity.clone(),
                     track,
                 };
                 match self.identity_map.get(&identity).cloned() {
@@ -1398,7 +1425,9 @@ impl MediaPool {
             }
             ConnectionEvent::TrackRemoved { identity, kind } => {
                 match self.identity_map.get(&identity).cloned() {
-                    Some(member_id) => self.remove_track(&member_id, kind, connection_key),
+                    Some(member_id) => {
+                        self.remove_track(&member_id, kind, connection_key, Some(&identity))
+                    }
                     None => {
                         if let Some(pending) = self.pending_tracks.get_mut(&identity) {
                             pending.retain(|(pending_kind, pooled)| {

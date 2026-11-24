@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
-use matrix_rtc_core::{IdentitySubject, LiveKitTransport, RtcTransport};
+use matrix_rtc_core::{IdentitySubject, LiveKitTransport, RtcIdentity, RtcTransport};
 
 use super::*;
 
@@ -99,25 +99,47 @@ fn members_share_a_connection_exactly_when_their_flow_and_its_endpoint_agree() {
     );
 }
 
+const HASHED: &str = "M3VnsLXrkbxIDINXO64u8PZzFyD9ZYFiQULR2dshWYs";
+
 #[test]
 fn the_identity_follows_the_flow_of_the_first_livekit_transport() {
-    let transitional = [RtcTransport::LiveKit(both())];
+    let service = [RtcTransport::LiveKit(LiveKitTransport::service(
+        "https://jwt.example.com",
+    ))];
     assert_eq!(
-        identity_for(&subject(&transitional, Some("DEVICE"))).as_deref(),
-        Some("@alice:example.com:DEVICE")
+        identity_for(&subject(&service, Some("DEVICE"))),
+        Some(RtcIdentity::Single("@alice:example.com:DEVICE".into()))
     );
     // `/sfu/get` mints the device into the identity: no device, no identity.
-    assert_eq!(identity_for(&subject(&transitional, None)), None);
+    assert_eq!(identity_for(&subject(&service, None)), None);
 
     let sfu = [RtcTransport::LiveKit(LiveKitTransport::sfu(
         "wss://sfu.example.com",
     ))];
     assert_eq!(
-        identity_for(&subject(&sfu, None)).as_deref(),
-        Some("M3VnsLXrkbxIDINXO64u8PZzFyD9ZYFiQULR2dshWYs")
+        identity_for(&subject(&sfu, None)),
+        Some(RtcIdentity::Single(HASHED.into()))
     );
 
     assert_eq!(identity_for(&subject(&[], Some("DEVICE"))), None);
+}
+
+// Spec 049 R3: either flow may have minted a both-fields member's identity.
+#[test]
+fn a_transport_naming_both_flows_may_hold_either_identity() {
+    let transitional = [RtcTransport::LiveKit(both())];
+    assert_eq!(
+        identity_for(&subject(&transitional, Some("DEVICE"))),
+        Some(RtcIdentity::Transition {
+            hashed: HASHED.into(),
+            legacy: "@alice:example.com:DEVICE".into(),
+        })
+    );
+    // Without a device only the hashed identity is known.
+    assert_eq!(
+        identity_for(&subject(&transitional, None)),
+        Some(RtcIdentity::Single(HASHED.into()))
+    );
 }
 
 #[test]

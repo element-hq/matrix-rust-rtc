@@ -2186,8 +2186,11 @@ mod tests {
             }
         }
 
-        fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-            Some(format!("id-{}", member.member_id))
+        fn remote_identity(
+            &self,
+            member: &JoinedMembership,
+        ) -> Option<matrix_rtc_core::RtcIdentity> {
+            Some(format!("id-{}", member.member_id).into())
         }
 
         async fn connect(
