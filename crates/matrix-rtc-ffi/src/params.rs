@@ -61,6 +61,12 @@ pub struct FfiEncryptionConfig {
     /// key can decrypt.
     #[uniffi(default = None)]
     pub max_key_lifetime_ms: Option<u64>,
+    /// Participant count (ourselves included) at which key rotation stops
+    /// (default: 30). Joiners are still served the current key; the index stops
+    /// moving and departures no longer rotate it, so a member who left keeps a
+    /// live key until the call drops back under the limit.
+    #[uniffi(default = None)]
+    pub key_rotation_participant_limit: Option<u32>,
     /// Whether to manage media keys (default: true).
     pub manage_media_keys: Option<bool>,
     /// Whether to discard keys from senders the client does not confirm
@@ -268,6 +274,9 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             max_key_lifetime_ms: value.max_key_lifetime_ms.unwrap_or(90 * 60 * 1000),
+            key_rotation_participant_limit: value
+                .key_rotation_participant_limit
+                .map_or(30, |limit| limit as usize),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
             require_confirmed_sender: value.require_confirmed_sender.unwrap_or(true),
         }

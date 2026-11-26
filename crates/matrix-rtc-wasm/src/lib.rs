@@ -702,6 +702,12 @@ pub struct WasmEncryptionConfig {
     /// membership (default 1h30).
     #[serde(default)]
     pub max_key_lifetime_ms: Option<u64>,
+    /// Participant count (ourselves included) at which key rotation stops:
+    /// joiners are still served the current key, but the index stops moving and
+    /// departures no longer rotate it. Rotation resumes below the limit.
+    /// Defaults to 30.
+    #[serde(default)]
+    pub key_rotation_participant_limit: Option<usize>,
     #[serde(default)]
     pub manage_media_keys: Option<bool>,
     /// Whether to discard keys from senders the client does not confirm
@@ -717,6 +723,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
             delay_before_use_ms: value.delay_before_use_ms.unwrap_or(5000),
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             max_key_lifetime_ms: value.max_key_lifetime_ms.unwrap_or(90 * 60 * 1000),
+            key_rotation_participant_limit: value.key_rotation_participant_limit.unwrap_or(30),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
             require_confirmed_sender: value.require_confirmed_sender.unwrap_or(true),
         }

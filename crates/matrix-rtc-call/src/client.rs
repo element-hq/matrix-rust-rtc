@@ -1064,6 +1064,19 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
                 .set_encryption_signal_handler(&self.slot_id, handler)
     }
 
+    /// Changes the participant count at which this call stops rotating its media
+    /// key, from the `key_rotation_participant_limit` it joined with. Applied by
+    /// the next key rollout. Returns `false` once the call has ended.
+    pub async fn set_key_rotation_participant_limit(&self, limit: usize) -> bool {
+        self.is_live()
+            && self
+                .state
+                .lock()
+                .await
+                .rtc_mut()
+                .set_key_rotation_participant_limit(&self.slot_id, limit)
+    }
+
     /// Whether this call's media is frame-encrypted: `false` in a room whose
     /// encryption is off (spec 038 R11), and once the call has ended.
     pub async fn encrypts_media(&self) -> bool {

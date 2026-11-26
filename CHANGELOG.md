@@ -12,6 +12,7 @@ log only.
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
 - `LiveKitCallOptions` takes `keep_alive_timeout_ms`, the delayed leave's timeout, which so far could only be set through `JoinOptions`.
+- `EncryptionConfig::key_rotation_participant_limit` (default 30) suspends key rotation in calls at or above that many participants, where arrivals are still sent the current key; `set_key_rotation_participant_limit` changes it on a live call.
 
 ### Fixed
 

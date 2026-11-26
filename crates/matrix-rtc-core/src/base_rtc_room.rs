@@ -553,6 +553,16 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         }
     }
 
+    /// Changes the participant count at which one slot's session suspends key
+    /// rotation, leaving the rest of its encryption configuration alone. Returns
+    /// `false` if the slot has no session or has not joined. The new limit is
+    /// applied by the next key rollout, not here.
+    pub fn set_key_rotation_participant_limit(&mut self, slot_id: &str, limit: usize) -> bool {
+        self.sessions
+            .get_mut(slot_id)
+            .is_some_and(|session| session.set_key_rotation_participant_limit(limit))
+    }
+
     /// Installs the RTC-backend identity mapper for one slot. Returns `false`
     /// if the slot has no session or has not joined.
     pub fn set_encryption_identity_mapper(

@@ -64,6 +64,16 @@
 //! slot session's upkeep runs it at [`EncryptionManager::subscribe_rotation_due`]'s
 //! deadline.
 //!
+//! Past `key_rotation_participant_limit` participants (default `30`, ourselves
+//! included) none of the above rotates: the key stands for as long as the call is
+//! that large, whatever its expiry says. A rotation is a message to every other
+//! member, so its cost grows with the call, and so does the rate of the changes
+//! that cause one; handing an arrival the key we already hold costs one message at
+//! any size, and that continues. The price is forward secrecy — a member who left
+//! keeps a live key until the call shrinks. They stay in the key's `shared_with`
+//! meanwhile, so the first rollout back under the limit retires all of them in one
+//! rotation.
+//!
 //! Membership changes that arrive *together* are cheaper still: a rollout sees a
 //! whole set of joined memberships, so any number of simultaneous changes cost one rotation between
 //! them. Hosts should feed complete state rather than event by event — see
@@ -216,6 +226,7 @@
 pub mod types;
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
@@ -473,6 +484,13 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// upkeep until delivered; a rotation replaces every entry, a departure
     /// drops its own.
     undelivered: Arc<watch::Sender<BTreeMap<String, Undelivered>>>,
+
+    /// The live value of [`EncryptionConfig::key_rotation_participant_limit`].
+    ///
+    /// Shared rather than read from `config`, which every clone of the manager
+    /// copies: the session's upkeep runs rollouts on its own clone, and a limit
+    /// changed after the join has to reach that one too.
+    key_rotation_participant_limit: Arc<AtomicUsize>,
 }
 
 /// A key a rollout could not hand to one member.
@@ -567,6 +585,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
             undelivered: Arc::new(watch::Sender::new(BTreeMap::new())),
+            key_rotation_participant_limit: Arc::new(AtomicUsize::new(
+                EncryptionConfig::default().key_rotation_participant_limit,
+            )),
         }
     }
 
@@ -583,7 +604,24 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
     /// Sets the configuration.
     pub fn set_config(&mut self, config: EncryptionConfig) {
+        self.key_rotation_participant_limit
+            .store(config.key_rotation_participant_limit, Ordering::SeqCst);
         self.config = config;
+    }
+
+    /// Changes [`EncryptionConfig::key_rotation_participant_limit`] on a manager
+    /// that has already joined, leaving the rest of the configuration — notably
+    /// the `manage_media_keys` the session negotiated at join — alone.
+    ///
+    /// Nothing is rolled out here. Whether rotation is suspended is decided
+    /// afresh from the roster on every key rollout, so the new limit takes effect
+    /// at the next membership update: raising it above the current participant
+    /// count retires, in one rotation, every member who left while it was
+    /// suspended.
+    pub fn set_key_rotation_participant_limit(&mut self, limit: usize) {
+        self.config.key_rotation_participant_limit = limit;
+        self.key_rotation_participant_limit
+            .store(limit, Ordering::SeqCst);
     }
 
     /// Sets the handler for key material signals.
@@ -1045,6 +1083,15 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             undelivered.len() != before
         });
 
+        // Rotation is the part of key management that grows with the call: a new
+        // key has to reach every other member. Serving an arrival the key we
+        // already hold costs one message at any size. So at or above the limit we
+        // keep the cheap half and drop the expensive one — see the module docs for
+        // the trade.
+        let participant_count = current_participants.len() + 1;
+        let participant_limit = self.key_rotation_participant_limit.load(Ordering::SeqCst);
+        let rotation_suspended = participant_count >= participant_limit;
+
         let current_key = {
             let guard = self.outbound_key.read().unwrap();
             guard.clone()
@@ -1177,7 +1224,24 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             });
         }
 
-        let rotating = now >= expires_at;
+        // Over the participant limit nothing rotates, whatever the expiry says.
+        // Nothing has to remember what is owed meanwhile: whoever left stays in
+        // `shared_with`, so the first rollout under the limit sees them in `left`
+        // and rotates.
+        let rotating = now >= expires_at && !rotation_suspended;
+        if rotation_suspended {
+            if let Some(reason) = &reason {
+                log::debug!(
+                    "[{}/{}] {participant_count} participants (rotation limit {}): not \
+                     rotating key index {} ({reason})",
+                    self.room_id,
+                    self.slot_id,
+                    participant_limit,
+                    current_key.key_index,
+                );
+            }
+            reason = None;
+        }
         match (&reason, rotating) {
             (Some(reason), true) => {
                 log::info!("[{}/{}] rotating: {reason}", self.room_id, self.slot_id)
@@ -1199,11 +1263,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         //
         // Always set, because every key expires: a scheduler always has a next
         // wake-up, and an owed rotation is simply one whose instant has not come yet.
-        self.set_rotation_due_at(Some(if rotating {
-            now.saturating_add(lifetime_ms)
+        //
+        // Except while rotation is suspended: a deadline we would decline to act
+        // on would only have the upkeep ask for rollouts in a loop. The rollout
+        // that takes the call back under the limit sets it again.
+        self.set_rotation_due_at(if rotation_suspended {
+            None
+        } else if rotating {
+            Some(now.saturating_add(lifetime_ms))
         } else {
-            expires_at
-        }));
+            Some(expires_at)
+        });
 
         if !rotating && joined_participants.is_empty() {
             // Nothing to rotate to and nobody waiting for what we already have.
@@ -2170,6 +2240,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
             undelivered: self.undelivered.clone(),
+            key_rotation_participant_limit: self.key_rotation_participant_limit.clone(),
         }
     }
 }
@@ -2353,6 +2424,191 @@ mod tests {
             SLOT_ID.to_string(),
             move || memberships.lock().unwrap().clone(),
         )
+    }
+
+    fn peer(user_id: &str, device_id: &str, member_id: &str) -> JoinedMembership {
+        JoinedMembership {
+            sender: user_id.to_string(),
+            origin: EventOrigin::encrypted(Some(device_id.to_string())),
+            sticky_key: member_id.to_string(),
+            member_id: member_id.to_string(),
+            ..bob_membership()
+        }
+    }
+
+    /// The key index of every key message sent, in order.
+    fn sent_key_indices(sender: &MockBackend) -> Vec<u64> {
+        sender
+            .to_device_messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(_, _, _, content)| {
+                content
+                    .pointer("/media_key/index")
+                    .and_then(|index| index.as_u64())
+            })
+            .collect()
+    }
+
+    /// At `key_rotation_participant_limit` the key index stops moving: a
+    /// departure costs nothing, and an arrival costs exactly one message — the
+    /// current key — with no rotation for the members who already hold it.
+    #[tokio::test]
+    async fn over_the_participant_limit_a_joiner_gets_the_current_key_and_nobody_rotates() {
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        // Bob, carol and us are three, so one more arrival reaches the limit.
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(sent_key_indices(&sender), vec![0, 0]);
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // The key settles: under the limit, the next arrival would rotate it.
+        clock.advance(EncryptionConfig::default().key_rotation_grace_period_ms);
+
+        // Dave takes the call to the limit. He is served the key we already hold,
+        // and bob and carol — who hold it too — hear nothing.
+        memberships
+            .lock()
+            .unwrap()
+            .push(peer("@dave:example.org", "DAVEDEV", "dave-a"));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "an arrival at the limit must not rotate, however old the key is"
+        );
+        assert_eq!(
+            sent_key_indices(&sender),
+            vec![0],
+            "the joiner gets exactly one message, carrying the live key index"
+        );
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@dave:example.org".to_string(), "DAVEDEV".to_string())],
+            "the members who already hold that key must not be re-sent it"
+        );
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Carol leaves while the call is still at the limit, replaced by erin.
+        // A departure from a settled key normally rotates at once; here the key
+        // stands, so erin is handed the same index carol keeps.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "carol-a");
+        memberships
+            .lock()
+            .unwrap()
+            .push(peer("@erin:example.org", "ERINDEV", "erin-a"));
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "a departure at the limit must not cost a rotation"
+        );
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@erin:example.org".to_string(), "ERINDEV".to_string())],
+            "only the arriving member is served"
+        );
+        assert_eq!(
+            manager.rotation_due_at_ms(),
+            None,
+            "a suspended rotation must not ask the upkeep for rollouts it will decline"
+        );
+    }
+
+    /// A departure that happened while the call was over the limit is still owed
+    /// a rotation, and the first rollout under the limit pays for every one of
+    /// them at once.
+    #[tokio::test]
+    async fn a_departure_over_the_limit_is_rotated_out_once_the_call_shrinks() {
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![
+            peer("@bob:example.org", "BOBDEV", "bob-a"),
+            peer("@carol:example.org", "CAROLDEV", "carol-a"),
+            peer("@dave:example.org", "DAVEDEV", "dave-a"),
+            peer("@erin:example.org", "ERINDEV", "erin-a"),
+        ]));
+        let mut manager = manager_over(sender.clone(), memberships.clone());
+        manager.set_config(EncryptionConfig {
+            key_rotation_participant_limit: 4,
+            ..EncryptionConfig::default()
+        });
+        let clock = TestClock::new();
+        manager.set_clock(clock.as_rtc_clock());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        clock.advance(EncryptionConfig::default().key_rotation_grace_period_ms);
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Erin leaves; four of us remain, still at the limit.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "erin-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(0),
+            "a departure at the limit must not rotate"
+        );
+        assert!(to_device_recipients(&sender).is_empty());
+
+        // Dave leaves too, taking the call under the limit. Erin's departure is
+        // paid for here, by the same rotation as dave's.
+        memberships
+            .lock()
+            .unwrap()
+            .retain(|member| member.member_id != "dave-a");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        assert_eq!(
+            manager.get_outbound_key().map(|key| key.key_index),
+            Some(1),
+            "the key both leavers hold must be retired once we are under the limit"
+        );
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![
+                ("@bob:example.org".to_string(), "BOBDEV".to_string()),
+                ("@carol:example.org".to_string(), "CAROLDEV".to_string()),
+            ],
+            "and the members still present must get the rotated key, once each"
+        );
+        assert_eq!(sent_key_indices(&sender), vec![1, 1]);
     }
 
     /// One membership update per arriving peer, but only ever one signal per key

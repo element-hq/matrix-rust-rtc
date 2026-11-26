@@ -563,6 +563,17 @@ impl LiveKitCall {
         self.call.member_id()
     }
 
+    /// Change the participant count at which this call stops rotating its media
+    /// key, from the `key_rotation_participant_limit` it joined with. Returns
+    /// `false` if the call has ended.
+    ///
+    /// Only that one setting moves; everything else the join negotiated stays.
+    /// The new limit is honoured by the next key rollout — the next membership
+    /// change, in other words.
+    pub async fn set_key_rotation_participant_limit(&self, limit: usize) -> bool {
+        self.call.set_key_rotation_participant_limit(limit).await
+    }
+
     /// Number of members (including ourselves) currently joined to the slot,
     /// as signalled over sticky membership events.
     pub async fn member_count(&self) -> usize {

@@ -285,6 +285,7 @@ export interface JoinParamsIn {
         delay_before_use_ms?: number;
         key_rotation_grace_period_ms?: number;
         max_key_lifetime_ms?: number;
+        key_rotation_participant_limit?: number;
         manage_media_keys?: boolean;
         require_confirmed_sender?: boolean;
     };
