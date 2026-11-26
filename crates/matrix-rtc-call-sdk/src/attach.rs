@@ -297,8 +297,10 @@ pub async fn livekit_flows<B: MatrixBackend + 'static>(
     let (Some(url), Some(_)) = (published.url(), published.livekit_service_url()) else {
         return LiveKitFlows::default();
     };
+    // The same request our own connect makes, so the probe answers for it.
+    let own_user_id = backend.own_user_id();
     let request = LiveKitTokenRequest {
-        server_name: None,
+        server_name: Some(published.sfu_server_name(&own_user_id).to_owned()),
         url: url.to_owned(),
         room_id: call.room_id().to_owned(),
         slot_id: call.slot_id().to_owned(),

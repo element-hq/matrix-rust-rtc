@@ -441,6 +441,7 @@ async fn the_livekit_flows_come_from_the_flag_and_a_get_token_probe() {
     let probe = mock.livekit_token_requests.lock().unwrap()[0].clone();
     assert_eq!(probe.url, "wss://sfu.example.org");
     assert_eq!(probe.member_id, call.member_id());
+    assert_eq!(probe.server_name.as_deref(), Some("example.org"));
 
     *mock.livekit_token_answer.lock().unwrap() = Err(BackendError::with_matrix_error(
         Some("M_UNRECOGNIZED".into()),
