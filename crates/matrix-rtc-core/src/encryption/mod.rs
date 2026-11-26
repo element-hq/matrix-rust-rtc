@@ -367,9 +367,8 @@ pub struct IdentitySubject<'a> {
 /// `matrix-rtc-core` stays agnostic about how that identity is derived: a
 /// consumer (e.g. the LiveKit transport, whose identity follows the token flow
 /// the published transport selects) injects the derivation via
-/// [`EncryptionManager::set_identity_mapper`]. When no mapper is set, the
-/// manager falls back to its default identity (`user_id:device_id` for the own
-/// key, `member_id` for inbound keys).
+/// [`EncryptionManager::set_identity_mapper`]. Until one is set, our own key
+/// goes out under `user_id:device_id` and peers' keys are held, not signalled.
 pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<RtcIdentity> + Send + Sync>;
 
 /// The EncryptionManager manages encryption keys for an RTC session.
@@ -731,17 +730,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             .unwrap_or_else(|| self.get_own_rtc_backend_identity())
     }
 
-    /// A peer's RTC backend identity: the mapper's, else their `member_id`.
+    /// A peer's RTC backend identity, as the mapper derives it. `None` until the
+    /// media layer installs one: only the transport knows the identity, so keys
+    /// are held and the replay signals them under it.
     fn peer_rtc_identity(&self, membership: &JoinedMembership) -> Option<RtcIdentity> {
-        match &self.identity_mapper {
-            Some(mapper) => mapper(&IdentitySubject {
-                user_id: &membership.sender,
-                device_id: membership.origin.sender_device_id(),
-                member_id: &membership.member_id,
-                transports: &membership.transports,
-            }),
-            None => Some(RtcIdentity::Single(membership.member_id.clone())),
-        }
+        let mapper = self.identity_mapper.as_ref()?;
+        mapper(&IdentitySubject {
+            user_id: &membership.sender,
+            device_id: membership.origin.sender_device_id(),
+            member_id: &membership.member_id,
+            transports: &membership.transports,
+        })
     }
 
     /// Gets the current timestamp in milliseconds.
@@ -2337,6 +2336,7 @@ mod tests {
             .expect("bob's key should be accepted");
 
         let handler = Arc::new(RecordingHandler::default());
+        manager.set_identity_mapper(member_id_mapper());
         manager.set_signal_handler(handler.clone());
         assert!(
             handler.signals.lock().unwrap().is_empty(),
@@ -3005,6 +3005,7 @@ mod tests {
             get_memberships,
         );
         let handler = Arc::new(RecordingHandler::default());
+        manager.set_identity_mapper(member_id_mapper());
         manager.set_signal_handler(handler.clone());
 
         manager
@@ -3043,6 +3044,7 @@ mod tests {
             get_memberships,
         );
         let handler = Arc::new(RecordingHandler::default());
+        manager.set_identity_mapper(member_id_mapper());
         manager.set_signal_handler(handler.clone());
 
         manager
@@ -3110,6 +3112,13 @@ mod tests {
                 .contains(&"mapped:@bob:example.org/device456/bob-device456-uuid".to_string()),
             "bob's key must replay under his mapped identity, not his member_id, got {identities:?}"
         );
+    }
+
+    /// A mapper for tests about key handling, not identities.
+    fn member_id_mapper() -> RtcIdentityMapper {
+        Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(RtcIdentity::Single(subject.member_id.to_owned()))
+        })
     }
 
     fn transition_mapper() -> RtcIdentityMapper {
