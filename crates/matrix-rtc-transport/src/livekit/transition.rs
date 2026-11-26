@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 use matrix_rtc_core::{IdentitySubject, LiveKitFlows, LiveKitTransport, RtcIdentity};
 
-use super::{LiveKitTarget, SfuToken, identity};
+use super::{LiveKitTarget, identity};
 
 /// The identities a member may hold when its published transport names both
 /// flows: [`RtcIdentity::Transition`]. `None` for a transport naming one flow.
@@ -52,36 +52,13 @@ pub struct FlowChoice {
     /// Servers whose `get_token` failed us: their SFUs are subscribed through
     /// `/sfu/get` for the rest of the call (R13).
     get_token_failed: Mutex<HashSet<String>>,
-    /// The probe's token, until our first own connect takes it.
-    own_token: Mutex<Option<SfuToken>>,
 }
 
 impl FlowChoice {
-    pub fn new(mut flows: LiveKitFlows) -> Self {
-        let own_token = flows
-            .own_token
-            .take()
-            .map(|(url, jwt)| SfuToken { jwt, url });
+    pub fn new(flows: LiveKitFlows) -> Self {
         Self {
             flows,
-            own_token: Mutex::new(own_token),
             ..Self::default()
-        }
-    }
-
-    /// The probe's token, once, for our own connection on `connection_key`
-    /// when it goes through `get_token` to the SFU the probe asked about.
-    pub fn take_own_token(&self, connection_key: &str) -> Option<SfuToken> {
-        let Some(LiveKitTarget::CsApi { url, .. }) =
-            LiveKitTarget::from_connection_key(connection_key)
-        else {
-            return None;
-        };
-        let mut own_token = self.own_token.lock().expect("flow choice poisoned");
-        if own_token.as_ref().is_some_and(|token| token.url == url) {
-            own_token.take()
-        } else {
-            None
         }
     }
 
@@ -188,33 +165,7 @@ mod tests {
     }
 
     fn choice(get_token: bool) -> FlowChoice {
-        FlowChoice::new(LiveKitFlows {
-            get_token,
-            own_token: None,
-        })
-    }
-
-    #[test]
-    fn the_probe_token_serves_our_first_own_connect_only() {
-        let flows = FlowChoice::new(LiveKitFlows {
-            get_token: true,
-            own_token: Some(("wss://a".into(), "jwt".into())),
-        });
-        let own = flows
-            .own_target(&both("wss://a", "https://jwt.a"), ME)
-            .connection_key();
-        assert_eq!(
-            flows.take_own_token(&sfu_get("https://jwt.a").connection_key()),
-            None
-        );
-        assert_eq!(
-            flows.take_own_token(&own),
-            Some(SfuToken {
-                jwt: "jwt".into(),
-                url: "wss://a".into()
-            })
-        );
-        assert_eq!(flows.take_own_token(&own), None);
+        FlowChoice::new(LiveKitFlows { get_token })
     }
 
     #[test]

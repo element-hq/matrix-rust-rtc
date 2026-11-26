@@ -216,7 +216,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     e2ee: ctx.e2ee,
                     auto_subscribe: self.auto_subscribe,
                     config: Mutex::new(config),
-                    token: Mutex::new(self.flows.take_own_token(connection_key)),
+                    token: Mutex::new(None),
                 },
                 wanted: Mutex::new(Default::default()),
                 installs: Mutex::new(0),
