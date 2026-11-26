@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use matrix_rtc_core::OpenIdToken;
 
 /// A token to connect with: the JWT and the SFU URL it is for.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct SfuToken {
     /// JWT to authenticate with the LiveKit SFU.
     pub jwt: String,

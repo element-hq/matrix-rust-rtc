@@ -90,10 +90,13 @@ pub fn msc_support(server_features: &[String], rtc_transports: &Value) -> MscSup
 /// their tokens from `get_token` on transports announcing both `url` and
 /// `livekit_service_url`, settled once as media attaches (R12). The default
 /// keeps every such transport on `/sfu/get`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LiveKitFlows {
     /// The local flag is on and our homeserver answered `get_token` (R8).
     pub get_token: bool,
+    /// The answer, `(SFU url, jwt)`: the token our first own connect uses,
+    /// so the probe costs no request of its own.
+    pub own_token: Option<(String, String)>,
 }
 
 /// TEMPORARY (spec 049 R8): whether a failed `get_token` says our homeserver

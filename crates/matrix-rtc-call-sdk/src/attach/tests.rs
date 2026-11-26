@@ -436,7 +436,10 @@ async fn the_livekit_flows_come_from_the_flag_and_a_get_token_probe() {
 
     assert_eq!(
         livekit_flows(&call, mock.as_ref(), true).await,
-        LiveKitFlows { get_token: true }
+        LiveKitFlows {
+            get_token: true,
+            own_token: Some(("wss://sfu.example.org".into(), "mock-jwt".into())),
+        }
     );
     let probe = mock.livekit_token_requests.lock().unwrap()[0].clone();
     assert_eq!(probe.url, "wss://sfu.example.org");

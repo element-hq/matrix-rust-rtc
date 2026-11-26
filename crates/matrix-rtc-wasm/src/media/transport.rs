@@ -504,7 +504,7 @@ impl OwnFocusTransport for JsMediaTransport {
         JsTransportConnection {
             connection_key: connection_key.to_owned(),
             handle: Rc::new(RefCell::new(None)),
-            token: Rc::new(RefCell::new(None)),
+            token: Rc::new(RefCell::new(self.flows.take_own_token(connection_key))),
             wanted: Rc::new(RefCell::new(Vec::new())),
             ctx: ctx.clone(),
             connector: self.connector.clone(),

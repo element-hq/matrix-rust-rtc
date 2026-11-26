@@ -305,7 +305,10 @@ pub async fn livekit_flows<B: MatrixBackend + 'static>(
         member_id: call.member_id().to_owned(),
     };
     match backend.livekit_token(&request).await {
-        Ok(_) => LiveKitFlows { get_token: true },
+        Ok(jwt) => LiveKitFlows {
+            get_token: true,
+            own_token: Some((request.url, jwt)),
+        },
         Err(error) if get_token_unsupported(&error) => {
             log::info!("the homeserver has no get_token ({error}): staying on /sfu/get");
             LiveKitFlows::default()
