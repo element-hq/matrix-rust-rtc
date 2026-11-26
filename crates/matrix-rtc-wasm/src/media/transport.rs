@@ -40,7 +40,7 @@ use async_trait::async_trait;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
 use matrix_rtc_core::{
     BackendError, IdentitySubject, JoinedMembership, LiveKitTokenRequest, MatrixBackend,
-    RtcIdentityMapper, RtcTransport,
+    RtcIdentity, RtcIdentityMapper, RtcTransport,
 };
 use matrix_rtc_transport::keys::FrameKeyRing;
 use matrix_rtc_transport::livekit::token::{legacy_token_request, parse_sfu_token};
@@ -516,7 +516,7 @@ impl MediaTransport for JsMediaTransport {
         }
     }
 
-    fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
+    fn remote_identity(&self, member: &JoinedMembership) -> Option<RtcIdentity> {
         // Same rule as the native transport, through the mapper so peers'
         // identities are derived exactly as the core addresses their keys.
         (self.identity_mapper)(&IdentitySubject {

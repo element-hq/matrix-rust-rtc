@@ -21,7 +21,7 @@ use matrix_rtc_call_sdk::{
     Interruptions, MediaAttachment, Participant, StabilityConfig, UnableToDecrypt, attach_media,
 };
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper};
+use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentity, RtcIdentityMapper};
 use matrix_rtc_transport::keys::MediaKeyHandler;
 use matrix_rtc_transport::livekit::identity_mapper;
 use matrix_rtc_transport::{FrameEncryptionState, TransportConnection as _};
@@ -354,9 +354,9 @@ struct RosterIdentities {
 }
 
 impl RosterIdentities {
-    fn identity(&self, participant: &Participant) -> Option<String> {
+    fn identity(&self, participant: &Participant) -> Option<RtcIdentity> {
         if participant.is_local {
-            return Some(self.own_identity.clone());
+            return Some(RtcIdentity::Single(self.own_identity.clone()));
         }
         let memberships = self.memberships.borrow();
         let membership = memberships
@@ -439,7 +439,11 @@ fn to_wasm_participant(
 ) -> WasmParticipant {
     // Derived as `remote_identity` derives it: `None` when the member cannot
     // be reached on the media plane either.
-    let rtc_identity = identities.identity(participant);
+    let identity = identities.identity(participant);
+    let rtc_identities: Vec<String> = identity
+        .iter()
+        .flat_map(|identity| identity.candidates().map(str::to_owned))
+        .collect();
     WasmParticipant {
         member_id: participant.member_id.clone(),
         user_id: participant.user_id.clone(),
@@ -447,7 +451,8 @@ fn to_wasm_participant(
         is_local: participant.is_local,
         connection: connection_str(participant.connection),
         unable_to_decrypt: participant.unable_to_decrypt.map(unable_to_decrypt_str),
-        rtc_identity,
+        rtc_identity: rtc_identities.first().cloned(),
+        rtc_identities,
         hand_raised_at_ms: participant.hand_raised_at_ms,
         hand_raised_position: participant.hand_raised_position,
         streams: participant
@@ -523,8 +528,12 @@ struct WasmParticipant {
     connection: &'static str,
     unable_to_decrypt: Option<&'static str>,
     /// The livekit-js participant identity, when derivable — the join key for
-    /// `room.getParticipantByIdentity()`.
+    /// `room.getParticipantByIdentity()`. The first of `rtc_identities`.
     rtc_identity: Option<String>,
+    /// Every identity the participant may hold on the SFU: two while their
+    /// transport names both token flows (spec 049, temporary), else at most
+    /// one. Join on whichever the room has.
+    rtc_identities: Vec<String>,
     streams: Vec<WasmStreamState>,
     /// When the participant raised their hand (ms since the epoch); `None`
     /// while it is down.

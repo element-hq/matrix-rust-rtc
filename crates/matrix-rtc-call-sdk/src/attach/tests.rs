@@ -13,7 +13,7 @@ use matrix_rtc_call::{
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
     EventEncryption, EventIn, IdentitySubject, JoinedMembership, KEY_MESSAGE_TYPE,
-    LeaveSessionParams, RoomOptions, RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
+    LeaveSessionParams, RoomOptions, RtcIdentity, RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -31,11 +31,7 @@ const PEER_FOCUS: &str = "wss://sfu-b.example.org";
 /// fallback (the mapper installed too late) shows.
 fn mapper() -> RtcIdentityMapper {
     Arc::new(|subject: &IdentitySubject<'_>| {
-        Some(identity(
-            subject.user_id,
-            subject.device_id?,
-            subject.member_id,
-        ))
+        Some(identity(subject.user_id, subject.device_id?, subject.member_id).into())
     })
 }
 
@@ -176,9 +172,9 @@ impl MediaTransport for FakeTransport {
         }
     }
 
-    fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
+    fn remote_identity(&self, member: &JoinedMembership) -> Option<RtcIdentity> {
         let device = member.origin.sender_device_id()?;
-        Some(identity(&member.sender, device, &member.member_id))
+        Some(identity(&member.sender, device, &member.member_id).into())
     }
 
     async fn connect(
