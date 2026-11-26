@@ -485,6 +485,15 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// drops its own.
     undelivered: Arc<watch::Sender<BTreeMap<String, Undelivered>>>,
 
+    /// When we last re-served our key to a member that appeared to have
+    /// restarted, by member id, in epoch milliseconds.
+    ///
+    /// A cooldown, not a record: the re-serve is triggered by a peer's own key
+    /// traffic (see [`Self::add_key_to_participant`]), and a peer minting keys in
+    /// a loop would otherwise have us send one message per rekey, to it, forever.
+    /// Cleared on `leave`.
+    restart_reserved_at_ms: Arc<Mutex<HashMap<String, u64>>>,
+
     /// The live value of [`EncryptionConfig::key_rotation_participant_limit`].
     ///
     /// Shared rather than read from `config`, which every clone of the manager
@@ -492,6 +501,14 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// changed after the join has to reach that one too.
     key_rotation_participant_limit: Arc<AtomicUsize>,
 }
+
+/// How long after re-serving our key to an apparently-restarted member we will
+/// do it again for that member.
+///
+/// Generous on purpose. The signal it throttles is a genuine restart, which for
+/// any one peer is rare; anything faster is a peer misbehaving, and the cost of
+/// answering it late is nothing — their next rollout re-sends to us anyway.
+const RESTART_RESERVE_COOLDOWN_MS: u64 = 30_000;
 
 /// A key a rollout could not hand to one member.
 #[derive(Clone, Debug, PartialEq)]
@@ -585,6 +602,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
             undelivered: Arc::new(watch::Sender::new(BTreeMap::new())),
+            restart_reserved_at_ms: Arc::new(Mutex::new(HashMap::new())),
             key_rotation_participant_limit: Arc::new(AtomicUsize::new(
                 EncryptionConfig::default().key_rotation_participant_limit,
             )),
@@ -881,6 +899,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         *self.superseded_key.write().unwrap() = None;
         self.set_rotation_due_at(None);
         self.undelivered.send_replace(BTreeMap::new());
+        self.restart_reserved_at_ms.lock().unwrap().clear();
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -2132,6 +2151,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // the older one last silently downgrades us to a key the sender has
         // stopped using.
         let map_key = key.member_id.clone();
+        let mut restarted = false;
         {
             let mut guard = self.inbound_keys.write().unwrap();
             let held = guard.entry(map_key).or_default();
@@ -2158,11 +2178,26 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                         key.key_index,
                     );
                     *existing = key.clone();
+                    // Within one participation a sender never reuses an index:
+                    // `next_key_index` only moves forward. Material replacing
+                    // material at an index we already hold therefore means the
+                    // member *restarted* — a fresh key ring under the same
+                    // member id. The only false positive is an index wrapping
+                    // after 256 rotations, which costs one redundant message.
+                    restarted = true;
                 }
                 None => held.push(key.clone()),
             }
+
+            if restarted {
+                // Everything else under this member id belongs to the
+                // participation that just ended and can never decrypt anything
+                // again.
+                held.retain(|existing| existing.key_index == key.key_index);
+            }
         }
 
+        let member_id = key.member_id.clone();
         // Signal to application
         match rtc_backend_id {
             Some(rtc_backend_id) => self.signal_inbound_key_to_app(key, rtc_backend_id).await,
@@ -2172,6 +2207,72 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 self.slot_id,
                 membership.member_id
             ),
+        }
+
+        if restarted {
+            self.reserve_key_to_restarted_member(&member_id).await;
+        }
+    }
+
+    /// Re-sends our key to a member whose key traffic says they restarted.
+    ///
+    /// The membership diff in `rollout_outbound_key` is the primary way a rejoin
+    /// is noticed, but it can only see one where the membership gives it
+    /// something to see — a fresh `member.id`, or a membership timestamp that
+    /// moved. A leave-and-rejoin that changes neither is identical to no change
+    /// at all, and above `key_rotation_participant_limit` nothing else will ever
+    /// re-send: rotation is suspended, so only arrivals are served, and the
+    /// returner does not read as one.
+    ///
+    /// Their own key is the signal that survives all of that. It is also
+    /// guaranteed to arrive: a rejoining member starts with an empty
+    /// `shared_with`, so its first rollout sends to *everyone*.
+    ///
+    /// Dropping them as a holder is all this does — the rollout it then kicks off
+    /// sees them as newly joined and serves them through the same path an
+    /// ordinary arrival takes.
+    async fn reserve_key_to_restarted_member(&self, member_id: &str) {
+        if !self.config.manage_media_keys {
+            return;
+        }
+
+        let now = self.timestamp_ms();
+        {
+            let mut cooldown = self.restart_reserved_at_ms.lock().unwrap();
+            if let Some(last) = cooldown.get(member_id)
+                && now.saturating_sub(*last) < RESTART_RESERVE_COOLDOWN_MS
+            {
+                return;
+            }
+            cooldown.insert(member_id.to_owned(), now);
+        }
+
+        {
+            let mut guard = self.outbound_key.write().unwrap();
+            let Some(ref mut key) = *guard else { return };
+            let held = key.shared_with.len();
+            key.shared_with
+                .retain(|holder| holder.member_id != member_id);
+            if key.shared_with.len() == held {
+                // We never served them in the first place, so there is nothing
+                // for this to repair and no reason to spend a rollout on it.
+                return;
+            }
+        }
+
+        log::info!(
+            "[{}/{}] member {} restarted their key ring; re-serving our key to them",
+            self.room_id,
+            self.slot_id,
+            member_id,
+        );
+
+        if let Err(error) = self.ensure_key_distribution().await {
+            log::warn!(
+                "[{}/{}] failed to re-serve our key to member {member_id}: {error:?}",
+                self.room_id,
+                self.slot_id,
+            );
         }
     }
 
@@ -2240,6 +2341,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
             undelivered: self.undelivered.clone(),
+            restart_reserved_at_ms: self.restart_reserved_at_ms.clone(),
             key_rotation_participant_limit: self.key_rotation_participant_limit.clone(),
         }
     }
@@ -3508,6 +3610,91 @@ mod tests {
         assert_eq!(keys.len(), 1, "an index should not accumulate keys");
         assert_eq!(keys[0].key_index, 1);
         assert_eq!(keys[0].key, vec![2u8; 32], "the rekey should have won");
+    }
+
+    /// The backstop for a rejoin the membership diff cannot see.
+    ///
+    /// A sender never reuses a key index within one participation, so material
+    /// replacing material at an index we already hold means that member restarted
+    /// — and their own key is the one signal that arrives whatever the membership
+    /// says. It is guaranteed, too: a rejoiner starts with an empty `shared_with`
+    /// and so sends its first key to everybody.
+    #[tokio::test]
+    async fn a_member_rekeying_an_index_we_hold_is_served_our_key_again() {
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+
+        // Bob's first participation, at index 0, and then a rotation to index 1.
+        for (material, index) in [(vec![1u8; 32], 0), (vec![2u8; 32], 1)] {
+            manager
+                .receive_key(bob_key(material, index))
+                .await
+                .expect("bob's key should be accepted");
+        }
+        sender.to_device_messages.lock().unwrap().clear();
+
+        // Bob restarts: a fresh key ring, so index 0 again with new material.
+        manager
+            .receive_key(bob_key(vec![3u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+
+        assert_eq!(
+            to_device_recipients(&sender),
+            vec![("@bob:example.org".to_string(), "device456".to_string())],
+            "the restarted member must be re-served our key"
+        );
+
+        let held = manager.get_inbound_keys("bob-device456-uuid");
+        assert_eq!(
+            held.iter().map(|key| key.key_index).collect::<Vec<_>>(),
+            vec![0],
+            "the previous participation's other indices decrypt nothing and must go"
+        );
+        assert_eq!(
+            held[0].key,
+            vec![3u8; 32],
+            "and the key we keep must be the one that just arrived"
+        );
+    }
+
+    /// The re-serve is driven by a peer's own key traffic, so it needs a limit: a
+    /// peer rekeying in a loop must not cost us one message per rekey forever.
+    #[tokio::test]
+    async fn a_repeated_rekey_from_the_same_member_is_only_answered_once() {
+        let sender = Arc::new(MockBackend::new());
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
+        let manager = manager_over(sender.clone(), memberships.clone());
+        manager.join().await.expect("join should succeed");
+        manager
+            .on_memberships_update()
+            .await
+            .expect("update should succeed");
+        manager
+            .receive_key(bob_key(vec![1u8; 32], 0))
+            .await
+            .expect("bob's key should be accepted");
+        sender.to_device_messages.lock().unwrap().clear();
+
+        for material in [vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]] {
+            manager
+                .receive_key(bob_key(material, 0))
+                .await
+                .expect("bob's key should be accepted");
+        }
+
+        assert_eq!(
+            to_device_recipients(&sender).len(),
+            1,
+            "three rekeys inside the cooldown must buy exactly one re-serve, got {:?}",
+            to_device_recipients(&sender),
+        );
     }
 
     /// Helper: a manager with Bob joined, using the default (strict) config.
