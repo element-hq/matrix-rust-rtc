@@ -2807,6 +2807,7 @@ dependencies = [
  "matrix-sdk",
  "matrix-sdk-ui",
  "reqwest 0.12.28",
+ "rlimit",
  "rustls",
  "serde",
  "serde_json",
@@ -4302,6 +4303,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rlimit"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f35ee2729c56bb610f6dba436bf78135f728b7373bdffae2ec815b2d3eb98cc3"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

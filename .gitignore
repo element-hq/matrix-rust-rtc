@@ -67,8 +67,7 @@ mobile/android/matrixrtc/src/main/java/
 # Split debug symbols from scripts/build-android-aar.sh --split-debug.
 mobile/android/debuginfo/
 
-# Working copy of scripts/load-test-sample.sh — carries the account password
-# and recovery key, so it must never be committed.
-scripts/load-test.sh
-
-scripts/load-test-state.sh
+# Working copies of scripts/load-test-sample.sh. They carry the account
+# password and recovery key, so they must never be committed.
+scripts/load-test*.sh
+!scripts/load-test-sample.sh
