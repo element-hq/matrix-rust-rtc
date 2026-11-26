@@ -18,6 +18,7 @@ log only.
 
 - `MediaSession.disconnect()` returns within 2 s: the close it awaits (engine shutdown, then LiveKit's room close) is otherwise unbounded and could hold a hang-up forever.
 - A member that rejoins without its membership changing is sent our media key again: a different key from them at an index we already hold means they restarted.
+- Sending media keys loads each recipient user's device list once per batch instead of once per device, which was quadratic for a user with many devices in the call.
 
 ## v0.5.0 - 2026-11-12
 
