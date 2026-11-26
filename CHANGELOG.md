@@ -11,6 +11,7 @@ log only.
 ### Added
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
+- `LiveKitCallOptions` takes `keep_alive_timeout_ms`, the delayed leave's timeout, which so far could only be set through `JoinOptions`.
 
 ### Fixed
 
