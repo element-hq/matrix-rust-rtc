@@ -382,10 +382,6 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
         self.inner.rtc_transports().await
     }
-
-    async fn unstable_features(&self) -> Result<Vec<String>, BackendError> {
-        self.inner.unstable_features().await
-    }
 }
 
 #[cfg(test)]

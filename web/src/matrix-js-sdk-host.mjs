@@ -18,8 +18,7 @@ Please see LICENSE in the repository root for full details.
  *   every change, plus timeline events and redactions as they arrive;
  *   `subscribeToDevice` delivers decrypted to-device messages with their Olm
  *   decryption metadata and MSC4153 cross-signing status; `relations`,
- *   `getOpenIdToken`, `getLivekitToken`, `rtcTransports` and `unstableFeatures`
- *   answer on request.
+ *   `getOpenIdToken`, `getLivekitToken` and `rtcTransports` answer on request.
  * The library parses every MatrixRTC content and applies the compatibility
  * dialects itself; this file hands events over verbatim.
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
@@ -203,10 +202,11 @@ export class MatrixHost {
   }
 
   /**
-   * The homeserver's `unstable_features` that are on: what the library reads
-   * at join (spec 049), and what the page hands `mscSupport` (spec 038 R45).
+   * The homeserver's `unstable_features` that are on, for the library's
+   * `mscSupport` (spec 038 R45). Not part of the backend contract: the page
+   * calls it.
    */
-  async unstableFeatures() {
+  async serverFeatures() {
     const versions = await this.client.getVersions();
     return Object.entries(versions.unstable_features ?? {})
       .filter(([, on]) => on === true)
@@ -433,16 +433,21 @@ export class MatrixHost {
   }
 
   /**
-   * The homeserver's MSC4195 LiveKit token, `{ jwt }`, from its `get_token`
-   * under the unstable prefix homeservers serve so far.
+   * The homeserver's MSC4195 LiveKit token, `{ jwt }`, from its `get_token`:
+   * under v1 once it announces `org.matrix.msc4195.stable`, else under the
+   * unstable prefix, which no `/versions` flag announces (as matrix-js-sdk's
+   * own `getLivekitToken` does).
    */
-  getLivekitToken(request) {
+  async getLivekitToken(request) {
+    const stable = await this.client.doesServerSupportUnstableFeature(
+      'org.matrix.msc4195.stable',
+    );
     return this.client.http.authedRequest(
       this.sdk.Method.Post,
       '/rtc/livekit/get_token',
       undefined,
       request,
-      { prefix: '/_matrix/client/unstable/io.element.msc4195' },
+      { prefix: stable ? '/_matrix/client/v1' : '/_matrix/client/unstable/io.element.msc4195' },
     );
   }
 

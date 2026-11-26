@@ -66,12 +66,10 @@ impl FlowChoice {
     /// join allowed it (R8), `/sfu/get` otherwise (R7).
     pub fn own_target(&self, transport: &LiveKitTransport, own_user_id: &str) -> LiveKitTarget {
         let target = match transport.url() {
-            Some(url) if names_both(transport) && self.flows.publish_get_token => {
-                LiveKitTarget::CsApi {
-                    url: url.to_owned(),
-                    server_name: transport.sfu_server_name(own_user_id).to_owned(),
-                }
-            }
+            Some(url) if names_both(transport) && self.flows.get_token => LiveKitTarget::CsApi {
+                url: url.to_owned(),
+                server_name: transport.sfu_server_name(own_user_id).to_owned(),
+            },
             _ => LiveKitTarget::for_transport(transport, own_user_id),
         };
         if let Some(url) = transport.url() {
@@ -83,8 +81,8 @@ impl FlowChoice {
 
     /// The target we subscribe to `publisher_user_id`'s `transport` through:
     /// our own connection when it is on that SFU (R14), else `get_token` when
-    /// our homeserver's is stable and the SFU's server has not failed us
-    /// (R13), else the flow the transport's shape selects.
+    /// the join settled on it and the SFU's server has not failed us (R13),
+    /// else the flow the transport's shape selects.
     pub fn subscribe_target(
         &self,
         transport: &LiveKitTransport,
@@ -99,7 +97,7 @@ impl FlowChoice {
         drop(own);
         if let Some(url) = transport.url()
             && names_both(transport)
-            && self.flows.subscribe_get_token
+            && self.flows.get_token
         {
             let server_name = transport.sfu_server_name(publisher_user_id);
             let failed = self.get_token_failed.lock().expect("flow choice poisoned");
@@ -166,11 +164,8 @@ mod tests {
         }
     }
 
-    fn choice(subscribe_get_token: bool, publish_get_token: bool) -> FlowChoice {
-        FlowChoice::new(LiveKitFlows {
-            subscribe_get_token,
-            publish_get_token,
-        })
+    fn choice(get_token: bool) -> FlowChoice {
+        FlowChoice::new(LiveKitFlows { get_token })
     }
 
     #[test]
@@ -191,19 +186,19 @@ mod tests {
     fn we_publish_through_get_token_only_when_allowed() {
         let ours = both("wss://a", "https://jwt.a");
         assert_eq!(
-            choice(true, false).own_target(&ours, ME),
+            choice(false).own_target(&ours, ME),
             sfu_get("https://jwt.a")
         );
         assert_eq!(
-            choice(true, true).own_target(&ours, ME),
+            choice(true).own_target(&ours, ME),
             cs_api("wss://a", "a.org")
         );
     }
 
-    /// R13 whatever the local flag; R14 for our own SFU.
+    /// R13; R14 for our own SFU.
     #[test]
     fn peers_are_subscribed_through_get_token_except_on_our_own_connection() {
-        let flows = choice(true, false);
+        let flows = choice(true);
         let own = flows.own_target(&both("wss://a", "https://jwt.a"), ME);
         assert_eq!(
             flows.subscribe_target(&both("wss://b", "https://jwt.b"), PEER),
@@ -221,7 +216,7 @@ mod tests {
 
     #[test]
     fn a_server_whose_get_token_failed_is_subscribed_through_sfu_get() {
-        let flows = choice(true, false);
+        let flows = choice(true);
         let peer = both("wss://b", "https://jwt.b");
         let failed = flows.subscribe_target(&peer, PEER).connection_key();
         assert!(flows.subscription_failed(&failed));
@@ -235,7 +230,7 @@ mod tests {
 
     #[test]
     fn a_transport_naming_one_flow_keeps_it() {
-        let flows = choice(true, true);
+        let flows = choice(true);
         let service = LiveKitTransport::service("https://jwt.b");
         let sfu = LiveKitTransport::sfu("wss://b");
         assert_eq!(

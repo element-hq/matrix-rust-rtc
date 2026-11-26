@@ -9,9 +9,10 @@ Please see LICENSE in the repository root for full details.
  * TEMPORARY (spec 049 R10): the move of LiveKit tokens from `/sfu/get` to the
  * homeserver's `get_token`, between our own two clients (web and native).
  * Both publish a transport naming both `url` and `livekit_service_url` in the
- * room-state dialect Element Call speaks (the MSC format reads only `url`), and
- * our homeserver's `get_token` counts as stable. Each scenario turns the local
- * flag on for one side, both, or neither, and checks the flag decides the
+ * room-state dialect Element Call speaks (the MSC format reads only `url`); our
+ * homeserver serves `get_token` under its unstable path, which no `/versions`
+ * flag announces. Each scenario turns the local flag on for one side, both, or
+ * neither, and checks the flag decides the
  * identity each side publishes under, and that both directions still see and
  * decrypt each other. Remove with the transition.
  */

@@ -639,17 +639,4 @@ impl MatrixBackend for JsBackend {
         serde_wasm_bindgen::from_value(result)
             .map_err(|e| BackendError::new(format!("rtcTransports resolved to non-JSON: {e}")))
     }
-
-    async fn unstable_features(&self) -> Result<Vec<String>, BackendError> {
-        let result = self
-            .call_async("unstableFeatures", Vec::new())
-            .await
-            .map_err(backend_error)?;
-        if result.is_undefined() || result.is_null() {
-            return Ok(Vec::new());
-        }
-        serde_wasm_bindgen::from_value(result).map_err(|e| {
-            BackendError::new(format!("unstableFeatures resolved to non-strings: {e}"))
-        })
-    }
 }

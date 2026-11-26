@@ -577,12 +577,6 @@ pub trait MatrixBackend: MaybeSend {
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
         Err(BackendError::not_implemented("rtc_transports"))
     }
-
-    /// The `unstable_features` of the homeserver's `GET /_matrix/client/versions`
-    /// that are on.
-    async fn unstable_features(&self) -> Result<Vec<String>, BackendError> {
-        Err(BackendError::not_implemented("unstable_features"))
-    }
 }
 
 /// A backend that accepts every send and reads nothing, for unit tests that
@@ -793,8 +787,6 @@ pub struct MockBackend {
     pub relations_answers: std::sync::Mutex<std::collections::HashMap<String, Vec<EventIn>>>,
     /// What `rtc_transports` answers.
     pub transports: std::sync::Mutex<Result<Value, BackendError>>,
-    /// What `unstable_features` answers.
-    pub unstable_features: std::sync::Mutex<Vec<String>>,
     /// How many times `rtc_transports` was asked.
     pub transports_requests: std::sync::atomic::AtomicUsize,
     /// Every `livekit_token` request, in order.
@@ -840,7 +832,6 @@ impl Default for MockBackend {
             relations_requests: Default::default(),
             relations_answers: Default::default(),
             transports: std::sync::Mutex::new(Ok(Value::Array(Vec::new()))),
-            unstable_features: std::sync::Mutex::new(Vec::new()),
             transports_requests: Default::default(),
             livekit_token_requests: Default::default(),
             livekit_token_answer: std::sync::Mutex::new(Ok("mock-jwt".to_owned())),
@@ -1230,10 +1221,6 @@ impl MatrixBackend for MockBackend {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.attempt(MockMethod::RtcTransports).await?;
         self.transports.lock().unwrap().clone()
-    }
-
-    async fn unstable_features(&self) -> Result<Vec<String>, BackendError> {
-        Ok(self.unstable_features.lock().unwrap().clone())
     }
 }
 

@@ -225,7 +225,31 @@ describe('MatrixHost server features', () => {
           }),
       },
     });
-    expect(await host.unstableFeatures()).toEqual(['org.matrix.msc4143']);
+    expect(await host.serverFeatures()).toEqual(['org.matrix.msc4143']);
   });
 });
 
+describe('MatrixHost LiveKit token', () => {
+  // TEMPORARY (spec 049 C4): v1 once announced stable, the unstable path otherwise.
+  it.each([
+    [true, '/_matrix/client/v1'],
+    [false, '/_matrix/client/unstable/io.element.msc4195'],
+  ])('asks get_token under the prefix the stable flag (%s) selects', async (stable, prefix) => {
+    const asked = [];
+    const host = new MatrixHost({
+      sdk: { ...sdk, Method: { Post: 'POST' } },
+      client: {
+        doesServerSupportUnstableFeature: (feature) =>
+          Promise.resolve(feature === 'org.matrix.msc4195.stable' && stable),
+        http: {
+          authedRequest: (method, path, query, body, opts) => {
+            asked.push({ path, prefix: opts.prefix });
+            return Promise.resolve({ jwt: 'jwt' });
+          },
+        },
+      },
+    });
+    expect(await host.getLivekitToken({ url: 'wss://sfu' })).toEqual({ jwt: 'jwt' });
+    expect(asked).toEqual([{ path: '/rtc/livekit/get_token', prefix }]);
+  });
+});

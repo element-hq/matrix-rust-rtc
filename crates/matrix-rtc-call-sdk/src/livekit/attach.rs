@@ -38,8 +38,8 @@ pub struct LiveKitAttachOptions {
     pub sfu_fallback: bool,
     /// TEMPORARY (spec 049): lets us publish through the homeserver's
     /// `get_token` on a transport naming both `url` and `livekit_service_url`,
-    /// when the homeserver announces `org.matrix.msc4195.stable`. Read once,
-    /// here (R12). Off by default: `/sfu/get`.
+    /// when our homeserver answers it. Read once, here (R12). Off by default:
+    /// `/sfu/get`.
     pub allow_livekit_get_token: bool,
 }
 
@@ -66,7 +66,7 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
     let providers = Msc4195KeyProviders::new();
     let key_bridge = Arc::new(msc4195_media_key_bridge(providers.clone()));
     let (own_user_id, own_device_id) = (backend.own_user_id(), backend.own_device_id());
-    let flows = livekit_flows(backend.as_ref(), options.allow_livekit_get_token).await;
+    let flows = livekit_flows(call, backend.as_ref(), options.allow_livekit_get_token).await;
     let transport = Arc::new(
         LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, providers)
             .with_auto_subscribe(options.auto_subscribe)

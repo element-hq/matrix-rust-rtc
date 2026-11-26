@@ -187,6 +187,7 @@ impl WasmRtcCall {
             backend.clone(),
             mapper.clone(),
             livekit_flows(
+                self.inner(),
                 backend.as_ref(),
                 config.allow_livekit_get_token.unwrap_or(false),
             )

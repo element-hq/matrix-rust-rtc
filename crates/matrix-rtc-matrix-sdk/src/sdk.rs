@@ -191,6 +191,19 @@ impl SdkMatrixBackend {
         &self.client
     }
 
+    /// The homeserver's `unstable_features` that are on, as `RtcClient::msc_support`
+    /// takes them (spec 038 R45).
+    pub async fn server_features(&self) -> Result<Vec<String>, BackendError> {
+        Ok(self
+            .client
+            .unstable_features()
+            .await
+            .map_err(backend_error)?
+            .into_iter()
+            .map(|feature| feature.to_string())
+            .collect())
+    }
+
     fn room(&self, room_id: &str) -> Result<Room, CommandError> {
         let room_id = RoomId::parse(room_id).map_err(local_error)?;
         // The client knows the room; one it does not know is final (R3).
@@ -721,8 +734,9 @@ impl MatrixBackend for SdkMatrixBackend {
         })
     }
 
-    /// The homeserver's MSC4195 `get_token`, under its unstable path (the only
-    /// one homeservers serve so far).
+    /// The homeserver's MSC4195 `get_token`, under its unstable path. TODO:
+    /// ruma 0.18 picks v1 itself once `org.matrix.msc4195.stable` is announced
+    /// (spec 049 C4); it comes with the next matrix-sdk bump.
     async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
         use ruma::api::client::rtc::livekit::get_token::v1 as get_token;
 
@@ -752,17 +766,6 @@ impl MatrixBackend for SdkMatrixBackend {
     /// falls back to the well-known `rtc_foci`. Nothing discovered is an empty
     /// array ("none advertised"); a failed request stays an error rather than
     /// reading as "none".
-    async fn unstable_features(&self) -> Result<Vec<String>, BackendError> {
-        Ok(self
-            .client
-            .unstable_features()
-            .await
-            .map_err(backend_error)?
-            .into_iter()
-            .map(|feature| feature.to_string())
-            .collect())
-    }
-
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
         if let Some(transports) = rtc_requests::transports(&self.client).await? {
             return Ok(transports);

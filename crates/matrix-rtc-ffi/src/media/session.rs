@@ -48,9 +48,8 @@ pub struct MediaSessionConfig {
     pub sfu_fallback: bool,
     /// TEMPORARY (spec 049): publish through the homeserver's `get_token`
     /// rather than `/sfu/get` when our transport names both `url` and
-    /// `livekit_service_url`, if the homeserver announces
-    /// `org.matrix.msc4195.stable` (read through the backend's
-    /// `unstable_features`). Read once, here. Off by default.
+    /// `livekit_service_url`, if our homeserver answers it. Read once, here.
+    /// Off by default.
     #[uniffi(default = false)]
     pub allow_livekit_get_token: bool,
 }

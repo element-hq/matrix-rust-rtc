@@ -12,13 +12,12 @@ log only.
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
 - A member whose LiveKit transport has both `url` and `livekit_service_url` is found under either identity, hashed or `user:device`, with its keys under both (spec 049).
-- Media session option `allow_livekit_get_token`, next to `sfu_fallback`: temporary, lets us take LiveKit tokens from `get_token` when the homeserver announces both flows and `org.matrix.msc4195.stable` (spec 049).
-- On a homeserver whose `get_token` is stable, peers announcing both LiveKit flows are subscribed through it, falling back to `/sfu/get` per server on failure, and a subscription to our own SFU shares our connection (spec 049).
+- Media session option `allow_livekit_get_token`, next to `sfu_fallback`: temporary, takes every LiveKit token from `get_token` on transports naming both flows once our homeserver answers it, falling back to `/sfu/get` otherwise and per server on a failed subscription (spec 049).
+- The web host asks the LiveKit `get_token` under v1 once the homeserver announces `org.matrix.msc4195.stable`, under the unstable path otherwise (spec 049).
 
 ### Breaking
 
 - `RtcIdentityMapper` returns `Option<RtcIdentity>`; web roster participants gain `rtc_identities` (spec 049).
-- `MatrixBackend` gains `unstable_features()`, the `/versions` features that are on; FFI hosts implement it, and the web host's `serverFeatures()` is now `unstableFeatures()`.
 
 ### Fixed
 

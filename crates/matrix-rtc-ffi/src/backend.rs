@@ -441,9 +441,6 @@ pub trait MatrixBackend: Send + Sync {
     /// The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`,
     /// as JSON; `[]` when the homeserver lacks the endpoint.
     async fn rtc_transports(&self) -> Result<String, FfiBackendError>;
-
-    /// The `unstable_features` of `GET /_matrix/client/versions` that are on.
-    async fn unstable_features(&self) -> Result<Vec<String>, FfiBackendError>;
 }
 
 /// Logs what the host made of an outbound command, so "the core decided to
@@ -763,13 +760,6 @@ impl CoreBackend for FfiBackend {
             .map_err(FfiBackendError::into_backend_error)?;
         serde_json::from_str(&json)
             .map_err(|error| BackendError::new(format!("rtc_transports is not JSON: {error}")))
-    }
-
-    async fn unstable_features(&self) -> Result<Vec<String>, BackendError> {
-        self.host
-            .unstable_features()
-            .await
-            .map_err(FfiBackendError::into_backend_error)
     }
 }
 
@@ -1151,10 +1141,6 @@ pub(crate) mod test_support {
 
         async fn rtc_transports(&self) -> Result<String, FfiBackendError> {
             Ok(self.transports_json.lock().unwrap().clone())
-        }
-
-        async fn unstable_features(&self) -> Result<Vec<String>, FfiBackendError> {
-            Ok(Vec::new())
         }
     }
 }

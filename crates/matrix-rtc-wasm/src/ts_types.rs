@@ -116,8 +116,6 @@ export interface MatrixBackendHost {
     getLivekitToken(request: { server_name?: string; url: string; room_id: string; slot_id: string; member_id: string }): Promise<{ jwt: string }>;
     /** The transports array of `GET /_matrix/client/v1/rtc/transports` (`transports`; the unstable endpoint's `rtc_transports`), entries as served; `[]` when the endpoint is missing. */
     rtcTransports(): Promise<unknown[]>;
-    /** The `unstable_features` of `GET /_matrix/client/versions` that are on. Optional: without it, LiveKit transports naming both flows stay on `/sfu/get` (spec 049). */
-    unstableFeatures?(): Promise<string[]>;
 }
 
 /** One thing the MSC format relies on (spec 038 R45). */
@@ -232,7 +230,7 @@ export interface MediaSessionConfigIn {
     stability?: StabilityConfigIn;
     /** How long our own SFU may stay unreachable before the call ends; 60 000 when omitted. */
     own_reconnect_budget_ms?: number;
-    /** TEMPORARY (spec 049): publish through the homeserver's `get_token` rather than `/sfu/get` when our transport names both `url` and `livekit_service_url`, if the host's `unstableFeatures` announces `org.matrix.msc4195.stable`. Read once, here. Default `false`. */
+    /** TEMPORARY (spec 049): publish through the homeserver's `get_token` rather than `/sfu/get` when our transport names both `url` and `livekit_service_url`, if our homeserver answers it. Read once, here. Default `false`. */
     allow_livekit_get_token?: boolean;
 }
 

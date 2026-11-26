@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::{
-    IdentitySubject, LiveKitFlows, MatrixBackend, RtcIdentity, RtcIdentityMapper, TransportIntent,
+    IdentitySubject, LiveKitFlows, LiveKitTokenRequest, MatrixBackend, RtcIdentity,
+    RtcIdentityMapper, RtcTransport, TransportIntent, get_token_unsupported,
 };
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
@@ -275,19 +276,45 @@ where
     })
 }
 
-/// TEMPORARY (spec 049): the LiveKit token flows a call's media takes, from
-/// the local flag and the homeserver's `/versions`, read once as media
-/// attaches (R12). A `/versions` that fails keeps every LiveKit token on
-/// `/sfu/get` where a transport still names it: never a reason to fail.
-pub async fn livekit_flows(backend: &dyn MatrixBackend, allow_get_token: bool) -> LiveKitFlows {
-    let features = backend
-        .unstable_features()
-        .await
-        .inspect_err(|error| {
-            log::warn!("reading the homeserver's unstable features failed: {error}");
-        })
-        .unwrap_or_default();
-    LiveKitFlows::new(&features, allow_get_token)
+/// TEMPORARY (spec 049): the LiveKit token flows a call's media takes, settled
+/// once as media attaches (R12). With the local flag on and our transport
+/// naming both `url` and `livekit_service_url`, our homeserver is asked for
+/// our own token through `get_token`: no `/versions` flag announces the
+/// unstable endpoint, so the answer is the probe (R8). Any refusal keeps every
+/// such transport on `/sfu/get`, which peers read us under too: never a reason
+/// to fail.
+pub async fn livekit_flows<B: MatrixBackend + 'static>(
+    call: &RtcCall<B>,
+    backend: &dyn MatrixBackend,
+    allow_get_token: bool,
+) -> LiveKitFlows {
+    if !allow_get_token {
+        return LiveKitFlows::default();
+    }
+    let TransportIntent::Publish(RtcTransport::LiveKit(published)) = call.transport() else {
+        return LiveKitFlows::default();
+    };
+    let (Some(url), Some(_)) = (published.url(), published.livekit_service_url()) else {
+        return LiveKitFlows::default();
+    };
+    let request = LiveKitTokenRequest {
+        server_name: None,
+        url: url.to_owned(),
+        room_id: call.room_id().to_owned(),
+        slot_id: call.slot_id().to_owned(),
+        member_id: call.member_id().to_owned(),
+    };
+    match backend.livekit_token(&request).await {
+        Ok(_) => LiveKitFlows { get_token: true },
+        Err(error) if get_token_unsupported(&error) => {
+            log::info!("the homeserver has no get_token ({error}): staying on /sfu/get");
+            LiveKitFlows::default()
+        }
+        Err(error) => {
+            log::warn!("get_token failed ({error}): staying on /sfu/get");
+            LiveKitFlows::default()
+        }
+    }
 }
 
 #[cfg(test)]
