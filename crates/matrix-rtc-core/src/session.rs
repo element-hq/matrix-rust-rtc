@@ -159,6 +159,17 @@ impl<T: MatrixBackend + 'static> PendingLeave<T> {
     }
 }
 
+/// Whether recording a membership event logs the change it made.
+///
+/// Incremental updates log per event, because each one is genuinely news. The
+/// batch path re-records the whole roster on every sticky tick, so it stays
+/// silent and logs a single diff against the previous set instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EventLogging {
+    PerEvent,
+    Silent,
+}
+
 /// Per-session MatrixRTC state machine and membership store.
 pub struct SlotSession<T: MatrixBackend> {
     /// Member events that are join-shaped and still sticky. These are
@@ -897,7 +908,49 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             // announce every partial set of joined memberships on the way — starting with a
             // one-member one, which reads as everybody else leaving. Refresh
             // happens once, below.
-            self.record_membership_event(event);
+            //
+            // Logging is left to the diff below for the same reason the refresh
+            // is: every candidate is re-recorded on every sticky tick, so
+            // per-event lines reprint the entire roster as "added" a few times a
+            // second — N lines per tick per session, N² for the process running
+            // a whole load test.
+            self.record_membership_event(event, EventLogging::Silent);
+        }
+
+        let is_same_candidate = |a: &JoinedMembership, b: &JoinedMembership| {
+            a.sender == b.sender && a.sticky_key == b.sticky_key
+        };
+
+        let added: Vec<&str> = self
+            .candidates
+            .iter()
+            .filter(|now| !previous.iter().any(|before| is_same_candidate(now, before)))
+            .map(|candidate| candidate.sticky_key.as_str())
+            .collect();
+        if !added.is_empty() {
+            log::debug!(
+                "[{}] {} candidate(s) new in the current sticky state: {added:?}",
+                self.log_tag,
+                added.len(),
+            );
+        }
+
+        let updated: Vec<&str> = self
+            .candidates
+            .iter()
+            .filter(|now| {
+                previous
+                    .iter()
+                    .any(|before| is_same_candidate(now, before) && before != *now)
+            })
+            .map(|candidate| candidate.sticky_key.as_str())
+            .collect();
+        if !updated.is_empty() {
+            log::debug!(
+                "[{}] {} candidate(s) changed in the current sticky state: {updated:?}",
+                self.log_tag,
+                updated.len(),
+            );
         }
 
         let dropped: Vec<&str> = previous
@@ -906,7 +959,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 !self
                     .candidates
                     .iter()
-                    .any(|now| now.sender == before.sender && now.sticky_key == before.sticky_key)
+                    .any(|now| is_same_candidate(now, before))
             })
             .map(|candidate| candidate.sticky_key.as_str())
             .collect();
@@ -959,7 +1012,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
     /// Applies one membership event and publishes the result.
     async fn apply_membership_event(&mut self, event: RtcMembershipEvent) {
-        if self.record_membership_event(event) {
+        if self.record_membership_event(event, EventLogging::PerEvent) {
             self.refresh().await;
         }
     }
@@ -980,7 +1033,13 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// call.
     ///
     /// [`set_current_state`]: Self::set_current_state
-    fn record_membership_event(&mut self, event: RtcMembershipEvent) -> bool {
+    fn record_membership_event(
+        &mut self,
+        event: RtcMembershipEvent,
+        logging: EventLogging,
+    ) -> bool {
+        let verbose = logging == EventLogging::PerEvent;
+
         match event {
             RtcMembershipEvent::Joined(joined) => {
                 let existing = self.candidates.iter().position(|candidate| {
@@ -1003,30 +1062,36 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
 
                 match existing {
                     Some(index) if self.candidates[index] == joined => {
-                        log::trace!(
-                            "[{}] member event unchanged, ignored: {}/{}",
-                            self.log_tag,
-                            joined.sender,
-                            joined.sticky_key,
-                        );
+                        if verbose {
+                            log::trace!(
+                                "[{}] member event unchanged, ignored: {}/{}",
+                                self.log_tag,
+                                joined.sender,
+                                joined.sticky_key,
+                            );
+                        }
                         return false;
                     }
                     Some(index) => {
-                        log::debug!(
-                            "[{}] candidate updated: {}/{}",
-                            self.log_tag,
-                            joined.sender,
-                            joined.sticky_key,
-                        );
+                        if verbose {
+                            log::debug!(
+                                "[{}] candidate updated: {}/{}",
+                                self.log_tag,
+                                joined.sender,
+                                joined.sticky_key,
+                            );
+                        }
                         self.candidates[index] = joined;
                     }
                     None => {
-                        log::debug!(
-                            "[{}] candidate added: {}/{}",
-                            self.log_tag,
-                            joined.sender,
-                            joined.sticky_key,
-                        );
+                        if verbose {
+                            log::debug!(
+                                "[{}] candidate added: {}/{}",
+                                self.log_tag,
+                                joined.sender,
+                                joined.sticky_key,
+                            );
+                        }
                         self.candidates.push(joined);
                     }
                 }
@@ -1053,21 +1118,25 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 });
 
                 if self.candidates.len() == before {
-                    log::trace!(
-                        "[{}] leave for an unknown candidate, ignored: {}/{}",
+                    if verbose {
+                        log::trace!(
+                            "[{}] leave for an unknown candidate, ignored: {}/{}",
+                            self.log_tag,
+                            left.sender,
+                            left.sticky_key,
+                        );
+                    }
+                    return false;
+                }
+
+                if verbose {
+                    log::debug!(
+                        "[{}] candidate removed: {}/{}",
                         self.log_tag,
                         left.sender,
                         left.sticky_key,
                     );
-                    return false;
                 }
-
-                log::debug!(
-                    "[{}] candidate removed: {}/{}",
-                    self.log_tag,
-                    left.sender,
-                    left.sticky_key,
-                );
             }
         }
 
