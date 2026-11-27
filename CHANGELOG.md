@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.6.0 - 2026-11-27
+
 ### Added
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
