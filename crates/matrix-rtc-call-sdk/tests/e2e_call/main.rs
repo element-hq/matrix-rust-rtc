@@ -47,6 +47,7 @@
 
 mod provision;
 mod resilience;
+mod resubscribe;
 mod simulcast;
 
 use std::env;
@@ -1143,8 +1144,8 @@ async fn verify_video_pattern(call: &LiveKitCall, label: &str) -> Result<bool, B
 /// 1. `visible = false` → **pause** (subscription kept): frames stop, then
 ///    resume instantly on `visible = true` — the scroll case.
 /// 2. `enabled = false` → **off**: the stream is released as fully as the
-///    transport supports (LiveKit currently pauses too — its client-side
-///    resubscribe is unreliable at 0.7.48), then `enabled = true` brings
+///    transport supports (LiveKit currently pauses too — livekit-rust cannot
+///    re-subscribe, see `resubscribe.rs`), then `enabled = true` brings
 ///    frames back — the closed-tile case. The re-fetch loop below stays
 ///    valid for transports whose `Off` really unsubscribes (new track).
 async fn verify_constraints_toggle(
