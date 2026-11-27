@@ -162,7 +162,7 @@ async fn publish_tone(
 /// publishing on `alice_sfu` (with the fallback when `alice_fallback`) and
 /// bob on `bob_sfu`, each seeing the other. Bob lives on the homeserver that
 /// mints his SFU's tokens.
-async fn two_in_a_call(
+pub(super) async fn two_in_a_call(
     cfg: &Config,
     alice_sfu: Sfu,
     bob_sfu: Sfu,
@@ -265,13 +265,13 @@ fn ended(call: &LiveKitCall) -> bool {
     matches!(call.status(), CallStatus::Ended { .. })
 }
 
-async fn leave(participants: [Participant; 2]) {
+pub(super) async fn leave(participants: [Participant; 2]) {
     for participant in participants {
         let _ = tokio::time::timeout(Duration::from_secs(30), participant.call.leave()).await;
     }
 }
 
-fn verdict(checks: &[(&str, bool)]) -> Result<(), Box<dyn Error>> {
+pub(super) fn verdict(checks: &[(&str, bool)]) -> Result<(), Box<dyn Error>> {
     println!("\n=== RESULT ===");
     for (what, ok) in checks {
         println!("{what:<56} {ok}");

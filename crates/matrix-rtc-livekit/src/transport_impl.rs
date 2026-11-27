@@ -800,12 +800,16 @@ impl TransportConnection for LiveKitTransportConnection {
         };
 
         // `Off` SHOULD be a full unsubscribe (`set_subscribed(false)`), but
-        // livekit 0.7.48's client-side *re*subscribe is unreliable: the SFU
-        // resumes RTP on the previous receiver without a new OnTrack, so no
+        // livekit-rust cannot re-subscribe (0.7.48 through 0.12.1, against
+        // livekit-server v1.10.1; the `e2e_livekit_resubscribes` e2e). The
+        // SFU re-adds the track on the same transceiver (`mid`) and stream
+        // id, and in two-peer-connection mode livekit drops the new track as
+        // already dispatched: `RtcEvent::Track` dedupes on `(mid, stream_id)`
+        // in `dispatched_streams`, and only the single-PC path ever clears
+        // that set (`rtc_session.rs`, `process_remote_track_addition`). So no
         // `TrackSubscribed` fires, `publication.track()` stays `None`, and
-        // every subsequent settings call no-ops — the stream is stranded
-        // (observed against livekit-server v1.10.1). Until that works
-        // upstream, `Off` maps to the pause path too: identical zero
+        // every later setting no-ops: the stream is stranded. Until that is
+        // fixed upstream, `Off` maps to the pause path too: identical zero
         // bandwidth (dynacast even stops the publisher's encoder), only an
         // idle decoder object is retained. `Paused`/`Off` keep the
         // subscription and set the `disabled` flag server-side — no data,
