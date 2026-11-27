@@ -41,6 +41,7 @@
 //! before the run began. Devices are then kept on exit, and `--purge-devices`
 //! clears the folder along with them.
 
+use rlimit::increase_nofile_limit;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -283,6 +284,9 @@ fn parse_resolution(value: &str) -> Result<(u32, u32), String> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if let Err(error) = increase_nofile_limit(rlimit::INFINITY) {
+        panic!("{error}");
+    }
     // Both rustls crypto backends are in the tree (`ring` via livekit/reqwest,
     // `aws-lc-rs` via matrix-sdk), so no process-level provider is picked
     // automatically; choose one before any TLS happens.

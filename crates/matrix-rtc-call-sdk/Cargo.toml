@@ -121,6 +121,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # examples install `aws-lc-rs` explicitly (matches matrix-sdk's default); this
 # dev-dep gives us the provider module to call `install_default()`.
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
+# Lifts the open-file limit for the `load_test` example: every device holds
+# its own store, sync and SFU connections.
+rlimit = "0.11.0"
 
 [[example]]
 name = "connect"
