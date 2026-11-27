@@ -323,7 +323,11 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             batches.entry(slot_id.clone()).or_default();
         }
 
+        // Own target, so a caller that wants the rest of this module at debug can
+        // still silence this one line: it fires per sticky-state sync per room,
+        // which drowns everything else out under a load test.
         log::debug!(
+            target: "matrix_rtc_core::base_rtc_room::sticky_routing",
             "[{}] current sticky state routed to {} session(s): {}",
             self.room_id,
             batches.len(),
