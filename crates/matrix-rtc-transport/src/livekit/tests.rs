@@ -6,6 +6,7 @@
 use matrix_rtc_core::{IdentitySubject, LiveKitTransport, RtcIdentity, RtcTransport};
 
 use super::*;
+use transition::FlowChoice;
 
 const ALICE: &str = "@alice:example.com";
 
@@ -83,19 +84,19 @@ fn members_share_a_connection_exactly_when_their_flow_and_its_endpoint_agree() {
     let service = RtcTransport::LiveKit(LiveKitTransport::service("https://jwt.example.com"));
     let transitional = RtcTransport::LiveKit(both());
     assert_eq!(
-        connection_key(&service, ALICE),
-        connection_key(&transitional, "@bob:other.org")
+        connection_key(&FlowChoice::default(), &service, ALICE),
+        connection_key(&FlowChoice::default(), &transitional, "@bob:other.org")
     );
 
     let sfu = RtcTransport::LiveKit(LiveKitTransport::sfu("wss://sfu.example.com"));
     assert_ne!(
-        connection_key(&sfu, ALICE),
-        connection_key(&sfu, "@bob:other.org"),
+        connection_key(&FlowChoice::default(), &sfu, ALICE),
+        connection_key(&FlowChoice::default(), &sfu, "@bob:other.org"),
         "the homeserver asked for the token differs"
     );
     assert_ne!(
-        connection_key(&sfu, ALICE),
-        connection_key(&transitional, ALICE)
+        connection_key(&FlowChoice::default(), &sfu, ALICE),
+        connection_key(&FlowChoice::default(), &transitional, ALICE)
     );
 }
 

@@ -130,7 +130,7 @@ export class WebPeerApp {
    * Join the RTC slot and attach media: feed the room, publish the
    * membership, connect the SFU through the engine, publish tracks.
    */
-  async join({ roomId, compat, publish = {} }) {
+  async join({ roomId, compat, publish = {}, transport, livekitGetToken = false }) {
     const focusUrl = await this.host.discoverFocus();
     this.roomId = roomId;
     this.slotId = DEFAULT_SLOT_ID;
@@ -146,9 +146,11 @@ export class WebPeerApp {
 
     this.rtcCall = await this.rtcRoom.joinCall({
       // Room-state pins the JWT service it discovered; MSC takes the
-      // homeserver's `m.livekit` SFU (spec 038 R17).
+      // homeserver's `m.livekit` SFU (spec 038 R17), unless the driver names
+      // one (a transport with both flows, spec 049).
       transport:
-        compat === 'msc' ? undefined : { kind: 'publish', livekit_service_url: focusUrl },
+        transport ??
+        (compat === 'msc' ? undefined : { kind: 'publish', livekit_service_url: focusUrl }),
     });
     const memberId = this.rtcCall.memberId;
     this.memberId = memberId;
@@ -164,6 +166,8 @@ export class WebPeerApp {
 
     await this.call.connect({
       format: compat === 'msc' ? undefined : compat,
+      // TEMPORARY (spec 049): the local flag.
+      allow_livekit_get_token: livekitGetToken,
     });
 
     await this.publishMedia(publish);

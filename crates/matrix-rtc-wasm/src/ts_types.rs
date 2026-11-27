@@ -230,6 +230,8 @@ export interface MediaSessionConfigIn {
     stability?: StabilityConfigIn;
     /** How long our own SFU may stay unreachable before the call ends; 60 000 when omitted. */
     own_reconnect_budget_ms?: number;
+    /** TEMPORARY (spec 049): publish through the homeserver's `get_token` rather than `/sfu/get` when our transport names both `url` and `livekit_service_url`, if our homeserver answers it. Read once, here. Default `false`. */
+    allow_livekit_get_token?: boolean;
 }
 
 /**

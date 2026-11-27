@@ -537,6 +537,7 @@ impl Call {
         manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
             Some(identity_of(subject.user_id, subject.device_id?).into())
         }));
+        manager.set_own_rtc_identity(identity_of(&user_id, &device_id));
         manager.join().await.expect("join should succeed");
 
         let peer = Peer {

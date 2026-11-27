@@ -68,13 +68,13 @@ struct LegacyGetTokenRequest<'a> {
 /// Build the **pre-MSC4195** `POST /sfu/get` request: the endpoint URL and the
 /// JSON body to send to it.
 ///
-/// Used, for publishing and subscribing alike, on every transport that names a
-/// `livekit_service_url`. There is deliberately **no** fallback between this
-/// and the homeserver's `get_token`: the endpoint is not an independent choice,
-/// it mints the participant identity peers map us by, and that is decided by
-/// the transport we published before any HTTP happens. Succeeding through the
-/// other flow produces a fully connected SFU session in which nothing decrypts
-/// and nobody appears, so a wrong guess would never surface. A 404 stays loud.
+/// Used on a transport naming only a `livekit_service_url`, and on one naming
+/// both where [`super::transition::FlowChoice`] picks it. For the connection we
+/// publish on there is deliberately **no** fallback between this and the
+/// homeserver's `get_token`: the endpoint mints the identity peers map us by,
+/// and succeeding through the other flow produces a session in which nothing
+/// decrypts and nobody sees us. A subscription only receives, so it may fall
+/// back from `get_token` to this (spec 049 R13).
 pub fn legacy_token_request(
     livekit_service_url: &str,
     room: &str,

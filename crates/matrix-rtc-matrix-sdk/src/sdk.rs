@@ -734,8 +734,9 @@ impl MatrixBackend for SdkMatrixBackend {
         })
     }
 
-    /// The homeserver's MSC4195 `get_token`, under its unstable path (the only
-    /// one homeservers serve so far).
+    /// The homeserver's MSC4195 `get_token`, under its unstable path. TODO:
+    /// ruma 0.18 picks v1 itself once `org.matrix.msc4195.stable` is announced
+    /// (spec 049 C4); it comes with the next matrix-sdk bump.
     async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
         use ruma::api::client::rtc::livekit::get_token::v1 as get_token;
 

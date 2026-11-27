@@ -12,8 +12,9 @@ use matrix_rtc_call::{
 };
 use matrix_rtc_core::testing::MockBackend;
 use matrix_rtc_core::{
-    EventEncryption, EventIn, IdentitySubject, JoinedMembership, KEY_MESSAGE_TYPE,
-    LeaveSessionParams, RoomOptions, RtcIdentity, RtcTransport, SLOT_EVENT_TYPE, ToDeviceMessageIn,
+    BackendError, EventEncryption, EventIn, IdentitySubject, JoinedMembership, KEY_MESSAGE_TYPE,
+    LeaveSessionParams, LiveKitFlows, LiveKitTransport, RoomOptions, RtcIdentity, RtcTransport,
+    SLOT_EVENT_TYPE, ToDeviceMessageIn,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -134,6 +135,8 @@ impl TransportConnection for FakeConnection {
 #[derive(Default)]
 struct FakeTransport {
     own: Arc<OwnFocus>,
+    /// Our identity as the transport's flow mints it, over the mapper's.
+    flow_identity: Option<String>,
 }
 
 impl FakeTransport {
@@ -196,6 +199,10 @@ impl MediaTransport for FakeTransport {
 #[async_trait]
 impl OwnFocusTransport for FakeTransport {
     type Connection = FakeConnection;
+
+    fn own_identity(&self, _connection_key: &str, _member: &OwnMemberClaims) -> Option<String> {
+        self.flow_identity.clone()
+    }
 
     async fn connect_own(
         &self,
@@ -375,6 +382,80 @@ async fn our_sender_adopts_the_key_index_we_are_already_on() {
     assert_eq!(
         *connection.local_key_indexes.lock().unwrap(),
         [own.key_index]
+    );
+}
+
+/// Spec 049 R9: the flow we publish through decides our identity, and our key
+/// is filed under it.
+#[tokio::test]
+async fn our_identity_and_key_follow_the_flow_we_publish_through() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock).await;
+    let call = room.join_call(CallJoinOptions::new()).await.expect("join");
+    let handler = Arc::new(MediaKeyHandler::new());
+    let transport = FakeTransport {
+        flow_identity: Some("hashed-us".to_owned()),
+        ..FakeTransport::default()
+    };
+
+    let attached = attach_media(&call, Arc::new(transport), handler.clone(), options(&mock))
+        .await
+        .expect("attaches");
+
+    assert_eq!(attached.own_identity, "hashed-us");
+    assert!(
+        handler.key_for("hashed-us").is_some(),
+        "our key is under it"
+    );
+}
+
+/// Spec 049 R8: with the flag on, our homeserver's answer to our own
+/// `get_token` decides; any refusal keeps us on `/sfu/get`.
+#[tokio::test]
+async fn the_livekit_flows_come_from_the_flag_and_a_get_token_probe() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock).await;
+    let both = LiveKitTransport::new(
+        Some("wss://sfu.example.org".into()),
+        Some("https://jwt.example.org".into()),
+        None,
+    )
+    .unwrap();
+    let call = room
+        .join_call(CallJoinOptions::new().transport(JoinTransport::Publish(both)))
+        .await
+        .expect("join");
+
+    assert_eq!(
+        livekit_flows(&call, mock.as_ref(), false).await,
+        LiveKitFlows::default()
+    );
+    assert!(mock.livekit_token_requests.lock().unwrap().is_empty());
+
+    assert_eq!(
+        livekit_flows(&call, mock.as_ref(), true).await,
+        LiveKitFlows { get_token: true }
+    );
+    let probe = mock.livekit_token_requests.lock().unwrap()[0].clone();
+    assert_eq!(probe.url, "wss://sfu.example.org");
+    assert_eq!(probe.member_id, call.member_id());
+    assert_eq!(probe.server_name.as_deref(), Some("example.org"));
+
+    *mock.livekit_token_answer.lock().unwrap() = Err(BackendError::with_matrix_error(
+        Some("M_UNRECOGNIZED".into()),
+        Some(404),
+        "no such endpoint",
+    ));
+    assert_eq!(
+        livekit_flows(&call, mock.as_ref(), true).await,
+        LiveKitFlows::default()
+    );
+    *mock.livekit_token_answer.lock().unwrap() = Err(BackendError::new("offline"));
+    assert_eq!(
+        livekit_flows(&call, mock.as_ref(), true).await,
+        LiveKitFlows::default()
     );
 }
 

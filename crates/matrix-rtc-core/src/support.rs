@@ -12,6 +12,7 @@
 
 use serde_json::Value;
 
+use crate::BackendError;
 use crate::compat::MembershipFormat;
 use crate::transport::{RawRtcTransport, RtcTransport};
 
@@ -85,6 +86,27 @@ pub fn msc_support(server_features: &[String], rtc_transports: &Value) -> MscSup
     support
 }
 
+/// TEMPORARY (spec 049): whether a joined call's LiveKit connections take
+/// their tokens from `get_token` on transports announcing both `url` and
+/// `livekit_service_url`, settled once as media attaches (R12). The default
+/// keeps every such transport on `/sfu/get`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiveKitFlows {
+    /// The local flag is on and our homeserver answered `get_token` (R8).
+    pub get_token: bool,
+}
+
+/// TEMPORARY (spec 049 R8): whether a failed `get_token` says our homeserver
+/// lacks the endpoint, rather than refusing this one request. No `/versions`
+/// flag announces the unstable endpoint, so asking is the only way to know.
+pub fn get_token_unsupported(error: &BackendError) -> bool {
+    error.status == Some(404)
+        || matches!(
+            error.errcode.as_deref(),
+            Some("M_NOT_FOUND" | "M_UNRECOGNIZED")
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -125,6 +147,25 @@ mod tests {
         );
         assert_eq!(support.warnings, [MscRequirement::DelayedEvents]);
         assert!(!support.is_supported());
+    }
+
+    #[test]
+    fn only_an_absent_endpoint_rules_get_token_out() {
+        let answered = |errcode: Option<&str>, status| {
+            BackendError::with_matrix_error(errcode.map(str::to_owned), Some(status), "refused")
+        };
+        assert!(get_token_unsupported(&answered(
+            Some("M_UNRECOGNIZED"),
+            400
+        )));
+        assert!(get_token_unsupported(&answered(Some("M_NOT_FOUND"), 404)));
+        assert!(get_token_unsupported(&answered(None, 404)));
+        assert!(!get_token_unsupported(&answered(Some("M_FORBIDDEN"), 403)));
+        assert!(!get_token_unsupported(&answered(
+            Some("M_LIMIT_EXCEEDED"),
+            429
+        )));
+        assert!(!get_token_unsupported(&BackendError::new("offline")));
     }
 
     /// Delayed events only warn: R43 bounds a crash without them.

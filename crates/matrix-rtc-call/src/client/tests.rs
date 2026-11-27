@@ -619,6 +619,21 @@ async fn a_media_key_reaches_only_the_room_it_names() {
     let other_call = other.join_call(CallJoinOptions::new()).await.expect("join");
     let here = Arc::new(KeyRecorder::default());
     let there = Arc::new(KeyRecorder::default());
+    // Peers' keys are signalled once media installs a mapper.
+    let by_member_id: matrix_rtc_core::RtcIdentityMapper = Arc::new(|subject| {
+        Some(matrix_rtc_core::RtcIdentity::Single(
+            subject.member_id.to_owned(),
+        ))
+    });
+    assert!(
+        call.set_encryption_identity_mapper(by_member_id.clone(), "me".into())
+            .await
+    );
+    assert!(
+        other_call
+            .set_encryption_identity_mapper(by_member_id, "me".into())
+            .await
+    );
     assert!(call.set_encryption_signal_handler(here.clone()).await);
     assert!(
         other_call

@@ -820,9 +820,10 @@ impl MediaPool {
             return;
         };
         log::debug!(
-            "member {} ({}) maps to transport identity {rtc_identity:?}",
+            "member {} ({}, origin {:?}) maps to transport identity {rtc_identity:?}",
             member.member_id,
             member.sender,
+            member.origin,
         );
         self.member_identities
             .insert(member.member_id.clone(), rtc_identity.clone());
@@ -1245,6 +1246,18 @@ impl MediaPool {
                 self.clear_degraded(key);
                 self.peer_up(key);
             }
+            // A subscription the backend can take another way (spec 049
+            // R13): its members regroup onto the other connection, and this
+            // one, left empty, is dropped at its retry.
+            Err(error) if self.subscription_regroups(key) => {
+                log::warn!("connecting to {key} failed: {error}; regrouping its members");
+                let entry = self.pool.get_mut(key).expect("entry checked above");
+                entry.state = ConnState::Backoff {
+                    attempt: attempt + 1,
+                };
+                self.schedule_retry(key, attempt + 1, backoff_delay(attempt + 1));
+                self.reconcile_pool();
+            }
             // About our homeserver, not this SFU: no connection can be had,
             // so retrying this one is pointless and the call is over (R44).
             Err(TransportError::TokenEndpointUnsupported(message)) => {
@@ -1259,6 +1272,18 @@ impl MediaPool {
                 self.schedule_retry(key, next, backoff_delay(next));
             }
         }
+    }
+
+    /// Whether the backend of the subscription on `key` now keys its members
+    /// elsewhere, after it failed to connect.
+    fn subscription_regroups(&self, key: &str) -> bool {
+        self.pool.get(key).is_some_and(|entry| {
+            !entry.is_own
+                && entry
+                    .backend
+                    .as_ref()
+                    .is_some_and(|backend| backend.subscription_failed(key))
+        })
     }
 
     fn schedule_retry(&self, key: &str, attempt: u32, delay: Duration) {

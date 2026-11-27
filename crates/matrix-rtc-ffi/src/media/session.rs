@@ -46,6 +46,12 @@ pub struct MediaSessionConfig {
     /// an account of our homeserver. Off by default.
     #[uniffi(default = false)]
     pub sfu_fallback: bool,
+    /// TEMPORARY (spec 049): publish through the homeserver's `get_token`
+    /// rather than `/sfu/get` when our transport names both `url` and
+    /// `livekit_service_url`, if our homeserver answers it. Read once, here.
+    /// Off by default.
+    #[uniffi(default = false)]
+    pub allow_livekit_get_token: bool,
 }
 
 /// Attach media to a joined call: wire frame-key signalling into the core,
@@ -95,6 +101,7 @@ async fn build_media_session(
                 .own_reconnect_budget_ms
                 .map(std::time::Duration::from_millis),
             sfu_fallback: config.sfu_fallback,
+            allow_livekit_get_token: config.allow_livekit_get_token,
         },
     )
     .await

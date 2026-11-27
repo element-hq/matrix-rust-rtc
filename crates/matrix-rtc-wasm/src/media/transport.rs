@@ -39,15 +39,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
 use matrix_rtc_core::{
-    BackendError, IdentitySubject, JoinedMembership, LiveKitTokenRequest, MatrixBackend,
-    RtcIdentity, RtcIdentityMapper, RtcTransport,
+    BackendError, IdentitySubject, JoinedMembership, LiveKitFlows, LiveKitTokenRequest,
+    MatrixBackend, RtcIdentity, RtcIdentityMapper, RtcTransport,
 };
 use matrix_rtc_transport::keys::FrameKeyRing;
 use matrix_rtc_transport::livekit::token::{legacy_token_request, parse_sfu_token};
+use matrix_rtc_transport::livekit::transition::FlowChoice;
 use matrix_rtc_transport::livekit::{LiveKitTarget, SfuToken};
 use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaStreamKind, MediaTransport,
-    OwnFocusTransport, RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
+    OwnFocusTransport, OwnMemberClaims, RemoteTrackHandle, SpeakingParticipant,
+    TransportConnection, TransportError,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -308,6 +310,9 @@ struct ConnectRequest<'a> {
 pub(crate) struct JsMediaTransport {
     connector: Rc<JsConnector>,
     identity_mapper: RtcIdentityMapper,
+    /// TEMPORARY (spec 049): which flow each connection takes on a transport
+    /// naming both.
+    flows: FlowChoice,
 }
 
 /// What a connect needs: the delegate that fetches and connects, and the
@@ -324,10 +329,12 @@ impl JsMediaTransport {
         delegate: JsValue,
         backend: Arc<dyn MatrixBackend>,
         identity_mapper: RtcIdentityMapper,
+        flows: LiveKitFlows,
     ) -> Self {
         Self {
             connector: Rc::new(JsConnector { delegate, backend }),
             identity_mapper,
+            flows: FlowChoice::new(flows),
         }
     }
 }
@@ -338,7 +345,8 @@ impl JsConnector {
     /// OpenID token exchanged at the legacy JWT service's `/sfu/get`, where
     /// Rust builds the request and decodes the response
     /// (`matrix_rtc_transport::livekit`) and the delegate performs the fetch.
-    /// No fallback between the two: each mints a different identity.
+    /// No fallback here: each mints a different identity. A subscription that
+    /// fails through `get_token` is regrouped by the pool (spec 049 R13).
     async fn acquire_token(
         &self,
         connection_key: &str,
@@ -468,6 +476,14 @@ impl JsConnector {
 impl OwnFocusTransport for JsMediaTransport {
     type Connection = JsTransportConnection;
 
+    fn own_connection_key(&self, transport: &RtcTransport, own_user_id: &str) -> Option<String> {
+        matrix_rtc_transport::livekit::own_connection_key(&self.flows, transport, own_user_id)
+    }
+
+    fn own_identity(&self, connection_key: &str, member: &OwnMemberClaims) -> Option<String> {
+        matrix_rtc_transport::livekit::own_identity(connection_key, member)
+    }
+
     async fn connect_own(
         &self,
         connection_key: &str,
@@ -503,7 +519,11 @@ impl MediaTransport for JsMediaTransport {
     }
 
     fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
-        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+        matrix_rtc_transport::livekit::connection_key(&self.flows, transport, publisher_user_id)
+    }
+
+    fn subscription_failed(&self, connection_key: &str) -> bool {
+        self.flows.subscription_failed(connection_key)
     }
 
     fn shares_identity(&self, a: &str, b: &str) -> bool {

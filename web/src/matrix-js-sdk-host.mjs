@@ -433,16 +433,21 @@ export class MatrixHost {
   }
 
   /**
-   * The homeserver's MSC4195 LiveKit token, `{ jwt }`, from its `get_token`
-   * under the unstable prefix homeservers serve so far.
+   * The homeserver's MSC4195 LiveKit token, `{ jwt }`, from its `get_token`:
+   * under v1 once it announces `org.matrix.msc4195.stable`, else under the
+   * unstable prefix, which no `/versions` flag announces (as matrix-js-sdk's
+   * own `getLivekitToken` does).
    */
-  getLivekitToken(request) {
+  async getLivekitToken(request) {
+    const stable = await this.client.doesServerSupportUnstableFeature(
+      'org.matrix.msc4195.stable',
+    );
     return this.client.http.authedRequest(
       this.sdk.Method.Post,
       '/rtc/livekit/get_token',
       undefined,
       request,
-      { prefix: '/_matrix/client/unstable/io.element.msc4195' },
+      { prefix: stable ? '/_matrix/client/v1' : '/_matrix/client/unstable/io.element.msc4195' },
     );
   }
 

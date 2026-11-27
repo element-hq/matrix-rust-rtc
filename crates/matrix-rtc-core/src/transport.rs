@@ -45,12 +45,15 @@ pub struct LiveKitTransport {
 ///
 /// The flow decides the participant identity the token mints, and peers map a
 /// participant to a member by that identity, so it is a property of the
-/// transport and never of the role or the membership format.
+/// transport and never of the membership format. For a transport naming both
+/// fields, this is only the default: the media layer may choose `get_token`
+/// per connection while homeservers move over (spec 049, the transport
+/// crate's `livekit::transition`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiveKitAuthFlow<'a> {
     /// An OpenID token exchanged at the legacy JWT service's `/sfu/get`,
-    /// minting `{user_id}:{device_id}`. Used whenever the transport still
-    /// names the service, even alongside a `url`: clients predating the
+    /// minting `{user_id}:{device_id}`. The default whenever the transport
+    /// still names the service, even alongside a `url`: clients predating the
     /// homeserver endpoints only look for that identity.
     SfuGet {
         /// The JWT service's base URL.

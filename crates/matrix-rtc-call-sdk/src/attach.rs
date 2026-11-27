@@ -18,7 +18,8 @@ use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::{
-    IdentitySubject, MatrixBackend, RtcIdentity, RtcIdentityMapper, TransportIntent,
+    IdentitySubject, LiveKitFlows, LiveKitTokenRequest, MatrixBackend, RtcIdentity,
+    RtcIdentityMapper, RtcTransport, TransportIntent, get_token_unsupported,
 };
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
@@ -104,7 +105,7 @@ where
     let own_key = match call.transport() {
         TransportIntent::Publish(published) => Some(
             transport
-                .connection_key(published, &options.own_user_id)
+                .own_connection_key(published, &options.own_user_id)
                 .ok_or_else(|| {
                     AttachError::UnsupportedTransport(format!(
                         "the call publishes on {published:?}, which is not a {} transport",
@@ -132,11 +133,41 @@ where
     let signalling = call.subscribe_signalling_health().await;
     let own_membership_lapsed = call.subscribe_own_membership_lapsed().await;
 
+    let own_claims = OwnMemberClaims {
+        member_id: member_id.clone(),
+        user_id: options.own_user_id.clone(),
+        device_id: options.own_device_id.clone(),
+    };
+    // The one place our identity is decided: the one the flow we publish
+    // through mints, when the transport knows it from our connection key;
+    // else the mapper's for the transport we publish on, when it names one
+    // identity; else `user:device`, as when nothing is published.
+    let own_transports = match call.transport() {
+        TransportIntent::Publish(published) => std::slice::from_ref(published),
+        TransportIntent::ReceiveOnly { .. } => &[],
+    };
+    let own_identity = own_key
+        .as_deref()
+        .and_then(|key| transport.own_identity(key, &own_claims))
+        .or_else(|| {
+            match (options.identity_mapper)(&IdentitySubject {
+                user_id: &options.own_user_id,
+                device_id: Some(&options.own_device_id),
+                member_id: &member_id,
+                transports: own_transports,
+            }) {
+                Some(RtcIdentity::Single(identity)) => Some(identity),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| format!("{}:{}", options.own_user_id, options.own_device_id));
+
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
     // peer keys under the raw `member_id` fallback — an identity the SFU never
-    // uses, which is indistinguishable from importing nothing.
-    call.set_encryption_identity_mapper(options.identity_mapper.clone())
+    // uses, which is indistinguishable from importing nothing. Our own goes
+    // with it, so our key is filed under the identity we publish as.
+    call.set_encryption_identity_mapper(options.identity_mapper.clone(), own_identity.clone())
         .await;
     if !call
         .set_encryption_signal_handler(key_handler.clone())
@@ -150,11 +181,7 @@ where
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
         slot_id: call.format().token_slot_id(&slot_id).into_owned(),
-        member: OwnMemberClaims {
-            member_id: member_id.clone(),
-            user_id: options.own_user_id.clone(),
-            device_id: options.own_device_id.clone(),
-        },
+        member: own_claims,
         e2ee: call.encrypts_media().await,
     };
     let pooled: Arc<dyn MediaTransport> = transport.clone();
@@ -204,22 +231,6 @@ where
         );
     }
 
-    // Derived as the core derives it for our own key: from the transport we
-    // publish on, falling back the same way when nothing is published.
-    let own_transports = match call.transport() {
-        TransportIntent::Publish(published) => std::slice::from_ref(published),
-        TransportIntent::ReceiveOnly { .. } => &[],
-    };
-    let own_identity = (options.identity_mapper)(&IdentitySubject {
-        user_id: &options.own_user_id,
-        device_id: Some(&options.own_device_id),
-        member_id: &member_id,
-        transports: own_transports,
-    })
-    .map_or_else(
-        || format!("{}:{}", options.own_user_id, options.own_device_id),
-        RtcIdentity::into_own,
-    );
     let own_connection = match &own_key {
         Some(own_key) => {
             // Not awaited: the join already has the user in the call, and our
@@ -263,6 +274,49 @@ where
         own_identity,
         events,
     })
+}
+
+/// TEMPORARY (spec 049): the LiveKit token flows a call's media takes, settled
+/// once as media attaches (R12). With the local flag on and our transport
+/// naming both `url` and `livekit_service_url`, our homeserver is asked for
+/// our own token through `get_token`: no `/versions` flag announces the
+/// unstable endpoint, so the answer is the probe (R8). Any refusal keeps every
+/// such transport on `/sfu/get`, which peers read us under too: never a reason
+/// to fail.
+pub async fn livekit_flows<B: MatrixBackend + 'static>(
+    call: &RtcCall<B>,
+    backend: &dyn MatrixBackend,
+    allow_get_token: bool,
+) -> LiveKitFlows {
+    if !allow_get_token {
+        return LiveKitFlows::default();
+    }
+    let TransportIntent::Publish(RtcTransport::LiveKit(published)) = call.transport() else {
+        return LiveKitFlows::default();
+    };
+    let (Some(url), Some(_)) = (published.url(), published.livekit_service_url()) else {
+        return LiveKitFlows::default();
+    };
+    // The same request our own connect makes, so the probe answers for it.
+    let own_user_id = backend.own_user_id();
+    let request = LiveKitTokenRequest {
+        server_name: Some(published.sfu_server_name(&own_user_id).to_owned()),
+        url: url.to_owned(),
+        room_id: call.room_id().to_owned(),
+        slot_id: call.slot_id().to_owned(),
+        member_id: call.member_id().to_owned(),
+    };
+    match backend.livekit_token(&request).await {
+        Ok(_) => LiveKitFlows { get_token: true },
+        Err(error) if get_token_unsupported(&error) => {
+            log::info!("the homeserver has no get_token ({error}): staying on /sfu/get");
+            LiveKitFlows::default()
+        }
+        Err(error) => {
+            log::warn!("get_token failed ({error}): staying on /sfu/get");
+            LiveKitFlows::default()
+        }
+    }
 }
 
 #[cfg(test)]

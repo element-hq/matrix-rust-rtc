@@ -43,17 +43,6 @@ impl RtcIdentity {
         };
         std::iter::once(first).chain(second)
     }
-
-    /// The one identity we publish under when this is ours.
-    ///
-    /// TEMPORARY (spec 049): announcing both fields, we publish via
-    /// `/sfu/get` (R7), so ours is the legacy identity.
-    pub fn into_own(self) -> String {
-        match self {
-            Self::Single(identity) => identity,
-            Self::Transition { legacy, .. } => legacy,
-        }
-    }
 }
 
 impl From<String> for RtcIdentity {

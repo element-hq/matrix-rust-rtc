@@ -71,7 +71,8 @@ export class MatrixRtcCall {
    * The own focus is the one the join publishes on (none for a receive-only
    * call) and the account is the backend's.
    *
-   * @param {object} [config] - `{ format? }`
+   * @param {object} [config] - `{ format?, allow_livekit_get_token? }`; the
+   *   latter is temporary (spec 049), see `MediaSessionConfigIn`
    */
   async connect(config = {}) {
     if (this.session) throw new Error('already connected');
@@ -79,7 +80,7 @@ export class MatrixRtcCall {
     this.keyProvider = makePerParticipantKeyProvider(this.livekit);
 
     this.session = await this.call.connectMedia(
-      { format: config.format },
+      { format: config.format, allow_livekit_get_token: config.allow_livekit_get_token },
       this.delegate(),
     );
 

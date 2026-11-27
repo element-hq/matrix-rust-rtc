@@ -1077,14 +1077,19 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
                 .unwrap_or(false)
     }
 
-    pub async fn set_encryption_identity_mapper(&self, mapper: RtcIdentityMapper) -> bool {
+    /// See `SlotSession::set_encryption_identity_mapper`.
+    pub async fn set_encryption_identity_mapper(
+        &self,
+        mapper: RtcIdentityMapper,
+        own_identity: String,
+    ) -> bool {
         self.is_live()
             && self
                 .state
                 .lock()
                 .await
                 .rtc_mut()
-                .set_encryption_identity_mapper(&self.slot_id, mapper)
+                .set_encryption_identity_mapper(&self.slot_id, mapper, own_identity)
     }
 
     pub async fn replay_encryption_keys(&self) -> bool {
