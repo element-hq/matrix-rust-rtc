@@ -903,13 +903,12 @@ pub enum FfiVideoDetail {
 #[derive(Clone, Copy, Debug, uniffi::Record)]
 pub struct FfiMediaConstraints {
     /// `false` releases the stream as fully as the transport supports; use
-    /// for closed tiles, not scroll-by invisibility.
+    /// for closed tiles, not scroll-by invisibility. LiveKit currently
+    /// pauses it, as for `visible: false`.
     pub enabled: bool,
     /// `false` pauses the stream (no data, instant resume).
     pub visible: bool,
     pub detail: FfiVideoDetail,
-    /// Pause all video of this participant, keep audio.
-    pub low_bandwidth: bool,
 }
 
 impl From<FfiMediaConstraints> for matrix_rtc_transport::MediaConstraints {
@@ -932,7 +931,6 @@ impl From<FfiMediaConstraints> for matrix_rtc_transport::MediaConstraints {
                     })
                 }
             },
-            low_bandwidth: constraints.low_bandwidth,
         }
     }
 }
