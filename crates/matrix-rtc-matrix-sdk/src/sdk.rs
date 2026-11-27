@@ -9,7 +9,8 @@
 //! Dialects and MatrixRTC parsing are not here: the wrapper and the feeder do
 //! those for every backend. Requires the `matrix-sdk` feature.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -23,7 +24,7 @@ use matrix_sdk::deserialized_responses::{
     AlgorithmInfo, DeviceLinkProblem, EncryptionInfo, RawAnySyncOrStrippedState, VerificationLevel,
     VerificationState,
 };
-use matrix_sdk::encryption::identities::Device;
+use matrix_sdk::encryption::identities::{Device, UserDevices};
 use matrix_sdk::event_handler::EventHandlerDropGuard;
 use matrix_sdk::room::{IncludeRelations, RelationsOptions};
 use matrix_sdk::ruma;
@@ -454,8 +455,13 @@ impl MatrixBackend for SdkMatrixBackend {
         let encryption = self.client.encryption();
         let mut devices = Vec::with_capacity(recipients.len());
         let mut unknown = Vec::new();
-        // One `/keys/query` per user per batch.
-        let mut queried: HashSet<OwnedUserId> = HashSet::new();
+        // One device-list load per user, not per recipient: the store answers
+        // `get_device` by deserialising the user's whole device list, so for a
+        // user with many devices in the call a per-recipient lookup costs
+        // O(devices) each and O(devices^2) per batch. The flag records which
+        // users we have already forced a `/keys/query` for: one per user per
+        // batch.
+        let mut lists: HashMap<OwnedUserId, (UserDevices, bool)> = HashMap::new();
 
         for recipient in &recipients {
             let user = match UserId::parse(&recipient.user_id) {
@@ -470,11 +476,25 @@ impl MatrixBackend for SdkMatrixBackend {
             };
             let device_id = <&DeviceId>::from(recipient.device_id.as_str());
 
-            let mut found = encryption.get_device(&user, device_id).await;
+            let entry = match lists.entry(user.clone()) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(slot) => match encryption.get_user_devices(&user).await {
+                    Ok(list) => slot.insert((list, false)),
+                    Err(error) => {
+                        unknown.push(ToDeviceDelivery::failed(
+                            recipient.clone(),
+                            format!("could not look up the device: {error}"),
+                        ));
+                        continue;
+                    }
+                },
+            };
+            let mut found = entry.0.get(device_id);
 
             // Routine on the first key we send a peer, and likely on the
             // pre-sticky path, where nothing has forced a `/keys/query` yet.
-            if matches!(found, Ok(None)) && queried.insert(user.clone()) {
+            if found.is_none() && !entry.1 {
+                entry.1 = true;
                 log::debug!(
                     "{user}/{device_id} is not in the crypto store; querying keys before \
                      giving up on delivering a media key to them",
@@ -482,18 +502,17 @@ impl MatrixBackend for SdkMatrixBackend {
                 if let Err(error) = encryption.request_user_identity(&user).await {
                     log::warn!("keys query for {user} failed: {error}");
                 }
-                found = encryption.get_device(&user, device_id).await;
+                if let Ok(list) = encryption.get_user_devices(&user).await {
+                    entry.0 = list;
+                    found = entry.0.get(device_id);
+                }
             }
 
             match found {
-                Ok(Some(device)) => devices.push(device),
-                Ok(None) => unknown.push(ToDeviceDelivery::failed(
+                Some(device) => devices.push(device),
+                None => unknown.push(ToDeviceDelivery::failed(
                     recipient.clone(),
                     "no such known device",
-                )),
-                Err(error) => unknown.push(ToDeviceDelivery::failed(
-                    recipient.clone(),
-                    format!("could not look up the device: {error}"),
                 )),
             }
         }

@@ -12,6 +12,7 @@ log only.
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
 - A member whose LiveKit transport has both `url` and `livekit_service_url` is found under either identity, hashed or `user:device`, with its keys under both (spec 049).
+- `LiveKitCallOptions` takes `keep_alive_timeout_ms`, the delayed leave's timeout, which so far could only be set through `JoinOptions`.
 
 ### Breaking
 
@@ -20,6 +21,7 @@ log only.
 ### Fixed
 
 - `MediaSession.disconnect()` returns within 2 s: the close it awaits (engine shutdown, then LiveKit's room close) is otherwise unbounded and could hold a hang-up forever.
+- Sending media keys loads each recipient user's device list once per batch instead of once per device, which was quadratic for a user with many devices in the call.
 
 ## v0.5.0 - 2026-11-12
 
