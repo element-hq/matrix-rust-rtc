@@ -14,7 +14,7 @@ log only.
 - A member whose LiveKit transport has both `url` and `livekit_service_url` is found under either identity, hashed or `user:device`, with its keys under both (spec 049).
 - Media session option `allow_livekit_get_token`, next to `sfu_fallback`: temporary, takes every LiveKit token from `get_token` on transports naming both flows once our homeserver answers it, falling back to `/sfu/get` otherwise and per server on a failed subscription (spec 049).
 - The web host asks the LiveKit `get_token` under v1 once the homeserver announces `org.matrix.msc4195.stable`, under the unstable path otherwise (spec 049).
-- `MediaSession.setReceiveVideo(receive)` stops all remote video at once, joiners and every SFU included, and holds through reconnects and fallback (spec 055).
+- `MediaSession.setReceiveVideo(receive)`, read back with `receivesVideo()`, stops all remote video at once, joiners and every SFU included, and holds through reconnects and fallback (spec 055).
 
 ### Breaking
 

@@ -23,6 +23,7 @@
 //! we arrive to, and the hands already up in it, are never announced.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -329,6 +330,8 @@ pub struct CallEngine {
     interruptions_rx: watch::Receiver<Interruptions>,
     unverified_rx: watch::Receiver<Vec<String>>,
     tracks: RemoteTracks,
+    /// The last [`Self::set_receive_video`], for [`Self::receives_video`].
+    receive_video: AtomicBool,
     task: rt::JoinHandle<()>,
 }
 
@@ -429,6 +432,7 @@ impl CallEngine {
             interruptions_rx,
             unverified_rx,
             tracks,
+            receive_video: AtomicBool::new(true),
             task,
         }
     }
@@ -673,9 +677,16 @@ impl CallEngine {
     /// reconnects and SFU fallback. `true` restores each stream's own
     /// constraints. Ordered with [`Self::set_constraints`] on the same queue.
     pub fn set_receive_video(&self, receive: bool) {
+        self.receive_video.store(receive, Ordering::Release);
         let _ = self
             .messages
             .send(ActorMessage::SetReceiveVideo { receive });
+    }
+
+    /// Whether other members' video is received: the last
+    /// [`Self::set_receive_video`], `true` until the first.
+    pub fn receives_video(&self) -> bool {
+        self.receive_video.load(Ordering::Acquire)
     }
 
     /// The handle for a participant's subscribed stream, to open frame
@@ -4710,7 +4721,9 @@ mod tests {
             .unwrap();
         rostered(&fx, &["bob"]).await;
         wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        assert!(fx.engine.receives_video());
         fx.engine.set_receive_video(false);
+        assert!(!fx.engine.receives_video());
         peer_sender(&fx, PEER_FOCUS)
             .unwrap()
             .send(ConnectionEvent::EncryptionStateChanged {

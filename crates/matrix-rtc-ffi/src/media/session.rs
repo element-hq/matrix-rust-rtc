@@ -336,6 +336,14 @@ impl MediaSession {
         self.engine.set_receive_video(receive);
     }
 
+    /// Whether other members' video is received: the last
+    /// [`MediaSession::set_receive_video`] on this session, `true` until the
+    /// first (a new session starts receiving). No event announces a change:
+    /// only the app changes it.
+    pub fn receives_video(&self) -> bool {
+        self.engine.receives_video()
+    }
+
     /// The audio frame stream of a participant's stream, once
     /// [`FfiCallEvent::StreamStarted`] announced it. Each call opens an
     /// independent stream.
