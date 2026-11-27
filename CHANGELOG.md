@@ -12,6 +12,7 @@ log only.
 
 - Receive and send stats now report the codec in use (`codec`, a MIME type such as `video/VP9`).
 - A member whose LiveKit transport has both `url` and `livekit_service_url` is found under either identity, hashed or `user:device`, with its keys under both (spec 049).
+- `LiveKitCallOptions` takes `keep_alive_timeout_ms`, the delayed leave's timeout, which so far could only be set through `JoinOptions`.
 
 ### Breaking
 

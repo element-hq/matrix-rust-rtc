@@ -124,6 +124,10 @@ pub struct LiveKitCallOptions {
     /// How often to refresh the dead man's switch delayed leave; `None` is
     /// [`DEFAULT_KEEP_ALIVE_INTERVAL_MS`](matrix_rtc_core::DEFAULT_KEEP_ALIVE_INTERVAL_MS).
     pub keep_alive_interval_ms: Option<u64>,
+    /// How long after the last refresh the dead man's switch fires, i.e. the
+    /// MSC4140 delayed leave's timeout; `None` is
+    /// [`DEFAULT_KEEP_ALIVE_TIMEOUT_MS`](matrix_rtc_core::DEFAULT_KEEP_ALIVE_TIMEOUT_MS).
+    pub keep_alive_timeout_ms: Option<u64>,
     /// How long the homeserver keeps our membership in the sticky map. `None`
     /// keeps the core's default of an hour.
     ///
@@ -201,6 +205,7 @@ impl Default for LiveKitCallOptions {
             livekit_transport: None,
             encryption_config: None,
             keep_alive_interval_ms: None,
+            keep_alive_timeout_ms: None,
             sticky_duration_ms: None,
             degraded_lifetime_ms: None,
             http: None,
@@ -307,6 +312,7 @@ impl LiveKitCall {
         join.sticky_duration_ms = options.sticky_duration_ms;
         join.degraded_lifetime_ms = options.degraded_lifetime_ms;
         join.keep_alive_interval_ms = options.keep_alive_interval_ms;
+        join.keep_alive_timeout_ms = options.keep_alive_timeout_ms;
         let call = Arc::new(
             room.join_call(CallJoinOptions {
                 join,
