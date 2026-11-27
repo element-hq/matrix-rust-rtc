@@ -40,6 +40,20 @@
 //! happen once, and a restored device can still decrypt member events sent
 //! before the run began. Devices are then kept on exit, and `--purge-devices`
 //! clears the folder along with them.
+//!
+//! While running, device 0 listens to the room for control messages, so the run
+//! can be steered from any Matrix client, without shell access to the machine
+//! running the tool:
+//!
+//! ```text
+//! !load_test device_count 12
+//! ```
+//!
+//! A count of `0` takes every device out of the call while the tool keeps
+//! listening, ready for the command that starts the demo back up. Devices
+//! removed this way stay logged in, so scaling up again costs no logins.
+//! Anyone in the room can send the command, which is why `--max-devices`
+//! caps it.
 
 use rlimit::increase_nofile_limit;
 use std::error::Error;
@@ -52,6 +66,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+// `join_all`, not `tokio::spawn`: `LiveKitCall::join` drives `!Send` futures, so a
+// batch of joins has to be concurrent *on this task* rather than spread over
+// the runtime's threads.
+use futures_util::future::{LocalBoxFuture, join_all};
 use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, open_slot};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
@@ -63,8 +81,10 @@ use matrix_sdk::authentication::matrix::MatrixSession;
 use matrix_sdk::encryption::EncryptionSettings;
 use matrix_sdk::ruma::api::client::uiaa;
 use matrix_sdk::ruma::api::error::{ErrorKind, RetryAfter};
-use matrix_sdk::ruma::events::room::message::RoomMessageEventContent;
-use matrix_sdk::ruma::{OwnedDeviceId, RoomId};
+use matrix_sdk::ruma::events::room::message::{
+    OriginalSyncRoomMessageEvent, RoomMessageEventContent,
+};
+use matrix_sdk::ruma::{MilliSecondsSinceUnixEpoch, OwnedDeviceId, RoomId};
 use matrix_sdk::{Client, Room};
 use matrix_sdk_ui::sync_service::SyncService;
 use tokio::signal::unix::{SignalKind, signal};
@@ -109,8 +129,10 @@ const MAX_LOGIN_BACKOFF: Duration = Duration::from_secs(60);
 const QUIT_COMMANDS: [&str; 4] = [":q", ":quit", "q", "quit"];
 /// Settle time after the warm-up messages, before any device joins the call.
 const WARMUP_SETTLE: Duration = Duration::from_secs(2);
+/// Prefix of a control message in the room. Anything else is chatter.
+const COMMAND_PREFIX: &str = "!load_test";
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(
     name = "load_test",
     about = "Join a MatrixRTC call with N devices, each publishing a video file"
@@ -139,9 +161,20 @@ struct Args {
     #[arg(long)]
     video: PathBuf,
 
-    /// How many devices (virtual participants) to run.
+    /// How many devices (virtual participants) to start with. While the run
+    /// lasts, a `!load_test device_count <n>` message in the room resizes the
+    /// fleet; 0 is allowed, and means "idle until told".
     #[arg(short = 'n', long, default_value_t = 1)]
     devices: usize,
+
+    /// Ceiling on the device count, whether it comes from --devices or from a
+    /// room message.
+    ///
+    /// The command channel is the room itself and anyone joined to it can
+    /// write there, so a stray `device_count 10000` — fat-fingered or hostile
+    /// — must not be able to talk this tool into ten thousand logins.
+    #[arg(long, default_value_t = 250)]
+    max_devices: usize,
 
     #[arg(long, default_value = "m.call#room")]
     slot_id: String,
@@ -188,12 +221,55 @@ struct Args {
     #[arg(long)]
     subscribe: bool,
 
-    /// Gap between successive call joins.
-    #[arg(long, default_value_t = 500)]
+    /// How many devices join the call at once.
+    ///
+    /// Joining is mostly waiting — the transport handshake, the SFU token
+    /// exchange, the first key send — so running a batch concurrently costs one
+    /// device's latency for the whole batch instead of the sum. Raise it for a
+    /// faster ramp; lower it to space the joins out and watch them arrive.
+    ///
+    /// The ceiling is local: every join in flight is a libwebrtc connection
+    /// being negotiated on this machine, spread over `--call-threads`.
+    #[arg(long, default_value_t = 8)]
+    join_concurrency: usize,
+
+    /// Threads to spread the calls over, round-robin by device index.
+    ///
+    /// A call's session manager is `!Send`, so everything that touches it (the
+    /// key fan-out on a rotation, every inbound key) runs on the thread that
+    /// joined it. With one thread, a 240-member rotation queued 80 devices'
+    /// worth of that on one core while the rest of the box idled. Defaults to
+    /// the core count.
+    #[arg(long, default_value_t = std::thread::available_parallelism().map_or(1, |n| n.get()))]
+    call_threads: usize,
+
+    /// Gap between successive join batches.
+    ///
+    /// `0` (the default) runs the batches back to back. Pacing here is not
+    /// needed to protect the homeserver — it is a knob for stretching a ramp out
+    /// when the point of the run is to watch devices arrive one at a time.
+    #[arg(long, default_value_t = 0)]
     ramp_ms: u64,
 
-    /// Gap between successive logins, to stay under homeserver rate limits.
-    #[arg(long, default_value_t = 250)]
+    /// How many devices log in at once.
+    ///
+    /// Same reasoning as `--join-concurrency`, over the slower half: a login is
+    /// a round trip, the cross-signing recovery is several more, and the first
+    /// sync is a wait. Serialised, that is seconds per device of idling.
+    ///
+    /// Lower it (with `--login-delay-ms`) for a homeserver whose login limiter
+    /// is tight — synapse's `rc_login` default is three logins then one per six
+    /// seconds, which no amount of concurrency gets past.
+    #[arg(long, default_value_t = 32)]
+    login_concurrency: usize,
+
+    /// Gap between successive login batches, to stay under homeserver rate
+    /// limits.
+    ///
+    /// `0` (the default) assumes a limiter provisioned for this, which is the
+    /// normal case for a deployment being load-tested. [`login_with_retry`]
+    /// remains the safety net whatever this is set to.
+    #[arg(long, default_value_t = 0)]
     login_delay_ms: u64,
 
     /// Seconds to keep publishing; 0 runs until Ctrl-C.
@@ -310,8 +386,12 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     if args.purge_devices {
         return purge_devices(&args).await;
     }
-    if args.devices == 0 {
-        return Err("--devices must be at least 1".into());
+    if args.devices > args.max_devices {
+        return Err(format!(
+            "--devices {} exceeds --max-devices {}",
+            args.devices, args.max_devices
+        )
+        .into());
     }
     if let Some(root) = &args.store {
         prepare_store(root)?;
@@ -490,10 +570,107 @@ struct Device {
     client: Client,
     device_id: OwnedDeviceId,
     sync: Option<SyncService>,
-    call: Option<LiveKitCall>,
+    /// The call's room as this device sees it; set once it came down sync.
+    room: Option<Room>,
+    call: Option<CallHandle>,
     captured: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
-    pumps: Vec<AbortOnDrop>,
+}
+
+type Job = Box<dyn FnOnce() -> LocalBoxFuture<'static, ()> + Send>;
+
+/// A thread driving its own `LocalSet` on the shared runtime, so the `!Send`
+/// calls can be spread across cores instead of all sharing the main thread.
+#[derive(Clone)]
+struct CallHost(tokio::sync::mpsc::UnboundedSender<Job>);
+
+impl CallHost {
+    fn spawn(handle: tokio::runtime::Handle, name: String) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Job>();
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(move || {
+                handle.block_on(tokio::task::LocalSet::new().run_until(async move {
+                    while let Some(job) = rx.recv().await {
+                        tokio::task::spawn_local(job());
+                    }
+                }));
+            })
+            .expect("failed to spawn a call host thread");
+        Self(tx)
+    }
+
+    fn run(&self, job: impl FnOnce() -> LocalBoxFuture<'static, ()> + Send + 'static) {
+        let _ = self.0.send(Box::new(job));
+    }
+}
+
+enum CallOp {
+    Leave(tokio::sync::oneshot::Sender<Result<(), String>>),
+    MemberCount(tokio::sync::oneshot::Sender<usize>),
+}
+
+/// A joined call living on a [`CallHost`] thread, driven through a channel
+/// because the `LiveKitCall` itself is `!Send`.
+struct CallHandle(tokio::sync::mpsc::UnboundedSender<CallOp>);
+
+impl CallHandle {
+    async fn leave(self) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .send(CallOp::Leave(tx))
+            .map_err(|_| "call task gone".to_string())?;
+        rx.await.map_err(|_| "call task gone".to_string())?
+    }
+
+    async fn member_count(&self) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.0.send(CallOp::MemberCount(tx));
+        rx.await.unwrap_or(0)
+    }
+}
+
+/// Join and then own one call on a host thread, serving [`CallOp`]s until it
+/// is asked to leave or its handle is dropped.
+#[allow(clippy::too_many_arguments)]
+async fn host_call(
+    args: Arc<Args>,
+    clip: Arc<Clip>,
+    http: reqwest::Client,
+    room: Room,
+    total: usize,
+    index: usize,
+    captured: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+    reply: tokio::sync::oneshot::Sender<Result<CallHandle, String>>,
+) {
+    let joined = join_device(&args, &clip, &http, room, total, index, captured, errors).await;
+    let (call, pumps) = match joined {
+        Ok(joined) => joined,
+        Err(error) => {
+            let _ = reply.send(Err(error.to_string()));
+            return;
+        }
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let _ = reply.send(Ok(CallHandle(tx)));
+    loop {
+        match rx.recv().await {
+            Some(CallOp::MemberCount(reply)) => {
+                let _ = reply.send(call.member_count().await);
+            }
+            Some(CallOp::Leave(reply)) => {
+                drop(pumps);
+                let _ = reply.send(call.leave().await.map_err(|error| error.to_string()));
+                return;
+            }
+            None => {
+                drop(pumps);
+                let _ = call.leave().await;
+                return;
+            }
+        }
+    }
 }
 
 /// Aborts the wrapped capture task on drop, so a device going away never
@@ -507,12 +684,34 @@ impl Drop for AbortOnDrop {
 }
 
 struct Fleet {
+    /// The fleet proper, where `devices[i].index == i` always holds. Both the
+    /// join loop and `--store` depend on that: the latter keys each device's
+    /// sqlite store on its index, so a device can never be renumbered.
     devices: Vec<Device>,
+    /// Devices that logged in during a batch where an earlier index failed.
+    ///
+    /// They cannot go in `devices` without leaving a hole at the failed index
+    /// and breaking the invariant above, and they cannot simply be dropped —
+    /// dropping a `Client` does not log its device out, so they would survive
+    /// the run as ghosts only `--purge-devices` could clear. So they are parked
+    /// here for [`Fleet::shutdown`] to log out with the rest.
+    stranded: Vec<Device>,
     run_id: String,
+    /// Whether a warm-up message went out since the last settle. The next join
+    /// batch then waits [`WARMUP_SETTLE`] first, so the key exchange the
+    /// warm-up started is not racing the joins.
+    needs_settle: bool,
+    /// The threads the calls live on; device `i` goes to `hosts[i % len]`.
+    hosts: Vec<CallHost>,
+    args: Arc<Args>,
 }
 
 impl Fleet {
     fn new(args: &Args) -> Self {
+        let handle = tokio::runtime::Handle::current();
+        let hosts = (0..args.call_threads.max(1))
+            .map(|i| CallHost::spawn(handle.clone(), format!("call-host-{i}")))
+            .collect();
         // A suffix unique per run, so device names from concurrent or previous
         // runs never collide.
         let nanos = SystemTime::now()
@@ -521,36 +720,33 @@ impl Fleet {
             .as_nanos();
         Self {
             devices: Vec::with_capacity(args.devices),
+            stranded: Vec::new(),
             run_id: format!("{nanos:x}"),
+            needs_settle: false,
+            hosts,
+            args: Arc::new(args.clone()),
         }
     }
 
-    /// Log in, warm up encryption, join, publish, then hold until the deadline
-    /// or Ctrl-C. Everything created along the way is recorded in `self`, so a
-    /// failure at any point still gets cleaned up by [`Fleet::shutdown`].
+    /// Log in the control device, then keep the number of devices in the call
+    /// matched to the target — `--devices` at first, then whatever the room
+    /// commands — until the deadline or Ctrl-C. Everything created along the
+    /// way is recorded in `self`, so a failure at any point still gets cleaned
+    /// up by [`Fleet::shutdown`].
     async fn run(&mut self, args: &Args, clip: Arc<Clip>) -> Result<(), Box<dyn Error>> {
         let room_id = RoomId::parse(&args.room)?;
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(args.insecure_tls)
             .build()?;
 
-        // 1. Log in every device and start its sync service.
-        let mut rooms = Vec::with_capacity(args.devices);
-        for index in 0..args.devices {
-            if index > 0 {
-                tokio::time::sleep(Duration::from_millis(args.login_delay_ms)).await;
-            }
-            let device = self.login(args, index).await?;
-            self.devices.push(device);
-            let device = self.devices.last_mut().expect("just pushed");
-            let sync = SyncService::builder(device.client.clone()).build().await?;
-            sync.start().await;
-            device.sync = Some(sync);
-            rooms.push(wait_for_room(&device.client, &room_id).await?);
-            println!("[{index}] logged in as device {}", device.device_id);
-        }
+        // Device 0 first and alone: it is the control channel. It stays logged
+        // in and syncing whatever the device count says, so a fleet scaled to
+        // zero can still hear the command that brings it back.
+        self.ensure_device(args, &room_id, 0).await?;
+        let control = self.devices[0].client.clone();
+        let room = self.devices[0].room.clone().expect("device 0 has its room");
 
-        if !rooms[0].latest_encryption_state().await?.is_encrypted() {
+        if !room.latest_encryption_state().await?.is_encrypted() {
             eprintln!(
                 "WARNING: {} is not encrypted. Membership events carry no sending device, so \
                  media cannot be attributed to a member and no media key is distributed — the \
@@ -559,23 +755,11 @@ impl Fleet {
             );
         }
 
-        // 2. One message per device before any RTC traffic. In an encrypted
-        //    room this establishes the Olm sessions and shares the megolm key
-        //    with every other device (ours and the observer's), so the key
-        //    exchange is not racing the joins later on.
-        for (index, room) in rooms.iter().enumerate() {
-            room.send(RoomMessageEventContent::text_plain(format!(
-                "{} {} device {index} ready",
-                args.device_prefix, self.run_id
-            )))
-            .await?;
-        }
-        println!("sent {} warm-up messages", args.devices);
-        tokio::time::sleep(WARMUP_SETTLE).await;
+        let mut targets = listen_for_commands(&control, &room_id, args);
 
         if args.open_slot {
             open_slot(
-                &self.devices[0].client,
+                &control,
                 room_id.as_str(),
                 &args.slot_id,
                 &args.application,
@@ -588,72 +772,35 @@ impl Fleet {
             println!("opened slot {}", args.slot_id);
         }
 
-        // 3. Join and publish, one device at a time.
-        for (index, room) in rooms.iter().enumerate() {
-            if index > 0 {
-                tokio::time::sleep(Duration::from_millis(args.ramp_ms)).await;
-            }
-            let call = LiveKitCall::join(
-                room,
-                LiveKitCallOptions {
-                    slot_id: args.slot_id.clone(),
-                    application: args.application.clone(),
-                    // Pinned in room-state only: MSC publishes on the
-                    // homeserver's `m.livekit` SFU (spec 038 R17).
-                    livekit_transport: (MembershipFormat::from(args.format)
-                        == MembershipFormat::RoomState)
-                        .then(|| LiveKitTransport::service(args.livekit_url.clone())),
-                    http: Some(http.clone()),
-                    auto_subscribe: args.subscribe,
-                    format: args.format.into(),
-                    sticky_duration_ms: Some(args.sticky_duration_ms),
-                    ..LiveKitCallOptions::default()
-                },
-            )
-            .await?;
-
-            let device = &mut self.devices[index];
-            let video = spawn_video_pump(
-                &call,
-                args,
-                clip.clone(),
-                index,
-                device.captured.clone(),
-                device.errors.clone(),
-            )
-            .await?;
-            device.pumps.push(video);
-            if args.audio {
-                let audio = spawn_audio_pump(&call, args, index, device.errors.clone()).await?;
-                device.pumps.push(audio);
-            }
-            println!(
-                "[{index}] joined as {} and publishing",
-                call.local_identity()
-            );
-            device.call = Some(call);
-        }
-
-        // 4. Hold. The stats line is this tool's own health signal: a device
-        //    whose frame count stops tracking `--fps` is starved locally, not
-        //    evidence of anything server-side.
         let deadline =
             (args.duration > 0).then(|| Instant::now() + Duration::from_secs(args.duration));
         println!(
-            "{} devices publishing; {}",
-            args.devices,
+            "listening for '{COMMAND_PREFIX} device_count <n>' (up to {}) in the room; {}",
+            args.max_devices,
             match deadline {
                 Some(_) => format!("stopping after {}s (type :q to stop early)", args.duration),
                 None => "type :q to stop".to_owned(),
             }
         );
 
+        // Hold, reconciling whenever the target moves. The stats line is this
+        // tool's own health signal: a device whose frame count stops tracking
+        // `--fps` is starved locally, not evidence of anything server-side.
         let mut ticker = tokio::time::interval(STATS_INTERVAL);
         ticker.tick().await; // fires immediately; skip it
-        let mut previous = vec![0u64; self.devices.len()];
+        let mut previous = Vec::new();
         loop {
+            let target = *targets.borrow_and_update();
+            if target != self.active_count() {
+                self.reconcile(args, &clip, &http, &room_id, target, &mut targets)
+                    .await?;
+                continue;
+            }
             tokio::select! {
                 _ = ticker.tick() => self.report(&mut previous).await,
+                // Cannot fail while device 0 (whose handler holds the sender)
+                // is alive; the loop re-reads the target on wake.
+                _ = targets.changed() => {}
                 _ = sleep_until(deadline) => {
                     println!("duration elapsed; leaving the call");
                     break;
@@ -661,6 +808,247 @@ impl Fleet {
             }
         }
         Ok(())
+    }
+
+    /// Log device `index` in and record it — unless it is already there.
+    /// Devices are only ever appended, so `index` is either present or the next
+    /// one.
+    async fn ensure_device(
+        &mut self,
+        args: &Args,
+        room_id: &RoomId,
+        index: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        if index < self.devices.len() {
+            return Ok(());
+        }
+        assert_eq!(index, self.devices.len(), "devices are appended in order");
+
+        let device = self.build_device(args, room_id, index).await?;
+        self.devices.push(device);
+        self.needs_settle = true;
+        Ok(())
+    }
+
+    /// Log device `index` in, start its sync, and send its warm-up message.
+    ///
+    /// Takes `&self` and returns the device rather than recording it, so a whole
+    /// batch of these can be in flight at once — `&mut self` would serialise
+    /// them, and the wait here is nearly all network.
+    async fn build_device(
+        &self,
+        args: &Args,
+        room_id: &RoomId,
+        index: usize,
+    ) -> Result<Device, Box<dyn Error>> {
+        let mut device = self.login(args, index).await?;
+        let sync = SyncService::builder(device.client.clone()).build().await?;
+        sync.start().await;
+        device.sync = Some(sync);
+        let room = wait_for_room(&device.client, room_id).await?;
+        println!("[{index}] logged in as device {}", device.device_id);
+
+        // One message before any RTC traffic. In an encrypted room this
+        // establishes the Olm sessions and shares the megolm key with every
+        // other device (ours and the observer's), so the key exchange is not
+        // racing the join later on.
+        room.send(RoomMessageEventContent::text_plain(format!(
+            "{} {} device {index} ready",
+            args.device_prefix, self.run_id
+        )))
+        .await?;
+        device.room = Some(room);
+        Ok(device)
+    }
+
+    /// Log in every device in `indices` at once, and append them in order.
+    ///
+    /// Partial failure is the interesting case. The successes are kept whatever
+    /// happens — a device that logged in exists server-side and must be logged
+    /// out on shutdown — but only the run up to the first failed index can go in
+    /// `devices` without renumbering the ones behind it. The rest are
+    /// [`Fleet::stranded`], and the first error is returned once they are all
+    /// safely parked.
+    async fn login_batch(
+        &mut self,
+        args: &Args,
+        room_id: &RoomId,
+        indices: std::ops::Range<usize>,
+    ) -> Result<(), Box<dyn Error>> {
+        let first = indices.start;
+        assert_eq!(first, self.devices.len(), "devices are appended in order");
+
+        let results = join_all(indices.map(|index| self.build_device(args, room_id, index))).await;
+
+        let mut contiguous = true;
+        let mut failure = None;
+        for result in results {
+            match result {
+                Ok(device) if contiguous => self.devices.push(device),
+                Ok(device) => self.stranded.push(device),
+                Err(error) => {
+                    contiguous = false;
+                    failure = failure.or(Some(error));
+                }
+            }
+        }
+        if self.devices.len() > first {
+            self.needs_settle = true;
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Devices currently in the call. Joins fill from the bottom and leaves
+    /// drain from the top, so these are always `0..count`.
+    fn active_count(&self) -> usize {
+        self.devices
+            .iter()
+            .filter(|device| device.call.is_some())
+            .count()
+    }
+
+    /// Bring the number of devices in the call to `target`.
+    ///
+    /// Scaling down only leaves the calls; the devices stay logged in and
+    /// syncing, so the next scale-up pays neither logins nor their rate
+    /// limits.
+    ///
+    /// Scaling up runs in batches of `--login-concurrency` then
+    /// `--join-concurrency`, and re-checks `targets` between them, bailing out
+    /// early when the target moved again — the caller re-reads it and reconciles
+    /// anew, so a `device_count 0` does not wait behind the rest of a
+    /// fifty-device ramp. The batch is therefore also the granularity at which a
+    /// scale-up can be interrupted: a wide one ramps faster but reacts later.
+    async fn reconcile(
+        &mut self,
+        args: &Args,
+        clip: &Arc<Clip>,
+        http: &reqwest::Client,
+        room_id: &RoomId,
+        target: usize,
+        targets: &mut tokio::sync::watch::Receiver<usize>,
+    ) -> Result<(), Box<dyn Error>> {
+        let active = self.active_count();
+        if target < active {
+            println!("scaling down: {active} -> {target} device(s) in the call");
+            for index in (target..active).rev() {
+                self.part_device(index).await;
+            }
+            return Ok(());
+        }
+        println!("scaling up: {active} -> {target} device(s) in the call");
+
+        while self.devices.len() < target {
+            let first = self.devices.len();
+            let last = target.min(first + args.login_concurrency.max(1));
+            if args.login_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(args.login_delay_ms)).await;
+            }
+            self.login_batch(args, room_id, first..last).await?;
+            if targets.has_changed().unwrap_or(false) {
+                println!("device count changed mid scale-up; rebalancing");
+                return Ok(());
+            }
+        }
+        if self.needs_settle {
+            tokio::time::sleep(WARMUP_SETTLE).await;
+            self.needs_settle = false;
+        }
+
+        let mut first = active;
+        while first < target {
+            let last = target.min(first + args.join_concurrency.max(1));
+            if first > active && args.ramp_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(args.ramp_ms)).await;
+            }
+            self.join_batch(args, clip, http, target, first..last)
+                .await?;
+            first = last;
+            if targets.has_changed().unwrap_or(false) {
+                println!("device count changed mid scale-up; rebalancing");
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Join every device in `indices` to the call at once.
+    ///
+    /// A partial failure needs none of [`Fleet::login_batch`]'s care: the
+    /// devices already exist and keep their indices, so the successes are simply
+    /// recorded — leaving a hole in the joined set that the returned error is
+    /// about to end the run over anyway.
+    async fn join_batch(
+        &mut self,
+        args: &Args,
+        clip: &Arc<Clip>,
+        http: &reqwest::Client,
+        total: usize,
+        indices: std::ops::Range<usize>,
+    ) -> Result<(), Box<dyn Error>> {
+        // Everything the joins touch is cloned out first: holding `&self`
+        // across the fan-out would rule out writing the results back.
+        let inputs: Vec<_> = indices
+            .map(|index| {
+                let device = &self.devices[index];
+                (
+                    index,
+                    device
+                        .room
+                        .clone()
+                        .expect("every logged-in device has its room"),
+                    device.captured.clone(),
+                    device.errors.clone(),
+                )
+            })
+            .collect();
+
+        let _ = args;
+        let replies: Vec<_> = inputs
+            .iter()
+            .map(|(index, room, captured, errors)| {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let (args, clip, http, room) =
+                    (self.args.clone(), clip.clone(), http.clone(), room.clone());
+                let index = *index;
+                let (captured, errors) = (captured.clone(), errors.clone());
+                self.hosts[index % self.hosts.len()].run(move || {
+                    Box::pin(host_call(
+                        args, clip, http, room, total, index, captured, errors, tx,
+                    ))
+                });
+                rx
+            })
+            .collect();
+        let results = join_all(replies).await;
+
+        let mut failure: Option<Box<dyn Error>> = None;
+        for ((index, ..), result) in inputs.iter().zip(results) {
+            match result {
+                Ok(Ok(call)) => self.devices[*index].call = Some(call),
+                Ok(Err(error)) => failure = failure.or(Some(error.into())),
+                Err(_) => failure = failure.or(Some("call host task vanished".into())),
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Take device `index` out of the call, keeping it logged in and syncing
+    /// so a later scale-up is free.
+    async fn part_device(&mut self, index: usize) {
+        let device = &mut self.devices[index];
+        if let Some(call) = device.call.take() {
+            match call.leave().await {
+                Ok(()) => println!("[{index}] left the call"),
+                Err(error) => eprintln!("[{index}] leave failed: {error}"),
+            }
+        }
     }
 
     async fn login(&self, args: &Args, index: usize) -> Result<Device, Box<dyn Error>> {
@@ -736,23 +1124,30 @@ impl Fleet {
             client,
             device_id,
             sync: None,
+            room: None,
             call: None,
             captured: Arc::new(AtomicU64::new(0)),
             errors: Arc::new(AtomicU64::new(0)),
-            pumps: Vec::new(),
         })
     }
 
-    async fn report(&self, previous: &mut [u64]) {
+    async fn report(&self, previous: &mut Vec<u64>) {
+        if previous.len() < self.devices.len() {
+            previous.resize(self.devices.len(), 0);
+        }
         let mut line = String::new();
+        let mut in_call = 0;
         for device in &self.devices {
             let captured = device.captured.load(Ordering::Relaxed);
             let delta = captured.saturating_sub(previous[device.index]);
             previous[device.index] = captured;
-            let members = match &device.call {
-                Some(call) => call.member_count().await,
-                None => 0,
+            // Parked devices stay out of the report; their counter is still
+            // tracked above so rejoining does not show the gap as one burst.
+            let Some(call) = &device.call else {
+                continue;
             };
+            in_call += 1;
+            let members = call.member_count().await;
             let _ = writeln!(
                 line,
                 "  [{}] {delta} frames/{}s, {captured} total, {} errors, {members} members",
@@ -761,7 +1156,14 @@ impl Fleet {
                 device.errors.load(Ordering::Relaxed),
             );
         }
-        print!("{line}");
+        if in_call == 0 {
+            println!(
+                "  idle: no devices in the call ({} logged in and waiting)",
+                self.devices.len()
+            );
+        } else {
+            print!("{line}");
+        }
     }
 
     /// Best effort, in order, never bailing out early: a failure to leave must
@@ -772,8 +1174,10 @@ impl Fleet {
         let mut captured = 0;
         let mut errors = 0;
 
-        for device in &mut self.devices {
-            device.pumps.clear();
+        // `stranded` alongside the fleet proper: those devices exist on the
+        // homeserver exactly like the rest, and skipping them here is what turns
+        // a failed scale-up into ghosts only `--purge-devices` can clear.
+        for device in self.devices.iter_mut().chain(self.stranded.iter_mut()) {
             captured += device.captured.load(Ordering::Relaxed);
             errors += device.errors.load(Ordering::Relaxed);
 
@@ -806,9 +1210,67 @@ impl Fleet {
         println!(
             "summary: {left}/{} calls left cleanly, {captured} frames captured, {errors} capture \
              errors, {removed} devices removed",
-            self.devices.len()
+            self.devices.len() + self.stranded.len()
         );
     }
+}
+
+/// Join one device to the call and start publishing.
+///
+/// A free function taking what it needs, rather than a `Fleet` method: reaching
+/// `&mut self.devices[index]` would let only one of these run at a time, and a
+/// join is nearly all waiting — transport handshake, SFU token exchange, the
+/// first key send. The caller records the returned call and pumps against the
+/// device once the whole batch is back.
+#[allow(clippy::too_many_arguments)]
+async fn join_device(
+    args: &Args,
+    clip: &Arc<Clip>,
+    http: &reqwest::Client,
+    room: Room,
+    total: usize,
+    index: usize,
+    captured: Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
+) -> Result<(LiveKitCall, Vec<AbortOnDrop>), Box<dyn Error>> {
+    let call = LiveKitCall::join(
+        &room,
+        LiveKitCallOptions {
+            slot_id: args.slot_id.clone(),
+            application: args.application.clone(),
+            // Pinned in room-state only: MSC publishes on the
+            // homeserver's `m.livekit` SFU (spec 038 R17).
+            livekit_transport: (MembershipFormat::from(args.format) == MembershipFormat::RoomState)
+                .then(|| LiveKitTransport::service(args.livekit_url.clone())),
+            http: Some(http.clone()),
+            auto_subscribe: args.subscribe,
+            format: args.format.into(),
+            sticky_duration_ms: Some(args.sticky_duration_ms),
+            ..LiveKitCallOptions::default()
+        },
+    )
+    .await?;
+
+    let mut pumps = vec![
+        spawn_video_pump(
+            &call,
+            args,
+            clip.clone(),
+            index,
+            total,
+            captured,
+            errors.clone(),
+        )
+        .await?,
+    ];
+    if args.audio {
+        pumps.push(spawn_audio_pump(&call, args, index, errors).await?);
+    }
+    println!(
+        "[{index}] joined as {} and publishing",
+        call.local_identity()
+    );
+    Ok((call, pumps))
 }
 
 /// Resolve when `deadline` passes, or never if there is none.
@@ -959,9 +1421,13 @@ fn device_id_of(client: &Client) -> Result<OwnedDeviceId, Box<dyn Error>> {
 /// `per_second: 0.17, burst_count: 3` — three logins immediately, then one per
 /// roughly six seconds. Without this, the first 429 propagates out of
 /// `login()` and aborts the entire run, discarding the devices that had already
-/// logged in and joined. `--login-delay-ms` is still what paces a healthy run;
-/// this is the safety net for a deployment whose limiter is stricter than the
-/// default, or a `--devices` count that outruns the pacing.
+/// logged in and joined. `--login-concurrency` and `--login-delay-ms` are what
+/// pace a healthy run; this is the safety net for a deployment whose limiter is
+/// stricter than they assume.
+///
+/// Note that a batch of concurrent logins all hit the limiter at once and then
+/// all back off together, so the pacing knobs are the fix for a tight limiter —
+/// this only keeps the run alive while someone reaches for them.
 ///
 /// Only rate limiting is retried. A wrong password or an unreachable
 /// homeserver fails on the first attempt, as it should.
@@ -993,7 +1459,7 @@ async fn login_with_retry(
         if attempt == LOGIN_ATTEMPTS {
             return Err(format!(
                 "still rate-limited after {LOGIN_ATTEMPTS} login attempts ({error}). \
-                 Raise --login-delay-ms, or lower --devices."
+                 Lower --login-concurrency, raise --login-delay-ms, or lower --devices."
             )
             .into());
         }
@@ -1047,16 +1513,118 @@ async fn wait_for_room(client: &Client, room_id: &RoomId) -> Result<Room, Box<dy
     }
 }
 
+/// Watch the room through `client` (device 0) for `!load_test` commands, and
+/// publish the device count they ask for on the returned channel, which starts
+/// at `--devices`.
+///
+/// Commands are acknowledged with a message back into the room, because
+/// whoever is steering the run from a chat client has no view of this tool's
+/// stdout. Counts above `--max-devices` are clamped, and the acknowledgement
+/// says so.
+///
+/// In an encrypted room a command decrypts only if its megolm key has arrived;
+/// the key is shared when the message is sent, but over to-device traffic that
+/// can lag it. A command that draws no acknowledgement within a few seconds
+/// was lost to that race — send it again. Device 0 cannot ask for a key it
+/// missed, because [`quiet_room_key_gossip`] turns key requests off, so a
+/// command that stays unacknowledged across several retries is waiting on the
+/// sender to rotate its megolm session rather than on this tool.
+fn listen_for_commands(
+    client: &Client,
+    room_id: &RoomId,
+    args: &Args,
+) -> tokio::sync::watch::Receiver<usize> {
+    let (device_count_tx, device_count) = tokio::sync::watch::channel(args.devices);
+    let max_devices = args.max_devices;
+    let started = MilliSecondsSinceUnixEpoch::now();
+    client.add_room_event_handler(
+        room_id,
+        move |event: OriginalSyncRoomMessageEvent, room: Room| {
+            let targets = device_count_tx.clone();
+            async move {
+                // Sync replays recent room history to a fresh device, and a
+                // command from a previous run must not steer this one.
+                if event.origin_server_ts < started {
+                    return;
+                }
+                let reply = match parse_command(event.content.body()) {
+                    None => return,
+                    Some(Err(usage)) => usage,
+                    Some(Ok(ControlCommand::DeviceCount(count))) => {
+                        let target = count.min(max_devices);
+                        let _ = targets.send(target);
+                        if target < count {
+                            format!("device count set to {target} ({count} is over --max-devices)")
+                        } else {
+                            format!("device count set to {target}")
+                        }
+                    }
+                };
+                // Spawned, not awaited: the SDK runs event handler futures
+                // *inside* the sync loop, so anything slow here stops this
+                // device seeing further room events. And this send is slow —
+                // every scale-up adds devices to our own user, which
+                // invalidates the megolm session, so the acknowledgement first
+                // claims keys for and fans out to the whole fleet; on a
+                // homeserver this tool has been hammering it can also sit in
+                // the SDK's unlimited 429 retry. Awaiting it here made each
+                // command make the next one later, until they stopped landing
+                // at all.
+                tokio::spawn(async move {
+                    if let Err(error) = room
+                        .send(RoomMessageEventContent::text_plain(format!(
+                            "load_test: {reply}"
+                        )))
+                        .await
+                    {
+                        eprintln!("could not acknowledge a command: {error}");
+                    }
+                });
+            }
+        },
+    );
+    device_count
+}
+
+/// What a control message asked for.
+#[derive(Debug, PartialEq, Eq)]
+enum ControlCommand {
+    /// How many devices should be in the call.
+    DeviceCount(usize),
+}
+
+/// Parse a room message as a control command.
+///
+/// `None` is a message that is not for this tool at all. `Some(Err)` is one
+/// that addressed it and got the syntax wrong, carrying the reply to send;
+/// `Some(Ok(command))` is an instruction for the run loop.
+fn parse_command(body: &str) -> Option<Result<ControlCommand, String>> {
+    let rest = body.trim().strip_prefix(COMMAND_PREFIX)?;
+    // "!load_tester" and friends address someone else.
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let mut tokens = rest.split_ascii_whitespace();
+    Some(match (tokens.next(), tokens.next(), tokens.next()) {
+        (Some("device_count"), Some(count), None) => count
+            .parse()
+            .map(ControlCommand::DeviceCount)
+            .map_err(|_| format!("{count:?} is not a device count")),
+        _ => Err(format!("usage: {COMMAND_PREFIX} device_count <n>")),
+    })
+}
+
 /// Publish the clip as a camera track and pump frames into it at `--fps`.
 ///
-/// Each device starts at a different offset in the clip: the encoders then do
-/// not run in lockstep, and the tiles are visibly distinct in the observing
-/// client.
+/// Each device starts at a different offset in the clip — spread over `total`,
+/// the device count being scaled to: the encoders then do not run in lockstep,
+/// and the tiles are visibly distinct in the observing client.
 async fn spawn_video_pump(
     call: &LiveKitCall,
     args: &Args,
     clip: Arc<Clip>,
     index: usize,
+    total: usize,
     captured: Arc<AtomicU64>,
     errors: Arc<AtomicU64>,
 ) -> Result<AbortOnDrop, Box<dyn Error>> {
@@ -1065,7 +1633,7 @@ async fn spawn_video_pump(
     options.simulcast = !args.no_simulcast;
     let track = call.publish(options).await?;
 
-    let offset = index * clip.len() / args.devices;
+    let offset = index * clip.len() / total.max(1) % clip.len();
     let period = Duration::from_micros(1_000_000 / u64::from(args.fps.max(1)));
     let task = tokio::spawn(async move {
         let started = Instant::now();
@@ -1422,6 +1990,39 @@ mod tests {
         let path = std::env::temp_dir().join("load_test_y4m_mismatch.y4m");
         std::fs::write(&path, y4m(1)).unwrap();
         assert!(read_y4m(&path, 640, 360).is_err());
+    }
+
+    #[test]
+    fn parses_device_count_commands() {
+        assert_eq!(
+            parse_command("!load_test device_count 12"),
+            Some(Ok(ControlCommand::DeviceCount(12)))
+        );
+        assert_eq!(
+            parse_command("  !load_test  device_count 0 "),
+            Some(Ok(ControlCommand::DeviceCount(0)))
+        );
+        // Chatter, including a longer word sharing the prefix, is ignored.
+        assert_eq!(parse_command("hello there"), None);
+        assert_eq!(parse_command("!load_tester device_count 3"), None);
+        // Anything addressing the tool but malformed draws a usage reply.
+        assert!(matches!(parse_command("!load_test"), Some(Err(_))));
+        assert!(matches!(
+            parse_command("!load_test device_count"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_command("!load_test device_count twelve"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_command("!load_test device_count 3 4"),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_command("!load_test devices 3"),
+            Some(Err(_))
+        ));
     }
 
     #[test]
