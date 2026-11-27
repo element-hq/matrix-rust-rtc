@@ -72,7 +72,7 @@ use clap::Parser;
 use futures_util::future::{LocalBoxFuture, join_all};
 use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, open_slot};
 use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
+use matrix_rtc_core::{EncryptionConfig, LiveKitTransport, SlotEncryption};
 use matrix_rtc_transport::{
     AudioFrame, AudioSourceConfig, I420Buffer, LocalTrackHandle, PublishOptions, VideoFrame,
     VideoRotation, VideoSourceConfig,
@@ -253,6 +253,10 @@ struct Args {
     /// `0` (the default) runs the batches back to back. Pacing here is not
     /// needed to protect the homeserver — it is a knob for stretching a ramp out
     /// when the point of the run is to watch devices arrive one at a time.
+    ///
+    /// Note the interaction with `--key-rotation-grace-ms`: a ramp that finishes
+    /// inside that window settles on one media key, where a slow ramp pays a
+    /// rotation per joiner. Spacing a ramp out is therefore not free.
     #[arg(long, default_value_t = 0)]
     ramp_ms: u64,
 
@@ -292,10 +296,47 @@ struct Args {
     ///
     /// The cost is signalling: the keep-alive re-sends each membership once it
     /// is halfway to expiring, so this many milliseconds means one extra send
-    /// per device every half of it. Keep it well above twice the keep-alive
-    /// interval (10s), or memberships lapse between ticks.
+    /// per device every half of it. Keep it well above twice
+    /// `--heartbeat-interval-ms`, or the refresh never gets a chance to run
+    /// before the entry lapses and every membership flaps once per beat.
     #[arg(long, default_value_t = 120_000)]
     sticky_duration_ms: u64,
+
+    /// Reuse the current key for a joiner while the key is younger than this,
+    /// sending it to the joiner alone instead of rotating for everyone.
+    ///
+    /// The setting a ramp
+    /// stresses hardest. A joiner met by a key older than this takes the
+    /// rotate branch, and a rotation goes to **every** member: one join then
+    /// costs N sends per device, N² across the fleet, where reusing the key
+    /// costs one send per device. A ramp of N devices spaced further apart than
+    /// this therefore pays O(N³) to-device messages for what O(N²) would buy —
+    /// with the whole fleet in one process, that is both the send and the
+    /// receive side of every one of them.
+    ///
+    /// Raise it above the ramp spacing (`--ramp-ms` × devices, roughly) and a
+    /// whole ramp settles on one key. The trade is MSC4143's: a member that
+    /// joined N milliseconds ago can decrypt up to N milliseconds of media from
+    /// before it arrived. `10000` is the library and MSC4143 default.
+    #[arg(long, default_value_t = 10_000)]
+    key_rotation_grace_ms: u64,
+
+    /// How often each device restarts its dead man's switch (MSC4140 delayed
+    /// leave) and refreshes its membership.
+    ///
+    /// The switch fires `--keep-alive-timeout-ms` after the last restart, and a
+    /// fired switch is a *real* departure: every other member sees it, rotates
+    /// at once, and sends to everyone — then the device reappears on its next
+    /// membership refresh and the fleet pays a second full fan-out. Under load
+    /// a beat can be held up by exactly that fan-out, so keep this well below
+    /// the timeout: the defaults here leave room for one missed beat.
+    #[arg(long, default_value_t = 150_000)]
+    heartbeat_interval_ms: u64,
+
+    /// How long after the last heartbeat the dead man's switch fires (the
+    /// MSC4140 delayed leave's timeout).
+    #[arg(long, default_value_t = 400_000)]
+    keep_alive_timeout_ms: u64,
 
     /// Publish the `m.rtc.slot` state event first. Needs the power level for
     /// it, and is unnecessary when a real client already opened the call.
@@ -1273,6 +1314,15 @@ async fn join_device(
             auto_subscribe: args.subscribe,
             format: args.format.into(),
             sticky_duration_ms: Some(args.sticky_duration_ms),
+            keep_alive_interval_ms: Some(args.heartbeat_interval_ms),
+            keep_alive_timeout_ms: Some(args.keep_alive_timeout_ms),
+            // Everything but the rotation grace period stays at the library's
+            // policy — notably the MSC4153 cross-signing requirement, which
+            // these devices satisfy.
+            encryption_config: Some(EncryptionConfig {
+                key_rotation_grace_period_ms: args.key_rotation_grace_ms,
+                ..EncryptionConfig::default()
+            }),
             ..LiveKitCallOptions::default()
         },
     )

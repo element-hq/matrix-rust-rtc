@@ -128,8 +128,51 @@ INSECURE_TLS=0
 # for the next attempt; two minutes does not.
 #
 # Costs one extra membership send per device every half of this. Keep it well
-# above twice the 10s keep-alive, or memberships lapse between ticks.
+# above twice HEARTBEAT_INTERVAL_MS below, or the refresh never gets a chance to
+# run before the entry lapses and every membership flaps once per beat.
 STICKY_DURATION_MS=120000
+
+# How long a key stays fresh: the single biggest lever on how much
+# to-device traffic a ramp costs.
+#
+# A joiner met by a key younger than this gets the current key and nobody else
+# is written to: one to-device message per device. A joiner met by an older key
+# rotates it, and a rotation goes to EVERY member: N messages per device, N x N
+# across the fleet — and this process is on both ends of all of them, so each
+# one is an Olm encrypt, an Olm decrypt and two crypto-store writes. At 100
+# devices that is ~10k messages for a single join.
+#
+# So keep it above the ramp: RAMP_MS x DEVICES is how long the fleet takes to
+# arrive, and anything shorter means the ramp rotates every few joins instead of
+# settling on one key. Raise it with DEVICES.
+#
+# The trade is MSC4143's: a device that joined N ms ago can decrypt up to N ms of
+# media from before it arrived. Fine for a load run, and the library default
+# stays 10000 for real clients.
+KEY_ROTATION_GRACE_MS=30000
+
+# How often each device restarts its dead man's switch (MSC4140 delayed leave)
+# and refreshes its membership.
+#
+# The switch fires KEEP_ALIVE_TIMEOUT_MS after the last restart, and a fired
+# switch is a REAL departure: every other device sees it, rotates immediately,
+# and sends to everyone — then the device reappears at its next membership
+# refresh and the fleet pays a second full fan-out. Under load a beat can be
+# held up by exactly that fan-out, so keep this well below
+# KEEP_ALIVE_TIMEOUT_MS: 30s against the 150s below is five beats per deadline.
+HEARTBEAT_INTERVAL_MS=30000
+
+# How long after the last heartbeat the dead man's switch fires.
+#
+# The deadline HEARTBEAT_INTERVAL_MS keeps pushing back. Only the ratio of the
+# two matters: it is how many beats a device may miss before the switch fires
+# and costs the fleet the two fan-outs above. 150000 against the 30s beat here
+# is five.
+#
+# Raising it also lengthens how long a run that is killed rather than left
+# cleanly keeps its delayed leaves pending — though ghosts outlive that anyway,
+# for STICKY_DURATION_MS above, which the switch does not clear.
+KEEP_ALIVE_TIMEOUT_MS=150000
 
 # Pacing, to stay under homeserver rate limits.
 RAMP_MS=500
@@ -179,7 +222,7 @@ cd "$(dirname "$0")/.."
 # Log filter, used only when RUST_LOG is not already set — so
 # `RUST_LOG=debug ./scripts/load-test.sh` still overrides it wholesale.
 #
-# Ours at debug, and four SDK subsystems silenced because they are pure noise
+# Ours at debug, and five SDK subsystems silenced because they are pure noise
 # for this tool rather than because they are unimportant:
 #
 #   event_cache        "missing target event id from the redaction event"
@@ -189,9 +232,14 @@ cd "$(dirname "$0")/.."
 #                      a run mints and deletes devices every time
 #   gossiping          "Received a forwarded room key that we didn't request" —
 #                      our own devices sharing keys with each other
+#   machine            "Received an unexpected encrypted to-device event" — the
+#                      crypto machine's catch-all for a decrypted olm event it
+#                      has no handler for: one per encrypted to-device message
+#                      we send ourselves. Kept at error, not off, since the
+#                      target also reports real decryption failures.
 #
 # Drop a line to see one of them again, or use RUST_LOG=debug for everything.
-: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_call_sdk=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off}"
+: "${RUST_LOG:=warn,matrix_rtc_core=debug,matrix_rtc_call_sdk=debug,matrix_rtc_livekit=debug,matrix_sdk::event_cache=off,matrix_sdk::latest_events=off,matrix_sdk_crypto::identities::manager=off,matrix_sdk_crypto::gossiping=off,matrix_sdk_crypto::machine=error}"
 export RUST_LOG
 
 if [[ -z "$RECOVERY_KEY" ]]; then
@@ -220,6 +268,9 @@ args=(
     --login-delay-ms "$LOGIN_DELAY_MS"
     --device-prefix "$DEVICE_PREFIX"
     --sticky-duration-ms "$STICKY_DURATION_MS"
+    --key-rotation-grace-ms "$KEY_ROTATION_GRACE_MS"
+    --heartbeat-interval-ms "$HEARTBEAT_INTERVAL_MS"
+    --keep-alive-timeout-ms "$KEEP_ALIVE_TIMEOUT_MS"
 )
 [[ "$SIMULCAST" == "0" ]] && args+=(--no-simulcast)
 [[ "$AUDIO" == "1" ]] && args+=(--audio)
