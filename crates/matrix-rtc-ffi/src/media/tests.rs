@@ -299,7 +299,6 @@ fn constraint_dtos_fold_like_the_core_model() {
             width: 320,
             height: 180,
         },
-        low_bandwidth: false,
     }
     .into();
 

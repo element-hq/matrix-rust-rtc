@@ -720,6 +720,7 @@ async fn run(
             let video_ok = verify_video_pattern(&bob.call, "bob").await?;
             let constraints_ok = if video_ok {
                 verify_constraints_toggle(&bob.call, "bob").await?
+                    && verify_receive_video(&alice.call, &bob.call, &mut _alice_video).await?
             } else {
                 false
             };
@@ -1107,6 +1108,12 @@ async fn verify_video_pattern(call: &LiveKitCall, label: &str) -> Result<bool, B
         return Ok(false);
     };
     println!("[{label}] receiving camera stream of {}", peer.member_id);
+    // A new video plays only once constrained, as a host does on showing it.
+    call.set_constraints(
+        &peer.member_id,
+        MediaStreamKind::Camera,
+        MediaConstraints::default(),
+    );
 
     let mut frames = track
         .video_frames()
@@ -1253,6 +1260,93 @@ async fn verify_constraints_toggle(
     println!("[{label}] video restarted after enabled=true: {restarted}");
 
     Ok(paused && resumed && stopped && restarted)
+}
+
+/// RTP packets received on `member_id`'s `kind` over `window`; `None` while
+/// the stream has no counters.
+async fn packets_over(
+    call: &LiveKitCall,
+    member_id: &str,
+    kind: MediaStreamKind,
+    window: Duration,
+) -> Option<u64> {
+    let before = call.receive_stats(member_id, kind).await?.packets_received;
+    tokio::time::sleep(window).await;
+    let after = call.receive_stats(member_id, kind).await?.packets_received;
+    Some(after.saturating_sub(before))
+}
+
+/// 055: the receive switch, on bob's side.
+///
+/// 1. Off: alice's camera stops arriving within a second while her
+///    microphone keeps flowing.
+/// 2. Off: a camera alice publishes anew (the shape of a member joining
+///    during the mode) is not subscribed at all.
+/// 3. On: her camera is subscribed and flows again.
+async fn verify_receive_video(
+    alice: &LiveKitCall,
+    bob: &LiveKitCall,
+    alice_video: &mut Option<VideoPublisher>,
+) -> Result<bool, Box<dyn Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let Some(peer) = wait_for_peer(bob, deadline).await else {
+        return Ok(false);
+    };
+    let alice_id = peer.member_id;
+    let window = Duration::from_secs(2);
+    bob.set_constraints(
+        &alice_id,
+        MediaStreamKind::Camera,
+        MediaConstraints::default(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let flowing = packets_over(bob, &alice_id, MediaStreamKind::Camera, window).await;
+    println!("[bob] camera packets before the switch: {flowing:?}");
+
+    bob.set_receive_video(false);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let camera = packets_over(bob, &alice_id, MediaStreamKind::Camera, window).await;
+    let microphone = packets_over(bob, &alice_id, MediaStreamKind::Microphone, window).await;
+    println!("[bob] video off: camera packets {camera:?}, microphone packets {microphone:?}");
+    let paused = flowing.is_some_and(|n| n > 0)
+        && camera.is_some_and(|n| n == 0)
+        && microphone.is_some_and(|n| n > 0);
+
+    println!("[alice] republishing her camera while bob receives no video");
+    alice_video.take();
+    alice.engine().unpublish(MediaStreamKind::Camera).await?;
+    wait_until_gone(bob, &alice_id, MediaStreamKind::Camera).await;
+    *alice_video = Some(publish_pattern_video(alice).await?);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let held_back = bob
+        .remote_track(&alice_id, MediaStreamKind::Camera)
+        .is_none();
+    println!("[bob] new camera left unsubscribed while video is off: {held_back}");
+
+    bob.set_receive_video(true);
+    let resumed_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let resubscribed =
+        wait_for_remote_track(bob, &alice_id, MediaStreamKind::Camera, resumed_deadline)
+            .await
+            .is_some();
+    // A new video plays once constrained; bob's constraint from step 1 still
+    // stands, so nothing more is asked.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let resumed = resubscribed
+        && packets_over(bob, &alice_id, MediaStreamKind::Camera, window)
+            .await
+            .is_some_and(|n| n > 0);
+    println!("[bob] video on: camera subscribed {resubscribed}, flowing {resumed}");
+
+    Ok(paused && held_back && resumed)
+}
+
+/// Waits up to 10 s for `member_id`'s `kind` to leave `call`.
+async fn wait_until_gone(call: &LiveKitCall, member_id: &str, kind: MediaStreamKind) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while call.remote_track(member_id, kind).is_some() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 /// Receive a peer's tone through the transport-agnostic media API: find the

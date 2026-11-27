@@ -395,6 +395,14 @@ pub trait TransportConnection: MaybeSend {
     /// ignores it, for transports that receive whatever they are sent.
     fn set_wanted(&self, _identities: &[String]) {}
 
+    /// Whether remote video is received on this connection. While `false`,
+    /// a camera or screen share published from now on is not subscribed, so
+    /// nothing of it is sent to us; turning it back on subscribes what was
+    /// skipped. Streams already subscribed are paused through
+    /// [`Self::apply_constraints`], not here. Told before [`Self::set_wanted`]
+    /// and held across reconnects. The default ignores it.
+    fn set_receive_video(&self, _receive: bool) {}
+
     /// Establish this connection again behind the same handle, after a loss
     /// or for a first connect (034 R24): the handle, and every local
     /// publication made through it, stays valid and is carried onto the new

@@ -221,6 +221,8 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                 wanted: Mutex::new(Default::default()),
                 installs: Mutex::new(0),
                 source_sizes: Mutex::new(Default::default()),
+                receive_video: AtomicBool::new(true),
+                desired: Mutex::new(Default::default()),
             }),
         }
     }
@@ -318,6 +320,14 @@ struct ConnectionShared {
     /// size we asked for, so it is read before our first request. One entry
     /// per publication this connection was asked to constrain.
     source_sizes: Mutex<std::collections::HashMap<String, (u32, u32)>>,
+    /// Whether remote video is subscribed ([`TransportConnection::
+    /// set_receive_video`], 055): while `false`, a camera or screen share is
+    /// left unsubscribed, so the SFU sends none of it.
+    receive_video: AtomicBool,
+    /// The last setting the pool asked for each remote stream, kept even
+    /// while the stream is not there, so a track is set to it the moment it
+    /// is subscribed.
+    desired: Mutex<std::collections::HashMap<(String, MediaStreamKind), ResolvedConstraints>>,
 }
 
 /// What [`TransportConnection::hand_over`] gives: the connected room and how
@@ -427,6 +437,67 @@ impl LiveKitTransportConnection {
         })
     }
 
+    /// Sets one remote publication to `resolved`.
+    fn apply_to(
+        &self,
+        publication: &RemoteTrackPublication,
+        kind: MediaStreamKind,
+        resolved: ResolvedConstraints,
+    ) {
+        // `Off` SHOULD be a full unsubscribe (`set_subscribed(false)`), but
+        // livekit 0.7.48's client-side *re*subscribe is unreliable: the SFU
+        // resumes RTP on the previous receiver without a new OnTrack, so no
+        // `TrackSubscribed` fires, `publication.track()` stays `None`, and
+        // every subsequent settings call no-ops — the stream is stranded
+        // (observed against livekit-server v1.10.1). Until that works
+        // upstream, `Off` maps to the pause path too: identical zero
+        // bandwidth (dynacast even stops the publisher's encoder), only an
+        // idle decoder object is retained. `Paused`/`Off` keep the
+        // subscription and set the `disabled` flag server-side — no data,
+        // instant resume.
+        let active = matches!(resolved.demand, StreamDemand::Active);
+        if !matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
+            publication.set_enabled(active);
+            return;
+        }
+
+        // ONE `UpdateTrackSettings` per change. Every livekit setter spawns
+        // its own task sending a full-replacement message, and nothing orders
+        // two of them: `set_enabled` carries the size last asked for,
+        // `set_video_quality` none at all, so resuming with a quality could
+        // land as the stale size and pin the stream to an old layer. Instead
+        // the pause flag is flipped locally (`enable`/`disable` send nothing)
+        // and a single `update_video_dimensions` sends `{disabled, width,
+        // height}` as they stand. A quality becomes a size of the publisher's
+        // full one.
+        let source = self.source_size(publication);
+        match requested_size(resolved.detail, source) {
+            Some((width, height)) => {
+                if let Some(track) = publication.track() {
+                    if active {
+                        track.enable();
+                    } else {
+                        track.disable();
+                    }
+                }
+                publication.update_video_dimensions(TrackDimension(width, height));
+            }
+            None => {
+                publication.set_enabled(active);
+                // Only when the publisher's size is unknown. `set_video_quality`
+                // sends zeroed dimensions and `disabled: false`, so it must
+                // never follow a pause. A no-op on a non-simulcast track.
+                if let (VideoDetail::Quality(limit), true) = (resolved.detail, active) {
+                    publication.set_video_quality(match limit {
+                        QualityLimit::Low => LkVideoQuality::Low,
+                        QualityLimit::Medium => LkVideoQuality::Medium,
+                        QualityLimit::High => LkVideoQuality::High,
+                    });
+                }
+            }
+        }
+    }
+
     /// The connected session, for the `LiveKitCall` facade's transition-period
     /// raw accessors; `None` before the first connect.
     pub fn session(&self) -> Option<Arc<LiveKitSession>> {
@@ -457,6 +528,13 @@ impl LiveKitTransportConnection {
                 .contains(identity)
     }
 
+    /// Whether `identity`'s stream of `kind` is to be subscribed: a wanted
+    /// participant's, and video only while video is received.
+    fn wants_stream(&self, identity: &str, kind: MediaStreamKind) -> bool {
+        self.wants(identity)
+            && (!kind.is_video() || self.shared.receive_video.load(Ordering::Acquire))
+    }
+
     /// Subscribes to the tracks of every wanted participant already in
     /// `session`; later ones are subscribed as they are published.
     ///
@@ -470,7 +548,8 @@ impl LiveKitTransportConnection {
                 continue;
             }
             for publication in participant.track_publications().into_values() {
-                if !publication.is_desired() {
+                let kind = stream_kind(publication.source(), publication.kind());
+                if !publication.is_desired() && self.wants_stream(identity.as_str(), kind) {
                     log::debug!(
                         "subscribing to {identity}'s {:?} on {}",
                         publication.source(),
@@ -552,10 +631,31 @@ impl TransportConnection for LiveKitTransportConnection {
             let mut wanted = self.shared.wanted.lock().expect("wanted mutex poisoned");
             let added = identities.iter().any(|identity| !wanted.contains(identity));
             *wanted = identities.iter().cloned().collect();
+            // A setting outlives neither the participant's place here nor the
+            // pool's constraint, which dies with the membership.
+            self.shared
+                .desired
+                .lock()
+                .expect("desired mutex poisoned")
+                .retain(|(identity, _), _| wanted.contains(identity));
             added
         };
         log::debug!("{} receives {identities:?}", self.connection_key);
         if added && let Some(session) = self.current_session() {
+            self.subscribe_wanted(&session);
+        }
+    }
+
+    /// Video already subscribed stays subscribed (the pool pauses it); only
+    /// what is published from now on is held back, and subscribed once video
+    /// is received again.
+    fn set_receive_video(&self, receive: bool) {
+        let was = self.shared.receive_video.swap(receive, Ordering::AcqRel);
+        log::debug!("{} receives video: {receive}", self.connection_key);
+        if receive
+            && !was
+            && let Some(session) = self.current_session()
+        {
             self.subscribe_wanted(&session);
         }
     }
@@ -782,8 +882,13 @@ impl TransportConnection for LiveKitTransportConnection {
         kind: MediaStreamKind,
         resolved: ResolvedConstraints,
     ) -> Result<(), TransportError> {
-        // The participant or publication being gone is not an error: the
-        // engine re-applies constraints when the stream (re)appears.
+        // Kept for a track subscribed later (see `TrackSubscribed`). The
+        // participant or publication being gone is not an error.
+        self.shared
+            .desired
+            .lock()
+            .expect("desired mutex poisoned")
+            .insert((identity.to_owned(), kind), resolved);
         let Some(session) = self.current_session() else {
             return Ok(());
         };
@@ -798,59 +903,7 @@ impl TransportConnection for LiveKitTransportConnection {
         else {
             return Ok(());
         };
-
-        // `Off` SHOULD be a full unsubscribe (`set_subscribed(false)`), but
-        // livekit 0.7.48's client-side *re*subscribe is unreliable: the SFU
-        // resumes RTP on the previous receiver without a new OnTrack, so no
-        // `TrackSubscribed` fires, `publication.track()` stays `None`, and
-        // every subsequent settings call no-ops — the stream is stranded
-        // (observed against livekit-server v1.10.1). Until that works
-        // upstream, `Off` maps to the pause path too: identical zero
-        // bandwidth (dynacast even stops the publisher's encoder), only an
-        // idle decoder object is retained. `Paused`/`Off` keep the
-        // subscription and set the `disabled` flag server-side — no data,
-        // instant resume.
-        let active = matches!(resolved.demand, StreamDemand::Active);
-        if !matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
-            publication.set_enabled(active);
-            return Ok(());
-        }
-
-        // ONE `UpdateTrackSettings` per change. Every livekit setter spawns
-        // its own task sending a full-replacement message, and nothing orders
-        // two of them: `set_enabled` carries the size last asked for,
-        // `set_video_quality` none at all, so resuming with a quality could
-        // land as the stale size and pin the stream to an old layer. Instead
-        // the pause flag is flipped locally (`enable`/`disable` send nothing)
-        // and a single `update_video_dimensions` sends `{disabled, width,
-        // height}` as they stand. A quality becomes a size of the publisher's
-        // full one.
-        let source = self.source_size(&publication);
-        match requested_size(resolved.detail, source) {
-            Some((width, height)) => {
-                if let Some(track) = publication.track() {
-                    if active {
-                        track.enable();
-                    } else {
-                        track.disable();
-                    }
-                }
-                publication.update_video_dimensions(TrackDimension(width, height));
-            }
-            None => {
-                publication.set_enabled(active);
-                // Only when the publisher's size is unknown. `set_video_quality`
-                // sends zeroed dimensions and `disabled: false`, so it must
-                // never follow a pause. A no-op on a non-simulcast track.
-                if let (VideoDetail::Quality(limit), true) = (resolved.detail, active) {
-                    publication.set_video_quality(match limit {
-                        QualityLimit::Low => LkVideoQuality::Low,
-                        QualityLimit::Medium => LkVideoQuality::Medium,
-                        QualityLimit::High => LkVideoQuality::High,
-                    });
-                }
-            }
-        }
+        self.apply_to(&publication, kind, resolved);
         Ok(())
     }
 
@@ -1175,7 +1228,8 @@ async fn translate_room_events(
                 publication,
                 participant,
             } => {
-                if owner.wants(participant.identity().as_str()) {
+                let kind = stream_kind(publication.source(), publication.kind());
+                if owner.wants_stream(participant.identity().as_str(), kind) {
                     publication.set_subscribed(true);
                 }
                 None
@@ -1197,6 +1251,28 @@ async fn translate_room_events(
                         kind,
                     })
                 } else {
+                    // A new video starts paused until the pool asks for it
+                    // (055): set to the last setting asked for this stream,
+                    // or paused when there is none, before the engine hears
+                    // of it. livekit can only pause a track that exists, so
+                    // this is the earliest moment. The pool's own apply on
+                    // `TrackAdded` sends the same setting, so the order the
+                    // two unordered settings messages land in cannot matter.
+                    if kind.is_video() {
+                        let identity = participant.identity().to_string();
+                        let resolved = owner
+                            .shared
+                            .desired
+                            .lock()
+                            .expect("desired mutex poisoned")
+                            .get(&(identity, kind))
+                            .copied()
+                            .unwrap_or(ResolvedConstraints {
+                                demand: StreamDemand::Paused,
+                                detail: VideoDetail::Auto,
+                            });
+                        owner.apply_to(&publication, kind, resolved);
+                    }
                     Some(ConnectionEvent::TrackAdded {
                         identity: participant.identity().to_string(),
                         kind,

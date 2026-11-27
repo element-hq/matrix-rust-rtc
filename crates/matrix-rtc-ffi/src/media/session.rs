@@ -298,6 +298,10 @@ impl MediaSession {
 
     /// Set the subscription constraints for one stream of one participant.
     /// Debounced and re-applied automatically when the stream (re)appears.
+    ///
+    /// A video stream with no constraints is paused: a new remote camera or
+    /// screen share does not play until the app constrains it. Constraints
+    /// can be set before the stream exists, and apply when it appears.
     pub fn set_constraints(
         &self,
         member_id: String,
@@ -306,6 +310,30 @@ impl MediaSession {
     ) {
         self.engine
             .set_constraints(member_id, kind.into(), constraints.into());
+    }
+
+    /// Whether other members' video is received.
+    ///
+    /// `false` pauses every remote camera and screen-share stream, on every
+    /// SFU this session receives from, now and for streams that appear later;
+    /// while it is `false` a newly published video is not subscribed at all,
+    /// so the SFU sends none of it. Audio, a screen share's included, is never
+    /// affected.
+    ///
+    /// Takes effect at once, without the debounce of
+    /// [`MediaSession::set_constraints`]. Holds for the life of this session:
+    /// through our own reconnects, LiveKit's restarts, SFU fallback and
+    /// members moving SFU. A new session starts with `true`, so call this
+    /// right after creating one to have it in place before the first roster.
+    ///
+    /// It overrides per-stream constraints rather than replacing them: while
+    /// `false`, `set_constraints` is still accepted and stored, and nothing
+    /// it sets lifts the pause, whatever order the two calls come in. `true`
+    /// restores each stream's own last constraints; a video stream nobody has
+    /// constrained stays paused. Idempotent.
+    pub fn set_receive_video(&self, receive: bool) {
+        log::info!("media: receive video={receive}");
+        self.engine.set_receive_video(receive);
     }
 
     /// The audio frame stream of a participant's stream, once
@@ -387,6 +415,12 @@ impl MediaSession {
     /// (`StreamMuted`/`StreamUnmuted` against our `member_id`), so a host can
     /// render its own state from the same source it renders everyone else's
     /// instead of keeping a parallel copy.
+    ///
+    /// The mute holds for the life of this session, not of one connection: a
+    /// track muted before or during a reconnect, LiveKit's restart, or SFU
+    /// fallback is still muted on the connection that comes back, and is
+    /// announced muted there, never briefly live. A track retracted with
+    /// [`MediaSession::unpublish`] is not republished.
     ///
     /// Errors if nothing of that kind is currently published.
     pub async fn set_local_muted(

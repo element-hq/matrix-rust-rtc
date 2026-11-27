@@ -517,6 +517,12 @@ impl LiveKitCall {
         self.engine.set_constraints(member_id, kind, constraints);
     }
 
+    /// Whether other members' video is received; see
+    /// [`CallEngine::set_receive_video`].
+    pub fn set_receive_video(&self, receive: bool) {
+        self.engine.set_receive_video(receive);
+    }
+
     /// The media engine driving this call's roster and event stream.
     pub fn engine(&self) -> &CallEngine {
         &self.engine

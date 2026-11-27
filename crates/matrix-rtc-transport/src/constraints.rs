@@ -81,8 +81,6 @@ pub struct MediaConstraints {
     pub visible: bool,
     /// How much detail to receive (video kinds only).
     pub detail: VideoDetail,
-    /// Bandwidth-saver mode: pause all video of this participant, keep audio.
-    pub low_bandwidth: bool,
 }
 
 impl Default for MediaConstraints {
@@ -91,7 +89,6 @@ impl Default for MediaConstraints {
             enabled: true,
             visible: true,
             detail: VideoDetail::Auto,
-            low_bandwidth: false,
         }
     }
 }
@@ -121,13 +118,12 @@ impl MediaConstraints {
     /// Fold the constraint fields into the effective per-stream setting.
     ///
     /// `enabled = false` wins over everything (full unsubscribe);
-    /// invisibility pauses; `low_bandwidth` pauses video kinds but leaves
-    /// audio flowing.
+    /// invisibility pauses.
     pub fn resolve(&self, kind: MediaStreamKind) -> ResolvedConstraints {
-        let is_video = matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare);
+        let is_video = kind.is_video();
         let demand = if !self.enabled {
             StreamDemand::Off
-        } else if !self.visible || (self.low_bandwidth && is_video) {
+        } else if !self.visible {
             StreamDemand::Paused
         } else {
             StreamDemand::Active
@@ -139,6 +135,23 @@ impl MediaConstraints {
             } else {
                 VideoDetail::Auto
             },
+        }
+    }
+}
+
+impl ResolvedConstraints {
+    /// The call-wide receive switch over a stream's own setting: while video
+    /// is not received, a video stream that would be active is paused. `Off`
+    /// stays `Off`, and audio kinds are never touched. Applied after
+    /// [`MediaConstraints::resolve`] rather than folded into it, so each
+    /// stream keeps its own value to return to when video is received again.
+    pub fn receiving(self, kind: MediaStreamKind, receive_video: bool) -> Self {
+        if receive_video || !kind.is_video() || self.demand != StreamDemand::Active {
+            return self;
+        }
+        Self {
+            demand: StreamDemand::Paused,
+            ..self
         }
     }
 }
@@ -160,7 +173,6 @@ mod tests {
             enabled: false,
             visible: true,
             detail: VideoDetail::Quality(QualityLimit::High),
-            low_bandwidth: false,
         };
         assert_eq!(
             constraints.resolve(MediaStreamKind::Camera).demand,
@@ -189,28 +201,52 @@ mod tests {
     }
 
     #[test]
-    fn low_bandwidth_pauses_video_but_keeps_audio() {
-        let constraints = MediaConstraints {
-            low_bandwidth: true,
+    fn not_receiving_video_pauses_video_but_keeps_audio() {
+        let active = MediaConstraints::default();
+        for kind in [MediaStreamKind::Camera, MediaStreamKind::ScreenShare] {
+            assert_eq!(
+                active.resolve(kind).receiving(kind, false).demand,
+                StreamDemand::Paused
+            );
+            assert_eq!(
+                active.resolve(kind).receiving(kind, true).demand,
+                StreamDemand::Active
+            );
+        }
+        for kind in [
+            MediaStreamKind::Microphone,
+            MediaStreamKind::ScreenShareAudio,
+        ] {
+            assert_eq!(
+                active.resolve(kind).receiving(kind, false).demand,
+                StreamDemand::Active
+            );
+        }
+    }
+
+    #[test]
+    fn not_receiving_video_keeps_off_and_detail() {
+        let released = MediaConstraints {
+            enabled: false,
             ..Default::default()
         };
         assert_eq!(
-            constraints.resolve(MediaStreamKind::Camera).demand,
-            StreamDemand::Paused
-        );
-        assert_eq!(
-            constraints.resolve(MediaStreamKind::ScreenShare).demand,
-            StreamDemand::Paused
-        );
-        assert_eq!(
-            constraints.resolve(MediaStreamKind::Microphone).demand,
-            StreamDemand::Active
-        );
-        assert_eq!(
-            constraints
-                .resolve(MediaStreamKind::ScreenShareAudio)
+            released
+                .resolve(MediaStreamKind::Camera)
+                .receiving(MediaStreamKind::Camera, false)
                 .demand,
-            StreamDemand::Active
+            StreamDemand::Off
+        );
+        let sized = MediaConstraints {
+            detail: VideoDetail::Quality(QualityLimit::Low),
+            ..Default::default()
+        };
+        assert_eq!(
+            sized
+                .resolve(MediaStreamKind::Camera)
+                .receiving(MediaStreamKind::Camera, false)
+                .detail,
+            VideoDetail::Quality(QualityLimit::Low)
         );
     }
 

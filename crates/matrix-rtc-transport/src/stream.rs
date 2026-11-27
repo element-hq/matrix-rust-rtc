@@ -18,3 +18,10 @@ pub enum MediaStreamKind {
     ScreenShareAudio,
     Data,
 }
+
+impl MediaStreamKind {
+    /// Camera or screen share: the kinds the receive-video switch pauses.
+    pub fn is_video(self) -> bool {
+        matches!(self, MediaStreamKind::Camera | MediaStreamKind::ScreenShare)
+    }
+}

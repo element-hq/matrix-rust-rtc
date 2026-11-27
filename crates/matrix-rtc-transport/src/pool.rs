@@ -398,6 +398,9 @@ pub struct MediaPool {
     /// Latest constraints per stream, with a generation counter that
     /// invalidates superseded debounce timers.
     constraints: HashMap<(String, MediaStreamKind), (MediaConstraints, u64)>,
+    /// Whether remote video is received at all (055): `false` pauses every
+    /// video stream over its own constraints, on every connection.
+    receive_video: bool,
     /// Media that arrived before its membership, flushed when it lands.
     pending_tracks: PendingTracks,
     /// Transport identities that published a track declared unencrypted,
@@ -460,6 +463,7 @@ impl MediaPool {
             identity_map: HashMap::new(),
             member_identities: HashMap::new(),
             constraints: HashMap::new(),
+            receive_video: true,
             pending_tracks: HashMap::new(),
             sent_in_clear: HashSet::new(),
             pending_keys: HashMap::new(),
@@ -697,6 +701,34 @@ impl MediaPool {
                 generation,
             }));
         });
+    }
+
+    /// Whether remote video is received (055). `false` pauses every remote
+    /// camera and screen share, current and future, on every connection,
+    /// whatever their own constraints say, and keeps connections from
+    /// subscribing video published from now on; audio is untouched. Applied
+    /// at once, without the constraints debounce. `true` restores each
+    /// stream's own constraints. Held for the life of the pool.
+    pub fn set_receive_video(&mut self, receive: bool) {
+        if self.receive_video == receive {
+            return;
+        }
+        self.receive_video = receive;
+        let keys: Vec<String> = self.pool.keys().cloned().collect();
+        for key in &keys {
+            if let Some(connection) = self.connection_to_tell(key) {
+                connection.set_receive_video(receive);
+            }
+        }
+        let video: Vec<(String, MediaStreamKind)> = self
+            .constraints
+            .keys()
+            .filter(|(_, kind)| kind.is_video())
+            .cloned()
+            .collect();
+        for (member_id, kind) in video {
+            self.apply_constraints_now(&member_id, kind);
+        }
     }
 
     /// Whether signalling reaches the homeserver: a fallback is only taken
@@ -987,7 +1019,9 @@ impl MediaPool {
         let Some((constraints, _)) = self.constraints.get(&(member_id.to_owned(), kind)) else {
             return;
         };
-        let resolved = constraints.resolve(kind);
+        let resolved = constraints
+            .resolve(kind)
+            .receiving(kind, self.receive_video);
         let Some(identity) = self.member_identities.get(member_id).cloned() else {
             return;
         };
@@ -1125,14 +1159,12 @@ impl MediaPool {
         let Some(entry) = self.pool.get(key) else {
             return;
         };
-        let connection = match &entry.state {
-            ConnState::Up { connection } => connection.clone(),
-            _ if entry.is_own => match &self.own {
-                Some(own) => own.connection.clone(),
-                None => return,
-            },
-            _ => return,
+        let Some(connection) = self.connection_to_tell(key) else {
+            return;
         };
+        // Before the identities: a connection subscribes as soon as it is
+        // told whom to receive, and video must not go out first.
+        connection.set_receive_video(self.receive_video);
         let mut identities: Vec<String> = entry
             .members
             .iter()
@@ -1141,6 +1173,18 @@ impl MediaPool {
             .collect();
         identities.sort();
         connection.set_wanted(&identities);
+    }
+
+    /// The handle to tell about `key`'s subscriptions: the connection once
+    /// it is up, and our own handle at any time (it keeps what it is told
+    /// across reconnects).
+    fn connection_to_tell(&self, key: &str) -> Option<Arc<dyn TransportConnection>> {
+        let entry = self.pool.get(key)?;
+        match &entry.state {
+            ConnState::Up { connection } => Some(connection.clone()),
+            _ if entry.is_own => self.own.as_ref().map(|own| own.connection.clone()),
+            _ => None,
+        }
     }
 
     /// Spawn a connect attempt for an existing pool entry.

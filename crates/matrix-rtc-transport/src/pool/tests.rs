@@ -14,7 +14,7 @@ use matrix_rtc_core::{EventOrigin, LiveKitTransport, RtcTransport};
 use tokio::sync::mpsc::UnboundedSender;
 
 use super::*;
-use crate::{OwnMemberClaims, ResolvedConstraints};
+use crate::{OwnMemberClaims, ResolvedConstraints, StreamDemand};
 
 const OWN_FOCUS: &str = "https://sfu.example.org";
 const PEER_FOCUS: &str = "https://sfu-b.example.org";
@@ -36,6 +36,9 @@ struct TransportState {
     takeovers: StdMutex<Vec<String>>,
     /// The last wanted set each connection key was handed.
     wanted: StdMutex<HashMap<String, Vec<String>>>,
+    /// `set_receive_video` and `set_wanted` calls per connection key, in
+    /// order: `"video on"`, `"video off"` or `"wanted"`.
+    told: StdMutex<Vec<(String, &'static str)>>,
     /// Another key for a connection key's members once a subscription on it
     /// failed, as the LiveKit transport falls back to `/sfu/get` (spec 049).
     fallbacks: StdMutex<HashMap<String, String>>,
@@ -124,7 +127,19 @@ impl TransportConnection for FakeConnection {
         &self.key
     }
 
+    fn set_receive_video(&self, receive: bool) {
+        self.state.told.lock().unwrap().push((
+            self.key.clone(),
+            if receive { "video on" } else { "video off" },
+        ));
+    }
+
     fn set_wanted(&self, identities: &[String]) {
+        self.state
+            .told
+            .lock()
+            .unwrap()
+            .push((self.key.clone(), "wanted"));
         self.state
             .wanted
             .lock()
@@ -843,6 +858,129 @@ async fn constraints_are_debounced_and_follow_the_stream() {
         *fx.state.applied.lock().unwrap(),
         vec![expected.clone(), expected]
     );
+}
+
+/// The last demand applied to `identity`'s `kind`, if any.
+fn last_applied(fx: &Fixture, identity: &str, kind: MediaStreamKind) -> Option<StreamDemand> {
+    fx.state
+        .applied
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|(applied, applied_kind, _)| applied == identity && *applied_kind == kind)
+        .map(|(_, _, resolved)| resolved.demand)
+}
+
+/// 055: turning video off pauses every video stream at once, over the
+/// stream's own constraints and over a stage write that lands later; audio
+/// is left alone, and turning it on restores each stream's own value.
+#[tokio::test(start_paused = true)]
+async fn not_receiving_video_pauses_video_over_its_own_constraints() {
+    let mut fx = Fixture::new();
+    fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    for kind in [
+        MediaStreamKind::Camera,
+        MediaStreamKind::ScreenShare,
+        MediaStreamKind::Microphone,
+    ] {
+        fx.pool
+            .set_constraints("bob".into(), kind, MediaConstraints::default());
+    }
+    tokio::time::sleep(CONSTRAINTS_DEBOUNCE * 2).await;
+    fx.drain().await;
+    fx.state.applied.lock().unwrap().clear();
+
+    // No debounce: applied before any timer could fire.
+    fx.pool.set_receive_video(false);
+    fx.drain().await;
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::Camera),
+        Some(StreamDemand::Paused)
+    );
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::ScreenShare),
+        Some(StreamDemand::Paused)
+    );
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::Microphone),
+        None
+    );
+
+    // The stage keeps writing; nothing it writes lifts the switch.
+    fx.pool.set_constraints(
+        "bob".into(),
+        MediaStreamKind::Camera,
+        MediaConstraints::default(),
+    );
+    tokio::time::sleep(CONSTRAINTS_DEBOUNCE * 2).await;
+    fx.drain().await;
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::Camera),
+        Some(StreamDemand::Paused)
+    );
+
+    fx.pool.set_receive_video(true);
+    fx.drain().await;
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::Camera),
+        Some(StreamDemand::Active)
+    );
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::ScreenShare),
+        Some(StreamDemand::Active)
+    );
+}
+
+/// 055 R13: the switch outlives a transport reconnect, which re-applies
+/// every stream's constraints.
+#[tokio::test(start_paused = true)]
+async fn not_receiving_video_holds_across_a_reconnect() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool.apply_snapshot(&[member_on("bob", OWN_FOCUS)]);
+    fx.pool.set_constraints(
+        "bob".into(),
+        MediaStreamKind::Camera,
+        MediaConstraints::default(),
+    );
+    fx.pool.set_receive_video(false);
+    tokio::time::sleep(CONSTRAINTS_DEBOUNCE * 2).await;
+    fx.drain().await;
+    fx.state.applied.lock().unwrap().clear();
+
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    own.send(ConnectionEvent::Reconnected).unwrap();
+    fx.drain().await;
+    assert_eq!(
+        last_applied(&fx, "id-bob", MediaStreamKind::Camera),
+        Some(StreamDemand::Paused)
+    );
+}
+
+/// 055 R1: a connection made while video is off hears so before it is told
+/// whom to receive, so it never subscribes a joiner's video.
+#[tokio::test(start_paused = true)]
+async fn a_new_connection_is_told_video_is_off_before_whom_to_receive() {
+    let mut fx = Fixture::new();
+    fx.adopt();
+    fx.pool.set_receive_video(false);
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("carol", PEER_FOCUS)]);
+    fx.drain().await;
+    let told: Vec<&str> = fx
+        .state
+        .told
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(key, _)| key == PEER_FOCUS)
+        .map(|(_, what)| *what)
+        .collect();
+    assert_eq!(told.first(), Some(&"video off"));
+    assert!(told.contains(&"wanted"));
+    assert!(!told.contains(&"video on"));
 }
 
 fn reconnecting(key: &str) -> PoolEvent {

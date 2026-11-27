@@ -74,7 +74,7 @@ pub const UNVERIFIED_GRACE: Duration = Duration::from_secs(10);
 /// stream sends no frames, so a key that arrives later could never be seen to
 /// work: the member would stay unable to decrypt until something else, such as
 /// their unmuting, sent frames. A stream the host released (`enabled: false`)
-/// or a bandwidth-saver choice is left as asked.
+/// is left as asked, and the receive switch (055) pauses it over the probe.
 fn probe_undecryptable(
     kind: MediaStreamKind,
     constraints: MediaConstraints,
@@ -260,6 +260,10 @@ enum ActorMessage {
         member_id: String,
         kind: MediaStreamKind,
         constraints: MediaConstraints,
+    },
+    /// Whether remote video is received at all (055).
+    SetReceiveVideo {
+        receive: bool,
     },
     /// A hysteresis timer elapsed; apply if it is still the current one (R10).
     SpeakerTimer {
@@ -659,6 +663,19 @@ impl CallEngine {
             kind,
             constraints,
         });
+    }
+
+    /// Whether other members' video is received (055). `false` pauses every
+    /// remote camera and screen share, on every connection, current and
+    /// future, whatever their own constraints say, and leaves video published
+    /// from then on unsubscribed; audio is untouched. Applied at once, without
+    /// the constraints debounce, and held for the life of the engine through
+    /// reconnects and SFU fallback. `true` restores each stream's own
+    /// constraints. Ordered with [`Self::set_constraints`] on the same queue.
+    pub fn set_receive_video(&self, receive: bool) {
+        let _ = self
+            .messages
+            .send(ActorMessage::SetReceiveVideo { receive });
     }
 
     /// The handle for a participant's subscribed stream, to open frame
@@ -1291,6 +1308,9 @@ impl Actor {
                     kind,
                     probe_undecryptable(kind, constraints, undecryptable),
                 );
+            }
+            ActorMessage::SetReceiveVideo { receive } => {
+                self.pool.set_receive_video(receive);
             }
             ActorMessage::SpeakerTimer {
                 member_id,
@@ -4599,7 +4619,7 @@ mod tests {
             "bob",
             MediaStreamKind::Camera,
             MediaConstraints {
-                low_bandwidth: true,
+                visible: false,
                 ..Default::default()
             },
         );
@@ -4616,7 +4636,7 @@ mod tests {
             })
             .unwrap();
         wait_until(|| fx.state.applied.lock().unwrap().len() == 2).await;
-        // low_bandwidth folds video to a pause (subscription kept).
+        // Invisibility folds video to a pause (subscription kept).
         assert_eq!(
             fx.state.applied.lock().unwrap()[1].2.demand,
             matrix_rtc_transport::StreamDemand::Paused
@@ -4677,6 +4697,39 @@ mod tests {
             last(&fx).unwrap().demand,
             matrix_rtc_transport::StreamDemand::Paused,
             "decrypting again, the host's hidden stream pauses as it asked"
+        );
+    }
+
+    /// 055: the undecryptable probe never lifts the receive switch, or a
+    /// member we cannot decrypt would stream through Low bandwidth mode.
+    #[tokio::test(start_paused = true)]
+    async fn not_receiving_video_wins_over_the_undecryptable_probe() {
+        let fx = fixture();
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        rostered(&fx, &["bob"]).await;
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        fx.engine.set_receive_video(false);
+        peer_sender(&fx, PEER_FOCUS)
+            .unwrap()
+            .send(ConnectionEvent::EncryptionStateChanged {
+                identity: "id-bob".to_owned(),
+                state: FrameEncryptionState::MissingKey,
+            })
+            .unwrap();
+        fx.engine.set_constraints(
+            "bob",
+            MediaStreamKind::Camera,
+            MediaConstraints {
+                visible: false,
+                ..Default::default()
+            },
+        );
+        wait_until(|| !fx.state.applied.lock().unwrap().is_empty()).await;
+        assert_eq!(
+            fx.state.applied.lock().unwrap().last().unwrap().2.demand,
+            matrix_rtc_transport::StreamDemand::Paused
         );
     }
 

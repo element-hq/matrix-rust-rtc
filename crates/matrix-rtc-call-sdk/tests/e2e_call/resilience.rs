@@ -29,11 +29,12 @@ use matrix_rtc_call::{CallEnd, CallStatus, ConnectionLossReason};
 use matrix_rtc_call_sdk::{CallEvent, ConnectionState, LiveKitCall, LiveKitCallOptions};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SignallingHealth, SlotEncryption};
-use matrix_rtc_transport::{AudioFrame, AudioSourceConfig, PublishOptions};
+use matrix_rtc_transport::{AudioFrame, AudioSourceConfig, MediaStreamKind, PublishOptions};
 
 use super::{
-    Config, Participant, Sfu, create_encrypted_room, credentials, login_and_sync, open_slot,
-    record_peer_tone, run_to_completion, wait_for_joined_members, wait_for_members, wait_for_room,
+    Config, Participant, Sfu, VideoPublisher, create_encrypted_room, credentials, login_and_sync,
+    open_slot, packets_over, publish_pattern_video, record_peer_tone, run_to_completion,
+    wait_for_joined_members, wait_for_members, wait_for_room,
 };
 
 /// Setup, a minute or two of outage, and teardown.
@@ -363,11 +364,64 @@ async fn homeserver_restart(cfg: Config) -> Result<(), Box<dyn Error>> {
 /// Our SFU stopped and started again inside the budget (R24): our media
 /// reconnects behind the same handle with the same member id, and the call
 /// never ends.
+/// Before an outage: alice's camera is published and muted, and bob receives
+/// no video (055). The guard keeps the camera publishing.
+async fn mute_camera_and_stop_video(
+    alice: &LiveKitCall,
+    bob: &LiveKitCall,
+) -> Result<VideoPublisher, Box<dyn Error>> {
+    let camera = publish_pattern_video(alice).await?;
+    alice
+        .engine()
+        .set_local_muted(MediaStreamKind::Camera, true)
+        .await?;
+    bob.set_receive_video(false);
+    println!("[alice] camera muted; [bob] receives no video");
+    Ok(camera)
+}
+
+/// After the outage: whether the SFU bob is on announces alice's camera muted
+/// (a mute survives the move, never briefly live), and whether bob still
+/// receives none of it (the switch survives the reconnect, 055 R13).
+async fn held_through_the_outage(alice: &LiveKitCall, bob: &LiveKitCall) -> (bool, bool) {
+    use livekit::prelude::{ParticipantIdentity, TrackSource};
+
+    let identity = ParticipantIdentity::from(alice.local_identity().to_owned());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut muted = false;
+    while tokio::time::Instant::now() < deadline {
+        let camera = bob
+            .session()
+            .room()
+            .remote_participants()
+            .get(&identity)
+            .and_then(|participant| {
+                participant
+                    .track_publications()
+                    .into_values()
+                    .find(|publication| publication.source() == TrackSource::Camera)
+            });
+        if let Some(camera) = camera {
+            muted = camera.is_muted();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let member = alice.membership_id();
+    let no_video = bob.remote_track(member, MediaStreamKind::Camera).is_none()
+        || packets_over(bob, member, MediaStreamKind::Camera, Duration::from_secs(2))
+            .await
+            .is_none_or(|packets| packets == 0);
+    println!("[bob] after the outage: alice's camera muted {muted}, no video received {no_video}");
+    (muted, no_video)
+}
+
 async fn own_sfu_back_in_time(cfg: Config) -> Result<(), Box<dyn Error>> {
     let (alice, bob) = two_in_a_call(&cfg, Sfu::First, Sfu::First, false).await?;
     let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let member = alice.call.membership_id().to_owned();
+    let _camera = mute_camera_and_stop_video(&alice.call, &bob.call).await?;
 
     let restore = stop(LIVEKIT).await?;
     let reconnecting = until_interruptions(&alice.call, Duration::from_secs(20), |record| {
@@ -382,12 +436,15 @@ async fn own_sfu_back_in_time(cfg: Config) -> Result<(), Box<dyn Error>> {
     })
     .await;
     let after = record_peer_tone(&bob.call, "bob-after-sfu", 440.0).await?;
+    let (muted, no_video) = held_through_the_outage(&alice.call, &bob.call).await;
     let checks = [
         ("tone alice->bob before the stop", before),
         ("our media reported reconnecting", reconnecting),
         ("the call still live 40 s into the outage", alive_at_40),
         ("our media connected again", back),
         ("tone alice->bob after the restart", after),
+        ("alice's camera still muted after the restart", muted),
+        ("bob still receives no video after the restart", no_video),
         ("same member id", alice.call.membership_id() == member),
         ("the call never ended", !ended(&alice.call)),
     ];
@@ -403,6 +460,7 @@ async fn own_sfu_fallback(cfg: Config) -> Result<(), Box<dyn Error>> {
     let _tone = publish_tone(&alice.call, 440.0).await?;
     let before = record_peer_tone(&bob.call, "bob", 440.0).await?;
     let member = alice.call.membership_id().to_owned();
+    let _camera = mute_camera_and_stop_video(&alice.call, &bob.call).await?;
 
     let _restore = stop(LIVEKIT).await?;
     let moved = until_interruptions(&alice.call, Duration::from_secs(40), |record| {
@@ -410,11 +468,14 @@ async fn own_sfu_fallback(cfg: Config) -> Result<(), Box<dyn Error>> {
     })
     .await;
     let through_peer = record_peer_tone(&bob.call, "bob-through-sfu-2", 440.0).await?;
+    let (muted, no_video) = held_through_the_outage(&alice.call, &bob.call).await;
     tokio::time::sleep(Duration::from_secs(50)).await;
     let checks = [
         ("tone alice->bob before the stop", before),
         ("our media connected again, on bob's SFU", moved),
         ("tone alice->bob with our SFU stopped", through_peer),
+        ("alice's camera still muted on bob's SFU", muted),
+        ("bob receives no video after the fallback", no_video),
         ("the call outlived the budget", !ended(&alice.call)),
         ("same member id", alice.call.membership_id() == member),
     ];
